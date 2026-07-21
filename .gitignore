@@ -1,0 +1,6 @@
+# Raw USB captures — large, may contain machine serials. Commit trimmed .hex fixtures instead.
+tools/capture/samples/*.pcapng
+tools/capture/samples/*.pcap
+__pycache__/
+*.pyc
+.venv/

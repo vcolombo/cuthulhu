@@ -1,5 +1,10 @@
 # Capturing Cameo 5 Alpha USB traffic
 
+> **OPTIONAL — not required to build.** The Silhouette protocol is ported from
+> `inkscape-silhouette` (see `silhouette-cameo5.md`). Capture only if you want to
+> cross-validate the ported command stream against real vendor-software traffic;
+> nothing in the project depends on it.
+
 The vendor's cutting software runs on Windows/macOS only, so capture on one of those.
 
 ## Windows (primary)

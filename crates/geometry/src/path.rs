@@ -124,7 +124,9 @@ fn parse_svg_path(d: &str) -> Result<Path, GeomError> {
     };
     let mut buf = String::new();
     for ch in d.chars().chain(std::iter::once(' ')) {
-        if ch.is_ascii_alphabetic() {
+        if (ch == 'e' || ch == 'E') && !buf.is_empty() {
+            buf.push(ch); // exponent inside a number (1e-3), not a command
+        } else if ch.is_ascii_alphabetic() {
             if let Some(c) = cmd { if !buf.is_empty() { nums.push(buf.parse().map_err(|_| GeomError::Parse("nan".into()))?); buf.clear(); } flush(c, &mut nums, &mut segs)?; }
             cmd = Some(ch);
         } else if ch == ',' || ch.is_whitespace() {
@@ -159,6 +161,14 @@ mod tests {
         assert!(matches!(Path::from_svg("M"), Err(GeomError::Parse(_))));
         assert!(matches!(Path::from_svg("M1"), Err(GeomError::Parse(_))));
         assert!(matches!(Path::from_svg("M0,0 C1,1 2,2"), Err(GeomError::Parse(_))));
+    }
+    #[test]
+    fn scientific_notation_numbers_parse() {
+        let p = Path::from_svg("M1e1,0 L2E1,1e-1").unwrap();
+        assert_eq!(p.segs, vec![
+            Seg::Move(Point { x: 10.0, y: 0.0 }),
+            Seg::Line(Point { x: 20.0, y: 0.1 }),
+        ]);
     }
     #[test]
     fn empty_path_bounds_is_zero_rect() {

@@ -29,11 +29,13 @@ impl Affine {
             a2 * e1 + c2 * f1 + e2,   b2 * e1 + d2 * f1 + f2,
         ])
     }
-    pub fn inverse(&self) -> Affine {
+    /// None for singular (non-invertible) transforms.
+    pub fn inverse(&self) -> Option<Affine> {
         let [a, b, c, d, e, f] = self.0;
         let det = a * d - b * c;
+        if det == 0.0 { return None; }
         let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
-        Affine([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)])
+        Some(Affine([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)]))
     }
 }
 
@@ -54,7 +56,12 @@ mod tests {
     #[test]
     fn inverse_undoes_translate() {
         let m = Affine::translate(7.0, 9.0);
-        let back = m.inverse();
-        assert_eq!(back.apply(m.apply(1.0, 1.0).0, m.apply(1.0, 1.0).1), (1.0, 1.0));
+        let back = m.inverse().unwrap();
+        let (fx, fy) = m.apply(1.0, 1.0);
+        assert_eq!(back.apply(fx, fy), (1.0, 1.0));
+    }
+    #[test]
+    fn singular_inverse_is_none() {
+        assert_eq!(Affine([0.0; 6]).inverse(), None);
     }
 }

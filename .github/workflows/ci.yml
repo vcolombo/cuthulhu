@@ -23,5 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install native deps (serialport needs libudev)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - name: Build and test workspace
         run: cargo test --workspace

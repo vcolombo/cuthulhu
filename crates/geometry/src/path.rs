@@ -43,6 +43,9 @@ impl Path {
 
     pub fn bounds(&self) -> Rect {
         let pts = self.flatten(0.1);
+        if pts.iter().all(|p| p.is_empty()) {
+            return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        }
         let (mut minx, mut miny, mut maxx, mut maxy) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for poly in &pts { for p in poly {
             minx = minx.min(p.x); miny = miny.min(p.y); maxx = maxx.max(p.x); maxy = maxy.max(p.y);
@@ -100,13 +103,22 @@ fn parse_svg_path(d: &str) -> Result<Path, GeomError> {
     let mut nums: Vec<f64> = vec![];
     let mut cmd: Option<char> = None;
     let flush = |cmd: char, nums: &mut Vec<f64>, segs: &mut Vec<Seg>| -> Result<(), GeomError> {
+        let need = match cmd {
+            'M' | 'L' => 2,
+            'C' => 6,
+            'Z' => 0,
+            _ => return Err(GeomError::Parse(format!("cmd {cmd}"))),
+        };
+        if nums.len() != need {
+            return Err(GeomError::Parse(format!("cmd {cmd}: expected {need} numbers, got {}", nums.len())));
+        }
         match cmd {
             'M' => { segs.push(Seg::Move(Point { x: nums[0], y: nums[1] })); }
             'L' => { segs.push(Seg::Line(Point { x: nums[0], y: nums[1] })); }
             'C' => { segs.push(Seg::Cubic(
                 Point{x:nums[0],y:nums[1]}, Point{x:nums[2],y:nums[3]}, Point{x:nums[4],y:nums[5]})); }
             'Z' => { segs.push(Seg::Close); }
-            _ => return Err(GeomError::Parse(format!("cmd {cmd}"))),
+            _ => unreachable!("validated above"),
         }
         nums.clear(); Ok(())
     };
@@ -141,6 +153,16 @@ mod tests {
         assert_eq!(polys[0].first().unwrap().x, 0.0);
         assert_eq!(polys[0].last().unwrap(), &Point { x: 10.0, y: 0.0 });
         assert!(polys[0].len() > 2); // subdivided
+    }
+    #[test]
+    fn truncated_command_is_parse_error_not_panic() {
+        assert!(matches!(Path::from_svg("M"), Err(GeomError::Parse(_))));
+        assert!(matches!(Path::from_svg("M1"), Err(GeomError::Parse(_))));
+        assert!(matches!(Path::from_svg("M0,0 C1,1 2,2"), Err(GeomError::Parse(_))));
+    }
+    #[test]
+    fn empty_path_bounds_is_zero_rect() {
+        assert_eq!(Path::default().bounds(), Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
     }
     #[test]
     fn transformed_bounds_shift() {

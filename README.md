@@ -1,8 +1,8 @@
 # cuthulhu
 
 Free, open-source (GPLv3), cross-platform desktop cutting software for vinyl
-cutters and craft plotters — a modern alternative to the proprietary incumbents and
-the vendor's cutting software, without the lock-in.
+cutters and craft plotters — a modern, no-lock-in alternative to the
+proprietary software that ships with these machines.
 
 > **Status: early.** This is a *protocol spike* — there is **no application and
 > no GUI yet**. The code here is throwaway protocol-research tooling. The real

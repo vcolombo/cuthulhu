@@ -5,7 +5,7 @@ Status: approved (brainstorming complete)
 
 ## Purpose
 
-Free, open-source (GPLv3), cross-platform (Windows/macOS/Linux) cutting software that beats the proprietary incumbents and the vendor's cutting software on four fronts:
+Free, open-source (GPLv3), cross-platform (Windows/macOS/Linux) cutting software that beats the proprietary incumbents on four fronts:
 
 1. **Stability / performance** — no crashes or laggy canvas on complex designs.
 2. **Open file formats** — no lock-in; documented project format, faithful SVG import/export.

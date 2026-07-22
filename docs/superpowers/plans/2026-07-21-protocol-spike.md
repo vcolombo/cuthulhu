@@ -92,7 +92,7 @@ git commit -m "Add protocol-notes scaffolding and clean-room provenance rules"
 ```markdown
 # Capturing Cameo 5 Alpha USB traffic
 
-the vendor's cutting software runs on Windows/macOS only, so capture on one of those.
+The vendor's cutting software runs on Windows/macOS only, so capture on one of those.
 
 ## Windows (primary)
 1. Install Wireshark with the USBPcap component.

@@ -6,5 +6,6 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 driver-core = { path = "../driver-core" }
+futures-lite = "2"
 geometry = { path = "../geometry" }
 nusb = "0.1"

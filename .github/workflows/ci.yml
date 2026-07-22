@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test deps
+        run: pip install pytest
+      - name: Run spike tool tests
+        run: cd tools && python -m pytest -q
+
+  # A Rust job (cargo test over crates/) lands with sub-project 2, once the
+  # workspace exists. Adding it now would fail red — there is no Cargo.toml yet.

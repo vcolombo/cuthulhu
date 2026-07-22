@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded (2026-07-22):** the project relicensed to **GPL-3.0-or-later**, so the clean-room constraint described below no longer applies. The Silhouette notes were **ported from `inkscape-silhouette`** (with attribution), and USB captures now *validate* rather than originate them; all SPDX headers are GPL-3.0-or-later. This plan is kept for history — see the design spec's Licensing section for the current rules.
+
 **Goal:** Produce committed, clean-room protocol notes for the Silhouette Cameo 5 Alpha (from our own USB captures) and the GCC Puma IV (from public HPGL docs), each proven by a physical square cut.
 
 **Architecture:** Throwaway-grade Python tooling under `tools/` captures and decodes USB traffic and drives the GCC over serial. The permanent deliverables are Markdown protocol notes under `docs/protocol/`. No Rust workspace yet — that starts in sub-project 2. The decoder and HPGL generator are TDD'd; capture and physical-cut steps use verification checklists because the machine is the test.
@@ -11,7 +13,7 @@
 ## Global Constraints
 
 - **Clean-room:** protocol facts come ONLY from our own USB captures and public vendor/community protocol writeups. Never read, translate, or paraphrase GPL sources (`inkscape-silhouette`, `robocut`, potrace). Every documented command cites its source (capture file + packet range, or public doc URL).
-- **License:** all files in this spike are Apache-2.0 (add SPDX header `# SPDX-License-Identifier: GPL-3.0-or-later` to Python files).
+- **License:** all files in this spike are GPL-3.0-or-later (add SPDX header `# SPDX-License-Identifier: GPL-3.0-or-later` to Python files).
 - **No secrets in repo:** raw `.pcapng` captures may be large/contain machine serials — commit decoded hex/notes, not raw multi-MB captures, unless a small trimmed sample. Add `tools/capture/samples/*.pcapng` to `.gitignore`; commit trimmed `*.hex` fixtures instead.
 - **Decoder stays format-generic:** it splits/pretty-prints byte records on an observed terminator. Command *meanings* live in the notes, filled from observation — not hardcoded in tooling.
 

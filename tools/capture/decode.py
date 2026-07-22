@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Generic USB-payload decoder: split a byte stream into records and render
-them as printable ASCII. Command *meanings* are documented by hand in
-docs/protocol/, not inferred here (clean-room)."""
+them as printable ASCII. Command *meanings* live in docs/protocol/ (ported
+from the GPL drivers), not inferred here — this stays dialect-agnostic."""
 
 
 def decode_records(hex_str: str, terminator: int = 0x03) -> list[str]:

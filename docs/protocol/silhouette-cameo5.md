@@ -4,7 +4,8 @@ Ported from the GPL driver `inkscape-silhouette`, file `silhouette/Graphtec.py`
 (GPL-2.0-or-later). Cite lines as `[src: Graphtec.py L### (GPL-2.0+)]`. Silhouette
 speaks a **GPGL-style** ASCII protocol (Graphtec Plotter Graphics Language), not
 HPGL — different command letters and units from the GCC Puma. See `README.md`
-for provenance rules.
+for provenance rules. Line numbers reference `fablabnbg/inkscape-silhouette`
+`main` as fetched 2026-07-22; re-verify if upstream shifts them.
 
 The Cameo 5 shares the **Cameo 4 protocol family**; the driver groups all Cameo
 5 variants with the Cameo 4 command dialect. `[src: Graphtec.py L151-163 (GPL-2.0+)]`

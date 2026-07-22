@@ -22,11 +22,11 @@
 
 ## Assumed SP2 interfaces
 
-These are the exact signatures SP3 depends on. SP2 must provide them; this plan calls them as defined here.
+SP3 depends on these. **Provided by SP2** — the geometry/fileio primitives below. **Added by SP3 itself** (deferred from SP2 per the SP2 spec) — booleans, text-to-path, and the primitive-path helpers; **Task 5 implements them in the `geometry` crate** before wiring the document commands. Treat that second group as an SP3 deliverable, not an SP2 dependency.
 
 ```rust
-// crate: geometry
-pub struct Affine([f64; 6]);                 // 2D affine, row-major a b c d e f
+// crate: geometry — PROVIDED BY SP2
+pub struct Affine([f64; 6]);                 // 2D affine, row-major a b c d e f; derives Serialize/Deserialize/PartialEq
 impl Affine {
     pub fn identity() -> Affine;
     pub fn translate(dx: f64, dy: f64) -> Affine;
@@ -34,13 +34,16 @@ impl Affine {
     pub fn inverse(&self) -> Affine;
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64);
 }
-pub struct Path;                              // sequence of sub-paths of Bézier/line segs, in mm
+pub struct Path;                              // sub-paths of Bézier/line segs, in mm
 impl Path {
     pub fn bounds(&self) -> Rect;             // axis-aligned bounds
     pub fn transformed(&self, m: &Affine) -> Path;
+    pub fn from_svg(d: &str) -> Result<Path, GeomError>;
+    pub fn to_svg(&self) -> String;
 }
 pub struct Rect { pub x: f64, pub y: f64, pub w: f64, pub h: f64 }
 
+// crate: geometry — ADDED BY SP3 in Task 5 (NOT from SP2)
 pub enum BoolOp { Union, Subtract, Intersect, Exclude }
 pub fn boolean(op: BoolOp, paths: &[Path]) -> Result<Path, GeomError>;
 pub fn text_to_path(family: &str, size_mm: f64, text: &str) -> Result<Path, GeomError>;
@@ -48,7 +51,7 @@ pub fn rect_path(x: f64, y: f64, w: f64, h: f64) -> Path;
 pub fn ellipse_path(cx: f64, cy: f64, rx: f64, ry: f64) -> Path;
 pub enum GeomError { Degenerate, NoFont, Other(String) }
 
-// crate: fileio
+// crate: fileio — PROVIDED BY SP2
 pub fn svg_to_paths(svg_bytes: &[u8]) -> Result<SvgImport, IoError>;
 pub struct SvgImport { pub paths: Vec<(Path, StyleHint)>, pub skipped: Vec<String> }
 pub struct StyleHint { pub stroke: Option<u32>, pub fill: Option<u32> } // 0xRRGGBBAA
@@ -548,11 +551,13 @@ git commit -m "Add transform/primitive/delete/reorder command builders"
 
 ### Task 5: Boolean + text commands (geometry-backed)
 
+> **First implement the deferred geometry ops.** SP2 did not ship booleans/text/primitive-path helpers (cut-path only). Before the document commands below, add to the `geometry` crate — each gated by its own golden tests: `rect_path`, `ellipse_path`, `boolean(BoolOp, &[Path])` (polygon booleans, e.g. an `i_overlay`/`kurbo`-based impl), `text_to_path` (glyph outlines via `ttf-parser`/`rustybuzz`), and `GeomError`. These are geometry-crate deliverables of this task.
+
 **Files:**
-- Modify: `crates/document/src/commands.rs`
+- Modify: `crates/geometry/src/lib.rs` (add the ops above), `crates/document/src/commands.rs`
 
 **Interfaces:**
-- Consumes: `geometry::{boolean, BoolOp, text_to_path, rect_path, ellipse_path, Path}`.
+- Consumes (and implements in this task): `geometry::{boolean, BoolOp, text_to_path, rect_path, ellipse_path, Path}`.
 - Produces: `boolean_op(doc, ids, BoolOp) -> Result<Delta, CmdError>` (replaces the selection with one Path shape), `add_text(ids, parent, family, size_mm, text) -> Result<Delta, CmdError>`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1193,4 +1198,4 @@ git add apps/desktop/ && git commit -m "Add end-to-end smoke test and manual rel
 
 **Type consistency:** `Delta`/`NodeOp`/`Node`/`NodeId`/`ShapeKind`/`Editor`/`Document` names consistent across Tasks 1–10; `Scene`/`hitTest`/`reconcile`/`Matrix` consistent across 11–13. `Editor::boolean`/`add_text` inject the minted id (Task 5 note) to keep `IdGen` the sole id source.
 
-**Known follow-ups folded into the SP2 contract:** `Affine` must derive `Serialize/Deserialize/PartialEq`; `Path` needs `from_svg`/`to_svg`; `fileio` needs `doc_to_svg`. All listed in "Assumed SP2 interfaces" — resolve there, not per-task.
+**Interface split (SP2 vs SP3):** `Affine` serde+`PartialEq` and `Path::from_svg`/`to_svg` are confirmed **SP2** deliverables (see the SP2 spec). Booleans, `text_to_path`, and `rect_path`/`ellipse_path` are **SP3** additions to `geometry`, implemented in Task 5. `fileio::doc_to_svg` (project save, Task 9) is an SP3 addition to `fileio`. All flagged in "Assumed SP2 interfaces."

@@ -1,0 +1,21 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuthulhu"
+path = "src/main.rs"
+
+[dependencies]
+geometry = { path = "../geometry" }
+fileio = { path = "../fileio" }
+driver-core = { path = "../driver-core" }
+driver-silhouette = { path = "../driver-silhouette" }
+driver-hpgl = { path = "../driver-hpgl" }
+clap = { version = "4", features = ["derive"] }

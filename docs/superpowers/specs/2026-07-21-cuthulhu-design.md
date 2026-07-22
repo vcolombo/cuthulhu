@@ -5,7 +5,7 @@ Status: approved (brainstorming complete)
 
 ## Purpose
 
-Commercial (GPLv3), cross-platform (Windows/macOS/Linux) cutting software that beats the proprietary incumbents and the vendor's cutting software on four fronts:
+Free, open-source (GPLv3), cross-platform (Windows/macOS/Linux) cutting software that beats the proprietary incumbents and the vendor's cutting software on four fronts:
 
 1. **Stability / performance** — no crashes or laggy canvas on complex designs.
 2. **Open file formats** — no lock-in; documented project format, faithful SVG import/export.
@@ -18,7 +18,7 @@ Primary reference hardware: **Silhouette Cameo 5 Alpha** (USB) and **GCC Puma IV
 
 - Whole project licensed **GPL-3.0-or-later**. GPLv3 is the umbrella that lets us reuse the existing GPL cutter drivers: `inkscape-silhouette` (GPL-2.0-or-later, upgrades into v3) and `robocut` (GPLv3-or-later).
 - We **may** vendor, link, and port those drivers' protocol code, keeping attribution and license notices intact. Trace may use GPL potrace or MIT vtracer (both GPL-compatible).
-- Monetization stays GPL-compatible (see Monetization below). No proprietary closed tier.
+- Fully open source and community-developed: every feature ships in this GPLv3 codebase.
 - Every ported protocol fact still cites its source (`docs/protocol/README.md`) — now for attribution/compliance, not clean-room isolation.
 
 ## Architecture
@@ -57,15 +57,6 @@ Six sub-projects. Each gets its own spec → plan → implementation cycle; this
 4. **Cut workflow** — device manager, material presets, cut dialog with preview, weed lines, cut-by-color.
 5. **Trace** — vtracer integration with cleanup controls.
 6. **Print & cut** — registration-mark printing, Cameo 5 optical registration, GCC AAS contour cutting. Hardest feature, deliberately last.
-
-## Monetization (GPLv3, no closed tier)
-
-All features ship in the GPL codebase — print & cut, nesting, tiling, batch/queue included. GPL forbids a proprietary tier, so revenue comes from around the code, not from withholding it:
-
-- **Official builds:** sell signed, auto-updating installers (Win/macOS/Linux). Source is free; convenience is paid.
-- **Support & priority:** paid support contracts, feature bounties.
-- **Hosted services (optional, later):** cloud sync / shared material library as a separate paid service.
-- **Copyright ownership:** contributors sign a CLA so we retain a future dual-license option for OEMs.
 
 ## Errors & testing
 

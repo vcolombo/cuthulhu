@@ -78,6 +78,8 @@ def main() -> None:
     ap.add_argument("--pressure", type=int, default=10)
     ap.add_argument("--tool", type=int, default=1, help="tool holder (1 or 2)")
     ap.add_argument("--steps-per-mm", type=float, default=20.0)
+    ap.add_argument("--product-id", type=lambda s: int(s, 0), default=PRODUCT_ID,
+                    help="USB product ID: 0x0001 Alpha (default), 0x0002 Alpha Plus")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the wire bytes as hex; do not open USB")
     args = ap.parse_args()
@@ -88,8 +90,8 @@ def main() -> None:
     if args.dry_run:
         sys.stdout.write(payload.hex() + "\n")
         return
-    n = send(payload)
-    print(f"sent {n} bytes to {VENDOR_ID:#06x}:{PRODUCT_ID:#06x}", file=sys.stderr)
+    n = send(payload, product_id=args.product_id)
+    print(f"sent {n} bytes to {VENDOR_ID:#06x}:{args.product_id:#06x}", file=sys.stderr)
 
 
 if __name__ == "__main__":

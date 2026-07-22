@@ -129,11 +129,21 @@ reply is `    0\x03`; timeout/other means marks not found.
 
 ## To validate on hardware (Cameo 5 Alpha)
 
-- Confirm `0x3844:0x0001` enumeration on the physical Alpha (`lsusb` / capture).
-- Confirm the cut of the 20 mm square above lands at 20 mm (verifies the 20 SU/mm
-  scale and the `(y,x)` order end-to-end).
-- Confirm the two-tool holder numbering (`J1`/`J2`) matches physical holders.
-- Confirm `TB124` quad-regmark behaviour when we reach Print & Cut.
+- [x] Confirm `0x3844` enumeration on physical hardware — **validated 2026-07-22**
+  on a Cameo 5 **Alpha Plus** (`0x3844:0x0002`, macOS/pyusb). Alpha (`0x0001`)
+  still unverified but shares the vendor ID and dialect.
+- [x] Confirm the cut of the 20 mm square above lands at 20 mm (verifies the 20
+  SU/mm scale and the `(y,x)` order end-to-end) — **validated 2026-07-22** via
+  `tools/replay/send_raw.py` (speed 10, pressure 10, tool 1): job accepted,
+  square cut correctly, machine returned to ready.
+- [ ] Confirm the two-tool holder numbering (`J1`/`J2`) matches physical holders.
+- [ ] Confirm `TB124` quad-regmark behaviour when we reach Print & Cut.
+
+Hardware note (macOS, Apple Silicon): a freshly attached Cameo stays
+`!registered` in IOKit until the user approves it under Privacy & Security →
+"Allow accessories to connect" — until then libusb enumerates zero devices.
+Status polling works as documented: `ESC ENQ` returned `2` (unloaded) before
+media load, `0` (ready) after, during the validated cut.
 
 USB captures (`tools/capture/`) now serve to **validate** this ported protocol,
 not to originate it.

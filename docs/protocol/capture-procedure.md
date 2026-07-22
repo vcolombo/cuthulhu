@@ -33,4 +33,6 @@ Feed the exported hex to the decoder to read the command stream:
 Then:
 - Trim a short representative slice into `tools/capture/samples/cameo5-square.hex`
   (the real fixture; replaces the committed `cameo5-square.SYNTHETIC.hex` placeholder).
-- Use the decoded stream to write `silhouette-cameo5.md` (Task 4).
+- **Validate** the decoded stream against `silhouette-cameo5.md` (ported from
+  `inkscape-silhouette`): expect ESC EOT init, `FG`, then `M`/`D` geometry in
+  `(y,x)` at 20 units/mm.

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Emit an HPGL program for a square, per docs/protocol/gcc-hpgl.md."""
 
 

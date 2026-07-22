@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - **Clean-room:** protocol facts come ONLY from our own USB captures and public vendor/community protocol writeups. Never read, translate, or paraphrase GPL sources (`inkscape-silhouette`, `robocut`, potrace). Every documented command cites its source (capture file + packet range, or public doc URL).
-- **License:** all files in this spike are Apache-2.0 (add SPDX header `# SPDX-License-Identifier: Apache-2.0` to Python files).
+- **License:** all files in this spike are Apache-2.0 (add SPDX header `# SPDX-License-Identifier: GPL-3.0-or-later` to Python files).
 - **No secrets in repo:** raw `.pcapng` captures may be large/contain machine serials — commit decoded hex/notes, not raw multi-MB captures, unless a small trimmed sample. Add `tools/capture/samples/*.pcapng` to `.gitignore`; commit trimmed `*.hex` fixtures instead.
 - **Decoder stays format-generic:** it splits/pretty-prints byte records on an observed terminator. Command *meanings* live in the notes, filled from observation — not hardcoded in tooling.
 
@@ -146,7 +146,7 @@ git commit -m "Document Cameo 5 USB capture and payload-export procedure"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 from decode import decode_records
 
 def test_splits_on_terminator_and_renders_ascii():
@@ -170,7 +170,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'decode'`.
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Generic USB-payload decoder: split a byte stream into records and render
 them as printable ASCII. Command *meanings* are documented by hand in
 docs/protocol/, not inferred here (clean-room)."""
@@ -247,7 +247,7 @@ git commit -m "Document Cameo 5 Alpha command set from USB captures"
 - [ ] **Step 1: Write the failing test (job builder is the unit under test; USB send is manual)**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 from send_raw import build_square_job
 
 def test_build_square_job_is_closed_path():
@@ -267,7 +267,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'send_raw'`.
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Build a minimal square cut job from the documented Cameo 5 command set and
 send it over the raw USB bulk endpoint. Command syntax here mirrors
 docs/protocol/silhouette-cameo5.md — update both together."""
@@ -359,7 +359,7 @@ git commit -m "Document GCC Puma IV HPGL command set from public references"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 from hpgl import hpgl_square
 
 def test_hpgl_square_golden_25_4mm():
@@ -380,7 +380,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'hpgl'`.
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Emit an HPGL program for a square, per docs/protocol/gcc-hpgl.md."""
 
 
@@ -419,7 +419,7 @@ git commit -m "Add HPGL square generator with golden tests"
 - [ ] **Step 1: Write the sender**
 
 ```python
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Send an HPGL program to the GCC Puma IV over serial. Serial params per
 docs/protocol/gcc-hpgl.md."""
 

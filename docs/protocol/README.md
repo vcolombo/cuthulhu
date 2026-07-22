@@ -1,19 +1,25 @@
-# Protocol notes — clean-room provenance
+# Protocol notes — sources & attribution
 
-These notes describe cutter USB/serial protocols reconstructed **only** from:
-1. USB captures we recorded ourselves (files under `tools/capture/samples/`, git-ignored; trimmed `.hex` fixtures committed alongside decoder tests).
-2. Public vendor manuals and community protocol writeups (cited by URL).
+cuthulhu is **GPL-3.0-or-later**, so we may reuse existing GPL cutter drivers
+directly. These notes reconstruct cutter USB/serial protocols from any of:
 
-We do **not** read, translate, or paraphrase GPL-licensed drivers
-(`inkscape-silhouette`, `robocut`, potrace). Anyone contributing protocol
-facts must state the source for each claim.
+1. **GPL driver source** we port or adapt — `inkscape-silhouette`
+   (GPL-2.0-or-later) and `robocut` (GPLv3-or-later). Any file that ports their
+   code must keep the original copyright and license notice intact.
+2. **USB captures** we recorded ourselves (`tools/capture/samples/`, git-ignored;
+   trimmed `.hex` fixtures committed alongside decoder tests) — now used to
+   *validate* the ported protocol, not to originate it.
+3. **Public vendor manuals** and community protocol writeups (cited by URL).
+
+Every documented command still cites its source — for attribution/GPL
+compliance and traceability, not for clean-room isolation.
 
 ## Citation format
 
-Every documented command references its evidence:
-- Capture-derived: `[cap: cameo5-square-2026-07-21.pcapng #142-158]`
-- Doc-derived: `[doc: <title>, <url>, section/page]`
+- GPL-source-derived: `[src: inkscape-silhouette silhouette/Graphtec.py L120-155 (GPL-2.0+)]`
+- Capture-derived:     `[cap: cameo5-square-2026-07-21.pcapng #142-158]`
+- Doc-derived:         `[doc: <title>, <url>, section/page]`
 
 ## Files
-- `silhouette-cameo5.md` — Cameo 5 Alpha command set (capture-derived).
+- `silhouette-cameo5.md` — Cameo 5 Alpha command set.
 - `gcc-hpgl.md` — GCC Puma IV HPGL command set (public-doc-derived).

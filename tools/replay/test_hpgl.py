@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 from hpgl import hpgl_square
 
 def test_hpgl_square_golden_25_4mm():

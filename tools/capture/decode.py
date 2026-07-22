@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Generic USB-payload decoder: split a byte stream into records and render
 them as printable ASCII. Command *meanings* are documented by hand in
 docs/protocol/, not inferred here (clean-room)."""

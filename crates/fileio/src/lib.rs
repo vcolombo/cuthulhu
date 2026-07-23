@@ -1,8 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use geometry::{Path, Seg, Point};
+use geometry::{Path, Seg, Point, Affine};
+use document::{Document, NodeId, NodeKind, ShapeKind};
 
 pub mod import;
 pub use import::import_svg;
+pub mod project;
+pub use project::{save_project, load_project};
+
+/// Minimal scene-tree → SVG serializer for the interchange `design.svg`.
+/// The manifest (`Document::snapshot_json`) is the source of truth on load;
+/// this is a best-effort visual copy, so unsupported node kinds are skipped
+/// with a comment rather than causing an error.
+pub fn doc_to_svg(doc: &Document) -> String {
+    let mut body = String::new();
+    walk_svg(doc, doc.root, &Affine::identity(), &mut body);
+    let ab = doc.artboard;
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}mm" height="{h}mm" viewBox="{x} {y} {w} {h}">{body}</svg>"#,
+        x = ab.x, y = ab.y, w = ab.w, h = ab.h, body = body,
+    )
+}
+
+fn walk_svg(doc: &Document, id: NodeId, parent_xf: &Affine, out: &mut String) {
+    let Some(node) = doc.get(id) else { return };
+    let xf = node.transform.then(parent_xf);
+    match &node.kind {
+        NodeKind::Shape(shape) => match shape_path(shape) {
+            Some(p) => out.push_str(&format!("<path d=\"{}\"/>", p.transformed(&xf).to_svg())),
+            None => out.push_str(&format!("<!-- skipped {} -->", shape_kind_name(shape))),
+        },
+        NodeKind::Group | NodeKind::Layer => {
+            for child in &node.children { walk_svg(doc, *child, &xf, out); }
+        }
+    }
+}
+
+fn shape_path(kind: &ShapeKind) -> Option<Path> {
+    match kind {
+        ShapeKind::Path { d } => Path::from_svg(d).ok(),
+        ShapeKind::Rect { w, h } => Some(geometry::rect_path(0.0, 0.0, *w, *h)),
+        ShapeKind::Ellipse { rx, ry } => Some(geometry::ellipse_path(0.0, 0.0, *rx, *ry)),
+        ShapeKind::Text { .. } => None,
+    }
+}
+
+fn shape_kind_name(kind: &ShapeKind) -> &'static str {
+    match kind {
+        ShapeKind::Path { .. } => "path (unparseable)",
+        ShapeKind::Rect { .. } => "rect",
+        ShapeKind::Ellipse { .. } => "ellipse",
+        ShapeKind::Text { .. } => "text",
+    }
+}
 
 const PX_TO_MM: f64 = 25.4 / 96.0;
 
@@ -110,5 +159,15 @@ mod tests {
         // 20 px → 20 * 25.4/96 mm ≈ 5.29 mm
         assert!((b.w - 20.0 * 25.4 / 96.0).abs() < 0.01);
         assert!(imp.skipped.is_empty());
+    }
+    #[test]
+    fn doc_to_svg_emits_a_path_for_a_rect_shape() {
+        let mut doc = Document::new();
+        let id = doc.ids.next();
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: doc.root, index: 0,
+            node: document::Node::shape(id, ShapeKind::Rect { w: 5.0, h: 5.0 }) }]));
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains("<path"), "svg missing <path>: {svg}");
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { CSSProperties } from "react";
+import { useRef, type CSSProperties } from "react";
 import type { MachineProfile } from "../App";
 
 type Props = {
@@ -10,6 +10,7 @@ type Props = {
   onReload: () => void;
   onUndo: () => void;
   onRedo: () => void;
+  onImportFile: (file: File) => void;
 };
 
 const btn: CSSProperties = {
@@ -20,7 +21,17 @@ const btn: CSSProperties = {
   cursor: "pointer",
 };
 
-export function TopBar({ machines, currentMachineId, onSelectMachine, onSave, onReload, onUndo, onRedo }: Props) {
+export function TopBar({
+  machines,
+  currentMachineId,
+  onSelectMachine,
+  onSave,
+  onReload,
+  onUndo,
+  onRedo,
+  onImportFile,
+}: Props) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
   return (
     <div
       style={{
@@ -39,6 +50,20 @@ export function TopBar({ machines, currentMachineId, onSelectMachine, onSave, on
       <button aria-label="Redo" style={btn} onClick={onRedo}>
         Redo
       </button>
+      <button aria-label="Import" style={btn} onClick={() => fileInputRef.current?.click()}>
+        Import
+      </button>
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".svg"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = ""; // allow re-selecting the same file
+          if (file) onImportFile(file);
+        }}
+      />
       <div style={{ flex: 1 }} />
       <select
         aria-label="Machine"

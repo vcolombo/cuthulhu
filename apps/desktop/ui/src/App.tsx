@@ -210,6 +210,14 @@ export function App() {
     run(() => ipc.commitTransform({ ids: selected, m }));
   };
 
+  const onImportFile = (file: File) => {
+    run(async () => {
+      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+      const [, skipped] = (await ipc.importSvg({ bytes, parent: root })) as [unknown, string[]];
+      if (skipped.length > 0) setError(`Imported with ${skipped.length} element(s) skipped: ${skipped.join(", ")}`);
+    });
+  };
+
   return (
     <div
       style={{
@@ -228,6 +236,7 @@ export function App() {
           onReload={() => run(() => ipc.loadProject({ path: PROJECT_PATH }))}
           onUndo={() => run(() => ipc.undo())}
           onRedo={() => run(() => ipc.redo())}
+          onImportFile={onImportFile}
         />
       </div>
       <ToolRail

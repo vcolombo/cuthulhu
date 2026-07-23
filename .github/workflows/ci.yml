@@ -18,5 +18,12 @@ jobs:
       - name: Run spike tool tests
         run: cd tools && python -m pytest -q
 
-  # A Rust job (cargo test over crates/) lands with sub-project 2, once the
-  # workspace exists. Adding it now would fail red — there is no Cargo.toml yet.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native deps (serialport needs libudev)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Build and test workspace
+        run: cargo test --workspace

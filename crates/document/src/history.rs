@@ -4,7 +4,7 @@ use crate::delta::{Document, Delta};
 pub struct Editor {
     pub doc: Document,
     undo_stack: Vec<Delta>,   // each entry is an inverse delta
-    redo_stack: Vec<Delta>,   // each entry is an inverse delta
+    redo_stack: Vec<Delta>,   // each entry is a forward delta
 }
 impl Editor {
     pub fn new() -> Editor { Editor { doc: Document::new(), undo_stack: vec![], redo_stack: vec![] } }
@@ -18,9 +18,9 @@ impl Editor {
     }
     pub fn undo(&mut self) -> Option<Delta> {
         let inverse = self.undo_stack.pop()?;
-        let forward = self.doc.apply(inverse);     // undo == applying the stored inverse
-        self.redo_stack.push(forward.clone());
-        Some(forward)
+        let redo = self.doc.apply(inverse.clone());
+        self.redo_stack.push(redo);
+        Some(inverse)
     }
     pub fn redo(&mut self) -> Option<Delta> {
         let forward = self.redo_stack.pop()?;
@@ -50,6 +50,7 @@ mod tests {
         let undo = ed.undo().unwrap();          // forward delta = removal
         assert!(ed.doc.get(id).is_none());
         assert_eq!(undo.0.len(), 1);
+        assert!(matches!(undo.0[0], NodeOp::Remove { .. }));
 
         ed.redo().unwrap();
         assert!(ed.doc.get(id).is_some());

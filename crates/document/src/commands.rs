@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::HashSet;
-use geometry::Affine;
+use geometry::{boolean, ellipse_path, rect_path, text_to_path, Affine, BoolOp, Path};
 use crate::{node::*, delta::*};
 
 #[derive(Debug, PartialEq)]
-pub enum CmdError { NotFound, EmptySelection }
+pub enum CmdError { NotFound, EmptySelection, Geometry(String) }
 
 /// Build a delta that appends a new primitive under `parent`. Mints the id from `ids`.
 pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result<Delta, CmdError> {
@@ -48,6 +48,49 @@ pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, Cm
 
 fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
     doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
+}
+
+/// Shape's outline in its own local space, in mm, matching `Rect { x:0, y:0, w, h }` bounds
+/// convention (an ellipse of radii rx,ry centered at (rx,ry) has the same 0,0-origin bounds).
+fn shape_to_path(node: &Node) -> Option<Path> {
+    let p = match &node.kind {
+        NodeKind::Shape(ShapeKind::Rect { w, h }) => rect_path(0.0, 0.0, *w, *h),
+        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => ellipse_path(*rx, *ry, *rx, *ry),
+        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok()?,
+        _ => return None,
+    };
+    Some(p.transformed(&node.transform))
+}
+
+/// Replace `ids` (>= 2 shape nodes) with a single Path node holding the boolean-op result.
+/// The result is appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
+/// placeholder for the new node's id — `Editor::boolean` overwrites it before commit.
+pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, CmdError> {
+    if ids.len() < 2 { return Err(CmdError::EmptySelection); }
+    let mut paths = vec![];
+    for &id in ids {
+        paths.push(shape_to_path(doc.get(id).ok_or(CmdError::NotFound)?).ok_or(CmdError::NotFound)?);
+    }
+    let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
+    let parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let mut ops: Vec<NodeOp> = ids.iter()
+        .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
+        .collect();
+    ops.push(NodeOp::Add {
+        parent,
+        node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result.to_svg() }),
+        index: usize::MAX,
+    });
+    Ok(Delta(ops))
+}
+
+/// Append a text node's glyph outlines (as a single Path) under `parent`. Mints
+/// `NodeId(u64::MAX)` as a placeholder — `Editor::add_text` overwrites it before commit.
+pub fn add_text(doc: &Document, parent: NodeId, family: &str, size_mm: f64, text: &str) -> Result<Delta, CmdError> {
+    doc.get(parent).ok_or(CmdError::NotFound)?;
+    let path = text_to_path(family, size_mm, text).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
+    let node = Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: path.to_svg() });
+    Ok(Delta(vec![NodeOp::Add { parent, node, index: usize::MAX }]))
 }
 
 #[cfg(test)]
@@ -109,5 +152,70 @@ mod tests {
         // pass the same id twice; should only emit one Remove
         ed.commit(delete_nodes(&ed.doc, &[id, id]).unwrap());
         assert!(ed.doc.get(id).is_none());
+    }
+
+    #[test]
+    fn boolean_union_replaces_selection_with_single_path() {
+        let mut ed = Editor::new();
+        for _ in 0..2 {
+            let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+                ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+            ed.commit(d);
+        }
+        let sel: Vec<NodeId> = ed.doc.get(ed.doc.root).unwrap().children.clone();
+        ed.boolean(&sel, geometry::BoolOp::Union).unwrap();
+        let kids = &ed.doc.get(ed.doc.root).unwrap().children;
+        assert_eq!(kids.len(), 1);
+        assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
+            NodeKind::Shape(ShapeKind::Path { .. })));
+    }
+
+    #[test]
+    fn boolean_union_is_undoable() {
+        let mut ed = Editor::new();
+        for _ in 0..2 {
+            let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+                ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+            ed.commit(d);
+        }
+        let sel: Vec<NodeId> = ed.doc.get(ed.doc.root).unwrap().children.clone();
+        ed.boolean(&sel, geometry::BoolOp::Union).unwrap();
+        ed.undo();
+        let kids = &ed.doc.get(ed.doc.root).unwrap().children;
+        assert_eq!(kids.len(), 2);
+    }
+
+    #[test]
+    fn boolean_op_requires_at_least_two_ids() {
+        let mut ed = Editor::new();
+        let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+            ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let id = *ed.doc.get(ed.doc.root).unwrap().children.first().unwrap();
+        assert_eq!(boolean_op(&ed.doc, &[id], geometry::BoolOp::Union), Err(CmdError::EmptySelection));
+    }
+
+    #[test]
+    fn boolean_op_unknown_id_is_not_found() {
+        let ed = Editor::new();
+        let bogus = NodeId(999);
+        assert_eq!(boolean_op(&ed.doc, &[ed.doc.root, bogus], geometry::BoolOp::Union),
+            Err(CmdError::NotFound));
+    }
+
+    #[test]
+    fn add_text_appends_a_path_shape_under_parent() {
+        let mut ed = Editor::new();
+        let parent = ed.doc.root;
+        match ed.add_text(parent, "Helvetica", 10.0, "Hi") {
+            Ok(_) => {
+                let kids = &ed.doc.get(parent).unwrap().children;
+                assert_eq!(kids.len(), 1);
+                assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
+                    NodeKind::Shape(ShapeKind::Path { .. })));
+            }
+            Err(CmdError::Geometry(msg)) => panic!("Helvetica font lookup failed in test env: {msg}"),
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
     }
 }

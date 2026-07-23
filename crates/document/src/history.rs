@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use crate::delta::{Document, Delta};
+use crate::delta::{Document, Delta, NodeOp};
+use crate::node::NodeId;
+use crate::commands::CmdError;
 
 pub struct Editor {
     pub doc: Document,
@@ -27,6 +29,20 @@ impl Editor {
         let inverse = self.doc.apply(forward.clone());
         self.undo_stack.push(inverse);
         Some(forward)
+    }
+
+    /// Replace `ids` with the boolean-op result, committed as one undoable step.
+    pub fn boolean(&mut self, ids: &[NodeId], op: geometry::BoolOp) -> Result<Delta, CmdError> {
+        let mut d = crate::commands::boolean_op(&self.doc, ids, op)?;
+        if let Some(NodeOp::Add { node, .. }) = d.0.last_mut() { node.id = self.doc.ids.next(); }
+        Ok(self.commit(d))
+    }
+
+    /// Add a text node's glyph outlines under `parent`, committed as one undoable step.
+    pub fn add_text(&mut self, parent: NodeId, family: &str, size_mm: f64, text: &str) -> Result<Delta, CmdError> {
+        let mut d = crate::commands::add_text(&self.doc, parent, family, size_mm, text)?;
+        if let Some(NodeOp::Add { node, .. }) = d.0.last_mut() { node.id = self.doc.ids.next(); }
+        Ok(self.commit(d))
     }
 }
 

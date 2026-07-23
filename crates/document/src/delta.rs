@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
+use geometry::Rect;
 use crate::node::*;
+use crate::machine::MachineProfile;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum NodeOp {
@@ -18,6 +20,8 @@ pub struct Document {
     pub nodes: HashMap<NodeId, Node>,
     pub root: NodeId,
     pub ids: IdGen,
+    pub artboard: Rect,
+    pub machine: Option<MachineProfile>,
 }
 
 impl Document {
@@ -26,7 +30,20 @@ impl Document {
         let root = ids.next();
         let mut nodes = HashMap::new();
         nodes.insert(root, Node::container(root, NodeKind::Layer));
-        Document { nodes, root, ids }
+        let first_profile = crate::machine::builtin_profiles().into_iter().next().unwrap();
+        let artboard = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: first_profile.width_mm,
+            h: first_profile.height_mm,
+        };
+        Document {
+            nodes,
+            root,
+            ids,
+            artboard,
+            machine: None,
+        }
     }
     pub fn get(&self, id: NodeId) -> Option<&Node> { self.nodes.get(&id) }
 

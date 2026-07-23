@@ -7,3 +7,5 @@ pub mod history;
 pub use history::*;
 pub mod commands;
 pub use commands::*;
+pub mod machine;
+pub use machine::*;

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "cuthulhu",
+  "version": "0.1.0",
+  "identifier": "dev.cuthulhu.desktop",
+  "build": {
+    "frontendDist": "ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "cuthulhu",
+        "width": 1200,
+        "height": 800
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

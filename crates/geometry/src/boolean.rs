@@ -3,10 +3,11 @@ use i_overlay::core::fill_rule::FillRule;
 use i_overlay::core::overlay_rule::OverlayRule;
 use i_overlay::float::single::SingleFloatOverlay;
 
+use serde::{Serialize, Deserialize};
 use crate::affine::Point;
 use crate::path::{GeomError, Path, Seg};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BoolOp { Union, Subtract, Intersect, Exclude }
 
 /// Flatten tolerance (mm) used to feed curved paths into the polygon overlay engine.

@@ -7,8 +7,9 @@ const FALLBACK_BORDER = "#2E2E34";
 
 export class Canvas2DRenderer implements Renderer {
   private scene: Scene = { nodes: [] };
-  // ponytail: markDirty ids double as the "selected" set for now — there's no
-  // selection channel yet (comes with the panels/selection work in later tasks).
+  private selected = new Set<NodeId>();
+  // ponytail: invalidation only — with the current full-clear+redraw loop this is just
+  // a "needs redraw" signal, not a per-node dirty rect. draw() clears it each call.
   private dirty = new Set<NodeId>();
 
   constructor(private readonly ctx: CanvasRenderingContext2D) {}
@@ -19,6 +20,10 @@ export class Canvas2DRenderer implements Renderer {
 
   markDirty(id: NodeId): void {
     this.dirty.add(id);
+  }
+
+  setSelection(ids: NodeId[]): void {
+    this.selected = new Set(ids);
   }
 
   draw(): void {
@@ -34,10 +39,12 @@ export class Canvas2DRenderer implements Renderer {
     const border = style.getPropertyValue("--border").trim() || FALLBACK_BORDER;
 
     for (const node of this.scene.nodes) {
-      const selected = this.dirty.has(node.id);
+      const selected = this.selected.has(node.id);
       ctx.strokeStyle = selected ? accent : border;
       ctx.lineWidth = selected ? 2 : 1;
       ctx.strokeRect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
     }
+
+    this.dirty.clear();
   }
 }

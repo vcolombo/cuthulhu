@@ -7,3 +7,4 @@ __pycache__/
 .pytest_cache/
 /target/
 apps/desktop/gen/
+apps/desktop/ui/node_modules/

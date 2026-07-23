@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install native deps (serialport needs libudev)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Install native deps (serialport needs libudev; Tauri 2 needs webkit2gtk/gtk3/rsvg2)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
       - name: Build and test workspace
         run: cargo test --workspace

@@ -48,7 +48,9 @@ function toggleId(ids: number[], id: number): number[] {
 function shapeBounds(kind: ShapeKindJson) {
   if ("Rect" in kind) return { x: 0, y: 0, w: kind.Rect.w, h: kind.Rect.h };
   if ("Ellipse" in kind) {
-    return { x: -kind.Ellipse.rx, y: -kind.Ellipse.ry, w: kind.Ellipse.rx * 2, h: kind.Ellipse.ry * 2 };
+    // Canonical convention (see crates/document/src/commands.rs shape_to_path): an
+    // Ellipse's local space is centered at (rx, ry), bounds 0..2rx / 0..2ry.
+    return { x: 0, y: 0, w: kind.Ellipse.rx * 2, h: kind.Ellipse.ry * 2 };
   }
   // ponytail: Text nodes are converted server-side into a Path before insertion (add_text
   // mints a Path node), and precise Path bounds need a bbox pass over the outline — a

@@ -39,7 +39,7 @@ fn shape_path(kind: &ShapeKind) -> Option<Path> {
     match kind {
         ShapeKind::Path { d } => Path::from_svg(d).ok(),
         ShapeKind::Rect { w, h } => Some(geometry::rect_path(0.0, 0.0, *w, *h)),
-        ShapeKind::Ellipse { rx, ry } => Some(geometry::ellipse_path(0.0, 0.0, *rx, *ry)),
+        ShapeKind::Ellipse { rx, ry } => Some(geometry::ellipse_path(*rx, *ry, *rx, *ry)),
         ShapeKind::Text { .. } => None,
     }
 }
@@ -169,6 +169,18 @@ mod tests {
             node: document::Node::shape(id, ShapeKind::Rect { w: 5.0, h: 5.0 }) }]));
         let svg = doc_to_svg(&doc);
         assert!(svg.contains("<path"), "svg missing <path>: {svg}");
+    }
+    #[test]
+    fn doc_to_svg_ellipse_uses_center_at_rx_ry_local_space() {
+        // Canonical convention (see commands.rs::shape_to_path): an Ellipse's local
+        // space is centered at (rx, ry), i.e. bounds 0..2rx / 0..2ry, not 0..0 centered.
+        let mut doc = Document::new();
+        let id = doc.ids.next();
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: doc.root, index: 0,
+            node: document::Node::shape(id, ShapeKind::Ellipse { rx: 3.0, ry: 2.0 }) }]));
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains("M6,2"), "expected ellipse path to start at (2rx,ry)=(6,2): {svg}");
     }
     #[test]
     fn doc_to_svg_composes_transforms_child_first_then_ancestors() {

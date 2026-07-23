@@ -74,7 +74,7 @@ pub fn load_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Resul
 
 #[tauri::command]
 pub fn set_machine(state: tauri::State<AppStateHandle>, machine_id: String) -> Result<(), String> {
-    state.lock().unwrap().set_machine(&machine_id)
+    state.lock().unwrap().set_machine(&machine_id).map_err(|e| format!("{e:?}"))
 }
 
 #[tauri::command]

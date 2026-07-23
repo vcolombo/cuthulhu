@@ -90,9 +90,9 @@ impl AppState {
         Ok(self.snapshot())
     }
 
-    pub fn set_machine(&mut self, machine_id: &str) -> Result<(), String> {
+    pub fn set_machine(&mut self, machine_id: &str) -> Result<(), CmdError> {
         let profile = document::builtin_profiles().into_iter().find(|p| p.id == machine_id)
-            .ok_or_else(|| format!("unknown machine id: {machine_id}"))?;
+            .ok_or(CmdError::NotFound)?;
         self.editor.set_machine(profile);
         Ok(())
     }

@@ -197,25 +197,42 @@ mod tests {
 
     #[test]
     fn boolean_op_unknown_id_is_not_found() {
-        let ed = Editor::new();
-        let bogus = NodeId(999);
-        assert_eq!(boolean_op(&ed.doc, &[ed.doc.root, bogus], geometry::BoolOp::Union),
+        let mut ed = Editor::new();
+        let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+            ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let real = *ed.doc.get(ed.doc.root).unwrap().children.first().unwrap();
+        let bogus = NodeId(9999);
+        assert_eq!(boolean_op(&ed.doc, &[real, bogus], geometry::BoolOp::Union),
             Err(CmdError::NotFound));
+    }
+
+    /// Picks whatever font family is actually installed, instead of hardcoding "Helvetica"
+    /// (macOS-only, absent on Linux CI). Returns None on a headless box with zero system faces.
+    fn any_available_family() -> Option<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let name = db.faces().next().and_then(|f| f.families.first().map(|(name, _)| name.clone()));
+        name
     }
 
     #[test]
     fn add_text_appends_a_path_shape_under_parent() {
         let mut ed = Editor::new();
         let parent = ed.doc.root;
-        match ed.add_text(parent, "Helvetica", 10.0, "Hi") {
-            Ok(_) => {
-                let kids = &ed.doc.get(parent).unwrap().children;
-                assert_eq!(kids.len(), 1);
-                assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
-                    NodeKind::Shape(ShapeKind::Path { .. })));
-            }
-            Err(CmdError::Geometry(msg)) => panic!("Helvetica font lookup failed in test env: {msg}"),
-            Err(e) => panic!("unexpected error: {e:?}"),
+        match any_available_family() {
+            Some(family) => match ed.add_text(parent, &family, 10.0, "Hi") {
+                Ok(_) => {
+                    let kids = &ed.doc.get(parent).unwrap().children;
+                    assert_eq!(kids.len(), 1);
+                    assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
+                        NodeKind::Shape(ShapeKind::Path { .. })));
+                }
+                Err(e) => panic!("unexpected error for family {family:?}: {e:?}"),
+            },
+            // headless CI with zero system fonts: assert the real Geometry(NoFont) path instead.
+            None => assert_eq!(ed.add_text(parent, "Whatever", 10.0, "Hi"),
+                Err(CmdError::Geometry(format!("{:?}", geometry::GeomError::NoFont)))),
         }
     }
 }

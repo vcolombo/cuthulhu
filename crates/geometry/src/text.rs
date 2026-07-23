@@ -88,18 +88,29 @@ pub fn text_to_path(family: &str, size_mm: f64, text: &str) -> Result<Path, Geom
 mod tests {
     use super::*;
 
+    /// Picks whatever font family is actually installed, instead of hardcoding "Helvetica"
+    /// (macOS-only). Returns None on a headless CI box with zero system faces.
+    fn any_available_family() -> Option<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let name = db.faces().next().and_then(|f| f.families.first().map(|(name, _)| name.clone()));
+        name
+    }
+
     #[test]
-    fn helvetica_text_produces_nonempty_positive_bounds_path() {
-        // macOS ships Helvetica; treat a missing font here as an environment gap, not a code bug.
-        match text_to_path("Helvetica", 10.0, "Ab") {
-            Ok(p) => {
-                assert!(!p.segs.is_empty());
-                let b = p.bounds();
-                assert!(b.w > 0.0, "width was {}", b.w);
-                assert!(b.h > 0.0, "height was {}", b.h);
-            }
-            Err(GeomError::NoFont) => panic!("Helvetica not found on this machine (font discovery environment gap)"),
-            Err(e) => panic!("unexpected error: {e:?}"),
+    fn available_font_text_produces_nonempty_positive_bounds_path() {
+        match any_available_family() {
+            Some(family) => match text_to_path(&family, 10.0, "Ab") {
+                Ok(p) => {
+                    assert!(!p.segs.is_empty());
+                    let b = p.bounds();
+                    assert!(b.w > 0.0, "width was {}", b.w);
+                    assert!(b.h > 0.0, "height was {}", b.h);
+                }
+                Err(e) => panic!("unexpected error for family {family:?}: {e:?}"),
+            },
+            // headless CI with zero system fonts: assert the real NoFont path instead.
+            None => assert_eq!(text_to_path("Whatever", 10.0, "Ab"), Err(GeomError::NoFont)),
         }
     }
 

@@ -32,6 +32,7 @@ export function TopBar({ machines, currentMachineId, onSelectMachine, onSave, on
         borderBottom: "1px solid var(--border)",
       }}
     >
+      <span style={{ color: "var(--text)", fontWeight: 600, fontSize: 13, marginRight: 8 }}>cuthulhu</span>
       <button aria-label="Undo" style={btn} onClick={onUndo}>
         Undo
       </button>

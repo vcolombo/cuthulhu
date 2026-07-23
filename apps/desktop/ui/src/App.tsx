@@ -41,6 +41,10 @@ export type DocSnapshot = {
 
 const PROJECT_PATH = "cuthulhu-project.cut"; // ponytail: fixed save path until tauri-plugin-dialog wires a file picker
 
+function toggleId(ids: number[], id: number): number[] {
+  return ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id];
+}
+
 function shapeBounds(kind: ShapeKindJson) {
   if ("Rect" in kind) return { x: 0, y: 0, w: kind.Rect.w, h: kind.Rect.h };
   if ("Ellipse" in kind) {
@@ -138,7 +142,7 @@ export function App() {
         if (selected.length === 0) return;
         e.preventDefault();
         run(() => ipc.deleteNodes({ ids: selected }));
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !typing) {
         e.preventDefault();
         run(() => (e.shiftKey ? ipc.redo() : ipc.undo()));
       }
@@ -155,7 +159,11 @@ export function App() {
   const onCanvasMouseDown = (e: MouseEvent<HTMLCanvasElement>) => {
     const p = canvasPos(e);
     const hit = hitTest(scene, p.x, p.y);
-    setSelected(hit === null ? [] : [hit]);
+    if (e.shiftKey && hit !== null) {
+      setSelected((prev) => toggleId(prev, hit));
+    } else {
+      setSelected(hit === null ? [] : [hit]);
+    }
     dragStart.current = hit === null ? null : p;
   };
 
@@ -184,6 +192,19 @@ export function App() {
     if (!selectedBounds) return;
     const m: Matrix = [1, 0, 0, 1, axis === "x" ? v - selectedBounds.x : 0, axis === "y" ? v - selectedBounds.y : 0];
     if (m[4] === 0 && m[5] === 0) return;
+    run(() => ipc.commitTransform({ ids: selected, m }));
+  };
+
+  // Scale about the bounds origin (x for width, y for height) so the opposite edge stays
+  // put: translate(origin) · scale(s) · translate(-origin), i.e. [s,0,0,1, x-s*x, 0] for
+  // width and [1,0,0,s, 0, y-s*y] for height.
+  const commitScale = (axis: "w" | "h", v: number) => {
+    if (!selectedBounds) return;
+    const { x, y, w, h } = selectedBounds;
+    const size = axis === "w" ? w : h;
+    if (size <= 0 || v <= 0) return;
+    const s = v / size;
+    const m: Matrix = axis === "w" ? [s, 0, 0, 1, x - s * x, 0] : [1, 0, 0, s, 0, y - s * y];
     run(() => ipc.commitTransform({ ids: selected, m }));
   };
 
@@ -227,11 +248,17 @@ export function App() {
         onMouseUp={onCanvasMouseUp}
       />
       <div style={{ display: "grid", gridTemplateRows: "1fr 1fr", borderLeft: "1px solid var(--border)", minHeight: 0 }}>
-        <LayersPanel doc={doc} selected={selected} onSelect={(id) => setSelected([id])} />
+        <LayersPanel
+          doc={doc}
+          selected={selected}
+          onSelect={(id, shiftKey) => setSelected((prev) => (shiftKey ? toggleId(prev, id) : [id]))}
+        />
         <PropertiesPanel
           bounds={selectedBounds}
           onChangeX={(v) => commitAxis("x", v)}
           onChangeY={(v) => commitAxis("y", v)}
+          onChangeW={(v) => commitScale("w", v)}
+          onChangeH={(v) => commitScale("h", v)}
         />
       </div>
       <div style={{ gridColumn: "1 / -1" }}>

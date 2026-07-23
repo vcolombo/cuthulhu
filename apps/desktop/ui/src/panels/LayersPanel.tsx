@@ -4,7 +4,7 @@ import type { DocNode, DocSnapshot, NodeKindJson } from "../App";
 type Props = {
   doc: DocSnapshot | null;
   selected: number[];
-  onSelect: (id: number) => void;
+  onSelect: (id: number, shiftKey: boolean) => void;
 };
 
 function labelFor(kind: NodeKindJson): string {
@@ -17,13 +17,13 @@ function labelFor(kind: NodeKindJson): string {
   return "Path";
 }
 
-function Row({ doc, node, depth, selected, onSelect }: { doc: DocSnapshot; node: DocNode; depth: number; selected: number[]; onSelect: (id: number) => void }) {
+function Row({ doc, node, depth, selected, onSelect }: { doc: DocSnapshot; node: DocNode; depth: number; selected: number[]; onSelect: (id: number, shiftKey: boolean) => void }) {
   const isSelected = selected.includes(node.id);
   return (
     <>
       <div
         data-testid="layer-row"
-        onClick={() => onSelect(node.id)}
+        onClick={(e) => onSelect(node.id, e.shiftKey)}
         style={{
           padding: `4px 8px 4px ${8 + depth * 12}px`,
           background: isSelected ? "var(--accent)" : "transparent",

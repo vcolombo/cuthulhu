@@ -109,6 +109,14 @@ test("new doc → add rect → save → reload keeps the rect", async ({ page })
   await page.mouse.click(400, 300);
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
   await page.getByRole("button", { name: "Save" }).click();
+
+  // Discriminating step: delete the rect after Save so Reload can only pass by genuinely
+  // restoring the saved copy, not by leaving live state untouched (a no-op load_project
+  // would otherwise pass the final assertion below for free).
+  await page.getByTestId("layer-row").click();
+  await page.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByTestId("layer-row")).toHaveCount(0);
+
   await page.getByRole("button", { name: "Reload" }).click();
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
 });

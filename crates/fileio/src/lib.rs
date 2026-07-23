@@ -24,6 +24,8 @@ fn walk(group: &usvg::Group, out: &mut Vec<(Path, StyleHint)>, skipped: &mut Vec
             usvg::Node::Path(p) => {
                 let mut segs = vec![];
                 let mut here = Point { x: 0.0, y: 0.0 };
+                let t = p.abs_transform();
+                let mm = |pt: usvg::tiny_skia_path::Point| mm_transformed(pt, &t);
                 for seg in p.data().segments() {
                     use usvg::tiny_skia_path::PathSegment as S;
                     match seg {
@@ -53,7 +55,14 @@ fn walk(group: &usvg::Group, out: &mut Vec<(Path, StyleHint)>, skipped: &mut Vec
         }
     }
 }
-fn mm(p: usvg::tiny_skia_path::Point) -> Point { Point { x: p.x as f64 * PX_TO_MM, y: p.y as f64 * PX_TO_MM } }
+fn mm_transformed(p: usvg::tiny_skia_path::Point, t: &usvg::Transform) -> Point {
+    let (x, y) = (p.x as f64, p.y as f64);
+    let (tx, ty) = (
+        t.sx as f64 * x + t.kx as f64 * y + t.tx as f64,
+        t.ky as f64 * x + t.sy as f64 * y + t.ty as f64,
+    );
+    Point { x: tx * PX_TO_MM, y: ty * PX_TO_MM }
+}
 fn lerp23(from: Point, to: Point) -> Point {
     Point { x: from.x + 2.0 / 3.0 * (to.x - from.x), y: from.y + 2.0 / 3.0 * (to.y - from.y) }
 }
@@ -62,6 +71,17 @@ fn paint_rgba(_paint: &usvg::Paint) -> u32 { 0x000000FF } // ponytail: solid-bla
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn group_transforms_are_applied() {
+        // 250px rect scaled 0.32 by an ancestor <g> → 80px → 80*25.4/96 mm.
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="378" height="378"
+                        viewBox="0 0 378 378"><g transform="matrix(0.32,0,0,0.32,0,0)">
+                        <rect x="100" y="100" width="250" height="250"/></g></svg>"#;
+        let imp = svg_to_paths(svg).unwrap();
+        let b = imp.paths[0].0.bounds();
+        assert!((b.w - 80.0 * PX_TO_MM).abs() < 0.01, "w={} mm", b.w);
+        assert!((b.x - 32.0 * PX_TO_MM).abs() < 0.01, "x={} mm", b.x);
+    }
     #[test]
     fn quadratic_converts_to_exact_cubic() {
         // M0,0 Q10,10 20,0 — true quad midpoint (t=0.5) is (10, 5) px.

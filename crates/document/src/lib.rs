@@ -5,3 +5,5 @@ pub mod delta;
 pub use delta::*;
 pub mod history;
 pub use history::*;
+pub mod commands;
+pub use commands::*;

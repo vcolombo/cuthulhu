@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 type Args = Record<string, any>;
 
 export async function newDoc() {
-  return invoke("newDoc", {});
+  return invoke("new_doc", {});
 }
 
 export async function snapshot() {
@@ -14,19 +14,19 @@ export async function snapshot() {
 }
 
 export async function commitTransform(args: Args) {
-  return invoke("commitTransform", args);
+  return invoke("commit_transform", args);
 }
 
 export async function addPrimitive(args: Args) {
-  return invoke("addPrimitive", args);
+  return invoke("add_primitive", args);
 }
 
 export async function booleanOp(args: Args) {
-  return invoke("booleanOp", args);
+  return invoke("boolean_op", args);
 }
 
 export async function addText(args: Args) {
-  return invoke("addText", args);
+  return invoke("add_text", args);
 }
 
 export async function deleteNodes(args: Args) {
@@ -46,21 +46,21 @@ export async function redo() {
 }
 
 export async function importSvg(args: Args) {
-  return invoke("importSvg", args);
+  return invoke("import_svg", args);
 }
 
 export async function saveProject(args: Args) {
-  return invoke("saveProject", args);
+  return invoke("save_project", args);
 }
 
 export async function loadProject(args: Args) {
-  return invoke("loadProject", args);
+  return invoke("load_project", args);
 }
 
 export async function setMachine(args: Args) {
-  return invoke("setMachine", args);
+  return invoke("set_machine", args);
 }
 
 export async function listMachines() {
-  return invoke("listMachines", {});
+  return invoke("list_machines", {});
 }

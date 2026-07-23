@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use geometry::{Path, Seg, Point};
 
+pub mod import;
+pub use import::import_svg;
+
 const PX_TO_MM: f64 = 25.4 / 96.0;
 
 #[derive(Debug)]

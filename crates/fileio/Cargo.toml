@@ -6,4 +6,5 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 geometry = { path = "../geometry" }
+document = { path = "../document" }
 usvg = "0.44"

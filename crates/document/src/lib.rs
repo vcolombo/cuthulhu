@@ -3,3 +3,5 @@ pub mod node;
 pub use node::*;
 pub mod delta;
 pub use delta::*;
+pub mod history;
+pub use history::*;

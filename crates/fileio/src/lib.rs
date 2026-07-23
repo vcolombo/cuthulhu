@@ -170,4 +170,26 @@ mod tests {
         let svg = doc_to_svg(&doc);
         assert!(svg.contains("<path"), "svg missing <path>: {svg}");
     }
+    #[test]
+    fn doc_to_svg_composes_transforms_child_first_then_ancestors() {
+        // group: translate(10,0); child point (1,0) scaled 2x → (2,0), then group
+        // translate → (12,0). If the composition order were swapped (ancestor
+        // applied before child), the result would be (11,0)*2 = (22,0) instead.
+        let mut doc = Document::new();
+        let group_id = doc.ids.next();
+        let mut group = document::Node::container(group_id, NodeKind::Group);
+        group.transform = Affine::translate(10.0, 0.0);
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: doc.root, index: 0, node: group }]));
+
+        let child_id = doc.ids.next();
+        let mut child = document::Node::shape(child_id, ShapeKind::Path { d: "M1,0".into() });
+        child.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: group_id, index: 0, node: child }]));
+
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains("M12,0"), "expected composed point M12,0: {svg}");
+        assert!(!svg.contains("M22,0"), "order looks swapped (parent applied before child): {svg}");
+    }
 }

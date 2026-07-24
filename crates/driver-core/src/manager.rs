@@ -9,13 +9,14 @@
 //! for a worker parked at `recv()` — see `DeviceManager::cancel`.
 
 use crate::{write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum DeviceState {
     Disconnected,
     Connecting,
@@ -30,7 +31,7 @@ pub enum DeviceState {
     Error(DeviceError),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum DeviceError { Disconnected, Busy, Timeout, WriteZero, Io(String) }
 
 impl From<TransportError> for DeviceError {
@@ -44,10 +45,10 @@ impl From<TransportError> for DeviceError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum DeviceEventKind {
     StateChanged(DeviceState),
     Progress { pass_index: usize, submitted_bytes: usize, total_bytes: usize },

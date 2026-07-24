@@ -6,3 +6,4 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 geometry = { path = "../geometry" }
+serde = { version = "1", features = ["derive"] }

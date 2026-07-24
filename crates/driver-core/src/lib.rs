@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use geometry::Polyline;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -36,12 +37,12 @@ pub trait Transport: Send {
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError>;
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TransportKind {
     Usb { locator: String }, // "bus:address"
     Serial { path: String, baud: u32 },
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub instance_id: String,
     pub machine_id: String,

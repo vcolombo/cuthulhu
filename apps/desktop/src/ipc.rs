@@ -2,8 +2,12 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
+use driver_core::DeviceInfo;
+use driver_core::manager::DeviceState;
 use geometry::{Affine, BoolOp};
+use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PlanCutResponse};
 use crate::state::AppState;
+use cutplan::presets::MaterialPreset;
 
 pub type AppStateHandle = Mutex<AppState>;
 
@@ -80,4 +84,66 @@ pub fn set_machine(state: tauri::State<AppStateHandle>, machine_id: String) -> R
 #[tauri::command]
 pub fn list_machines(state: tauri::State<AppStateHandle>) -> Result<Vec<MachineProfile>, String> {
     Ok(state.lock().unwrap().list_machines())
+}
+
+// --- device / cut / preset commands: operate over DeviceManagerHandle, never AppStateHandle's mutex ---
+
+#[tauri::command]
+pub fn list_devices(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<DeviceInfo>, IpcError> {
+    Ok(dev.list_devices())
+}
+
+#[tauri::command]
+pub fn connect_device(dev: tauri::State<DeviceManagerHandle>, info: DeviceInfo) -> Result<(), IpcError> {
+    dev.connect(info)
+}
+
+#[tauri::command]
+pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.disconnect()
+}
+
+#[tauri::command]
+pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<DeviceState, IpcError> {
+    Ok(dev.state())
+}
+
+#[tauri::command]
+pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, IpcError> {
+    plan_cut_response(&state.lock().unwrap().editor.doc)
+}
+
+#[tauri::command]
+pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<u64, IpcError> {
+    dev.cut_from_request(&state.lock().unwrap(), request)
+}
+
+#[tauri::command]
+pub fn cancel_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.cancel()
+}
+
+#[tauri::command]
+pub fn resume_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.resume()
+}
+
+#[tauri::command]
+pub fn confirm_pass_done(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.confirm_pass_done()
+}
+
+#[tauri::command]
+pub fn list_presets(machine_id: String) -> Result<Vec<MaterialPreset>, IpcError> {
+    crate::device::list_presets(&machine_id)
+}
+
+#[tauri::command]
+pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
+    crate::device::save_preset(p)
+}
+
+#[tauri::command]
+pub fn delete_preset(id: String) -> Result<(), IpcError> {
+    crate::device::delete_preset(&id)
 }

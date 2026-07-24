@@ -6,3 +6,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 /target/
+apps/desktop/gen/
+apps/desktop/ui/node_modules/
+apps/desktop/ui/test-results/
+apps/desktop/ui/playwright-report/

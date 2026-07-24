@@ -14,13 +14,13 @@ pub struct MachineProfile {
 pub fn builtin_profiles() -> Vec<MachineProfile> {
     vec![
         MachineProfile {
-            id: "cameo5_alpha".into(),
+            id: "cameo5".into(),
             name: "Silhouette Cameo 5 Alpha".into(),
             width_mm: 330.0,
             height_mm: 3000.0,
         },
         MachineProfile {
-            id: "puma_iv".into(),
+            id: "puma".into(),
             name: "GCC Puma IV".into(),
             width_mm: 600.0,
             height_mm: 5000.0,
@@ -45,11 +45,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builtin_ids_are_canonical() {
+        let ids: Vec<String> = builtin_profiles().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec!["cameo5", "puma"]);
+    }
+
+    #[test]
     fn set_machine_resizes_artboard() {
         let mut ed = Editor::new();
         let puma = builtin_profiles()
             .into_iter()
-            .find(|p| p.id == "puma_iv")
+            .find(|p| p.id == "puma")
             .unwrap();
         ed.set_machine(puma);
         assert!(ed.doc.artboard.w > 300.0); // Puma is wide-format

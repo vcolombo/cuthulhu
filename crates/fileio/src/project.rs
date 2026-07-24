@@ -28,11 +28,34 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
     let mut s = String::new();
     zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?
         .read_to_string(&mut s).map_err(|e| IoError::Io(e.to_string()))?;
-    serde_json::from_str(&s).map_err(|e| IoError::Parse(e.to_string()))
+    let mut doc: Document = serde_json::from_str(&s).map_err(|e| IoError::Parse(e.to_string()))?;
+    if let Some(m) = doc.machine.as_mut() {
+        m.id = match m.id.as_str() {
+            "cameo5_alpha" => "cameo5".into(),
+            "puma_iv" => "puma".into(),
+            _ => std::mem::take(&mut m.id),
+        };
+    }
+    Ok(doc)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_machine_ids_migrate_on_load() {
+        let mut doc = document::Document::new();
+        let legacy = document::MachineProfile { id: "puma_iv".into(), name: "GCC Puma IV".into(),
+            width_mm: 600.0, height_mm: 5000.0 };
+        doc.machine = Some(legacy);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.cut");
+        save_project(&path, &doc).unwrap();
+        let back = load_project(&path).unwrap();
+        assert_eq!(back.machine.unwrap().id, "puma");
+    }
+
     #[test]
     fn save_then_load_round_trips_document() {
         let mut doc = document::Document::new();

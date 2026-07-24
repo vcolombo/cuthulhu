@@ -15,8 +15,8 @@ function installMockTauri() {
   };
 
   const machines = [
-    { id: "cameo5_alpha", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
-    { id: "puma_iv", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
+    { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
+    { id: "puma", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
   ];
 
   let nextId = 1;

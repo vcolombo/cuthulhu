@@ -20,6 +20,11 @@ compliance and traceability, not for clean-room isolation.
 - Capture-derived:     `[cap: cameo5-square-2026-07-21.pcapng #142-158]`
 - Doc-derived:         `[doc: <title>, <url>, section/page]`
 
+## Material presets
+
+Builtin preset values for common materials are sourced from the Cameo/Puma driver
+defaults in `fablabnbg/inkscape-silhouette` (GPL-2.0+): `[src: inkscape-silhouette Cameo/Puma defaults (GPL-2.0+)]`
+
 ## Files
 - `silhouette-cameo5.md` — Cameo 5 Alpha command set.
 - `gcc-hpgl.md` — GCC Puma IV HPGL command set (public-doc-derived).

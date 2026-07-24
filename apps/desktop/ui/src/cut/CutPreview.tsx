@@ -47,10 +47,11 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     ctx.lineWidth = 1;
     ctx.strokeRect(artboard.x, artboard.y, artboard.w, artboard.h);
 
+    const nodesById = new Map(scene.nodes.map((n) => [n.id, n]));
     passes.forEach((pass, passIndex) => {
       const color = pass.color !== null ? cssColor(pass.color) : text;
       for (const nodeId of pass.nodeIds) {
-        const node = scene.nodes.find((n) => n.id === nodeId);
+        const node = nodesById.get(nodeId);
         if (!node) continue;
 
         ctx.globalAlpha = pass.enabled ? 1 : 0.35;

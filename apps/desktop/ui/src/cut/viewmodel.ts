@@ -56,11 +56,11 @@ export type Preset = {
  * @param dir Direction: -1 (up) or 1 (down)
  * @returns A new array with the reordered passes
  */
-export function reorderPass(
-  passes: PassVm[],
+export function reorderPass<T>(
+  passes: T[],
   index: number,
   dir: -1 | 1
-): PassVm[] {
+): T[] {
   // Clamp: if at boundary in the direction of movement, return unchanged
   if (dir === -1 && index === 0) return passes;
   if (dir === 1 && index === passes.length - 1) return passes;

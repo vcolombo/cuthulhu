@@ -334,7 +334,7 @@ describe("toCutRequest", () => {
     });
   });
 
-  it("omits null values in ConfiguredPassDto", () => {
+  it("serializes null values explicitly in ConfiguredPassDto", () => {
     const passes: PassVm[] = [
       {
         color: null,

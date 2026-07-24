@@ -322,10 +322,10 @@ export function CutDialog({
                   style={{ width: 50 }}
                 />
                 {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, -1) as PassRow[])} disabled={i === 0}>
+                <button style={btn} onClick={() => setRows(reorderPass(rows, i, -1))} disabled={i === 0}>
                   Up
                 </button>
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, 1) as PassRow[])} disabled={i === rows.length - 1}>
+                <button style={btn} onClick={() => setRows(reorderPass(rows, i, 1))} disabled={i === rows.length - 1}>
                   Down
                 </button>
               </div>

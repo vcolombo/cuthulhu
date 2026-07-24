@@ -53,13 +53,14 @@ pub struct MockTransport {
 impl Transport for MockTransport {
     fn write(&mut self, b: &[u8]) -> Result<usize, TransportError> {
         match self.write_results.pop_front() {
-            Some(result) => {
-                match result {
-                    Ok(n) => self.written.extend_from_slice(&b[..n.min(b.len())]),
-                    Err(e) => return Err(e),
+            Some(result) => match result {
+                Ok(n) => {
+                    let clamped = n.min(b.len());
+                    self.written.extend_from_slice(&b[..clamped]);
+                    Ok(clamped)
                 }
-                Ok(result?)
-            }
+                Err(e) => Err(e),
+            },
             None => {
                 self.written.extend_from_slice(b);
                 Ok(b.len())
@@ -115,5 +116,13 @@ mod tests {
         let n = t.read(&mut buf, Duration::from_millis(10)).unwrap();
         assert_eq!(&buf[..n], b"ready");
         assert_eq!(t.read(&mut buf, Duration::from_millis(10)), Err(TransportError::Timeout));
+    }
+    #[test]
+    fn mock_write_clamps_scripted_count_to_buffer_length() {
+        let mut t = MockTransport::default();
+        t.write_results.push_back(Ok(6)); // script says 6 bytes
+        let result = t.write(b"HELLO").unwrap(); // but buffer is only 5
+        assert_eq!(result, 5); // should return 5, not 6
+        assert_eq!(t.written, b"HELLO"); // and only append 5 bytes
     }
 }

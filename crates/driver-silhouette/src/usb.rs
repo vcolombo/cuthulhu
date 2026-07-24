@@ -33,15 +33,31 @@ impl Transport for UsbTransport {
         completion.status.map_err(|e| TransportError::Io(format!("{e:?}")))?;
         Ok(bytes.len())
     }
-    fn read(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize, TransportError> {
+    fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
         let req_buf = RequestBuffer::new(buf.len());
         let xfer = self.iface.bulk_in(EP_IN, req_buf);
-        let completion = futures_lite::future::block_on(xfer);
-        completion.status.map_err(|e| TransportError::Io(format!("{e:?}")))?;
-        let data = completion.data;
-        let n = data.len();
-        buf[..n].copy_from_slice(&data);
-        Ok(n)
+
+        // ponytail: nusb bulk_in has no timeout; spawn thread + channel to enforce it.
+        // Thread exits with transfer result or dies at timeout, caller recv_timeout maps timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let completion = futures_lite::future::block_on(xfer);
+            let _ = tx.send(completion);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(completion) => {
+                completion.status.map_err(|e| TransportError::Io(format!("{e:?}")))?;
+                let data = completion.data;
+                let n = data.len();
+                buf[..n].copy_from_slice(&data);
+                Ok(n)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TransportError::Timeout),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(TransportError::Io("transfer thread panicked".to_string()))
+            }
+        }
     }
 }
 

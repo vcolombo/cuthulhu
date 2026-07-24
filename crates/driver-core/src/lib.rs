@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use geometry::Polyline;
+use std::collections::VecDeque;
+use std::time::Duration;
 
 pub struct Job { pub polylines: Vec<Polyline>, pub settings: Settings }
 
@@ -16,7 +18,7 @@ pub struct MachineCaps { pub supports_speed: bool, pub supports_force: bool, pub
 #[derive(Debug, PartialEq)]
 pub enum DriverError { UnsupportedGeometry, Encode(String) }
 #[derive(Debug, PartialEq)]
-pub enum TransportError { NotFound, Io(String) }
+pub enum TransportError { NotFound, Timeout, WriteZero, Io(String) }
 
 pub trait Driver {
     fn profile(&self) -> &MachineProfile;
@@ -27,15 +29,55 @@ pub trait Driver {
     fn session_end(&self) -> Vec<u8>;
     fn abort_bytes(&self) -> Option<Vec<u8>>;
 }
-pub trait Transport {
+pub trait Transport: Send {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, TransportError>;
+    fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError>;
+}
+
+pub fn write_all(t: &mut dyn Transport, mut bytes: &[u8]) -> Result<(), TransportError> {
+    while !bytes.is_empty() {
+        match t.write(bytes)? {
+            0 => return Err(TransportError::WriteZero),
+            n => bytes = &bytes[n..],
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
-pub struct MockTransport { pub written: Vec<u8> }
+pub struct MockTransport {
+    pub written: Vec<u8>,
+    pub reads: VecDeque<Result<Vec<u8>, TransportError>>,
+    pub write_results: VecDeque<Result<usize, TransportError>>,
+}
 impl Transport for MockTransport {
     fn write(&mut self, b: &[u8]) -> Result<usize, TransportError> {
-        self.written.extend_from_slice(b); Ok(b.len())
+        match self.write_results.pop_front() {
+            Some(result) => {
+                match result {
+                    Ok(n) => self.written.extend_from_slice(&b[..n.min(b.len())]),
+                    Err(e) => return Err(e),
+                }
+                Ok(result?)
+            }
+            None => {
+                self.written.extend_from_slice(b);
+                Ok(b.len())
+            }
+        }
+    }
+    fn read(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<usize, TransportError> {
+        match self.reads.pop_front() {
+            Some(result) => match result {
+                Ok(data) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                Err(e) => Err(e),
+            },
+            None => Err(TransportError::Timeout),
+        }
     }
 }
 
@@ -53,5 +95,25 @@ mod tests {
     fn default_settings_leave_speed_force_unset() {
         let s = Settings::default();
         assert!(s.speed.is_none() && s.force.is_none() && s.repeat_count == 1);
+    }
+    #[test]
+    fn write_all_loops_partial_writes_and_flags_zero() {
+        let mut t = MockTransport::default();
+        t.write_results.push_back(Ok(2)); // partial: only 2 of 5 accepted
+        write_all(&mut t, b"HELLO").unwrap();
+        assert_eq!(t.written, b"HELLO");
+
+        let mut z = MockTransport::default();
+        z.write_results.push_back(Ok(0));
+        assert_eq!(write_all(&mut z, b"X"), Err(TransportError::WriteZero));
+    }
+    #[test]
+    fn mock_read_replays_script_then_times_out() {
+        let mut t = MockTransport::default();
+        t.reads.push_back(Ok(b"ready".to_vec()));
+        let mut buf = [0u8; 8];
+        let n = t.read(&mut buf, Duration::from_millis(10)).unwrap();
+        assert_eq!(&buf[..n], b"ready");
+        assert_eq!(t.read(&mut buf, Duration::from_millis(10)), Err(TransportError::Timeout));
     }
 }

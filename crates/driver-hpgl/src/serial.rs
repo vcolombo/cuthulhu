@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use driver_core::{Transport, TransportError};
+use std::io::Read;
 use std::time::Duration;
 
 pub struct SerialTransport { port: Box<dyn serialport::SerialPort> }
@@ -19,6 +20,14 @@ impl Transport for SerialTransport {
         use std::io::Write;
         self.port.write_all(bytes).map_err(|e| TransportError::Io(e.to_string()))?;
         Ok(bytes.len())
+    }
+    fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
+        self.port.set_timeout(timeout).map_err(|e| TransportError::Io(e.to_string()))?;
+        match self.port.read(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(TransportError::Timeout),
+            Err(e) => Err(TransportError::Io(e.to_string())),
+        }
     }
 }
 

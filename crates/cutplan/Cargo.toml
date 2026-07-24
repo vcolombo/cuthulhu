@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 document = { path = "../document" }
+driver-core = { path = "../driver-core" }
 geometry = { path = "../geometry" }
 serde = { version = "1", features = ["derive"] }
 

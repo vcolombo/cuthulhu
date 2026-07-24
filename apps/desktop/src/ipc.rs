@@ -103,9 +103,11 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
+// Non-blocking, event-driven cache — safe to call even while a cut is
+// mid-transmit (never touches the worker thread; see DeviceManagerHandle::cached_state).
 #[tauri::command]
 pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<DeviceState, IpcError> {
-    Ok(dev.state())
+    Ok(dev.cached_state())
 }
 
 #[tauri::command]
@@ -113,22 +115,31 @@ pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, 
     plan_cut_response(&state.lock().unwrap().editor.doc)
 }
 
-#[tauri::command]
+// async: prepare_cut briefly locks the document (plan + preflight), then the
+// lock is dropped before execute_cut's blocking call into the device worker
+// so `cut` never holds the doc mutex while blocked, and running off the main
+// loop keeps the UI (and cancel_cut) responsive while it blocks.
+#[tauri::command(async)]
 pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<u64, IpcError> {
-    dev.cut_from_request(&state.lock().unwrap(), request)
+    let passes = {
+        let app = state.lock().unwrap();
+        dev.prepare_cut(&app, request)?
+    };
+    dev.execute_cut(passes)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn cancel_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
     dev.cancel()
 }
 
-#[tauri::command]
+// async: blocks like `cut` while the worker drives the next pass.
+#[tauri::command(async)]
 pub fn resume_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
     dev.resume()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn confirm_pass_done(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
     dev.confirm_pass_done()
 }

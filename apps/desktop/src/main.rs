@@ -60,7 +60,9 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                if is_active(&dev.state()) {
+                // Non-blocking cached read: the worker thread may be busy
+                // mid-transmit, and this handler must never block on it.
+                if is_active(&dev.cached_state()) {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();
                 }
@@ -71,18 +73,21 @@ fn main() {
 
     // Event bridge: sole consumer of the device-event channel. Coalesces
     // `Progress` to <=10Hz (drop intermediate ticks); every other event kind
-    // is forwarded immediately. Dropped webview listeners are a normal `emit`
-    // no-op, not an error.
+    // is forwarded immediately. Also the sole writer of DeviceManagerHandle's
+    // cached state (record_state), so get_device_state and the close handler
+    // above never block on the worker thread. Dropped webview listeners are a
+    // normal `emit` no-op, not an error.
     let bridge_handle = app.handle().clone();
     std::thread::spawn(move || {
-        let mut last_progress = Instant::now() - Duration::from_secs(1);
+        let mut last_progress: Option<Instant> = None;
         for event in events {
+            bridge_handle.state::<DeviceManagerHandle>().record_state(&event);
             if matches!(event.kind, DeviceEventKind::Progress { .. }) {
                 let now = Instant::now();
-                if now.duration_since(last_progress) < Duration::from_millis(100) {
+                if last_progress.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
                     continue;
                 }
-                last_progress = now;
+                last_progress = Some(now);
             }
             let _ = bridge_handle.emit("device-event", &event);
         }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use cutplan::preflight::{preflight, ConfiguredPass, PreflightError};
 use cutplan::presets::{default_presets_path, load_presets, save_user_presets, MaterialPreset};
 use cutplan::{plan_passes, ColorPass};
-use driver_core::manager::{CutPass, DeviceManager};
+use driver_core::manager::{CutPass, DeviceEvent, DeviceEventKind, DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Job, Settings, Transport, TransportError, TransportKind};
 use serde::{Deserialize, Serialize};
 
@@ -87,15 +87,24 @@ pub struct DeviceManagerHandle {
     // several live handles to the same manager (not the case here — one per app).
     manager: Mutex<Option<Arc<DeviceManager>>>,
     pub connected: Mutex<Option<DeviceInfo>>,
+    // ponytail: event-driven cache, kept current by the bridge thread calling
+    // `record_state` for every event it forwards. Never blocks on the worker
+    // thread (unlike `DeviceManager::snapshot()`), so it's safe to read from
+    // the close handler or a polling command even mid-transmit; may lag the
+    // true state by one event. Upgrade to a blocking read only if a caller
+    // ever needs the exact instantaneous state (tests use `DeviceManager::
+    // snapshot()` directly for that).
+    state_cache: Mutex<DeviceState>,
 }
 
 impl DeviceManagerHandle {
-    pub fn new(factory: Arc<dyn DeviceBackendFactory>) -> (Self, std::sync::mpsc::Receiver<driver_core::manager::DeviceEvent>) {
+    pub fn new(factory: Arc<dyn DeviceBackendFactory>) -> (Self, std::sync::mpsc::Receiver<DeviceEvent>) {
         let (mgr, events) = DeviceManager::spawn(factory.clone());
         let handle = DeviceManagerHandle {
             factory,
             manager: Mutex::new(Some(Arc::new(mgr))),
             connected: Mutex::new(None),
+            state_cache: Mutex::new(DeviceState::Disconnected),
         };
         (handle, events)
     }
@@ -121,11 +130,17 @@ impl DeviceManagerHandle {
         Ok(())
     }
 
-    pub fn state(&self) -> driver_core::manager::DeviceState {
-        match self.manager() {
-            Ok(m) => m.snapshot(),
-            Err(_) => driver_core::manager::DeviceState::Disconnected,
+    /// Called by the event bridge thread for every event it forwards; updates
+    /// the cache on `StateChanged`, ignored for every other event kind.
+    pub fn record_state(&self, event: &DeviceEvent) {
+        if let DeviceEventKind::StateChanged(s) = &event.kind {
+            *self.state_cache.lock().unwrap() = s.clone();
         }
+    }
+
+    /// Non-blocking, event-driven snapshot — see `state_cache`'s doc comment.
+    pub fn cached_state(&self) -> DeviceState {
+        self.state_cache.lock().unwrap().clone()
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
@@ -153,10 +168,12 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// Locks `app`'s document just long enough to plan + revalidate, then
-    /// resolves presets/overrides and runs preflight before submitting the
-    /// job. Never touches `AppStateHandle`'s mutex beyond that read.
-    pub fn cut_from_request(&self, app: &AppState, request: CutRequest) -> Result<u64, IpcError> {
+    /// Locks `app`'s document just long enough to plan + revalidate, resolve
+    /// presets/overrides, and run preflight — returns an owned `Vec<CutPass>`
+    /// with no remaining borrow of `app`, so the caller drops the document
+    /// lock *before* calling `execute_cut` (which blocks on the worker
+    /// thread). Never touches `AppStateHandle`'s mutex beyond that.
+    pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<Vec<CutPass>, IpcError> {
         let planned = plan_passes(&app.editor.doc)
             .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
         if planned.doc_revision != request.doc_revision {
@@ -182,23 +199,41 @@ impl DeviceManagerHandle {
             Vec::new()
         };
 
-        let configured: Vec<ConfiguredPass> = request.passes.iter().filter_map(|dto| {
-            let pass = planned.passes.iter().find(|p| p.color == dto.color)?;
+        let mut configured: Vec<ConfiguredPass> = Vec::with_capacity(request.passes.len());
+        for dto in &request.passes {
+            let pass = planned.passes.iter().find(|p| p.color == dto.color).ok_or_else(|| {
+                IpcError::new("unknown_pass_color", format!("no planned pass matches color {:?}", dto.color))
+            })?;
             let preset = dto.preset_id.as_deref().and_then(|id| presets.iter().find(|p| p.id == id));
-            Some(ConfiguredPass { pass, settings: resolve_settings(preset, dto), enabled: dto.enabled })
-        }).collect();
+            configured.push(ConfiguredPass { pass, settings: resolve_settings(preset, dto), enabled: dto.enabled });
+        }
 
         let doc_machine_id = app.editor.doc.machine.as_ref().map(|m| m.id.as_str());
         preflight(&configured, &profile, &caps, doc_machine_id, false).map_err(map_preflight_error)?;
 
-        let cut_passes: Vec<CutPass> = configured.iter().filter(|c| c.enabled).map(|c| CutPass {
+        Ok(configured.iter().filter(|c| c.enabled).map(|c| CutPass {
             job: Job {
                 polylines: c.pass.shapes.iter().flat_map(|s| s.polylines.iter().cloned()).collect(),
                 settings: c.settings.clone(),
             },
-        }).collect();
+        }).collect())
+    }
 
-        self.manager()?.cut(cut_passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+    /// Submits already-planned passes to the device manager. Blocks until the
+    /// worker reaches its first pause point or completion — call this off the
+    /// document lock (see `prepare_cut`) and from an async command so it
+    /// doesn't freeze the Tauri main loop.
+    pub fn execute_cut(&self, passes: Vec<CutPass>) -> Result<u64, IpcError> {
+        self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+    }
+
+    /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
+    /// callers (`ipc::cut`) keep the two steps separate so the document lock
+    /// is dropped before the blocking `execute_cut` call.
+    #[cfg(test)]
+    fn cut_from_request(&self, app: &AppState, request: CutRequest) -> Result<u64, IpcError> {
+        let passes = self.prepare_cut(app, request)?;
+        self.execute_cut(passes)
     }
 }
 
@@ -214,8 +249,8 @@ fn resolve_settings(preset: Option<&MaterialPreset>, dto: &ConfiguredPassDto) ->
 
 /// True while a cut job is mid-flight — used by the window close handler to
 /// decide whether to block the close and ask the UI to confirm.
-pub fn is_active(state: &driver_core::manager::DeviceState) -> bool {
-    use driver_core::manager::DeviceState::*;
+pub fn is_active(state: &DeviceState) -> bool {
+    use DeviceState::*;
     matches!(state, Transmitting { .. } | AwaitingCompletion { .. } | WaitingForColorSwap { .. } | CancelRequested { .. } | Stopping { .. })
 }
 
@@ -393,5 +428,17 @@ mod tests {
         let request = CutRequest { device_instance_id: test_instance().instance_id, doc_revision: revision, passes: vec![] };
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "nothing_to_cut");
+    }
+
+    #[test]
+    fn unknown_pass_color_is_rejected_not_dropped() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        let mut request = request_from(plan);
+        request.passes[0].color = Some(0xDEADBEEF); // doesn't match any planned pass
+        let err = dev.cut_from_request(&app, request).unwrap_err();
+        assert_eq!(err.code, "unknown_pass_color");
     }
 }

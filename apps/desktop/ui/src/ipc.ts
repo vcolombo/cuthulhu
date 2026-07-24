@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
+import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
 
 // ponytail: loose types for delta/snapshot payloads until Rust shape mirrors TS
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -63,4 +64,15 @@ export async function setMachine(args: Args) {
 
 export async function listMachines() {
   return invoke("list_machines", {});
+}
+
+const CUT_FILTER = [{ name: "cuthulhu project", extensions: ["cut"] }];
+
+export async function pickSavePath(): Promise<string | null> {
+  return dialogSave({ defaultPath: "cuthulhu-project.cut", filters: CUT_FILTER });
+}
+
+export async function pickOpenPath(): Promise<string | null> {
+  const r = await dialogOpen({ multiple: false, filters: CUT_FILTER });
+  return typeof r === "string" ? r : null;
 }

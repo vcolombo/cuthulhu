@@ -47,8 +47,6 @@ export type DocSnapshot = {
   machine: MachineProfile | null;
 };
 
-const PROJECT_PATH = "cuthulhu-project.cut"; // ponytail: fixed save path until tauri-plugin-dialog wires a file picker
-
 function toggleId(ids: number[], id: number): number[] {
   return ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id];
 }
@@ -147,6 +145,7 @@ export function App() {
   const [machines, setMachines] = useState<MachineProfile[]>([]);
   const [tool, setTool] = useState("select");
   const [error, setError] = useState<string | null>(null);
+  const [lastPath, setLastPath] = useState<string | null>(null);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
 
@@ -338,8 +337,26 @@ export function App() {
           machines={machines}
           currentMachineId={doc?.machine?.id ?? null}
           onSelectMachine={(id) => run(() => ipc.setMachine({ machineId: id }))}
-          onSave={() => run(() => ipc.saveProject({ path: PROJECT_PATH }))}
-          onReload={() => run(() => ipc.loadProject({ path: PROJECT_PATH }))}
+          onSave={() =>
+            run(async () => {
+              const p = await ipc.pickSavePath();
+              if (p) {
+                await ipc.saveProject({ path: p });
+                setLastPath(p);
+              }
+            })
+          }
+          onOpen={() =>
+            run(async () => {
+              const p = await ipc.pickOpenPath();
+              if (p) {
+                await ipc.loadProject({ path: p });
+                setLastPath(p);
+              }
+            })
+          }
+          onReload={() => run(() => ipc.loadProject({ path: lastPath! }))}
+          canReload={lastPath !== null}
           onUndo={() => run(() => ipc.undo())}
           onRedo={() => run(() => ipc.redo())}
           onImportFile={onImportFile}

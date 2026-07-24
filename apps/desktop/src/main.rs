@@ -7,6 +7,7 @@ use desktop::state::AppState;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppState::new()))
         .invoke_handler(tauri::generate_handler![
             ipc::new_doc,

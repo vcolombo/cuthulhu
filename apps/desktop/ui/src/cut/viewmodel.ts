@@ -29,7 +29,7 @@ export type ConfiguredPassDto = {
 
 export type CutRequest = {
   device_instance_id: string;
-  doc_revision: number;
+  doc_revision: string;
   passes: ConfiguredPassDto[];
 };
 
@@ -119,8 +119,7 @@ export function fieldDisabled(
   caps: Caps
 ): boolean {
   if (field === "speed") return !caps.supportsSpeed;
-  if (field === "force") return !caps.supportsForce;
-  return false;
+  return !caps.supportsForce;
 }
 
 /**
@@ -150,7 +149,7 @@ export function acceptEvent(
  */
 export function toCutRequest(
   deviceInstanceId: string,
-  docRevision: number,
+  docRevision: string,
   passes: PassVm[]
 ): CutRequest {
   return {

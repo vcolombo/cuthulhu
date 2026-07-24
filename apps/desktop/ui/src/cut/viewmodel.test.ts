@@ -8,6 +8,7 @@ import {
   toCutRequest,
   type PassVm,
   type Caps,
+  type Preset,
 } from "./viewmodel";
 
 describe("reorderPass", () => {
@@ -120,10 +121,13 @@ describe("effectiveSettings", () => {
       repeatCount: null,
     };
 
-    const presets: { id: string; settings: { speed?: number | null; force?: number | null; repeat_count: number } }[] = [
+    const presets: Preset[] = [
       {
         id: "preset1",
+        name: "Acrylic",
+        machine_id: "cameo5",
         settings: { speed: 150, force: 75, repeat_count: 3 },
+        builtin: true,
       },
     ];
 
@@ -161,10 +165,13 @@ describe("effectiveSettings", () => {
       repeatCount: null,
     };
 
-    const presets: { id: string; settings: { speed?: number | null; force?: number | null; repeat_count: number } }[] = [
+    const presets: Preset[] = [
       {
         id: "preset1",
+        name: "Paper",
+        machine_id: "cameo5",
         settings: { speed: 150, force: 75, repeat_count: 3 },
+        builtin: false,
       },
     ];
 
@@ -249,10 +256,10 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", 42, passes);
+    const result = toCutRequest("device123", "42", passes);
 
     expect(result.device_instance_id).toBe("device123");
-    expect(result.doc_revision).toBe(42);
+    expect(result.doc_revision).toBe("42");
     expect(result.passes).toHaveLength(1);
     expect(result.passes[0]).toEqual({
       color: 0xff0000,
@@ -277,7 +284,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", 42, passes);
+    const result = toCutRequest("device123", "42", passes);
 
     expect(result.passes[0]).toEqual({
       color: null,
@@ -311,7 +318,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", 42, passes);
+    const result = toCutRequest("device123", "42", passes);
 
     expect(result.passes).toHaveLength(2);
     expect(result.passes[0].preset_id).toBe("preset1");

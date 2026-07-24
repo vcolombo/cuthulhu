@@ -22,7 +22,7 @@ impl IpcError {
 #[derive(Deserialize)]
 pub struct CutRequest {
     pub device_instance_id: String,
-    pub doc_revision: u64,
+    pub doc_revision: String,
     pub passes: Vec<ConfiguredPassDto>,
 }
 
@@ -189,7 +189,7 @@ impl DeviceManagerHandle {
     pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<Vec<CutPass>, IpcError> {
         let planned = plan_passes(&app.editor.doc)
             .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
-        if planned.doc_revision != request.doc_revision {
+        if planned.doc_revision.to_string() != request.doc_revision {
             return Err(IpcError::new("stale_plan", "document changed since the cut was planned"));
         }
 
@@ -283,7 +283,7 @@ fn map_preflight_error(e: PreflightError) -> IpcError {
 pub struct PlanCutResponse {
     pub passes: Vec<PlanCutPassSummary>,
     pub skipped_no_stroke: usize,
-    pub doc_revision: u64,
+    pub doc_revision: String,
     pub travel: Vec<[f64; 4]>,
 }
 
@@ -307,7 +307,7 @@ pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, Ip
             node_ids: p.shapes.iter().map(|s| s.node_id).collect(),
         }).collect(),
         skipped_no_stroke: planned.skipped_no_stroke,
-        doc_revision: planned.doc_revision,
+        doc_revision: planned.doc_revision.to_string(),
         travel: travel.into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect(),
     })
 }
@@ -398,7 +398,7 @@ mod tests {
     fn request_from(plan: PlannedCut) -> CutRequest {
         CutRequest {
             device_instance_id: test_instance().instance_id,
-            doc_revision: plan.doc_revision,
+            doc_revision: plan.doc_revision.to_string(),
             passes: plan.passes.iter().map(|p| ConfiguredPassDto {
                 color: p.color, enabled: true, preset_id: None, speed: None, force: None, repeat_count: None,
             }).collect(),
@@ -438,7 +438,7 @@ mod tests {
         let app = AppState::new();
         let dev = test_device_setup();
         let revision = cutplan::doc_revision(&app.editor.doc);
-        let request = CutRequest { device_instance_id: test_instance().instance_id, doc_revision: revision, passes: vec![] };
+        let request = CutRequest { device_instance_id: test_instance().instance_id, doc_revision: revision.to_string(), passes: vec![] };
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "nothing_to_cut");
     }

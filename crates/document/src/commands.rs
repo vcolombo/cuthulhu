@@ -255,6 +255,46 @@ mod tests {
     }
 
     #[test]
+    fn boolean_cross_depth_inputs_discriminate_world_vs_node_transform() {
+        // root -> groupA(translate 50,0) -> groupB(translate 0,20) -> a (Rect 10x10, identity)
+        //      -> groupA -> c (Rect 10x10, translate(-5,20))  [sibling of groupB, not of a]
+        let mut ed = Editor::new();
+        let ga = ed.doc.ids.next();
+        let mut group_a = Node::container(ga, NodeKind::Group);
+        group_a.transform = Affine::translate(50.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group_a, index: 0 }]));
+        let gb = ed.doc.ids.next();
+        let mut group_b = Node::container(gb, NodeKind::Group);
+        group_b.transform = Affine::translate(0.0, 20.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ga, node: group_b, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gb,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let c = ed.doc.ids.next();
+        let mut nc = Node::shape(c, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        nc.transform = Affine::translate(-5.0, 20.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ga, node: nc, index: 1 }]));
+
+        // world(a) = translate(50,20); world(c) = translate(45,20)
+        // union world bounds: x 45..60, y 20..30 (w=15, h=10)
+        // dest_parent = groupB, dest_world = translate(50,20)
+        // result in groupB-local: x -5..10 (w=15), y 0..10 (h=10)
+        ed.boolean(&[a, c], geometry::BoolOp::Union).unwrap();
+        let kids = ed.doc.get(gb).unwrap().children.clone();
+        assert_eq!(kids.len(), 1, "result should land under groupB (parent of a)");
+        let result = ed.doc.get(kids[0]).unwrap();
+        let d = match &result.kind {
+            NodeKind::Shape(ShapeKind::Path { d }) => d.clone(),
+            other => panic!("expected Path, got {other:?}"),
+        };
+        let bounds = geometry::Path::from_svg(&d).unwrap().bounds();
+        assert!((bounds.x - -5.0).abs() < 0.5, "x={} (expected -5)", bounds.x);
+        assert!((bounds.w - 15.0).abs() < 0.5, "w={} (expected 15)", bounds.w);
+        assert!((bounds.y - 0.0).abs() < 0.5, "y={} (expected 0)", bounds.y);
+        assert!((bounds.h - 10.0).abs() < 0.5, "h={} (expected 10)", bounds.h);
+    }
+
+    #[test]
     fn boolean_op_dedupes_ids() {
         let mut ed = Editor::new();
         for _ in 0..2 {

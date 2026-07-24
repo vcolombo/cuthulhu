@@ -54,7 +54,8 @@ pub enum DeviceEventKind {
 pub struct CutPass { pub job: Job }
 
 /// Lifecycle events (connect/disconnect) aren't scoped to a job; they're
-/// reported with this sentinel job_id.
+/// reported with this sentinel job_id. Job ids start at 1 — 0 is reserved
+/// for lifecycle events, so Task 7's job-id counter must begin at 1.
 const NO_JOB: u64 = 0;
 
 enum Command {
@@ -106,9 +107,12 @@ impl DeviceManager {
         self.call(|reply| Command::Cut { passes, reply })?
     }
 
-    /// Stub: real cancellation lands in Task 8.
+    /// Stub: real cancellation lands in Task 8 (a cancel-flag `AtomicBool`
+    /// the worker checks between blocking writes). Fire-and-forget: `try_send`
+    /// so a full command queue (worker busy writing) can't block the caller —
+    /// Task 8's flag is how a busy worker actually observes the cancel.
     pub fn cancel(&self) {
-        let _ = self.cmd_tx.send(Command::Cancel);
+        let _ = self.cmd_tx.try_send(Command::Cancel);
     }
 
     /// Stub: real resume lands in Task 7.
@@ -122,7 +126,12 @@ impl DeviceManager {
     }
 
     pub fn shutdown(self) {
-        let _ = self.cmd_tx.send(Command::Shutdown);
+        // try_send, not send: a blocking send here could itself hang if the
+        // worker is wedged (e.g. blocked in a transport write, Task 7) and
+        // the queue is full. Skip the send in that case rather than block —
+        // dropping cmd_tx below still wakes a worker parked in cmd_rx.recv().
+        let _ = self.cmd_tx.try_send(Command::Shutdown);
+        drop(self.cmd_tx);
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = self.handle.join();
@@ -242,15 +251,24 @@ mod tests {
     }
     fn test_factory() -> TestFactory { TestFactory }
 
-    struct FailingOpenFactory;
-    impl DeviceBackendFactory for FailingOpenFactory {
+    /// Fails the first `open_transport` call, succeeds on every call after —
+    /// drives the connect-fails-then-reconnect-recovers path.
+    struct FlakyOpenFactory { attempts: std::sync::atomic::AtomicUsize }
+    impl FlakyOpenFactory {
+        fn new() -> Self { FlakyOpenFactory { attempts: std::sync::atomic::AtomicUsize::new(0) } }
+    }
+    impl DeviceBackendFactory for FlakyOpenFactory {
         fn list_devices(&self) -> Vec<DeviceInfo> { vec![cameo_info()] }
         fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> { Some(fake_driver()) }
         fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
-            Err(TransportError::NotFound)
+            use std::sync::atomic::Ordering;
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(TransportError::NotFound)
+            } else {
+                Ok(Box::new(MockTransport::default()))
+            }
         }
     }
-    fn failing_open_factory() -> FailingOpenFactory { FailingOpenFactory }
 
     #[test]
     fn connect_transitions_disconnected_to_idle_and_events_fire() {
@@ -266,9 +284,11 @@ mod tests {
 
     #[test]
     fn connect_failure_yields_error_state_and_reconnect_recovers() {
-        let (mgr, _events) = DeviceManager::spawn(Arc::new(failing_open_factory()));
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(FlakyOpenFactory::new()));
         assert!(mgr.connect(cameo_info()).is_err());
         assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        mgr.connect(cameo_info()).unwrap(); // recovery: a later successful connect clears Error
+        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
         mgr.shutdown();
     }
 

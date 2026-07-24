@@ -12,11 +12,36 @@ pub struct UsbTransport {
     iface: nusb::Interface,
 }
 
+/// Locators ("bus:address") for every enumerated Cameo device, in enumeration order.
+pub fn list_locators() -> Vec<String> {
+    let Ok(devices) = nusb::list_devices() else { return Vec::new() };
+    devices
+        .filter(|d| d.vendor_id() == VID && PIDS.contains(&d.product_id()))
+        .map(|d| format!("{}:{}", d.bus_number(), d.device_address()))
+        .collect()
+}
+
+fn parse_locator(locator: &str) -> Option<(u8, u8)> {
+    let (bus, addr) = locator.split_once(':')?;
+    Some((bus.parse().ok()?, addr.parse().ok()?))
+}
+
 impl UsbTransport {
+    /// Opens the first enumerated Cameo device. Kept for CLI back-compat; prefer `open_at`.
     pub fn open() -> Result<UsbTransport, TransportError> {
+        let locator = list_locators().into_iter().next().ok_or(TransportError::NotFound)?;
+        Self::open_at(&locator)
+    }
+
+    /// Opens the Cameo device at the given "bus:address" locator (from `list_locators`).
+    pub fn open_at(locator: &str) -> Result<UsbTransport, TransportError> {
+        let (bus, addr) = parse_locator(locator).ok_or(TransportError::NotFound)?;
         let di = nusb::list_devices()
             .map_err(|e| TransportError::Io(e.to_string()))?
-            .find(|d| d.vendor_id() == VID && PIDS.contains(&d.product_id()))
+            .find(|d| {
+                d.vendor_id() == VID && PIDS.contains(&d.product_id())
+                    && d.bus_number() == bus && d.device_address() == addr
+            })
             .ok_or(TransportError::NotFound)?;
         let dev = di.open().map_err(|e| TransportError::Io(e.to_string()))?;
         let iface = dev
@@ -71,6 +96,22 @@ mod tests {
     fn open_without_device_reports_not_found() {
         // CI has no Cameo attached → must be a typed NotFound, never a panic.
         match UsbTransport::open() {
+            Err(TransportError::NotFound) => {}
+            Err(e) => panic!("expected NotFound, got: {e:?}"),
+            Ok(_) => panic!("device unexpectedly found"),
+        }
+    }
+    #[test]
+    fn open_at_unknown_locator_reports_not_found() {
+        match UsbTransport::open_at("99:99") {
+            Err(TransportError::NotFound) => {}
+            Err(e) => panic!("expected NotFound, got: {e:?}"),
+            Ok(_) => panic!("device unexpectedly found"),
+        }
+    }
+    #[test]
+    fn open_at_malformed_locator_reports_not_found() {
+        match UsbTransport::open_at("not-a-locator") {
             Err(TransportError::NotFound) => {}
             Err(e) => panic!("expected NotFound, got: {e:?}"),
             Ok(_) => panic!("device unexpectedly found"),

@@ -34,6 +34,25 @@ pub trait Transport: Send {
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError>;
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransportKind {
+    Usb { locator: String }, // "bus:address"
+    Serial { path: String, baud: u32 },
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceInfo {
+    pub instance_id: String,
+    pub machine_id: String,
+    pub transport: TransportKind,
+    pub candidate: bool,
+}
+
+pub trait DeviceBackendFactory: Send + Sync {
+    fn list_devices(&self) -> Vec<DeviceInfo>;
+    fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>>;
+    fn open_transport(&self, info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError>;
+}
+
 pub fn write_all(t: &mut dyn Transport, mut bytes: &[u8]) -> Result<(), TransportError> {
     while !bytes.is_empty() {
         match t.write(bytes)? {
@@ -124,5 +143,36 @@ mod tests {
         let result = t.write(b"HELLO").unwrap(); // but buffer is only 5
         assert_eq!(result, 5); // should return 5, not 6
         assert_eq!(t.written, b"HELLO"); // and only append 5 bytes
+    }
+
+    struct FakeFactory;
+    impl DeviceBackendFactory for FakeFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            vec![
+                DeviceInfo {
+                    instance_id: "usb:1:4".into(),
+                    machine_id: "cameo5".into(),
+                    transport: TransportKind::Usb { locator: "1:4".into() },
+                    candidate: false,
+                },
+                DeviceInfo {
+                    instance_id: "serial:/dev/ttyUSB0".into(),
+                    machine_id: "puma".into(),
+                    transport: TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 9600 },
+                    candidate: true,
+                },
+            ]
+        }
+        fn driver_for(&self, _: &str) -> Option<Box<dyn Driver + Send>> { None }
+        fn open_transport(&self, _: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Err(TransportError::NotFound)
+        }
+    }
+    #[test]
+    fn serial_devices_are_candidates_requiring_user_selection() {
+        let f = FakeFactory;
+        let serial: Vec<_> = f.list_devices().into_iter()
+            .filter(|d| matches!(d.transport, TransportKind::Serial { .. })).collect();
+        assert!(serial.iter().all(|d| d.candidate), "serial ports can't be assumed to be Pumas");
     }
 }

@@ -3,6 +3,14 @@ use driver_core::{Transport, TransportError};
 use std::io::Read;
 use std::time::Duration;
 
+/// Names of all serial ports currently visible to the OS (not narrowed to Puma devices —
+/// serial has no VID/PID-equivalent discriminator here, so the caller must ask the operator).
+pub fn list_ports() -> Vec<String> {
+    serialport::available_ports()
+        .map(|ports| ports.into_iter().map(|p| p.port_name).collect())
+        .unwrap_or_default()
+}
+
 pub struct SerialTransport { port: Box<dyn serialport::SerialPort> }
 impl SerialTransport {
     pub fn open(port: &str, baud: u32) -> Result<SerialTransport, TransportError> {

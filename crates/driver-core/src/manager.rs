@@ -153,9 +153,15 @@ impl DeviceManager {
 }
 
 fn emit(state: &mut DeviceState, new: DeviceState, events: &mpsc::Sender<DeviceEvent>) {
+    emit_for(NO_JOB, state, new, events);
+}
+
+/// Like `emit`, but tags the `StateChanged` event with the job it belongs to
+/// instead of `NO_JOB`, so listeners can filter a job's own state transitions.
+fn emit_for(job_id: u64, state: &mut DeviceState, new: DeviceState, events: &mpsc::Sender<DeviceEvent>) {
     *state = new.clone();
     // Dropped receiver must not panic the worker.
-    let _ = events.send(DeviceEvent { job_id: NO_JOB, kind: DeviceEventKind::StateChanged(new) });
+    let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::StateChanged(new) });
 }
 
 /// A job parked mid-flight (waiting on a color swap or an operator's pass
@@ -221,17 +227,17 @@ fn resolve_pass_completion(
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        write_all(transport, &[0x05]).map_err(DeviceError::from)?; // ESC-less ENQ status query
+        write_all(transport, &[0x05]).map_err(DeviceError::from)?; // ENQ status query
         let mut buf = [0u8; 8];
-        if let Ok(n) = transport.read(&mut buf, Duration::from_millis(250)) {
-            if n > 0 && buf[0] == b'0' {
-                return Ok(PassCompletion::Ready);
-            }
+        match transport.read(&mut buf, Duration::from_millis(250)) {
+            Ok(n) if n > 0 && buf[0] == b'0' => return Ok(PassCompletion::Ready),
+            Ok(_) => {} // not-ready reply (e.g. still moving); keep polling
+            Err(TransportError::Timeout) => {} // no reply within the interval; keep polling
+            Err(e) => return Err(DeviceError::from(e)), // hard transport error: fail fast
         }
         if Instant::now() >= deadline {
             return Err(DeviceError::Timeout);
         }
-        thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -250,12 +256,12 @@ fn finish_pass(
     if pass_index + 1 < total_passes {
         write_all(transport, &driver.pass_park()).map_err(DeviceError::from)?;
         let next_pass_index = pass_index + 1;
-        emit(state, DeviceState::WaitingForColorSwap { job_id, next_pass_index }, events);
+        emit_for(job_id, state, DeviceState::WaitingForColorSwap { job_id, next_pass_index }, events);
         Ok(PassRunOutcome::Paused { next_pass_index })
     } else {
         write_all(transport, &driver.session_end()).map_err(DeviceError::from)?;
         let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::JobComplete });
-        emit(state, DeviceState::Idle, events);
+        emit_for(job_id, state, DeviceState::Idle, events);
         Ok(PassRunOutcome::Done)
     }
 }
@@ -279,7 +285,7 @@ fn run_from_pass(
     transmit_bytes(transport, &bytes, job_id, pass_index, state, events)?;
     match resolve_pass_completion(driver, transport)? {
         PassCompletion::NeedsConfirm => {
-            emit(state, DeviceState::AwaitingCompletion { job_id, pass_index }, events);
+            emit_for(job_id, state, DeviceState::AwaitingCompletion { job_id, pass_index }, events);
             Ok(PassRunOutcome::AwaitingConfirm { pass_index })
         }
         PassCompletion::Ready => finish_pass(job_id, pass_index, passes.len(), driver, transport, state, events),
@@ -290,7 +296,7 @@ fn run_from_pass(
 /// same error so the caller can send it back as the command's reply.
 fn fail(job_id: u64, e: DeviceError, state: &mut DeviceState, events: &mpsc::Sender<DeviceEvent>) -> DeviceError {
     let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::Failed(e.clone()) });
-    emit(state, DeviceState::Error(e.clone()), events);
+    emit_for(job_id, state, DeviceState::Error(e.clone()), events);
     e
 }
 
@@ -336,6 +342,7 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                 emit(&mut state, DeviceState::Disconnecting, &events);
                 transport = None;
                 driver = None;
+                active_job = None; // invariant: active_job.is_some() <=> a job is parked
                 emit(&mut state, DeviceState::Disconnected, &events);
                 let _ = reply.send(Ok(()));
             }
@@ -390,6 +397,9 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
+                            // pass_index >= 1 here, so session_begin already went out and
+                            // there's no abort_bytes write on this path yet — the device is
+                            // left mid-session until Task 8 wires cancel/abort handling.
                             let e = fail(job_id, e, &mut state, &events);
                             let _ = reply.send(Err(e));
                         }
@@ -633,7 +643,7 @@ mod tests {
         panic!("timed out waiting for expected state; last snapshot: {:?}", mgr.snapshot());
     }
 
-    fn drain(events: mpsc::Receiver<DeviceEvent>) -> Vec<DeviceEvent> { events.try_iter().collect() }
+    fn drain(events: &mpsc::Receiver<DeviceEvent>) -> Vec<DeviceEvent> { events.try_iter().collect() }
 
     fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
         if needle.is_empty() || haystack.len() < needle.len() {
@@ -647,13 +657,16 @@ mod tests {
         let (factory, written) = factory_with_ready_reads(2);
         let (mgr, events) = DeviceManager::spawn(factory);
         mgr.connect(cameo_info()).unwrap();
+        drain(&events); // discard connect-time (NO_JOB) events; only the job's own events matter below
+
         let job_id = mgr.cut(two_pass_job()).unwrap();
         wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
         mgr.resume().unwrap();
         wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
 
-        let evs = drain(events);
-        assert!(evs.iter().all(|e| e.job_id == job_id || e.job_id == NO_JOB));
+        let evs = drain(&events);
+        assert!(!evs.is_empty());
+        assert!(evs.iter().all(|e| e.job_id == job_id));
         assert_eq!(evs.iter().filter(|e| matches!(e.kind, DeviceEventKind::PassComplete(_))).count(), 2);
         assert!(evs.iter().any(|e| matches!(e.kind, DeviceEventKind::JobComplete)));
 
@@ -690,7 +703,7 @@ mod tests {
         mgr.confirm_pass_done().unwrap();
         wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
 
-        let evs = drain(events);
+        let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::JobComplete)));
         mgr.shutdown();
     }
@@ -707,7 +720,7 @@ mod tests {
         wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
 
         assert_ne!(job1, job2);
-        let evs = drain(events);
+        let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job1 && matches!(e.kind, DeviceEventKind::JobComplete)));
         assert!(evs.iter().any(|e| e.job_id == job2 && matches!(e.kind, DeviceEventKind::JobComplete)));
         mgr.shutdown();

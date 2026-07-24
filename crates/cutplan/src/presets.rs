@@ -152,6 +152,20 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
         let content = fs::read_to_string(user_file)
             .map_err(|e| PresetError::Io(e.to_string()))?;
 
+        // Check version FIRST before parsing full schema (allows future schema changes)
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| PresetError::Corrupt(e.to_string()))?;
+
+        let version = value
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| PresetError::Corrupt("missing or invalid version field".into()))?;
+
+        if version != 1 {
+            return Err(PresetError::UnknownVersion(version as u32));
+        }
+
+        // Now parse full schema
         #[derive(Deserialize)]
         struct FileFormat {
             version: u32,
@@ -161,17 +175,19 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
         let file_data: FileFormat = serde_json::from_str(&content)
             .map_err(|e| PresetError::Corrupt(e.to_string()))?;
 
-        if file_data.version != 1 {
-            return Err(PresetError::UnknownVersion(file_data.version));
+        // Force builtin: false on all user entries (on-disk contract is user-entries-only)
+        let mut user_presets = file_data.presets;
+        for preset in &mut user_presets {
+            preset.builtin = false;
         }
 
         // Remove builtin presets that are shadowed by user presets
         let user_ids: std::collections::HashSet<_> =
-            file_data.presets.iter().map(|p| &p.id).collect();
+            user_presets.iter().map(|p| &p.id).collect();
         all_presets.retain(|p| !user_ids.contains(&p.id));
 
         // Add user presets
-        all_presets.extend(file_data.presets);
+        all_presets.extend(user_presets);
     }
 
     Ok(all_presets)
@@ -208,6 +224,10 @@ pub fn save_user_presets(user_file: &Path, user: &[MaterialPreset]) -> Result<()
         .map_err(|e| PresetError::Io(e.to_string()))?;
 
     Ok(())
+}
+
+pub fn default_presets_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("cuthulhu").join("presets.json"))
 }
 
 #[cfg(test)]
@@ -286,7 +306,19 @@ mod tests {
         let content_after = fs::read_to_string(&user_file).unwrap();
         assert_eq!(content_after, original_content);
 
-        // Test 2: Write unknown version and verify it errors
+        // Test 2: Write unknown version (no presets field) and verify it errors as UnknownVersion
+        // This tests that version check runs FIRST, before parsing full schema
+        fs::write(&user_file, r#"{"version": 99}"#).unwrap();
+        let original_content = fs::read_to_string(&user_file).unwrap();
+
+        let result = load_presets(&user_file);
+        assert_eq!(result, Err(PresetError::UnknownVersion(99)));
+
+        // Verify file was not clobbered
+        let content_after = fs::read_to_string(&user_file).unwrap();
+        assert_eq!(content_after, original_content);
+
+        // Test 3: Unknown version with presets field present
         fs::write(&user_file, r#"{"version": 99, "presets": []}"#).unwrap();
         let original_content = fs::read_to_string(&user_file).unwrap();
 
@@ -400,6 +432,13 @@ mod tests {
                 "puma preset {} should have force=None",
                 preset.id
             );
+        }
+    }
+
+    #[test]
+    fn default_presets_path_ends_with_cuthulhu_presets_json() {
+        if let Some(path) = default_presets_path() {
+            assert!(path.ends_with("cuthulhu/presets.json"));
         }
     }
 }

@@ -51,7 +51,7 @@ fn run() -> Result<(), String> {
         Command::Cut { file, device, dry_run, speed, force, port, baud } => {
             let device = Device::from_id(&device)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-            let settings = Settings { speed, force, passes: 1 };
+            let settings = Settings { speed, force, repeat_count: 1 };
             let bytes = build_bytes(&svg, device, &settings)?;
             if dry_run {
                 print_hex_ascii(&bytes);

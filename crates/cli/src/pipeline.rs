@@ -28,5 +28,9 @@ pub fn build_bytes(svg: &[u8], device: Device, settings: &Settings) -> Result<Ve
         .collect::<Vec<_>>();
     if polylines.is_empty() { return Err("no cuttable paths in SVG".into()); }
     let job = Job { polylines, settings: settings.clone() };
-    device.driver().encode(&job).map_err(|e| format!("encode: {e:?}"))
+    let d = device.driver();
+    let mut bytes = d.session_begin();
+    bytes.extend(d.encode_pass(&job).map_err(|e| format!("encode: {e:?}"))?);
+    bytes.extend(d.session_end());
+    Ok(bytes)
 }

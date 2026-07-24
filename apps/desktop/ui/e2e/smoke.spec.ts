@@ -255,6 +255,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       return null;
     },
     get_device_state: () => deviceState,
+    get_connected_device: () => connected,
     plan_cut: () => planFromDoc(),
     cut: (a) => {
       const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
@@ -430,6 +431,23 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
+});
+
+test("reopening the dialog after connect recovers the connected device", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByText("connected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // Without get_connected_device seeding this on mount, the reopened dialog's local
+  // `connected` state comes back null even though the backend is still connected,
+  // leaving Start Cut stuck disabled and the device row stuck on "Connect".
+  await expect(page.getByText("connected")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
 test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {

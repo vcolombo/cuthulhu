@@ -111,6 +111,13 @@ pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<Device
     Ok(dev.cached_state())
 }
 
+// Non-blocking cache read, same shape as get_device_state — lets the UI recover which
+// device is connected after reopening the cut dialog, without a redundant reconnect.
+#[tauri::command]
+pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Option<DeviceInfo>, IpcError> {
+    Ok(dev.connected.lock().unwrap().clone())
+}
+
 #[tauri::command]
 pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, IpcError> {
     plan_cut_response(&state.lock().unwrap().editor.doc)

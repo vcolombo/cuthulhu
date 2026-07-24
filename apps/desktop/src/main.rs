@@ -47,6 +47,7 @@ fn main() {
             ipc::connect_device,
             ipc::disconnect_device,
             ipc::get_device_state,
+            ipc::get_connected_device,
             ipc::plan_cut,
             ipc::cut,
             ipc::cancel_cut,

@@ -97,6 +97,11 @@ export function CutDialog({
 
   useEffect(() => {
     ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    // Reopening the dialog after a connect earlier in the session lost the local
+    // `connected` state (it lives only in this component) even though the backend
+    // is still connected — seed it from the manager's own cache so Start Cut isn't
+    // stuck disabled.
+    ipc.getConnectedDevice().then(setConnected).catch((e) => onError(ipc.ipcErrorMessage(e)));
     // A stale jobId from a previous dialog session (or a previous cut that finished
     // while this dialog was closed) must not make a leftover Idle/Cancelled state
     // read as "just completed" on reopen — see justCompleted below.

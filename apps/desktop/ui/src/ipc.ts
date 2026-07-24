@@ -148,6 +148,10 @@ export async function getDeviceState(): Promise<DeviceState> {
   return invoke("get_device_state", {});
 }
 
+export async function getConnectedDevice(): Promise<DeviceInfo | null> {
+  return invoke("get_connected_device", {});
+}
+
 export async function planCut(): Promise<PlanCutResponse> {
   return invoke("plan_cut", {});
 }

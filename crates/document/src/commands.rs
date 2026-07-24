@@ -19,8 +19,17 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
     let mut ops = vec![];
     for &id in ids {
         let before = doc.get(id).ok_or(CmdError::NotFound)?.clone();
+        // Convert the world-space matrix into this node's parent space so that
+        // new_world = old_world.then(m) holds under transformed ancestors:
+        // new_local = old_local.then(pw).then(m).then(pw⁻¹)
+        let pw = match parent_of(doc, id) {
+            Some(pid) => world_transform(doc, pid).ok_or(CmdError::NotFound)?,
+            None => Affine::identity(),
+        };
+        let pw_inv = pw.inverse()
+            .ok_or_else(|| CmdError::Geometry("degenerate ancestor transform".into()))?;
         let mut after = before.clone();
-        after.transform = before.transform.then(&m);
+        after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
     }
     Ok(Delta(ops))
@@ -48,6 +57,18 @@ pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, Cm
 
 fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
     doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
+}
+
+/// World transform of `id`: its local transform composed through every ancestor
+/// (node world = local.then(parent world)). None if `id` is not in the document.
+pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
+    let mut m = doc.get(id)?.transform.clone();
+    let mut cur = id;
+    while let Some(pid) = parent_of(doc, cur) {
+        m = m.then(&doc.get(pid)?.transform);
+        cur = pid;
+    }
+    Some(m)
 }
 
 /// Shape's outline in its own local space, in mm, matching `Rect { x:0, y:0, w, h }` bounds
@@ -251,5 +272,42 @@ mod tests {
             None => assert_eq!(ed.add_text(parent, "Whatever", 10.0, "Hi"),
                 Err(CmdError::Geometry(format!("{:?}", geometry::GeomError::NoFont)))),
         }
+    }
+
+    #[test]
+    fn world_transform_composes_ancestors() {
+        let mut ed = Editor::new();
+        // group scaled 2x, child rect translated (5,0) locally
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let cid = ed.doc.ids.next();
+        let mut child = Node::shape(cid, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        child.transform = Affine::translate(5.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid, node: child, index: 0 }]));
+        // world = local.then(group): (0,0) -local-> (5,0) -group 2x-> (10,0)
+        let w = world_transform(&ed.doc, cid).unwrap();
+        assert_eq!(w.apply(0.0, 0.0), (10.0, 0.0));
+        assert!(world_transform(&ed.doc, NodeId(999)).is_none());
+    }
+
+    #[test]
+    fn transform_under_scaled_group_moves_exact_world_distance() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+
+        let before_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        let d = transform_nodes(&ed.doc, &[cid], Affine::translate(10.0, 0.0)).unwrap();
+        ed.commit(d);
+        let after_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        // world moved exactly 10mm — NOT 20mm (the double-application bug this fixes)
+        assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0));
     }
 }

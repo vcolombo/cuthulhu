@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useRef, type PointerEvent } from "react";
+import { useRef, useState, type PointerEvent } from "react";
 
 export function scrubValue(v: number, dx: number, step: number, min = -Infinity): number {
   return Math.max(min, v + dx * step);
@@ -14,9 +14,18 @@ type Props = {
   onChange: (v: number) => void;
 };
 
-/** Numeric input whose label doubles as a drag-scrub handle (pointer dx * step). */
+/** Numeric input whose label doubles as a drag-scrub handle (pointer dx * step).
+ *  Scrubbing only previews locally as the pointer moves; onChange fires once on
+ *  pointerup so one drag gesture produces one undo step. */
 export function NumberField({ label, value, step = 1, min, disabled, onChange }: Props) {
   const drag = useRef<{ startX: number; startValue: number } | null>(null);
+  const [preview, setPreview] = useState<number | null>(null);
+
+  const valueAt = (clientX: number) => {
+    const d = drag.current;
+    if (!d) return value;
+    return scrubValue(d.startValue, clientX - d.startX, step, min ?? -Infinity);
+  };
 
   const onPointerDown = (e: PointerEvent<HTMLSpanElement>) => {
     if (disabled) return;
@@ -25,11 +34,14 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
   };
   const onPointerMove = (e: PointerEvent<HTMLSpanElement>) => {
     if (!drag.current) return;
-    const dx = e.clientX - drag.current.startX;
-    onChange(scrubValue(drag.current.startValue, dx, step, min ?? -Infinity));
+    setPreview(valueAt(e.clientX));
   };
-  const onPointerUp = () => {
+  const onPointerUp = (e: PointerEvent<HTMLSpanElement>) => {
+    if (!drag.current) return;
+    const final = valueAt(e.clientX);
     drag.current = null;
+    setPreview(null);
+    if (final !== value) onChange(final);
   };
 
   return (
@@ -44,7 +56,7 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
       </span>
       <input
         type="number"
-        value={value}
+        value={preview ?? value}
         step={step}
         min={min}
         disabled={disabled}

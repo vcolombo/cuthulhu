@@ -165,10 +165,10 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
             return Err(PresetError::UnknownVersion(version as u32));
         }
 
-        // Now parse full schema
+        // Now parse full schema. Version was already validated from the Value probe
+        // above, so the full parse only needs the presets.
         #[derive(Deserialize)]
         struct FileFormat {
-            version: u32,
             presets: Vec<MaterialPreset>,
         }
 

@@ -221,8 +221,11 @@ enum TransmitOutcome {
 const WRITE_CHUNK: usize = 4096;
 
 /// Write `bytes` in `WRITE_CHUNK`-sized pieces, updating `Transmitting` state
-/// and emitting a `Progress` event after each chunk actually lands. Checks
-/// `cancel_flag` before each chunk so a cancel mid-transmit stops promptly.
+/// and emitting a `Progress` event after each chunk actually lands. Emits a
+/// single `StateChanged(Transmitting)` event up front (not one per chunk) so
+/// listeners — the GUI, in particular — see the device enter `Transmitting`
+/// and can offer a cancel control for the whole pass. Checks `cancel_flag`
+/// before each chunk so a cancel mid-transmit stops promptly.
 fn transmit_bytes(
     transport: &mut dyn Transport,
     bytes: &[u8],
@@ -234,6 +237,7 @@ fn transmit_bytes(
 ) -> Result<TransmitOutcome, DeviceError> {
     let total_bytes = bytes.len();
     let mut submitted_bytes = 0usize;
+    emit_for(job_id, state, DeviceState::Transmitting { job_id, pass_index, submitted_bytes, total_bytes }, events);
     for chunk in bytes.chunks(WRITE_CHUNK) {
         if cancel_flag.load(Ordering::SeqCst) {
             return Ok(TransmitOutcome::Cancelled { submitted_bytes });

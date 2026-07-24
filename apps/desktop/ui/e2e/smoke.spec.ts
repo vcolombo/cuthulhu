@@ -207,25 +207,38 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
   // Drives the scripted pass sequence for one pass, then either pauses at
   // WaitingForColorSwap (more enabled passes remain) or completes the job — matching
   // execute_cut's documented behavior of blocking until the next pause point.
+  //
+  // The initial Transmitting(0 bytes) StateChanged fires synchronously (matches real
+  // execute_cut, which enters Transmitting immediately) but everything after it is
+  // deferred a tick: in production, event delivery crosses real async Tauri IPC (worker
+  // thread -> event bridge -> window.emit/listen), giving React's setJobId(null)/
+  // jobIdRef sync effect time to commit before any event arrives. This mock's invoke()
+  // used to run every command fully synchronously in the same call stack as the click
+  // handler, so a second cut's events could arrive before React had committed the new
+  // jobId — a mock-fidelity gap, not a production bug. The setTimeout also makes
+  // Transmitting observable to Playwright's polling assertions instead of being
+  // superseded within the same synchronous burst.
   function runPass(passIndex: number, enabledIndices: number[]) {
     const total = 100;
     deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: 0, total_bytes: total } };
     emit({ StateChanged: deviceState });
-    deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: total, total_bytes: total } };
-    emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
-    emit({ PassComplete: passIndex });
+    setTimeout(() => {
+      deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: total, total_bytes: total } };
+      emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
+      emit({ PassComplete: passIndex });
 
-    const pos = enabledIndices.indexOf(passIndex);
-    const isLast = pos === enabledIndices.length - 1;
-    if (isLast) {
-      deviceState = "Idle";
-      emit("JobComplete");
-      emit({ StateChanged: "Idle" });
-    } else {
-      const next = enabledIndices[pos + 1];
-      deviceState = { WaitingForColorSwap: { job_id: jobId, next_pass_index: next } };
-      emit({ StateChanged: deviceState });
-    }
+      const pos = enabledIndices.indexOf(passIndex);
+      const isLast = pos === enabledIndices.length - 1;
+      if (isLast) {
+        deviceState = "Idle";
+        emit("JobComplete");
+        emit({ StateChanged: "Idle" });
+      } else {
+        const next = enabledIndices[pos + 1];
+        deviceState = { WaitingForColorSwap: { job_id: jobId, next_pass_index: next } };
+        emit({ StateChanged: deviceState });
+      }
+    }, 50);
   }
 
   Object.assign(commands, {
@@ -385,6 +398,18 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.getByText("Cancelled")).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("transmitting shows a Cancel button and progress so the GUI can cancel mid-cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
 });
 
 test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {

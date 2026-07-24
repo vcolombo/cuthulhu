@@ -23,6 +23,13 @@ export type ShapeKindJson =
 
 export type NodeKindJson = "Layer" | "Group" | { Shape: ShapeKindJson };
 
+// Delta shape returned by commands like boolean_op — see crates/document/src/delta.rs's
+// NodeOp. Only the Add variant's node id is read (to select a command's result node).
+type NodeOpJson =
+  | { Add: { parent: number; node: { id: number }; index: number } }
+  | { Remove: { parent: number; id: number } }
+  | { Update: { id: number; before: unknown; after: unknown } };
+
 export type DocNode = {
   id: number;
   kind: NodeKindJson;
@@ -189,14 +196,32 @@ export function App() {
     r.draw();
   };
 
-  const onCanvasMouseUp = (e: MouseEvent<HTMLCanvasElement>) => {
-    const start = dragStart.current;
-    dragStart.current = null;
-    if (!start) return;
-    const m = dragMatrix(start, canvasPos(e));
-    if (m[4] === 0 && m[5] === 0) return; // click, not a drag
-    run(() => ipc.commitTransform({ ids: selected, m }));
-  };
+  // Shared by the canvas's own mouseup and the window-level listener below, so a drag
+  // released outside the canvas (mouse left the element before the button came up) still
+  // commits instead of leaving the optimistic preview stranded and never saved.
+  const finishDrag = useCallback(
+    (clientX: number, clientY: number) => {
+      const start = dragStart.current;
+      dragStart.current = null;
+      if (!start || !canvasRef.current) return;
+      const rect = canvasRef.current.getBoundingClientRect();
+      const m = dragMatrix(start, { x: clientX - rect.left, y: clientY - rect.top });
+      if (m[4] === 0 && m[5] === 0) return; // click, not a drag
+      run(() => ipc.commitTransform({ ids: selected, m }));
+    },
+    [run, selected],
+  );
+
+  const onCanvasMouseUp = (e: MouseEvent<HTMLCanvasElement>) => finishDrag(e.clientX, e.clientY);
+
+  // Catches mouseup anywhere in the window, not just over the canvas. finishDrag no-ops
+  // when dragStart is already null, so this is harmless on the common in-canvas release
+  // (which fires first and clears dragStart before this listener runs).
+  useEffect(() => {
+    const onWindowMouseUp = (e: globalThis.MouseEvent) => finishDrag(e.clientX, e.clientY);
+    window.addEventListener("mouseup", onWindowMouseUp);
+    return () => window.removeEventListener("mouseup", onWindowMouseUp);
+  }, [finishDrag]);
 
   const root = doc?.root ?? 0;
   const selectedBounds = selected.length === 1 ? (scene.nodes.find((n) => n.id === selected[0])?.bounds ?? null) : null;
@@ -220,6 +245,21 @@ export function App() {
     const m: Matrix = axis === "w" ? [s, 0, 0, 1, x - s * x, 0] : [1, 0, 0, s, 0, y - s * y];
     run(() => ipc.commitTransform({ ids: selected, m }));
   };
+
+  // A successful boolean op removes the source nodes and adds a result node — selecting
+  // the removed ids would error the next transform with NotFound, so read the result id
+  // straight out of the returned Delta's Add op and select that instead (or clear
+  // selection if the shape ever comes back without one).
+  const onBooleanOp = useCallback(
+    (op: BoolOp) => {
+      run(async () => {
+        const delta = (await ipc.booleanOp({ ids: selected, op })) as NodeOpJson[];
+        const added = delta.find((o): o is Extract<NodeOpJson, { Add: unknown }> => "Add" in o);
+        setSelected(added ? [added.Add.node.id] : []);
+      });
+    },
+    [run, selected],
+  );
 
   const onImportFile = (file: File) => {
     run(async () => {
@@ -257,7 +297,7 @@ export function App() {
         onAddRect={() => run(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }))}
         onAddEllipse={() => run(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }))}
         onAddText={() => run(() => ipc.addText({ parent: root, family: "Arial", sizeMm: 10, text: "Text" }))}
-        onBoolean={(op: BoolOp) => run(() => ipc.booleanOp({ ids: selected, op }))}
+        onBoolean={onBooleanOp}
         onDelete={deleteSelected}
       />
       <canvas

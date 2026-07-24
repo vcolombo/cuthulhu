@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import * as ipc from "./ipc";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { hitTest, type Scene, type ShapeGeom } from "./render/hittest";
+import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
 import { TopBar } from "./panels/TopBar";
@@ -13,8 +13,8 @@ import { StatusBar } from "./panels/StatusBar";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
-export type Affine6 = [number, number, number, number, number, number];
 export type BoolOp = "Union" | "Subtract" | "Intersect" | "Exclude";
+export type { Affine6 };
 
 export type ShapeKindJson =
   | { Rect: { w: number; h: number } }
@@ -352,10 +352,16 @@ export function App() {
               if (p) {
                 await ipc.loadProject({ path: p });
                 setLastPath(p);
+                setSelected([]); // loaded doc may not contain the old ids
               }
             })
           }
-          onReload={() => run(() => ipc.loadProject({ path: lastPath! }))}
+          onReload={() =>
+            run(async () => {
+              await ipc.loadProject({ path: lastPath! });
+              setSelected([]);
+            })
+          }
           canReload={lastPath !== null}
           onUndo={() => run(() => ipc.undo())}
           onRedo={() => run(() => ipc.redo())}

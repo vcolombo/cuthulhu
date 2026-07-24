@@ -123,22 +123,21 @@ pub fn preflight(
     }
 
     // Rule 7: Estimated encoded size > 64 MB → OutputTooLarge
-    // Estimate: 16 bytes/point × repeat_count
-    let mut total_points = 0usize;
+    // Estimate: 16 bytes/point × that pass's own repeat_count, summed per pass —
+    // exact weighting, unlike an all-passes max which over-rejects mixed-repeat jobs.
+    let mut estimated_size = 0usize;
     for pass in passes.iter().filter(|p| p.enabled) {
+        let mut pass_points = 0usize;
         for shape in &pass.pass.shapes {
             for polyline in &shape.polylines {
-                total_points = total_points.saturating_add(polyline.len());
+                pass_points = pass_points.saturating_add(polyline.len());
             }
         }
+        let pass_bytes = pass_points
+            .saturating_mul(16)
+            .saturating_mul(pass.settings.repeat_count as usize);
+        estimated_size = estimated_size.saturating_add(pass_bytes);
     }
-    let max_repeat = passes
-        .iter()
-        .filter(|p| p.enabled)
-        .map(|p| p.settings.repeat_count as usize)
-        .max()
-        .unwrap_or(1);
-    let estimated_size = total_points.saturating_mul(16).saturating_mul(max_repeat);
     if estimated_size > 64 * 1024 * 1024 {
         return Err(PreflightError::OutputTooLarge(estimated_size));
     }
@@ -465,6 +464,25 @@ mod tests {
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert!(matches!(result, Err(PreflightError::OutputTooLarge(_))));
+    }
+
+    #[test]
+    fn output_size_weights_each_pass_by_its_own_repeat_count() {
+        // Big pass at repeat 1, tiny pass at repeat 10. Per-pass weighting:
+        // 500000×16×1 + 10×16×10 ≈ 8 MB → fine. The old all-passes max formula
+        // charged the big pass at repeat 10 too (80 MB) and over-rejected this.
+        let mut points = vec![];
+        for i in 0..500000 {
+            points.push(pt((i % 100) as f64, ((i / 100) % 100) as f64));
+        }
+        let big = make_pass(Some(0xFF0000FF), vec![make_shape(20, vec![points])]);
+        let tiny = make_pass(Some(0x00FF00FF), vec![make_shape(21, vec![vec![pt(0.0, 0.0); 10]])]);
+        let configured = vec![
+            make_configured_pass(&big, Settings { speed: None, force: None, repeat_count: 1 }, true),
+            make_configured_pass(&tiny, Settings { speed: None, force: None, repeat_count: 10 }, true),
+        ];
+        let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
+        assert!(result.is_ok());
     }
 
     #[test]

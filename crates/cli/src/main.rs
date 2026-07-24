@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::pipeline::{build_bytes, check_interactive, cutpass_from_color_pass, format_pass_color, plan_from_svg, CliBackendFactory, Device};
+use cli::pipeline::{build_bytes, check_interactive, cutpass_from_color_pass, format_pass_color, pass_stream_bytes, plan_from_svg, CliBackendFactory, Device};
 use driver_core::manager::{CutPass, DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};
 use std::io::IsTerminal;
@@ -84,7 +84,9 @@ fn run() -> Result<(), String> {
                         )
                     }
                 };
-                transport.write(&bytes).map_err(|e| format!("write: {e:?}"))?;
+                // write_all, not a single write(): a partial write would silently
+                // truncate the job while still reporting the full byte count.
+                driver_core::write_all(transport.as_mut(), &bytes).map_err(|e| format!("write: {e:?}"))?;
                 println!("sent {} bytes", bytes.len());
                 return Ok(());
             }
@@ -122,11 +124,7 @@ fn cut_by_color(
         for (i, pass) in passes.iter().enumerate() {
             println!("-- pass {}/{} (color {}) --", i + 1, passes.len(), format_pass_color(pass.color));
             let cutpass = cutpass_from_color_pass(pass, settings);
-            let mut bytes = if i == 0 { d.session_begin() } else { Vec::new() };
-            bytes.extend(d.encode_pass(&cutpass.job).map_err(|e| format!("encode: {e:?}"))?);
-            if i + 1 == passes.len() {
-                bytes.extend(d.session_end());
-            }
+            let bytes = pass_stream_bytes(d.as_ref(), &cutpass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }
         return Ok(());

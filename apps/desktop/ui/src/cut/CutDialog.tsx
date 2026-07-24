@@ -100,8 +100,16 @@ export function CutDialog({
     // Reopening the dialog after a connect earlier in the session lost the local
     // `connected` state (it lives only in this component) even though the backend
     // is still connected — seed it from the manager's own cache so Start Cut isn't
-    // stuck disabled.
-    ipc.getConnectedDevice().then(setConnected).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    // stuck disabled. Presets load with it: they're otherwise only fetched in
+    // connect(), so a reopened dialog would show an empty preset dropdown.
+    ipc
+      .getConnectedDevice()
+      .then((info) => {
+        setConnected(info);
+        if (!info) return;
+        return ipc.listPresets(info.machine_id).then((p) => setPresets(p as Preset[]));
+      })
+      .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // A stale jobId or latched outcome from a previous dialog session must not
     // leak into this one: reopening the dialog starts fresh, so a prior cut's
     // "Job complete"/"Cut failed" banner doesn't reappear.

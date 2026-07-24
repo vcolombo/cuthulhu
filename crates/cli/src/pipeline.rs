@@ -80,6 +80,21 @@ pub fn build_bytes(svg: &[u8], device: Device, settings: &Settings) -> Result<Ve
     Ok(bytes)
 }
 
+/// Bytes for pass `i` of `total`, framed exactly as `DeviceManager` transmits
+/// them: `session_begin` before the first pass, `pass_park` between passes,
+/// `session_end` after the last. Keeps `cut --by-color --dry-run` output
+/// faithful to what a real multi-pass cut sends.
+pub fn pass_stream_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = if i == 0 { d.session_begin() } else { Vec::new() };
+    bytes.extend(d.encode_pass(job).map_err(|e| format!("encode: {e:?}"))?);
+    if i + 1 == total {
+        bytes.extend(d.session_end());
+    } else {
+        bytes.extend(d.pass_park());
+    }
+    Ok(bytes)
+}
+
 /// Import `svg` into a fresh `Document`, plan passes, then apply `--order`
 /// (reorder listed colors to the front, in listed sequence; unlisted passes
 /// keep their original relative order after) and `--skip-color` (drop

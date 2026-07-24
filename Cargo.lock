@@ -616,6 +616,7 @@ name = "cutplan"
 version = "0.1.0"
 dependencies = [
  "document",
+ "driver-core",
  "fontdb",
  "geometry",
  "serde",

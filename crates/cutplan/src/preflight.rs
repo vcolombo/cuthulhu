@@ -25,8 +25,8 @@ pub enum PreflightError {
 /// 2. Any NaN/inf coordinate → NonFiniteGeometry
 /// 3. Polyline < 2 points → DegeneratePolyline
 /// 4. Geometry outside 0..width_mm × 0..height_mm → OutOfBounds (unless allow_out_of_bounds)
-/// 5. repeat_count outside 1..=10 or (when caps support them) speed outside 1..=30 / force outside 1..=33
-///    (Cameo bounds from docs/protocol/silhouette-cameo5.md §Command reference) → SettingsOutOfRange
+/// 5. repeat_count outside 1..=10 or speed outside 1..=30 / force outside 1..=33 when set
+///    (Cameo bounds from docs/protocol/silhouette-cameo5.md §Settings ranges) → SettingsOutOfRange
 /// 6. doc_machine_id set and ≠ profile.id → MachineMismatch
 /// 7. Estimated encoded size (16 bytes/point × repeat_count) > 64 MB → OutputTooLarge
 pub fn preflight(
@@ -45,19 +45,25 @@ pub fn preflight(
         return Err(PreflightError::NothingToCut);
     }
 
-    // Rules 2–3: Iterate through all geometry for NaN/inf and degenerate polylines.
+    // Rule 2: Scan all enabled geometry for NaN/inf coordinates first (rule 2 before rule 3)
     for pass in passes.iter().filter(|p| p.enabled) {
         for shape in &pass.pass.shapes {
             for polyline in &shape.polylines {
-                // Rule 3: Polyline < 2 points → DegeneratePolyline
-                if polyline.len() < 2 {
-                    return Err(PreflightError::DegeneratePolyline(shape.node_id));
-                }
-                // Rule 2: Any NaN/inf coordinate → NonFiniteGeometry
                 for point in polyline {
                     if !point.x.is_finite() || !point.y.is_finite() {
                         return Err(PreflightError::NonFiniteGeometry(shape.node_id));
                     }
+                }
+            }
+        }
+    }
+
+    // Rule 3: Polyline < 2 points → DegeneratePolyline (checked after NaN/inf)
+    for pass in passes.iter().filter(|p| p.enabled) {
+        for shape in &pass.pass.shapes {
+            for polyline in &shape.polylines {
+                if polyline.len() < 2 {
+                    return Err(PreflightError::DegeneratePolyline(shape.node_id));
                 }
             }
         }
@@ -91,22 +97,16 @@ pub fn preflight(
             return Err(PreflightError::SettingsOutOfRange("repeat_count must be 1..=10"));
         }
 
-        // Speed bounds: 1..=30 when supported
+        // Speed bounds: 1..=30 when supported; unsupported speed is ignored (drivers skip it)
         if let Some(speed) = settings.speed {
-            if !caps.supports_speed {
-                return Err(PreflightError::SettingsOutOfRange("speed not supported by device"));
-            }
-            if speed < 1 || speed > 30 {
+            if caps.supports_speed && (speed < 1 || speed > 30) {
                 return Err(PreflightError::SettingsOutOfRange("speed must be 1..=30"));
             }
         }
 
-        // Force bounds: 1..=33 when supported
+        // Force bounds: 1..=33 when supported; unsupported force is ignored (drivers skip it)
         if let Some(force) = settings.force {
-            if !caps.supports_force {
-                return Err(PreflightError::SettingsOutOfRange("force not supported by device"));
-            }
-            if force < 1 || force > 33 {
+            if caps.supports_force && (force < 1 || force > 33) {
                 return Err(PreflightError::SettingsOutOfRange("force must be 1..=33"));
             }
         }
@@ -250,6 +250,18 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_wins_over_degenerate_polyline() {
+        // Rule 2 (NaN/inf) checked before rule 3 (degenerate polyline):
+        // job with early degenerate polyline + later NaN → NonFiniteGeometry wins
+        let shape1 = make_shape(100, vec![vec![pt(10.0, 10.0)]]);  // degenerate: 1 point
+        let shape2 = make_shape(101, vec![vec![pt(20.0, 20.0), pt(f64::NAN, 30.0)]]); // has NaN
+        let pass = make_pass(Some(0xFF0000FF), vec![shape1, shape2]);
+        let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
+        let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
+        assert_eq!(result, Err(PreflightError::NonFiniteGeometry(NodeId(101))));
+    }
+
+    #[test]
     fn out_of_bounds_x_negative() {
         let shape = make_shape(5, vec![vec![pt(-1.0, 10.0), pt(20.0, 20.0)]]);
         let pass = make_pass(Some(0xFF0000FF), vec![shape]);
@@ -339,13 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn speed_unsupported_by_device_rejected() {
+    fn speed_unsupported_by_device_ignored() {
+        // Unsupported speed is ignored (drivers skip it); should pass preflight
         let shape = make_shape(12, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
         let pass = make_pass(Some(0xFF0000FF), vec![shape]);
         let settings = Settings { speed: Some(15), force: None, repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
-        assert_eq!(result, Err(PreflightError::SettingsOutOfRange("speed not supported by device")));
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -369,13 +382,14 @@ mod tests {
     }
 
     #[test]
-    fn force_unsupported_by_device_rejected() {
+    fn force_unsupported_by_device_ignored() {
+        // Unsupported force is ignored (drivers skip it); should pass preflight
         let shape = make_shape(15, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
         let pass = make_pass(Some(0xFF0000FF), vec![shape]);
         let settings = Settings { speed: None, force: Some(15), repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
-        assert_eq!(result, Err(PreflightError::SettingsOutOfRange("force not supported by device")));
+        assert!(result.is_ok());
     }
 
     #[test]

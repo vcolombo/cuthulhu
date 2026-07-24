@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import { describe, it, expect } from "vitest";
+import {
+  reorderPass,
+  effectiveSettings,
+  fieldDisabled,
+  acceptEvent,
+  toCutRequest,
+  type PassVm,
+  type Caps,
+} from "./viewmodel";
+
+describe("reorderPass", () => {
+  it("swaps adjacent passes when within bounds", () => {
+    const passes: PassVm[] = [
+      {
+        color: 0xff0000,
+        shapeCount: 5,
+        enabled: true,
+        presetId: "p1",
+        speed: 100,
+        force: 50,
+        repeatCount: 1,
+      },
+      {
+        color: 0x00ff00,
+        shapeCount: 3,
+        enabled: true,
+        presetId: "p2",
+        speed: 120,
+        force: 60,
+        repeatCount: 1,
+      },
+    ];
+
+    const result = reorderPass(passes, 0, 1);
+    expect(result[0]).toEqual(passes[1]);
+    expect(result[1]).toEqual(passes[0]);
+  });
+
+  it("clamps at the start (index=0, dir=-1)", () => {
+    const passes: PassVm[] = [
+      {
+        color: 0xff0000,
+        shapeCount: 5,
+        enabled: true,
+        presetId: "p1",
+        speed: 100,
+        force: 50,
+        repeatCount: 1,
+      },
+      {
+        color: 0x00ff00,
+        shapeCount: 3,
+        enabled: true,
+        presetId: "p2",
+        speed: 120,
+        force: 60,
+        repeatCount: 1,
+      },
+    ];
+
+    const result = reorderPass(passes, 0, -1);
+    expect(result).toEqual(passes);
+  });
+
+  it("clamps at the end (index=length-1, dir=1)", () => {
+    const passes: PassVm[] = [
+      {
+        color: 0xff0000,
+        shapeCount: 5,
+        enabled: true,
+        presetId: "p1",
+        speed: 100,
+        force: 50,
+        repeatCount: 1,
+      },
+      {
+        color: 0x00ff00,
+        shapeCount: 3,
+        enabled: true,
+        presetId: "p2",
+        speed: 120,
+        force: 60,
+        repeatCount: 1,
+      },
+    ];
+
+    const result = reorderPass(passes, 1, 1);
+    expect(result).toEqual(passes);
+  });
+});
+
+describe("effectiveSettings", () => {
+  it("uses pass override over preset", () => {
+    const pass: PassVm = {
+      color: 0xff0000,
+      shapeCount: 5,
+      enabled: true,
+      presetId: "preset1",
+      speed: 100,
+      force: 50,
+      repeatCount: 2,
+    };
+
+    const result = effectiveSettings(pass, []);
+    expect(result.speed).toBe(100);
+    expect(result.force).toBe(50);
+    expect(result.repeatCount).toBe(2);
+  });
+
+  it("falls back to preset when pass fields are null", () => {
+    const pass: PassVm = {
+      color: 0xff0000,
+      shapeCount: 5,
+      enabled: true,
+      presetId: "preset1",
+      speed: null,
+      force: null,
+      repeatCount: null,
+    };
+
+    const presets: { id: string; settings: { speed?: number | null; force?: number | null; repeat_count: number } }[] = [
+      {
+        id: "preset1",
+        settings: { speed: 150, force: 75, repeat_count: 3 },
+      },
+    ];
+
+    const result = effectiveSettings(pass, presets);
+    expect(result.speed).toBe(150);
+    expect(result.force).toBe(75);
+    expect(result.repeatCount).toBe(3);
+  });
+
+  it("uses default repeatCount=1 when no preset match and pass is null", () => {
+    const pass: PassVm = {
+      color: 0xff0000,
+      shapeCount: 5,
+      enabled: true,
+      presetId: null,
+      speed: null,
+      force: null,
+      repeatCount: null,
+    };
+
+    const result = effectiveSettings(pass, []);
+    expect(result.speed).toBeNull();
+    expect(result.force).toBeNull();
+    expect(result.repeatCount).toBe(1);
+  });
+
+  it("handles partial overrides (speed override, force from preset)", () => {
+    const pass: PassVm = {
+      color: 0xff0000,
+      shapeCount: 5,
+      enabled: true,
+      presetId: "preset1",
+      speed: 100,
+      force: null,
+      repeatCount: null,
+    };
+
+    const presets: { id: string; settings: { speed?: number | null; force?: number | null; repeat_count: number } }[] = [
+      {
+        id: "preset1",
+        settings: { speed: 150, force: 75, repeat_count: 3 },
+      },
+    ];
+
+    const result = effectiveSettings(pass, presets);
+    expect(result.speed).toBe(100);
+    expect(result.force).toBe(75);
+    expect(result.repeatCount).toBe(3);
+  });
+});
+
+describe("fieldDisabled", () => {
+  it("returns true for speed when supportsSpeed is false", () => {
+    const caps: Caps = {
+      supportsSpeed: false,
+      supportsForce: true,
+      needsOperatorPassConfirm: false,
+    };
+
+    expect(fieldDisabled("speed", caps)).toBe(true);
+  });
+
+  it("returns false for speed when supportsSpeed is true", () => {
+    const caps: Caps = {
+      supportsSpeed: true,
+      supportsForce: true,
+      needsOperatorPassConfirm: false,
+    };
+
+    expect(fieldDisabled("speed", caps)).toBe(false);
+  });
+
+  it("returns true for force when supportsForce is false", () => {
+    const caps: Caps = {
+      supportsSpeed: true,
+      supportsForce: false,
+      needsOperatorPassConfirm: false,
+    };
+
+    expect(fieldDisabled("force", caps)).toBe(true);
+  });
+
+  it("returns false for force when supportsForce is true", () => {
+    const caps: Caps = {
+      supportsSpeed: true,
+      supportsForce: true,
+      needsOperatorPassConfirm: false,
+    };
+
+    expect(fieldDisabled("force", caps)).toBe(false);
+  });
+});
+
+describe("acceptEvent", () => {
+  it("accepts event when currentJobId is null", () => {
+    expect(acceptEvent(null, { job_id: 1 })).toBe(true);
+  });
+
+  it("accepts event when currentJobId matches job_id", () => {
+    expect(acceptEvent(5, { job_id: 5 })).toBe(true);
+  });
+
+  it("rejects stale event when currentJobId does not match", () => {
+    expect(acceptEvent(2, { job_id: 1 })).toBe(false);
+  });
+
+  it("rejects stale event with different numbers", () => {
+    expect(acceptEvent(10, { job_id: 9 })).toBe(false);
+  });
+});
+
+describe("toCutRequest", () => {
+  it("serializes PassVm to CutRequest with ConfiguredPassDto fields", () => {
+    const passes: PassVm[] = [
+      {
+        color: 0xff0000,
+        shapeCount: 5,
+        enabled: true,
+        presetId: "preset1",
+        speed: 100,
+        force: 50,
+        repeatCount: 2,
+      },
+    ];
+
+    const result = toCutRequest("device123", 42, passes);
+
+    expect(result.device_instance_id).toBe("device123");
+    expect(result.doc_revision).toBe(42);
+    expect(result.passes).toHaveLength(1);
+    expect(result.passes[0]).toEqual({
+      color: 0xff0000,
+      enabled: true,
+      preset_id: "preset1",
+      speed: 100,
+      force: 50,
+      repeat_count: 2,
+    });
+  });
+
+  it("omits null values in ConfiguredPassDto", () => {
+    const passes: PassVm[] = [
+      {
+        color: null,
+        shapeCount: 3,
+        enabled: false,
+        presetId: null,
+        speed: null,
+        force: null,
+        repeatCount: null,
+      },
+    ];
+
+    const result = toCutRequest("device123", 42, passes);
+
+    expect(result.passes[0]).toEqual({
+      color: null,
+      enabled: false,
+      preset_id: null,
+      speed: null,
+      force: null,
+      repeat_count: null,
+    });
+  });
+
+  it("handles multiple passes", () => {
+    const passes: PassVm[] = [
+      {
+        color: 0xff0000,
+        shapeCount: 5,
+        enabled: true,
+        presetId: "preset1",
+        speed: 100,
+        force: 50,
+        repeatCount: 1,
+      },
+      {
+        color: 0x00ff00,
+        shapeCount: 3,
+        enabled: true,
+        presetId: "preset2",
+        speed: 120,
+        force: 60,
+        repeatCount: 2,
+      },
+    ];
+
+    const result = toCutRequest("device123", 42, passes);
+
+    expect(result.passes).toHaveLength(2);
+    expect(result.passes[0].preset_id).toBe("preset1");
+    expect(result.passes[1].preset_id).toBe("preset2");
+  });
+});

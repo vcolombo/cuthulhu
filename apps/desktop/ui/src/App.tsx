@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
 import * as ipc from "./ipc";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
+import { acceptEvent } from "./cut/viewmodel";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { StatusBar } from "./panels/StatusBar";
+import { CutDialog } from "./cut/CutDialog";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -146,6 +149,14 @@ export function App() {
   const [tool, setTool] = useState("select");
   const [error, setError] = useState<string | null>(null);
   const [lastPath, setLastPath] = useState<string | null>(null);
+  const [cutOpen, setCutOpen] = useState(false);
+  const [deviceState, setDeviceState] = useState<ipc.DeviceState>("Disconnected");
+  const [lastEvent, setLastEvent] = useState<ipc.DeviceEvent | null>(null);
+  const [jobId, setJobId] = useState<number | null>(null);
+  const jobIdRef = useRef<number | null>(null);
+  useEffect(() => {
+    jobIdRef.current = jobId;
+  }, [jobId]);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
 
@@ -166,21 +177,47 @@ export function App() {
         await refresh();
         return true;
       } catch (e) {
-        // No silent failures: every caught error is surfaced in the status bar.
-        setError(String(e));
+        // No silent failures: every caught error is surfaced in the status bar. Device/cut
+        // commands reject with a structured IpcError, not a string — ipcErrorMessage handles
+        // both that and the plain-string rejections from the older doc-editing commands.
+        setError(ipc.ipcErrorMessage(e));
         return false;
       }
     },
     [refresh],
   );
 
+  const refreshDeviceState = useCallback(() => {
+    ipc
+      .getDeviceState()
+      .then(setDeviceState)
+      .catch((e) => setError(ipc.ipcErrorMessage(e)));
+  }, []);
+
   useEffect(() => {
-    refresh().catch((e) => setError(String(e)));
+    refresh().catch((e) => setError(ipc.ipcErrorMessage(e)));
     ipc
       .listMachines()
       .then((m) => setMachines(m as MachineProfile[]))
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(ipc.ipcErrorMessage(e)));
   }, [refresh]);
+
+  // Mount-once device-event listener: filters by job id (viewmodel's acceptEvent — accepts
+  // everything until a job is actually running, then only that job's own events) and keeps
+  // deviceState in sync with StateChanged payloads without a separate poll.
+  useEffect(() => {
+    const unlisten = listen<ipc.DeviceEvent>("device-event", (e) => {
+      const ev = e.payload;
+      if (!acceptEvent(jobIdRef.current, ev)) return;
+      setLastEvent(ev);
+      if (typeof ev.kind === "object" && "StateChanged" in ev.kind) {
+        setDeviceState(ev.kind.StateChanged);
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
 
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");
@@ -366,6 +403,7 @@ export function App() {
           onUndo={() => run(() => ipc.undo())}
           onRedo={() => run(() => ipc.redo())}
           onImportFile={onImportFile}
+          onCut={() => setCutOpen(true)}
         />
       </div>
       <ToolRail
@@ -402,8 +440,23 @@ export function App() {
         />
       </div>
       <div style={{ gridColumn: "1 / -1" }}>
-        <StatusBar machine={doc?.machine ?? null} artboard={doc?.artboard ?? null} error={error} />
+        <StatusBar machine={doc?.machine ?? null} artboard={doc?.artboard ?? null} error={error} deviceState={deviceState} />
       </div>
+      {cutOpen && doc ? (
+        <CutDialog
+          scene={scene}
+          artboard={doc.artboard}
+          docMachineId={doc.machine?.id ?? null}
+          deviceState={deviceState}
+          lastEvent={lastEvent}
+          jobId={jobId}
+          setJobId={setJobId}
+          refreshDeviceState={refreshDeviceState}
+          onConvertMachine={(machineId) => run(() => ipc.setMachine({ machineId }))}
+          onError={setError}
+          onClose={() => setCutOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }

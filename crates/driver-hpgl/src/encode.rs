@@ -89,4 +89,11 @@ mod tests {
         let want = b"IN;PU40,80;PD120,160;PU40,80;PD120,160;PU;".to_vec();
         assert_eq!(session, want);
     }
+
+    #[test]
+    fn caps_and_abort_bytes_match_the_documented_contract() {
+        let d = HpglDriver::new();
+        assert_eq!(d.caps(), MachineCaps { supports_speed: false, supports_force: false, needs_operator_pass_confirm: true });
+        assert_eq!(d.abort_bytes(), Some(b"PU;".to_vec()));
+    }
 }

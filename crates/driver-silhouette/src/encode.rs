@@ -118,4 +118,11 @@ mod tests {
         }
         assert_eq!(session, sp2_golden_for_job());
     }
+
+    #[test]
+    fn caps_and_abort_bytes_match_the_documented_contract() {
+        let d = SilhouetteDriver::new();
+        assert_eq!(d.caps(), MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false });
+        assert_eq!(d.abort_bytes(), None);
+    }
 }

@@ -125,10 +125,16 @@ impl DeviceManager {
     /// returns to `cmd_rx.recv()`), and also queues `Command::Cancel` via
     /// `try_send` for a worker already *parked* in `WaitingForColorSwap`/
     /// `AwaitingCompletion`. Emits `CancelRequested -> Stopping -> Cancelled
-    /// { completion_known } -> Idle`; `completion_known` is only `true` when an
-    /// ENQ poll actually confirmed the device is ready (never for
-    /// `needs_operator_pass_confirm` machines). A no-op when no job is active.
+    /// { completion_known }`, which then stays the resting/observable state
+    /// (`snapshot()` can see it) until the next `cut` transitions back to
+    /// `Idle`. `completion_known` is only `true` when an ENQ poll actually
+    /// confirmed the device is ready (never for `needs_operator_pass_confirm`
+    /// machines). A no-op when no job is active.
     pub fn cancel(&self) {
+        // ponytail: a concurrent cancel()/cut() enqueue can race — which job
+        // the flag lands on isn't guaranteed by send order alone, but it's
+        // safe either way: worst case the *new* job gets cancelled instead
+        // of the one the caller meant.
         self.cancel_flag.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.try_send(Command::Cancel);
     }
@@ -336,11 +342,25 @@ fn run_from_pass(
     }
 }
 
+/// Recompute the byte length of an already-fully-transmitted pass, mirroring
+/// `run_from_pass`'s own encode step — used by `Command::Cancel` to report
+/// `submitted_bytes` for a job parked in `AwaitingCompletion`. Errors fall
+/// back to 0: encoding already succeeded once to get here.
+fn pass_byte_len(driver: &(dyn Driver + Send), passes: &[CutPass], pass_index: usize) -> usize {
+    let mut bytes = if pass_index == 0 { driver.session_begin() } else { Vec::new() };
+    if let Ok(pass_bytes) = driver.encode_pass(&passes[pass_index].job) {
+        bytes.extend(pass_bytes);
+    }
+    bytes.len()
+}
+
 /// Run once cancellation has been observed (either the worker noticed the
 /// flag mid-transmit/mid-poll, or a `Command::Cancel` arrived while parked):
 /// emit `CancelRequested` and `Stopping`, best-effort abort the device
 /// (`abort_bytes`, failure here doesn't block cancellation), resolve whether
-/// the device's readiness is actually known, emit `Cancelled` then `Idle`.
+/// the device's readiness is actually known, then emit `Cancelled` and leave
+/// it as the resting state — `Cancelled` is what `snapshot()`/the next
+/// `Command::Cut` sees until a fresh job starts and transitions to `Idle`.
 fn perform_cancel(
     job_id: u64,
     pass_index: usize,
@@ -358,14 +378,17 @@ fn perform_cancel(
     }
     let completion_known = cancel_completion_known(driver, transport);
     emit_for(job_id, state, DeviceState::Cancelled { job_id, pass_index, submitted_bytes, completion_known }, events);
-    emit_for(job_id, state, DeviceState::Idle, events);
+    // Cancelled stays the resting state (no auto-Idle) so a snapshot/event
+    // drain can actually observe it; Command::Cut clears it back to Idle.
     cancel_flag.store(false, Ordering::SeqCst); // consumed: don't poison the next job
 }
 
 /// After a cancel, best-effort check whether the device is actually ready
 /// (confirmed via a short bounded ENQ poll, distinct from the full 60s
 /// pass-completion budget) — never true for `needs_operator_pass_confirm`
-/// machines, which can't be polled at all.
+/// machines, which can't be polled at all. Paced like `resolve_pass_completion`
+/// so a device that replies "not ready" promptly still gets real wall-clock
+/// time between polls to actually become ready.
 fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Transport) -> bool {
     if driver.caps().needs_operator_pass_confirm {
         return false;
@@ -373,6 +396,7 @@ fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Tra
     const ATTEMPTS: u8 = 3;
     let interval = Duration::from_millis(250);
     for _ in 0..ATTEMPTS {
+        let iter_start = Instant::now();
         if write_all(transport, &[0x05]).is_err() {
             return false;
         }
@@ -382,6 +406,7 @@ fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Tra
                 return true;
             }
         }
+        thread::sleep(interval.saturating_sub(iter_start.elapsed()));
     }
     false
 }
@@ -446,7 +471,10 @@ fn worker_loop(
                 let _ = reply.send(Ok(()));
             }
             Command::Cut { passes, reply } => {
-                if !matches!(state, DeviceState::Idle) {
+                // Idle is the normal rest state; Cancelled is also a valid
+                // start state so a job can be resubmitted with no manual
+                // reset — see perform_cancel's doc comment.
+                if !matches!(state, DeviceState::Idle | DeviceState::Cancelled { .. }) {
                     let _ = reply.send(Err(DeviceError::Busy));
                     continue;
                 }
@@ -454,10 +482,13 @@ fn worker_loop(
                     let _ = reply.send(Err(DeviceError::Io("cut: no passes".into())));
                     continue;
                 }
+                if matches!(state, DeviceState::Cancelled { .. }) {
+                    emit(&mut state, DeviceState::Idle, &events); // leave the cancelled rest state behind
+                }
                 let job_id = next_job_id;
                 next_job_id += 1;
                 cancel_flag.store(false, Ordering::SeqCst); // fresh job: clear any stale cancel from a prior one
-                // Idle implies a successful prior connect, so both are Some.
+                // Idle/Cancelled both imply a successful prior connect, so both are Some.
                 let drv = driver.as_deref().expect("driver present while Idle");
                 let tr = transport.as_deref_mut().expect("transport present while Idle");
                 match run_from_pass(job_id, 0, &passes, drv, tr, &mut state, &events, &cancel_flag) {
@@ -484,14 +515,21 @@ fn worker_loop(
             }
             Command::Cancel => {
                 if let Some(job) = active_job.take() {
-                    let JobProgress { job_id, pass_index, .. } = job;
+                    let JobProgress { job_id, passes, pass_index } = job;
                     let drv = driver.as_deref().expect("driver present while job active");
                     let tr = transport.as_deref_mut().expect("transport present while job active");
-                    // ponytail: submitted_bytes unknown for a job parked mid-pause (no
-                    // transmit in flight here); 0 is a best-effort placeholder — a real
-                    // byte counter threaded through JobProgress would be needed for a
-                    // precise figure, add if callers start relying on this number.
-                    perform_cancel(job_id, pass_index, 0, drv, tr, &mut state, &events, &cancel_flag);
+                    // submitted_bytes: AwaitingCompletion means this pass's transmit
+                    // already fully completed (same physical situation as the
+                    // mid-poll Cancelled arm in run_from_pass, so recompute the same
+                    // way it does). WaitingForColorSwap means pass_index is the
+                    // *next*, not-yet-started pass, so 0 is the true count there,
+                    // not a placeholder.
+                    let submitted_bytes = if matches!(state, DeviceState::AwaitingCompletion { .. }) {
+                        pass_byte_len(drv, &passes, pass_index)
+                    } else {
+                        0
+                    };
+                    perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
                 }
                 // else: nothing active, safe no-op.
             }
@@ -517,9 +555,11 @@ fn worker_loop(
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
-                            // pass_index >= 1 here, so session_begin already went out and
-                            // there's no abort_bytes write on this path yet — the device is
-                            // left mid-session until Task 8 wires cancel/abort handling.
+                            // pass_index >= 1 here, so session_begin already went out.
+                            // This is a transport failure, not a cancel, so we
+                            // deliberately skip the best-effort abort_bytes write
+                            // (that belongs to perform_cancel's cancel path) — a
+                            // write that just failed is unlikely to accept an abort.
                             let e = fail(job_id, e, &mut state, &events);
                             let _ = reply.send(Err(e));
                         }
@@ -690,7 +730,7 @@ mod tests {
         assert_eq!(mgr.cut(Vec::new()).unwrap_err(), DeviceError::Io("cut: no passes".into()));
         assert_eq!(mgr.resume().unwrap_err(), DeviceError::Busy);
         assert_eq!(mgr.confirm_pass_done().unwrap_err(), DeviceError::Busy);
-        mgr.cancel(); // still a Task 8 no-op, must not panic or hang
+        mgr.cancel(); // no active job: safe no-op, must not panic or hang
         mgr.shutdown();
     }
 
@@ -945,7 +985,14 @@ mod tests {
             proceed_tx.send(()).unwrap();
             let job_id = cut_thread.join().unwrap();
 
-            wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+            // Cancelled is now the resting state: wait for it directly, and
+            // confirm a live snapshot() actually observes it (not just the
+            // event trail) per the review fix.
+            wait_for_state(&mgr, |s| matches!(s, DeviceState::Cancelled { .. }));
+            assert!(matches!(
+                mgr.snapshot(),
+                DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
+            ));
             let evs = drain(&events);
             assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
             assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
@@ -1116,7 +1163,8 @@ mod tests {
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
+        // Cancelled is the resting state post-shutdown (no further Cut arrives
+        // to lazily flip it back to Idle), so that's the terminal state here.
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Cancelled { .. }))));
-        assert!(evs.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Idle))));
     }
 }

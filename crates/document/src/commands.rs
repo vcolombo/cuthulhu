@@ -66,9 +66,11 @@ fn shape_to_path(node: &Node) -> Option<Path> {
 /// The result is appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
 /// placeholder for the new node's id — `Editor::boolean` overwrites it before commit.
 pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, CmdError> {
+    let mut seen = HashSet::new();
+    let ids: Vec<NodeId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
     if ids.len() < 2 { return Err(CmdError::EmptySelection); }
     let mut paths = vec![];
-    for &id in ids {
+    for &id in &ids {
         paths.push(shape_to_path(doc.get(id).ok_or(CmdError::NotFound)?).ok_or(CmdError::NotFound)?);
     }
     let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
@@ -168,6 +170,21 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
             NodeKind::Shape(ShapeKind::Path { .. })));
+    }
+
+    #[test]
+    fn boolean_op_dedupes_ids() {
+        let mut ed = Editor::new();
+        for _ in 0..2 {
+            let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+                ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+            ed.commit(d);
+        }
+        let sel: Vec<NodeId> = ed.doc.get(ed.doc.root).unwrap().children.clone();
+        // duplicate the first id in the selection; must not double-Remove-panic in apply.
+        ed.boolean(&[sel[0], sel[0], sel[1]], geometry::BoolOp::Union).unwrap();
+        let kids = &ed.doc.get(ed.doc.root).unwrap().children;
+        assert_eq!(kids.len(), 1);
     }
 
     #[test]

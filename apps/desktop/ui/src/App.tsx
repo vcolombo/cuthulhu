@@ -107,9 +107,11 @@ export function App() {
         setError(null);
         await fn();
         await refresh();
+        return true;
       } catch (e) {
         // No silent failures: every caught error is surfaced in the status bar.
         setError(String(e));
+        return false;
       }
     },
     [refresh],
@@ -136,6 +138,15 @@ export function App() {
     r.draw();
   }, [scene, selected]);
 
+  // Clears selection only once the delete actually lands, so a failed delete leaves the
+  // (still valid) selection in place, and a successful one can't leave stale ids around to
+  // error out a later transform.
+  const deleteSelected = useCallback(() => {
+    run(() => ipc.deleteNodes({ ids: selected })).then((ok) => {
+      if (ok) setSelected([]);
+    });
+  }, [run, selected]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -143,7 +154,7 @@ export function App() {
       if ((e.key === "Delete" || e.key === "Backspace") && !typing) {
         if (selected.length === 0) return;
         e.preventDefault();
-        run(() => ipc.deleteNodes({ ids: selected }));
+        deleteSelected();
       } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !typing) {
         e.preventDefault();
         run(() => (e.shiftKey ? ipc.redo() : ipc.undo()));
@@ -151,7 +162,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected, run]);
+  }, [selected, run, deleteSelected]);
 
   const canvasPos = (e: MouseEvent<HTMLCanvasElement>): Pt => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -247,7 +258,7 @@ export function App() {
         onAddEllipse={() => run(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }))}
         onAddText={() => run(() => ipc.addText({ parent: root, family: "Arial", sizeMm: 10, text: "Text" }))}
         onBoolean={(op: BoolOp) => run(() => ipc.booleanOp({ ids: selected, op }))}
-        onDelete={() => run(() => ipc.deleteNodes({ ids: selected }))}
+        onDelete={deleteSelected}
       />
       <canvas
         ref={canvasRef}

@@ -2,7 +2,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import * as ipc from "./ipc";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { hitTest, type Scene } from "./render/hittest";
+import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
+import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
@@ -12,8 +13,8 @@ import { StatusBar } from "./panels/StatusBar";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
-export type Affine6 = [number, number, number, number, number, number];
 export type BoolOp = "Union" | "Subtract" | "Intersect" | "Exclude";
+export type { Affine6 };
 
 export type ShapeKindJson =
   | { Rect: { w: number; h: number } }
@@ -46,8 +47,6 @@ export type DocSnapshot = {
   machine: MachineProfile | null;
 };
 
-const PROJECT_PATH = "cuthulhu-project.cut"; // ponytail: fixed save path until tauri-plugin-dialog wires a file picker
-
 function toggleId(ids: number[], id: number): number[] {
   return ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id];
 }
@@ -55,14 +54,21 @@ function toggleId(ids: number[], id: number): number[] {
 function shapeBounds(kind: ShapeKindJson) {
   if ("Rect" in kind) return { x: 0, y: 0, w: kind.Rect.w, h: kind.Rect.h };
   if ("Ellipse" in kind) {
-    // Canonical convention (see crates/document/src/commands.rs shape_to_path): an
+    // Canonical convention (see crates/document/src/commands.rs local_shape_path): an
     // Ellipse's local space is centered at (rx, ry), bounds 0..2rx / 0..2ry.
     return { x: 0, y: 0, w: kind.Ellipse.rx * 2, h: kind.Ellipse.ry * 2 };
   }
-  // ponytail: Text nodes are converted server-side into a Path before insertion (add_text
-  // mints a Path node), and precise Path bounds need a bbox pass over the outline — a
-  // placeholder box covers both cases until that lands.
-  return { x: 0, y: 0, w: 10, h: 10 };
+  // Text nodes are converted server-side into a Path before insertion (add_text mints a
+  // Path node), so this is the real Path bounds path too.
+  if ("Path" in kind) return pathBounds(kind.Path.d) ?? { x: 0, y: 0, w: 0, h: 0 };
+  return { x: 0, y: 0, w: 0, h: 0 }; // bare Text kind shouldn't reach here at runtime
+}
+
+function shapeGeom(kind: ShapeKindJson): ShapeGeom | undefined {
+  if ("Rect" in kind) return { t: "rect", w: kind.Rect.w, h: kind.Rect.h };
+  if ("Ellipse" in kind) return { t: "ellipse", rx: kind.Ellipse.rx, ry: kind.Ellipse.ry };
+  if ("Path" in kind) return { t: "path", d: kind.Path.d };
+  return undefined;
 }
 
 const IDENTITY_AFFINE6: Affine6 = [1, 0, 0, 1, 0, 0];
@@ -111,7 +117,12 @@ function buildScene(doc: DocSnapshot): Scene {
       const ys = corners.map((c) => c.y);
       const x = Math.min(...xs);
       const y = Math.min(...ys);
-      nodes.push({ id: n.id, bounds: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } });
+      nodes.push({
+        id: n.id,
+        bounds: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y },
+        shape: shapeGeom(n.kind.Shape),
+        world,
+      });
     } else {
       for (const child of n.children) walk(child, world);
     }
@@ -134,6 +145,7 @@ export function App() {
   const [machines, setMachines] = useState<MachineProfile[]>([]);
   const [tool, setTool] = useState("select");
   const [error, setError] = useState<string | null>(null);
+  const [lastPath, setLastPath] = useState<string | null>(null);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
 
@@ -325,8 +337,32 @@ export function App() {
           machines={machines}
           currentMachineId={doc?.machine?.id ?? null}
           onSelectMachine={(id) => run(() => ipc.setMachine({ machineId: id }))}
-          onSave={() => run(() => ipc.saveProject({ path: PROJECT_PATH }))}
-          onReload={() => run(() => ipc.loadProject({ path: PROJECT_PATH }))}
+          onSave={() =>
+            run(async () => {
+              const p = await ipc.pickSavePath();
+              if (p) {
+                await ipc.saveProject({ path: p });
+                setLastPath(p);
+              }
+            })
+          }
+          onOpen={() =>
+            run(async () => {
+              const p = await ipc.pickOpenPath();
+              if (p) {
+                await ipc.loadProject({ path: p });
+                setLastPath(p);
+                setSelected([]); // loaded doc may not contain the old ids
+              }
+            })
+          }
+          onReload={() =>
+            run(async () => {
+              await ipc.loadProject({ path: lastPath! });
+              setSelected([]);
+            })
+          }
+          canReload={lastPath !== null}
           onUndo={() => run(() => ipc.undo())}
           onRedo={() => run(() => ipc.redo())}
           onImportFile={onImportFile}

@@ -9,7 +9,14 @@ export function dragMatrix(start: Pt, cur: Pt): Matrix {
 export function applyOptimistic(scene: Scene, ids: number[], m: Matrix): Scene {
   return { nodes: scene.nodes.map(n =>
     ids.includes(n.id)
-      ? { ...n, bounds: { ...n.bounds, x: n.bounds.x + m[4], y: n.bounds.y + m[5] } }
+      ? {
+          ...n,
+          bounds: { ...n.bounds, x: n.bounds.x + m[4], y: n.bounds.y + m[5] },
+          world: n.world
+            ? ([n.world[0], n.world[1], n.world[2], n.world[3],
+                n.world[4] + m[4], n.world[5] + m[5]] as typeof n.world)
+            : n.world,
+        }
       : n) };
 }
 export type DeltaOp = { op: "add" | "update" | "remove"; nodeId: number; patch?: any };

@@ -90,6 +90,9 @@ function installMockTauri() {
 
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args: Record<string, unknown> = {}) => {
+      if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
+        return Promise.resolve("/mock/cuthulhu-project.cut");
+      }
       const fn = commands[cmd];
       if (!fn) return Promise.reject(new Error(`unmocked command: ${cmd}`));
       try {

@@ -7,7 +7,9 @@ type Props = {
   currentMachineId: string | null;
   onSelectMachine: (id: string) => void;
   onSave: () => void;
+  onOpen: () => void;
   onReload: () => void;
+  canReload: boolean;
   onUndo: () => void;
   onRedo: () => void;
   onImportFile: (file: File) => void;
@@ -26,7 +28,9 @@ export function TopBar({
   currentMachineId,
   onSelectMachine,
   onSave,
+  onOpen,
   onReload,
+  canReload,
   onUndo,
   onRedo,
   onImportFile,
@@ -83,7 +87,10 @@ export function TopBar({
       <button aria-label="Save" style={btn} onClick={onSave}>
         Save
       </button>
-      <button aria-label="Reload" style={btn} onClick={onReload}>
+      <button aria-label="Open" style={btn} onClick={onOpen}>
+        Open
+      </button>
+      <button aria-label="Reload" style={btn} onClick={onReload} disabled={!canReload}>
         Reload
       </button>
     </div>

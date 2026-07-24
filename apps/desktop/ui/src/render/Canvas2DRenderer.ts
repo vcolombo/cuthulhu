@@ -5,6 +5,7 @@ import type { Bounds, Scene } from "./hittest";
 const FALLBACK_ACCENT = "#22D3EE";
 const FALLBACK_BORDER = "#2E2E34";
 const FALLBACK_PANEL = "#1F1F23";
+const FALLBACK_TEXT = "#E7E7EA";
 
 export class Canvas2DRenderer implements Renderer {
   private scene: Scene = { nodes: [] };
@@ -44,6 +45,7 @@ export class Canvas2DRenderer implements Renderer {
     const accent = style.getPropertyValue("--accent").trim() || FALLBACK_ACCENT;
     const border = style.getPropertyValue("--border").trim() || FALLBACK_BORDER;
     const panel = style.getPropertyValue("--panel").trim() || FALLBACK_PANEL;
+    const text = style.getPropertyValue("--text").trim() || FALLBACK_TEXT;
 
     // Artboard drawn first so node outlines paint over it, not the other way around.
     if (this.artboard) {
@@ -57,9 +59,34 @@ export class Canvas2DRenderer implements Renderer {
 
     for (const node of this.scene.nodes) {
       const selected = this.selected.has(node.id);
-      ctx.strokeStyle = selected ? accent : border;
-      ctx.lineWidth = selected ? 2 : 1;
-      ctx.strokeRect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
+      const stroke = selected ? accent : text;
+      const lineWidth = selected ? 2 : 1;
+      if (node.shape && node.world) {
+        ctx.save();
+        const [a, b, c, d, e, f] = node.world;
+        ctx.transform(a, b, c, d, e, f);
+        ctx.beginPath();
+        if (node.shape.t === "rect") {
+          ctx.rect(0, 0, node.shape.w, node.shape.h);
+        } else if (node.shape.t === "ellipse") {
+          ctx.ellipse(node.shape.rx, node.shape.ry, node.shape.rx, node.shape.ry, 0, 0, Math.PI * 2);
+        }
+        ctx.strokeStyle = stroke;
+        // ponytail: lineWidth is in local units, so a scaled node gets a scaled
+        // stroke; screen-constant strokes need lineWidth / scale once zoom lands.
+        ctx.lineWidth = lineWidth;
+        if (node.shape.t === "path") {
+          ctx.stroke(new Path2D(node.shape.d));
+        } else {
+          ctx.stroke();
+        }
+        ctx.restore();
+      } else {
+        // Nodes without geometry (tests, mocks) keep the SP3 bounds outline.
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = lineWidth;
+        ctx.strokeRect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
+      }
     }
 
     this.dirty.clear();

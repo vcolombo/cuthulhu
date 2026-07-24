@@ -13,14 +13,24 @@ pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result
 }
 
 /// Apply world-space transform `m` to each node by composing it with the node's existing local transform.
-/// The new transform applies the node's existing transform first, then the world-space transform.
+/// Converts the world-space matrix into the node's parent space so that new_world = old_world.then(m)
+/// holds under transformed ancestors.
 pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let mut ops = vec![];
     for &id in ids {
         let before = doc.get(id).ok_or(CmdError::NotFound)?.clone();
+        // Convert the world-space matrix into this node's parent space so that
+        // new_world = old_world.then(m) holds under transformed ancestors:
+        // new_local = old_local.then(pw).then(m).then(pw⁻¹)
+        let pw = match parent_of(doc, id) {
+            Some(pid) => world_transform(doc, pid).ok_or(CmdError::NotFound)?,
+            None => Affine::identity(),
+        };
+        let pw_inv = pw.inverse()
+            .ok_or_else(|| CmdError::Geometry("degenerate ancestor transform".into()))?;
         let mut after = before.clone();
-        after.transform = before.transform.then(&m);
+        after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
     }
     Ok(Delta(ops))
@@ -28,13 +38,34 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
 
 pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    let selected: HashSet<NodeId> = ids.iter().copied().collect();
+    let has_selected_ancestor = |id: NodeId| {
+        let mut cur = id;
+        while let Some(pid) = parent_of(doc, cur) {
+            if selected.contains(&pid) { return true; }
+            cur = pid;
+        }
+        false
+    };
+    // Emit a subtree's Removes children-first so each Remove still has its parent
+    // in the map, and the inverse delta (reversed Adds) restores parents first.
+    fn push_subtree(doc: &Document, id: NodeId, parent: NodeId, ops: &mut Vec<NodeOp>)
+        -> Result<(), CmdError> {
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        for &child in &node.children {
+            push_subtree(doc, child, id, ops)?;
+        }
+        ops.push(NodeOp::Remove { parent, id });
+        Ok(())
+    }
     let mut ops = vec![];
     let mut seen = HashSet::new();
     for &id in ids {
-        if !seen.insert(id) { continue; } // skip duplicates
+        if !seen.insert(id) || has_selected_ancestor(id) { continue; }
         let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
-        ops.push(NodeOp::Remove { parent, id });
+        push_subtree(doc, id, parent, &mut ops)?;
     }
+    if ops.is_empty() { return Err(CmdError::EmptySelection); }
     Ok(Delta(ops))
 }
 
@@ -50,20 +81,34 @@ fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
     doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
 }
 
-/// Shape's outline in its own local space, in mm, matching `Rect { x:0, y:0, w, h }` bounds
-/// convention (an ellipse of radii rx,ry centered at (rx,ry) has the same 0,0-origin bounds).
-fn shape_to_path(node: &Node) -> Option<Path> {
-    let p = match &node.kind {
-        NodeKind::Shape(ShapeKind::Rect { w, h }) => rect_path(0.0, 0.0, *w, *h),
-        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => ellipse_path(*rx, *ry, *rx, *ry),
-        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok()?,
-        _ => return None,
-    };
-    Some(p.transformed(&node.transform))
+/// World transform of `id`: its local transform composed through every ancestor
+/// (node world = local.then(parent world)). None if `id` is not in the document.
+pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
+    let mut m = doc.get(id)?.transform.clone();
+    let mut cur = id;
+    while let Some(pid) = parent_of(doc, cur) {
+        m = m.then(&doc.get(pid)?.transform);
+        cur = pid;
+    }
+    Some(m)
+}
+
+/// Shape's outline in its own local space (node's own transform NOT applied), in mm,
+/// matching `Rect { x:0, y:0, w, h }` bounds convention (an ellipse of radii rx,ry
+/// centered at (rx,ry) has the same 0,0-origin bounds).
+fn local_shape_path(node: &Node) -> Option<Path> {
+    match &node.kind {
+        NodeKind::Shape(ShapeKind::Rect { w, h }) => Some(rect_path(0.0, 0.0, *w, *h)),
+        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => Some(ellipse_path(*rx, *ry, *rx, *ry)),
+        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok(),
+        _ => None,
+    }
 }
 
 /// Replace `ids` (>= 2 shape nodes) with a single Path node holding the boolean-op result.
-/// The result is appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
+/// Inputs are flattened via each node's world transform (so nodes at different nesting
+/// depths combine correctly), and the result is mapped back into the destination parent's
+/// space before being appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
 /// placeholder for the new node's id — `Editor::boolean` overwrites it before commit.
 pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, CmdError> {
     let mut seen = HashSet::new();
@@ -71,16 +116,23 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     if ids.len() < 2 { return Err(CmdError::EmptySelection); }
     let mut paths = vec![];
     for &id in &ids {
-        paths.push(shape_to_path(doc.get(id).ok_or(CmdError::NotFound)?).ok_or(CmdError::NotFound)?);
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        let local = local_shape_path(node).ok_or(CmdError::NotFound)?;
+        let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
+        paths.push(local.transformed(&world));
     }
     let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
-    let parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
+    let dest_inv = dest_world.inverse()
+        .ok_or_else(|| CmdError::Geometry("degenerate destination transform".into()))?;
+    let result_local = result.transformed(&dest_inv);
     let mut ops: Vec<NodeOp> = ids.iter()
         .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
         .collect();
     ops.push(NodeOp::Add {
-        parent,
-        node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result.to_svg() }),
+        parent: dest_parent,
+        node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result_local.to_svg() }),
         index: usize::MAX,
     });
     Ok(Delta(ops))
@@ -173,6 +225,76 @@ mod tests {
     }
 
     #[test]
+    fn boolean_inputs_use_world_space_and_result_lands_in_parent_space() {
+        let mut ed = Editor::new();
+        // group translated (100,0); two 10x10 rects inside at local x=0 and x=5 (overlapping)
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine::translate(100.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        let mut nb = Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        nb.transform = Affine::translate(5.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid, node: nb, index: 1 }]));
+
+        ed.boolean(&[a, b], geometry::BoolOp::Union).unwrap();
+        let kids = ed.doc.get(gid).unwrap().children.clone();
+        assert_eq!(kids.len(), 1, "result should replace both inputs under the group");
+        let result = ed.doc.get(kids[0]).unwrap();
+        let d = match &result.kind {
+            NodeKind::Shape(ShapeKind::Path { d }) => d.clone(),
+            other => panic!("expected Path, got {other:?}"),
+        };
+        // Path data is in the group's LOCAL space: union of x 0..15 — not 100..115.
+        let bounds = geometry::Path::from_svg(&d).unwrap().bounds();
+        assert!((bounds.x - 0.0).abs() < 0.5, "x={} (world coords leaked in)", bounds.x);
+        assert!((bounds.w - 15.0).abs() < 0.5, "w={}", bounds.w);
+    }
+
+    #[test]
+    fn boolean_cross_depth_inputs_discriminate_world_vs_node_transform() {
+        // root -> groupA(translate 50,0) -> groupB(translate 0,20) -> a (Rect 10x10, identity)
+        //      -> groupA -> c (Rect 10x10, translate(-5,20))  [sibling of groupB, not of a]
+        let mut ed = Editor::new();
+        let ga = ed.doc.ids.next();
+        let mut group_a = Node::container(ga, NodeKind::Group);
+        group_a.transform = Affine::translate(50.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group_a, index: 0 }]));
+        let gb = ed.doc.ids.next();
+        let mut group_b = Node::container(gb, NodeKind::Group);
+        group_b.transform = Affine::translate(0.0, 20.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ga, node: group_b, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gb,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let c = ed.doc.ids.next();
+        let mut nc = Node::shape(c, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        nc.transform = Affine::translate(-5.0, 20.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ga, node: nc, index: 1 }]));
+
+        // world(a) = translate(50,20); world(c) = translate(45,20)
+        // union world bounds: x 45..60, y 20..30 (w=15, h=10)
+        // dest_parent = groupB, dest_world = translate(50,20)
+        // result in groupB-local: x -5..10 (w=15), y 0..10 (h=10)
+        ed.boolean(&[a, c], geometry::BoolOp::Union).unwrap();
+        let kids = ed.doc.get(gb).unwrap().children.clone();
+        assert_eq!(kids.len(), 1, "result should land under groupB (parent of a)");
+        let result = ed.doc.get(kids[0]).unwrap();
+        let d = match &result.kind {
+            NodeKind::Shape(ShapeKind::Path { d }) => d.clone(),
+            other => panic!("expected Path, got {other:?}"),
+        };
+        let bounds = geometry::Path::from_svg(&d).unwrap().bounds();
+        assert!((bounds.x - -5.0).abs() < 0.5, "x={} (expected -5)", bounds.x);
+        assert!((bounds.w - 15.0).abs() < 0.5, "w={} (expected 15)", bounds.w);
+        assert!((bounds.y - 0.0).abs() < 0.5, "y={} (expected 0)", bounds.y);
+        assert!((bounds.h - 10.0).abs() < 0.5, "h={} (expected 10)", bounds.h);
+    }
+
+    #[test]
     fn boolean_op_dedupes_ids() {
         let mut ed = Editor::new();
         for _ in 0..2 {
@@ -251,5 +373,77 @@ mod tests {
             None => assert_eq!(ed.add_text(parent, "Whatever", 10.0, "Hi"),
                 Err(CmdError::Geometry(format!("{:?}", geometry::GeomError::NoFont)))),
         }
+    }
+
+    #[test]
+    fn world_transform_composes_ancestors() {
+        let mut ed = Editor::new();
+        // group scaled 2x, child rect translated (5,0) locally
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let cid = ed.doc.ids.next();
+        let mut child = Node::shape(cid, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        child.transform = Affine::translate(5.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid, node: child, index: 0 }]));
+        // world = local.then(group): (0,0) -local-> (5,0) -group 2x-> (10,0)
+        let w = world_transform(&ed.doc, cid).unwrap();
+        assert_eq!(w.apply(0.0, 0.0), (10.0, 0.0));
+        assert!(world_transform(&ed.doc, NodeId(999)).is_none());
+    }
+
+    #[test]
+    fn transform_under_scaled_group_moves_exact_world_distance() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+
+        let before_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        let d = transform_nodes(&ed.doc, &[cid], Affine::translate(10.0, 0.0)).unwrap();
+        ed.commit(d);
+        let after_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        // world moved exactly 10mm — NOT 20mm (the double-application bug this fixes)
+        assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0));
+    }
+
+    #[test]
+    fn deleting_group_removes_descendants_and_undo_restores_structure() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::container(gid, NodeKind::Group), index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 1.0, h: 1.0 }), index: 0 }]));
+
+        ed.commit(delete_nodes(&ed.doc, &[gid]).unwrap());
+        assert!(ed.doc.get(gid).is_none());
+        assert!(ed.doc.get(cid).is_none(), "descendants must not be orphaned");
+
+        ed.undo();
+        assert!(ed.doc.get(gid).is_some());
+        assert!(ed.doc.get(cid).is_some());
+        assert_eq!(ed.doc.get(gid).unwrap().children, vec![cid]);
+    }
+
+    #[test]
+    fn selecting_group_and_child_together_does_not_panic() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::container(gid, NodeKind::Group), index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 1.0, h: 1.0 }), index: 0 }]));
+        // group first, child second — the ordering that panicked before
+        ed.commit(delete_nodes(&ed.doc, &[gid, cid]).unwrap());
+        assert!(ed.doc.get(gid).is_none());
+        assert!(ed.doc.get(cid).is_none());
     }
 }

@@ -142,8 +142,9 @@ export function App() {
     if (!r) return;
     r.setScene(scene);
     r.setSelection(selected);
+    r.setArtboard(doc?.artboard ?? null);
     r.draw();
-  }, [scene, selected]);
+  }, [scene, selected, doc]);
 
   // Clears selection only once the delete actually lands, so a failed delete leaves the
   // (still valid) selection in place, and a successful one can't leave stale ids around to

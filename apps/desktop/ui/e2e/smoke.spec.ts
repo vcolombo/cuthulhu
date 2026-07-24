@@ -264,8 +264,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       return jobId;
     },
     cancel_cut: () => {
-      deviceState = "Idle";
-      emit({ StateChanged: "Idle" });
+      // Mirrors driver-core::manager: cancel is unconditional and lands on the
+      // Cancelled resting state (no auto-Idle) — not a jump straight to Idle.
+      const s = deviceState as { Transmitting?: { pass_index: number; submitted_bytes: number }; WaitingForColorSwap?: { next_pass_index: number } };
+      const passIndex = s.Transmitting?.pass_index ?? s.WaitingForColorSwap?.next_pass_index ?? 0;
+      const submittedBytes = s.Transmitting?.submitted_bytes ?? 0;
+      deviceState = { Cancelled: { job_id: jobId, pass_index: passIndex, submitted_bytes: submittedBytes, completion_known: true } };
+      emit({ StateChanged: deviceState });
       return null;
     },
     resume_cut: () => {
@@ -365,4 +370,36 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
 
   await page.getByRole("button", { name: "Close" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByText("Cancelled")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText(/complete/i)).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByText(/complete/i)).toHaveCount(0);
 });

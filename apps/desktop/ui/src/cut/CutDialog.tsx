@@ -8,15 +8,18 @@ import {
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
+  dialogPhase,
+  canStartCut,
+  dialogButtons,
   type PassVm,
   type Caps,
   type Preset,
 } from "./viewmodel";
 
-// ponytail: no IPC exposes machine capabilities yet. Hardcoded from spec §5 — the Puma's
-// speed/force are set on its own panel, so those fields stay disabled with a hint; the
-// Cameo exposes both over the wire. Replace with a real capability query if more machines
-// or knob variety show up.
+// ponytail: no IPC exposes machine capabilities yet (follow-up: expose MachineCaps via
+// IPC). Hardcoded from spec §5 — the Puma's speed/force are set on its own panel, so
+// those fields stay disabled with a hint; the Cameo exposes both over the wire. Replace
+// with a real capability query if more machines or knob variety show up.
 const CAPS: Record<string, Caps> = {
   cameo5: { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false },
   puma: { supportsSpeed: false, supportsForce: false, needsOperatorPassConfirm: true },
@@ -24,18 +27,6 @@ const CAPS: Record<string, Caps> = {
 const DEFAULT_CAPS: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
 type PassRow = PassVm & { nodeIds: number[] };
-
-function stateLabel(s: ipc.DeviceState): string {
-  if (typeof s === "string") return s;
-  if ("Transmitting" in s) return "sending";
-  if ("AwaitingCompletion" in s) return "awaiting completion";
-  if ("WaitingForColorSwap" in s) return "Waiting for color swap";
-  if ("CancelRequested" in s) return "cancel requested";
-  if ("Stopping" in s) return "stopping";
-  if ("Cancelled" in s) return "cancelled";
-  if ("Error" in s) return "error";
-  return "unknown";
-}
 
 type Props = {
   scene: Scene;
@@ -106,6 +97,10 @@ export function CutDialog({
 
   useEffect(() => {
     ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    // A stale jobId from a previous dialog session (or a previous cut that finished
+    // while this dialog was closed) must not make a leftover Idle/Cancelled state
+    // read as "just completed" on reopen — see justCompleted below.
+    setJobId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -152,14 +147,12 @@ export function CutDialog({
 
   const caps = connected ? CAPS[connected.machine_id] ?? DEFAULT_CAPS : DEFAULT_CAPS;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
-  const idle = deviceState === "Idle";
-  const waitingSwap = typeof deviceState === "object" && "WaitingForColorSwap" in deviceState;
-  const awaitingCompletion = typeof deviceState === "object" && "AwaitingCompletion" in deviceState;
-  const transmitting = typeof deviceState === "object" && "Transmitting" in deviceState;
-  const active = transmitting || (typeof deviceState === "object" && ("CancelRequested" in deviceState || "Stopping" in deviceState));
-  // Idle only reads as "job complete" once a job has actually run — the pre-cut Idle
-  // state (jobId still null) must not show a stale completion message.
-  const justCompleted = jobId !== null && idle;
+  const phase = dialogPhase(deviceState);
+  const buttons = dialogButtons(phase);
+  // Idle only reads as "job complete" once a job has actually run in this dialog
+  // session — jobId is reset to null on mount (above) and on every new cut() call
+  // (in startCut below), so a stale prior job's Idle can't read as a fresh completion.
+  const justCompleted = jobId !== null && phase.kind === "idle";
   const failed = lastEvent && jobId !== null && lastEvent.job_id === jobId && typeof lastEvent.kind === "object" && "Failed" in lastEvent.kind;
 
   const startCut = () => {
@@ -302,6 +295,15 @@ export function CutDialog({
                   onChange={(e) => updateRow(i, { force: e.target.value === "" ? null : Number(e.target.value) })}
                   style={{ width: 60 }}
                 />
+                <input
+                  aria-label={`Repeat count for pass ${i + 1}`}
+                  type="number"
+                  min={1}
+                  value={eff.repeatCount}
+                  placeholder="repeat"
+                  onChange={(e) => updateRow(i, { repeatCount: e.target.value === "" ? null : Number(e.target.value) })}
+                  style={{ width: 50 }}
+                />
                 {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
                 <button style={btn} onClick={() => setRows(reorderPass(rows, i, -1) as PassRow[])} disabled={i === 0}>
                   Up
@@ -319,40 +321,41 @@ export function CutDialog({
         <CutPreview scene={scene} artboard={artboard} passes={rows} travel={travel} />
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {waitingSwap ? <span>Waiting for color swap</span> : null}
-          {transmitting && typeof deviceState === "object" && "Transmitting" in deviceState ? (
+          {phase.kind === "waitingSwap" ? <span>Waiting for color swap</span> : null}
+          {phase.kind === "transmitting" ? (
             <span>
-              sending {deviceState.Transmitting.submitted_bytes} / {deviceState.Transmitting.total_bytes} bytes
+              sending {phase.submittedBytes} / {phase.totalBytes} bytes
             </span>
-          ) : active ? (
-            <span>{stateLabel(deviceState)}</span>
           ) : null}
-          {awaitingCompletion ? <span>Awaiting completion</span> : null}
+          {phase.kind === "cancelRequested" ? <span>cancel requested</span> : null}
+          {phase.kind === "stopping" ? <span>stopping</span> : null}
+          {phase.kind === "awaitingCompletion" ? <span>Awaiting completion</span> : null}
+          {phase.kind === "cancelled" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
           {justCompleted ? <span>Job complete</span> : null}
           {failed ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
 
           <div style={{ flex: 1 }} />
 
-          {waitingSwap ? (
+          {buttons.resume ? (
             <button aria-label="Resume" style={btn} onClick={resume}>
               Resume
             </button>
           ) : null}
-          {awaitingCompletion ? (
+          {buttons.confirmPassDone ? (
             <button aria-label="Confirm pass done" style={btn} onClick={confirmPassDone}>
               Confirm pass done
             </button>
           ) : null}
-          {active ? (
+          {buttons.cancel ? (
             <button aria-label="Cancel" style={btn} onClick={cancel}>
               Cancel
             </button>
           ) : null}
-          {!waitingSwap && !awaitingCompletion && !active ? (
+          {buttons.start ? (
             <button
               aria-label="Start Cut"
               style={btn}
-              disabled={!connected || !idle || machineMismatch || rows.length === 0}
+              disabled={!connected || !canStartCut(phase) || machineMismatch || rows.length === 0}
               onClick={startCut}
             >
               Start Cut

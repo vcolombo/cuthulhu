@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import type { DeviceState } from "../ipc";
 
 // View model types (UI representation)
 export type PassVm = {
@@ -164,4 +165,84 @@ export function toCutRequest(
       repeat_count: p.repeatCount,
     })),
   };
+}
+
+/**
+ * Classified, dialog-relevant view of a raw DeviceState. Every DeviceState
+ * variant maps to exactly one DevicePhase — this is the single place that
+ * decides what a raw wire state "means" for the cut dialog, so CutDialog.tsx
+ * never has to re-derive it ad hoc (and so every variant, including
+ * Cancelled, has a tested mapping).
+ */
+export type DevicePhase =
+  | { kind: "disconnected" }
+  | { kind: "connecting" }
+  | { kind: "idle" }
+  | { kind: "disconnecting" }
+  | { kind: "transmitting"; passIndex: number; submittedBytes: number; totalBytes: number }
+  | { kind: "awaitingCompletion"; passIndex: number }
+  | { kind: "waitingSwap"; nextPassIndex: number }
+  | { kind: "cancelRequested" }
+  | { kind: "stopping" }
+  | { kind: "cancelled"; passIndex: number; submittedBytes: number; completionKnown: boolean }
+  | { kind: "error" };
+
+export function dialogPhase(state: DeviceState): DevicePhase {
+  if (state === "Disconnected") return { kind: "disconnected" };
+  if (state === "Connecting") return { kind: "connecting" };
+  if (state === "Idle") return { kind: "idle" };
+  if (state === "Disconnecting") return { kind: "disconnecting" };
+  if ("Transmitting" in state) {
+    const t = state.Transmitting;
+    return { kind: "transmitting", passIndex: t.pass_index, submittedBytes: t.submitted_bytes, totalBytes: t.total_bytes };
+  }
+  if ("AwaitingCompletion" in state) return { kind: "awaitingCompletion", passIndex: state.AwaitingCompletion.pass_index };
+  if ("WaitingForColorSwap" in state) return { kind: "waitingSwap", nextPassIndex: state.WaitingForColorSwap.next_pass_index };
+  if ("CancelRequested" in state) return { kind: "cancelRequested" };
+  if ("Stopping" in state) return { kind: "stopping" };
+  if ("Cancelled" in state) {
+    const c = state.Cancelled;
+    return { kind: "cancelled", passIndex: c.pass_index, submittedBytes: c.submitted_bytes, completionKnown: c.completion_known };
+  }
+  return { kind: "error" };
+}
+
+/**
+ * Whether Cut can be started from this phase. Mirrors driver-core::manager's
+ * `matches!(state, DeviceState::Idle | DeviceState::Cancelled { .. })` — Cancelled
+ * is a valid resting state on the Rust side too, not a dead end.
+ */
+export function canStartCut(phase: DevicePhase): boolean {
+  return phase.kind === "idle" || phase.kind === "cancelled";
+}
+
+export type DialogButtons = {
+  start: boolean;
+  resume: boolean;
+  confirmPassDone: boolean;
+  cancel: boolean;
+};
+
+/**
+ * Which action buttons apply for a given phase. `cancel` is available in
+ * every state that has an active job (including WaitingForColorSwap and
+ * AwaitingCompletion) — DeviceManager::cancel() explicitly unparks a worker
+ * sitting in either of those states, it isn't limited to mid-transmit.
+ */
+export function dialogButtons(phase: DevicePhase): DialogButtons {
+  const resume = phase.kind === "waitingSwap";
+  const confirmPassDone = phase.kind === "awaitingCompletion";
+  const cancel =
+    phase.kind === "transmitting" ||
+    phase.kind === "cancelRequested" ||
+    phase.kind === "stopping" ||
+    phase.kind === "waitingSwap" ||
+    phase.kind === "awaitingCompletion";
+  // Start is the default fallback button — it renders whenever no other action
+  // button applies (including disconnected/connecting/disconnecting/error), even
+  // though it's only enabled (canStartCut) from idle/cancelled. Its disabled state
+  // is driven separately by canStartCut() plus dialog-local checks (connected,
+  // machine match, row count) that live in CutDialog, not here.
+  const start = !resume && !confirmPassDone && !cancel;
+  return { start, resume, confirmPassDone, cancel };
 }

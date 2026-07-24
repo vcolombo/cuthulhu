@@ -199,7 +199,11 @@ pub fn save_user_presets(user_file: &Path, user: &[MaterialPreset]) -> Result<()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    let tmp = tempfile::NamedTempFile::new_in(dir)
+    // First-run: the default path lives under config_dir()/cuthulhu/, which doesn't
+    // exist on a fresh install, and NamedTempFile::new_in requires it to.
+    std::fs::create_dir_all(dir).map_err(|e| PresetError::Io(e.to_string()))?;
+
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| PresetError::Io(e.to_string()))?;
 
     #[derive(Serialize)]
@@ -216,8 +220,10 @@ pub fn save_user_presets(user_file: &Path, user: &[MaterialPreset]) -> Result<()
     let json = serde_json::to_string_pretty(&file_data)
         .map_err(|e| PresetError::Io(e.to_string()))?;
 
-    let mut file = tmp.reopen().map_err(|e| PresetError::Io(e.to_string()))?;
-    file.write_all(json.as_bytes())
+    // Write through the temp file's own handle: a reopen()'d second handle held
+    // across persist() can make the atomic rename fail on Windows.
+    tmp.as_file_mut()
+        .write_all(json.as_bytes())
         .map_err(|e| PresetError::Io(e.to_string()))?;
 
     tmp.persist(user_file)
@@ -233,6 +239,17 @@ pub fn default_presets_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_run_save_creates_missing_parent_directory() {
+        // Mirrors a fresh install: default_presets_path()'s cuthulhu/ directory
+        // doesn't exist yet, and save must create it rather than error.
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("cuthulhu").join("presets.json");
+
+        save_user_presets(&user_file, &[]).unwrap();
+        assert!(user_file.exists());
+    }
 
     #[test]
     fn user_entry_shadows_builtin_and_delete_reveals_it() {

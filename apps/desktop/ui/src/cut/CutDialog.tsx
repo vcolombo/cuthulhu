@@ -155,26 +155,14 @@ export function CutDialog({
   const phase = dialogPhase(deviceState);
   const buttons = dialogButtons(phase);
   // Idle only reads as "job complete" once a job has actually run in this dialog
-  // session — jobId is reset to null on mount (above), on every new cut() call (in
-  // startCut below), and when the current job hits a terminal event (useEffect
-  // below), so a stale prior job's Idle can't read as a fresh completion.
+  // session — jobId is reset to null on mount (above) and on every new cut() call
+  // (in startCut below), so a stale prior job's Idle can't read as a fresh
+  // completion, and the banner stays visible until the next cut or dialog close.
+  // ponytail: jobId is NOT reset when a job reaches its terminal event, so NO_JOB=0
+  // lifecycle events (e.g. a reconnect) after a completed job are filtered by
+  // acceptEvent until the dialog is reopened — acceptable; reopening reseeds state.
   const justCompleted = jobId !== null && phase.kind === "idle";
   const failed = lastEvent && jobId !== null && lastEvent.job_id === jobId && typeof lastEvent.kind === "object" && "Failed" in lastEvent.kind;
-
-  // Also reset once the current job actually finishes (not just at the next cut()
-  // or the next mount): otherwise jobId stays pinned to the finished job and
-  // acceptEvent (App.tsx) keeps rejecting every later NO_JOB=0 lifecycle event
-  // (e.g. a reconnect) for the rest of this dialog session.
-  // ponytail: this makes the "Job complete"/"Cut failed" banner above flash for one
-  // render then clear (justCompleted/failed both key off jobId) — accepted, since the
-  // alternative is decoupling the banner from jobId entirely, which is more plumbing
-  // than this fix asked for.
-  useEffect(() => {
-    if (jobId === null || !lastEvent || lastEvent.job_id !== jobId) return;
-    const k = lastEvent.kind;
-    const terminal = k === "JobComplete" || (typeof k === "object" && "Failed" in k);
-    if (terminal) setJobId(null);
-  }, [lastEvent, jobId, setJobId]);
 
   const startCut = () => {
     if (!connected || planRevision === null) return;

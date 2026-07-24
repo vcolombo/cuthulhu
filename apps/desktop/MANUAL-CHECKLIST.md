@@ -23,7 +23,7 @@
 
 ### GUI verification
 - [ ] Open Cut dialog on a 2-color document — displays 2 passes with correct color swatches.
-- [ ] Preview shows order badges at shape start points and dashed travel lines in configured order.
+- [ ] Preview shows order badges at shape start points and dashed travel lines in planned order (reordering passes does not yet update the travel lines — deferred).
 - [ ] Material preset selection works; per-pass override fields functional (subject to machine capabilities).
 - [ ] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
 - [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).

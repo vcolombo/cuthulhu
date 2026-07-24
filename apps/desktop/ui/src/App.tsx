@@ -219,6 +219,20 @@ export function App() {
     };
   }, []);
 
+  // Backend refuses to close the window mid-cut (main.rs's on_window_event calls
+  // prevent_close and emits this instead) — ask the user, then force_quit if they
+  // confirm. No-op on cancel, so the window just stays open.
+  useEffect(() => {
+    const unlisten = listen("cut-in-progress", () => {
+      if (window.confirm("A cut is in progress — quit anyway?")) {
+        ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");
     if (ctx) rendererRef.current = new Canvas2DRenderer(ctx);

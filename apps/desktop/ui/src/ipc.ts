@@ -152,6 +152,10 @@ export async function getConnectedDevice(): Promise<DeviceInfo | null> {
   return invoke("get_connected_device", {});
 }
 
+export async function forceQuit(): Promise<void> {
+  return invoke("force_quit", {});
+}
+
 export async function planCut(): Promise<PlanCutResponse> {
   return invoke("plan_cut", {});
 }

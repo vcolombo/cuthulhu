@@ -226,10 +226,12 @@ fn resolve_pass_completion(
         return Ok(PassCompletion::NeedsConfirm);
     }
     let deadline = Instant::now() + Duration::from_secs(60);
+    let interval = Duration::from_millis(250);
     loop {
+        let iter_start = Instant::now();
         write_all(transport, &[0x05]).map_err(DeviceError::from)?; // ENQ status query
         let mut buf = [0u8; 8];
-        match transport.read(&mut buf, Duration::from_millis(250)) {
+        match transport.read(&mut buf, interval) {
             Ok(n) if n > 0 && buf[0] == b'0' => return Ok(PassCompletion::Ready),
             Ok(_) => {} // not-ready reply (e.g. still moving); keep polling
             Err(TransportError::Timeout) => {} // no reply within the interval; keep polling
@@ -238,6 +240,9 @@ fn resolve_pass_completion(
         if Instant::now() >= deadline {
             return Err(DeviceError::Timeout);
         }
+        // Pace to the full interval even when the device replies promptly
+        // (e.g. "not ready") instead of timing out the read.
+        thread::sleep(interval.saturating_sub(iter_start.elapsed()));
     }
 }
 

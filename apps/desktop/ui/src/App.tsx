@@ -124,6 +124,10 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Canvas2DRenderer | null>(null);
   const dragStart = useRef<Pt | null>(null);
+  // Ids being dragged, captured at mousedown. Reading `selected` in the move/up handlers
+  // would depend on React having flushed the mousedown's setSelected before the next
+  // event — true today, but fragile. The ref pins the gesture's selection explicitly.
+  const dragIds = useRef<number[]>([]);
 
   const [doc, setDoc] = useState<DocSnapshot | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
@@ -214,20 +218,21 @@ export function App() {
   const onCanvasMouseDown = (e: MouseEvent<HTMLCanvasElement>) => {
     const p = canvasPos(e);
     const hit = hitTest(scene, p.x, p.y);
-    if (e.shiftKey && hit !== null) {
-      setSelected((prev) => toggleId(prev, hit));
-    } else {
-      setSelected(hit === null ? [] : [hit]);
-    }
-    dragStart.current = hit === null ? null : p;
+    const next =
+      e.shiftKey && hit !== null ? toggleId(selected, hit) : hit === null ? [] : [hit];
+    setSelected(next);
+    dragIds.current = next;
+    // Only start a drag when the hit node is part of the new selection — a
+    // shift-click that toggles a node OUT shouldn't begin dragging the rest.
+    dragStart.current = hit !== null && next.includes(hit) ? p : null;
   };
 
   const onCanvasMouseMove = (e: MouseEvent<HTMLCanvasElement>) => {
     const r = rendererRef.current;
     if (!dragStart.current || !r) return;
     const m = dragMatrix(dragStart.current, canvasPos(e));
-    r.setScene(applyOptimistic(scene, selected, m));
-    r.setSelection(selected);
+    r.setScene(applyOptimistic(scene, dragIds.current, m));
+    r.setSelection(dragIds.current);
     r.draw();
   };
 
@@ -242,9 +247,11 @@ export function App() {
       const rect = canvasRef.current.getBoundingClientRect();
       const m = dragMatrix(start, { x: clientX - rect.left, y: clientY - rect.top });
       if (m[4] === 0 && m[5] === 0) return; // click, not a drag
-      run(() => ipc.commitTransform({ ids: selected, m }));
+      const ids = dragIds.current;
+      if (ids.length === 0) return;
+      run(() => ipc.commitTransform({ ids, m }));
     },
-    [run, selected],
+    [run],
   );
 
   const onCanvasMouseUp = (e: MouseEvent<HTMLCanvasElement>) => finishDrag(e.clientX, e.clientY);

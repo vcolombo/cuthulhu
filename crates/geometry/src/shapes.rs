@@ -44,7 +44,8 @@ mod tests {
     fn ellipse_path_bounds_approximate_the_radii() {
         let p = ellipse_path(0.0, 0.0, 10.0, 5.0);
         let b = p.bounds();
-        // cubic-arc flattening stays within the true ellipse, so bounds are close but not exact.
+        // kappa cubic approximation can deviate slightly either side of the true ellipse,
+        // so bounds are close but not exact.
         assert!((b.x - -10.0).abs() < 0.05, "x={}", b.x);
         assert!((b.y - -5.0).abs() < 0.05, "y={}", b.y);
         assert!((b.w - 20.0).abs() < 0.05, "w={}", b.w);

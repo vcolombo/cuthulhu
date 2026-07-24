@@ -47,3 +47,17 @@ mod tests {
         assert_eq!(back, doc);
     }
 }
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+    #[test]
+    fn save_twice_to_same_path_overwrites() {
+        let doc = document::Document::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proj.cut");
+        save_project(&path, &doc).unwrap();
+        save_project(&path, &doc).unwrap(); // second save must overwrite, not error
+        assert!(load_project(&path).is_ok());
+    }
+}

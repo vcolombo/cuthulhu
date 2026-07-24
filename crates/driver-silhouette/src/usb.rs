@@ -38,7 +38,10 @@ impl Transport for UsbTransport {
         let xfer = self.iface.bulk_in(EP_IN, req_buf);
 
         // ponytail: nusb bulk_in has no timeout; spawn thread + channel to enforce it.
-        // Thread exits with transfer result or dies at timeout, caller recv_timeout maps timeout.
+        // On a genuine timeout (device hung but enumerated) the thread stays blocked in
+        // block_on forever and leaks — one thread + one live transfer handle per timed-out
+        // read. Acceptable for low-frequency status polling; upgrade path is nusb's Queue
+        // interface with real cancellation if tight-loop reads ever need this.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let completion = futures_lite::future::block_on(xfer);

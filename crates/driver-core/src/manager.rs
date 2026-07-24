@@ -3,10 +3,13 @@
 //! command channel serializes access. `cut` drives a job through session
 //! framing (`session_begin` once, per-pass `encode_pass`/`pass_park`,
 //! `session_end` once) and a per-pass completion policy; `resume` and
-//! `confirm_pass_done` continue a job parked mid-flight. `cancel` is still a
-//! no-op lifecycle stub here — completed by Task 8.
+//! `confirm_pass_done` continue a job parked mid-flight. `cancel` is
+//! cooperative/best-effort: a shared flag the worker checks between transmit
+//! chunks and ENQ polls (for a busy worker), plus a queued `Command::Cancel`
+//! for a worker parked at `recv()` — see `DeviceManager::cancel`.
 
 use crate::{write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -75,14 +78,17 @@ enum Command {
 pub struct DeviceManager {
     cmd_tx: mpsc::SyncSender<Command>,
     handle: thread::JoinHandle<()>,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl DeviceManager {
     pub fn spawn(factory: Arc<dyn DeviceBackendFactory>) -> (DeviceManager, mpsc::Receiver<DeviceEvent>) {
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(16);
         let (event_tx, event_rx) = mpsc::channel::<DeviceEvent>();
-        let handle = thread::spawn(move || worker_loop(cmd_rx, event_tx, factory));
-        (DeviceManager { cmd_tx, handle }, event_rx)
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let worker_flag = cancel_flag.clone();
+        let handle = thread::spawn(move || worker_loop(cmd_rx, event_tx, factory, worker_flag));
+        (DeviceManager { cmd_tx, handle, cancel_flag }, event_rx)
     }
 
     /// Send a command built from a fresh reply channel and wait for the reply.
@@ -113,11 +119,17 @@ impl DeviceManager {
         self.call(|reply| Command::Cut { passes, reply })?
     }
 
-    /// Stub: real cancellation lands in Task 8 (a cancel-flag `AtomicBool`
-    /// the worker checks between blocking writes). Fire-and-forget: `try_send`
-    /// so a full command queue (worker busy writing) can't block the caller —
-    /// Task 8's flag is how a busy worker actually observes the cancel.
+    /// Cooperative, best-effort cancellation: sets a shared flag the worker
+    /// checks between transmit chunks and ENQ-poll iterations (the only way to
+    /// interrupt a *busy* worker, since it can't see a queued command until it
+    /// returns to `cmd_rx.recv()`), and also queues `Command::Cancel` via
+    /// `try_send` for a worker already *parked* in `WaitingForColorSwap`/
+    /// `AwaitingCompletion`. Emits `CancelRequested -> Stopping -> Cancelled
+    /// { completion_known } -> Idle`; `completion_known` is only `true` when an
+    /// ENQ poll actually confirmed the device is ready (never for
+    /// `needs_operator_pass_confirm` machines). A no-op when no job is active.
     pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.try_send(Command::Cancel);
     }
 
@@ -139,6 +151,8 @@ impl DeviceManager {
         // worker is wedged (e.g. blocked in a transport write, Task 7) and
         // the queue is full. Skip the send in that case rather than block —
         // dropping cmd_tx below still wakes a worker parked in cmd_rx.recv().
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.try_send(Command::Cancel); // best-effort: unpark a job parked at recv() so it cancels cleanly
         let _ = self.cmd_tx.try_send(Command::Shutdown);
         drop(self.cmd_tx);
         let (done_tx, done_rx) = mpsc::channel();
@@ -178,6 +192,7 @@ struct JobProgress {
 enum PassCompletion {
     Ready,
     NeedsConfirm,
+    Cancelled,
 }
 
 enum PassRunOutcome {
@@ -187,12 +202,20 @@ enum PassRunOutcome {
     AwaitingConfirm { pass_index: usize },
     /// Job finished; worker is `Idle`.
     Done,
+    /// Cancelled mid-pass, either mid-transmit or mid completion-poll.
+    Cancelled { pass_index: usize, submitted_bytes: usize },
+}
+
+enum TransmitOutcome {
+    Completed,
+    Cancelled { submitted_bytes: usize },
 }
 
 const WRITE_CHUNK: usize = 4096;
 
 /// Write `bytes` in `WRITE_CHUNK`-sized pieces, updating `Transmitting` state
-/// and emitting a `Progress` event after each chunk actually lands.
+/// and emitting a `Progress` event after each chunk actually lands. Checks
+/// `cancel_flag` before each chunk so a cancel mid-transmit stops promptly.
 fn transmit_bytes(
     transport: &mut dyn Transport,
     bytes: &[u8],
@@ -200,10 +223,14 @@ fn transmit_bytes(
     pass_index: usize,
     state: &mut DeviceState,
     events: &mpsc::Sender<DeviceEvent>,
-) -> Result<(), DeviceError> {
+    cancel_flag: &AtomicBool,
+) -> Result<TransmitOutcome, DeviceError> {
     let total_bytes = bytes.len();
     let mut submitted_bytes = 0usize;
     for chunk in bytes.chunks(WRITE_CHUNK) {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Ok(TransmitOutcome::Cancelled { submitted_bytes });
+        }
         write_all(transport, chunk).map_err(DeviceError::from)?;
         submitted_bytes += chunk.len();
         *state = DeviceState::Transmitting { job_id, pass_index, submitted_bytes, total_bytes };
@@ -212,15 +239,17 @@ fn transmit_bytes(
             kind: DeviceEventKind::Progress { pass_index, submitted_bytes, total_bytes },
         });
     }
-    Ok(())
+    Ok(TransmitOutcome::Completed)
 }
 
 /// Completion policy per brief/protocol doc: machines that can report status
 /// get polled (`ENQ` + read, 250ms interval, 60s cap); machines that can't
 /// (`needs_operator_pass_confirm`) wait for an explicit `confirm_pass_done`.
+/// Checks `cancel_flag` at the top of each poll iteration.
 fn resolve_pass_completion(
     driver: &(dyn Driver + Send),
     transport: &mut dyn Transport,
+    cancel_flag: &AtomicBool,
 ) -> Result<PassCompletion, DeviceError> {
     if driver.caps().needs_operator_pass_confirm {
         return Ok(PassCompletion::NeedsConfirm);
@@ -228,6 +257,9 @@ fn resolve_pass_completion(
     let deadline = Instant::now() + Duration::from_secs(60);
     let interval = Duration::from_millis(250);
     loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Ok(PassCompletion::Cancelled);
+        }
         let iter_start = Instant::now();
         write_all(transport, &[0x05]).map_err(DeviceError::from)?; // ENQ status query
         let mut buf = [0u8; 8];
@@ -281,20 +313,77 @@ fn run_from_pass(
     transport: &mut dyn Transport,
     state: &mut DeviceState,
     events: &mpsc::Sender<DeviceEvent>,
+    cancel_flag: &AtomicBool,
 ) -> Result<PassRunOutcome, DeviceError> {
     let mut bytes = if pass_index == 0 { driver.session_begin() } else { Vec::new() };
     let pass_bytes = driver
         .encode_pass(&passes[pass_index].job)
         .map_err(|e| DeviceError::Io(format!("{e:?}")))?;
     bytes.extend(pass_bytes);
-    transmit_bytes(transport, &bytes, job_id, pass_index, state, events)?;
-    match resolve_pass_completion(driver, transport)? {
+    match transmit_bytes(transport, &bytes, job_id, pass_index, state, events, cancel_flag)? {
+        TransmitOutcome::Cancelled { submitted_bytes } => {
+            return Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes });
+        }
+        TransmitOutcome::Completed => {}
+    }
+    match resolve_pass_completion(driver, transport, cancel_flag)? {
+        PassCompletion::Cancelled => Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes: bytes.len() }),
         PassCompletion::NeedsConfirm => {
             emit_for(job_id, state, DeviceState::AwaitingCompletion { job_id, pass_index }, events);
             Ok(PassRunOutcome::AwaitingConfirm { pass_index })
         }
         PassCompletion::Ready => finish_pass(job_id, pass_index, passes.len(), driver, transport, state, events),
     }
+}
+
+/// Run once cancellation has been observed (either the worker noticed the
+/// flag mid-transmit/mid-poll, or a `Command::Cancel` arrived while parked):
+/// emit `CancelRequested` and `Stopping`, best-effort abort the device
+/// (`abort_bytes`, failure here doesn't block cancellation), resolve whether
+/// the device's readiness is actually known, emit `Cancelled` then `Idle`.
+fn perform_cancel(
+    job_id: u64,
+    pass_index: usize,
+    submitted_bytes: usize,
+    driver: &(dyn Driver + Send),
+    transport: &mut dyn Transport,
+    state: &mut DeviceState,
+    events: &mpsc::Sender<DeviceEvent>,
+    cancel_flag: &AtomicBool,
+) {
+    emit_for(job_id, state, DeviceState::CancelRequested { job_id }, events);
+    emit_for(job_id, state, DeviceState::Stopping { job_id }, events);
+    if let Some(abort) = driver.abort_bytes() {
+        let _ = write_all(transport, &abort); // best-effort: failure here doesn't block cancellation
+    }
+    let completion_known = cancel_completion_known(driver, transport);
+    emit_for(job_id, state, DeviceState::Cancelled { job_id, pass_index, submitted_bytes, completion_known }, events);
+    emit_for(job_id, state, DeviceState::Idle, events);
+    cancel_flag.store(false, Ordering::SeqCst); // consumed: don't poison the next job
+}
+
+/// After a cancel, best-effort check whether the device is actually ready
+/// (confirmed via a short bounded ENQ poll, distinct from the full 60s
+/// pass-completion budget) — never true for `needs_operator_pass_confirm`
+/// machines, which can't be polled at all.
+fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Transport) -> bool {
+    if driver.caps().needs_operator_pass_confirm {
+        return false;
+    }
+    const ATTEMPTS: u8 = 3;
+    let interval = Duration::from_millis(250);
+    for _ in 0..ATTEMPTS {
+        if write_all(transport, &[0x05]).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 8];
+        if let Ok(n) = transport.read(&mut buf, interval) {
+            if n > 0 && buf[0] == b'0' {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// A pass/job failed: report `Failed` + transition to `Error`, returning the
@@ -305,7 +394,12 @@ fn fail(job_id: u64, e: DeviceError, state: &mut DeviceState, events: &mpsc::Sen
     e
 }
 
-fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent>, factory: Arc<dyn DeviceBackendFactory>) {
+fn worker_loop(
+    cmd_rx: mpsc::Receiver<Command>,
+    events: mpsc::Sender<DeviceEvent>,
+    factory: Arc<dyn DeviceBackendFactory>,
+    cancel_flag: Arc<AtomicBool>,
+) {
     let mut state = DeviceState::Disconnected;
     let mut transport: Option<Box<dyn Transport>> = None;
     let mut driver: Option<Box<dyn Driver + Send>> = None;
@@ -362,10 +456,11 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                 }
                 let job_id = next_job_id;
                 next_job_id += 1;
+                cancel_flag.store(false, Ordering::SeqCst); // fresh job: clear any stale cancel from a prior one
                 // Idle implies a successful prior connect, so both are Some.
                 let drv = driver.as_deref().expect("driver present while Idle");
                 let tr = transport.as_deref_mut().expect("transport present while Idle");
-                match run_from_pass(job_id, 0, &passes, drv, tr, &mut state, &events) {
+                match run_from_pass(job_id, 0, &passes, drv, tr, &mut state, &events, &cancel_flag) {
                     Ok(PassRunOutcome::Paused { next_pass_index }) => {
                         active_job = Some(JobProgress { job_id, passes, pass_index: next_pass_index });
                         let _ = reply.send(Ok(job_id));
@@ -377,19 +472,35 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                     Ok(PassRunOutcome::Done) => {
                         let _ = reply.send(Ok(job_id));
                     }
+                    Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes }) => {
+                        perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
+                        let _ = reply.send(Ok(job_id));
+                    }
                     Err(e) => {
                         let e = fail(job_id, e, &mut state, &events);
                         let _ = reply.send(Err(e));
                     }
                 }
             }
-            Command::Cancel => {} // Task 8
+            Command::Cancel => {
+                if let Some(job) = active_job.take() {
+                    let JobProgress { job_id, pass_index, .. } = job;
+                    let drv = driver.as_deref().expect("driver present while job active");
+                    let tr = transport.as_deref_mut().expect("transport present while job active");
+                    // ponytail: submitted_bytes unknown for a job parked mid-pause (no
+                    // transmit in flight here); 0 is a best-effort placeholder — a real
+                    // byte counter threaded through JobProgress would be needed for a
+                    // precise figure, add if callers start relying on this number.
+                    perform_cancel(job_id, pass_index, 0, drv, tr, &mut state, &events, &cancel_flag);
+                }
+                // else: nothing active, safe no-op.
+            }
             Command::Resume { reply } => match (&state, active_job.take()) {
                 (DeviceState::WaitingForColorSwap { .. }, Some(job)) => {
                     let JobProgress { job_id, passes, pass_index } = job;
                     let drv = driver.as_deref().expect("driver present while job active");
                     let tr = transport.as_deref_mut().expect("transport present while job active");
-                    match run_from_pass(job_id, pass_index, &passes, drv, tr, &mut state, &events) {
+                    match run_from_pass(job_id, pass_index, &passes, drv, tr, &mut state, &events, &cancel_flag) {
                         Ok(PassRunOutcome::Paused { next_pass_index }) => {
                             active_job = Some(JobProgress { job_id, passes, pass_index: next_pass_index });
                             let _ = reply.send(Ok(()));
@@ -399,6 +510,10 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                             let _ = reply.send(Ok(()));
                         }
                         Ok(PassRunOutcome::Done) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes }) => {
+                            perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -430,6 +545,7 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Command>, events: mpsc::Sender<DeviceEvent
                             let _ = reply.send(Ok(()));
                         }
                         Ok(PassRunOutcome::AwaitingConfirm { .. }) => unreachable!("finish_pass never re-parks for confirmation"),
+                        Ok(PassRunOutcome::Cancelled { .. }) => unreachable!("finish_pass never cancels"),
                         Err(e) => {
                             let e = fail(job_id, e, &mut state, &events);
                             let _ = reply.send(Err(e));
@@ -452,19 +568,35 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    struct FakeDriver { profile: MachineProfile, caps: MachineCaps }
+    struct FakeDriver {
+        profile: MachineProfile,
+        caps: MachineCaps,
+        abort: Option<Vec<u8>>,
+        payload_len: usize,
+        park_bytes: Vec<u8>,
+    }
     impl Driver for FakeDriver {
         fn profile(&self) -> &MachineProfile { &self.profile }
         fn caps(&self) -> MachineCaps { self.caps }
         fn session_begin(&self) -> Vec<u8> { vec![0x1b, 0x04] }
-        fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> { Ok(Vec::new()) }
-        fn pass_park(&self) -> Vec<u8> { Vec::new() }
+        fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> { Ok(vec![0xAA; self.payload_len]) }
+        fn pass_park(&self) -> Vec<u8> { self.park_bytes.clone() }
         fn session_end(&self) -> Vec<u8> { b"SO0".to_vec() }
-        fn abort_bytes(&self) -> Option<Vec<u8>> { None }
+        fn abort_bytes(&self) -> Option<Vec<u8>> { self.abort.clone() }
     }
 
     fn fake_driver_with_caps(profile: MachineProfile, caps: MachineCaps) -> Box<dyn Driver + Send> {
-        Box::new(FakeDriver { profile, caps })
+        fake_driver_custom(profile, caps, None, 0, Vec::new())
+    }
+
+    fn fake_driver_custom(
+        profile: MachineProfile,
+        caps: MachineCaps,
+        abort: Option<Vec<u8>>,
+        payload_len: usize,
+        park_bytes: Vec<u8>,
+    ) -> Box<dyn Driver + Send> {
+        Box::new(FakeDriver { profile, caps, abort, payload_len, park_bytes })
     }
 
     fn fake_driver() -> Box<dyn Driver + Send> {
@@ -729,5 +861,262 @@ mod tests {
         assert!(evs.iter().any(|e| e.job_id == job1 && matches!(e.kind, DeviceEventKind::JobComplete)));
         assert!(evs.iter().any(|e| e.job_id == job2 && matches!(e.kind, DeviceEventKind::JobComplete)));
         mgr.shutdown();
+    }
+
+    // --- cancel + failure-path test support -------------------------------
+
+    /// Blocks the worker inside `write()` exactly once (on the `block_on`th
+    /// call, 1-indexed) so a test can deterministically catch it "mid-transmit"
+    /// before releasing it — avoids sleep-based timing races.
+    struct GateTransport {
+        inner: MockTransport,
+        mirror: Arc<Mutex<Vec<u8>>>,
+        call_index: usize,
+        block_on: usize,
+        sync: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+    impl Transport for GateTransport {
+        fn write(&mut self, b: &[u8]) -> Result<usize, TransportError> {
+            self.call_index += 1;
+            if self.call_index == self.block_on {
+                if let Some((ready, proceed)) = self.sync.take() {
+                    let _ = ready.send(());
+                    let _ = proceed.recv();
+                }
+            }
+            let n = self.inner.write(b)?;
+            self.mirror.lock().unwrap().extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
+            self.inner.read(buf, timeout)
+        }
+    }
+
+    /// Driver + a queue of pre-scripted transports (one per `open_transport`
+    /// call) — covers every cut-flow test below, including scenarios needing
+    /// a fresh transport after a prior one failed.
+    struct ScriptedFactory {
+        info: DeviceInfo,
+        profile: MachineProfile,
+        caps: MachineCaps,
+        abort: Option<Vec<u8>>,
+        payload_len: usize,
+        park_bytes: Vec<u8>,
+        transports: Mutex<VecDeque<Box<dyn Transport>>>,
+    }
+    impl DeviceBackendFactory for ScriptedFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> { vec![self.info.clone()] }
+        fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            Some(fake_driver_custom(self.profile.clone(), self.caps, self.abort.clone(), self.payload_len, self.park_bytes.clone()))
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            self.transports.lock().unwrap().pop_front().ok_or(TransportError::NotFound)
+        }
+    }
+
+    /// Cuts a large single-pass job on a `GateTransport` gated at the second
+    /// chunk write, releases it after calling `cancel()` mid-transmit, then
+    /// asserts: no further payload bytes land, exactly one `abort_bytes` write
+    /// went out, and the final `Cancelled` event carries `expect_completion_known`.
+    fn assert_cancel_mid_transmit(caps: MachineCaps, ready_reads: Vec<Result<Vec<u8>, TransportError>>, expect_completion_known: bool) {
+        let mirror = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let inner = MockTransport { reads: ready_reads.into(), ..Default::default() };
+        let gate = GateTransport { inner, mirror: mirror.clone(), call_index: 0, block_on: 2, sync: Some((ready_tx, proceed_rx)) };
+        let factory = ScriptedFactory {
+            info: cameo_info(),
+            profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
+            caps,
+            abort: Some(b"PU;".to_vec()),
+            payload_len: WRITE_CHUNK * 3,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![Box::new(gate) as Box<dyn Transport>])),
+        };
+        let (mgr, events) = DeviceManager::spawn(Arc::new(factory));
+        mgr.connect(cameo_info()).unwrap();
+        drain(&events);
+
+        thread::scope(|scope| {
+            let cut_thread = scope.spawn(|| mgr.cut(one_pass_job()).unwrap());
+            ready_rx.recv().unwrap(); // worker is blocked mid-write on chunk 2
+            mgr.cancel();
+            proceed_tx.send(()).unwrap();
+            let job_id = cut_thread.join().unwrap();
+
+            wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+            let evs = drain(&events);
+            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
+            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
+            let cancelled = evs.iter().find_map(|e| match &e.kind {
+                DeviceEventKind::StateChanged(DeviceState::Cancelled { completion_known, .. }) if e.job_id == job_id => Some(*completion_known),
+                _ => None,
+            });
+            assert_eq!(cancelled, Some(expect_completion_known));
+        });
+
+        let written = mirror.lock().unwrap();
+        // Chunk 1 carries the 2-byte session_begin header plus payload, so the
+        // exact 0xAA count after 2 full chunks land is 2 * WRITE_CHUNK - 2.
+        assert_eq!(written.iter().filter(|&&b| b == 0xAA).count(), 2 * WRITE_CHUNK - 2);
+        assert_eq!(count_subseq(&written, b"PU;"), 1, "abort bytes written exactly once");
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn cancel_mid_transmit_stops_writes_sends_abort_and_confirms_stop() {
+        let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
+        assert_cancel_mid_transmit(cameo_caps, vec![Ok(b"0\x03".to_vec())], true);
+
+        let puma_caps = MachineCaps { supports_speed: false, supports_force: false, needs_operator_pass_confirm: true };
+        assert_cancel_mid_transmit(puma_caps, Vec::new(), false);
+    }
+
+    #[test]
+    fn transport_write_error_mid_job_fails_loudly() {
+        let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
+        let write_results = VecDeque::from(vec![Ok(WRITE_CHUNK), Ok(WRITE_CHUNK), Err(TransportError::Io("cable pulled".into()))]);
+        let inner = MockTransport { write_results, ..Default::default() };
+        let factory = ScriptedFactory {
+            info: cameo_info(),
+            profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
+            caps: cameo_caps,
+            abort: None,
+            payload_len: WRITE_CHUNK * 3,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![Box::new(inner) as Box<dyn Transport>])),
+        };
+        let (mgr, events) = DeviceManager::spawn(Arc::new(factory));
+        mgr.connect(cameo_info()).unwrap();
+        drain(&events);
+
+        let err = mgr.cut(one_pass_job()).unwrap_err();
+        assert_eq!(err, DeviceError::Io("cable pulled".into()));
+        assert!(matches!(mgr.snapshot(), DeviceState::Error(DeviceError::Io(_))));
+
+        let evs = drain(&events);
+        assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
+        assert!(!evs.iter().any(|e| matches!(e.kind, DeviceEventKind::JobComplete)));
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn write_zero_maps_to_typed_error() {
+        let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
+        let write_results = VecDeque::from(vec![Ok(0)]);
+        let inner = MockTransport { write_results, ..Default::default() };
+        let factory = ScriptedFactory {
+            info: cameo_info(),
+            profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
+            caps: cameo_caps,
+            abort: None,
+            payload_len: 0,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![Box::new(inner) as Box<dyn Transport>])),
+        };
+        let (mgr, events) = DeviceManager::spawn(Arc::new(factory));
+        mgr.connect(cameo_info()).unwrap();
+        drain(&events);
+
+        let err = mgr.cut(one_pass_job()).unwrap_err();
+        assert_eq!(err, DeviceError::WriteZero);
+
+        let evs = drain(&events);
+        assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::WriteZero))));
+        mgr.shutdown();
+    }
+
+    /// Runs `drive` against a `ScriptedFactory` built from the given script,
+    /// asserts it fails with `expect`, that the manager lands in `Error`, and
+    /// that `shutdown` still joins cleanly (proving the worker isn't wedged).
+    fn assert_unplug_surfaces_typed_error(
+        caps: MachineCaps,
+        write_results: VecDeque<Result<usize, TransportError>>,
+        reads: VecDeque<Result<Vec<u8>, TransportError>>,
+        payload_len: usize,
+        drive: impl FnOnce(&DeviceManager) -> Result<(), DeviceError>,
+        expect: DeviceError,
+    ) {
+        let inner = MockTransport { write_results, reads, ..Default::default() };
+        let factory = ScriptedFactory {
+            info: cameo_info(),
+            profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
+            caps,
+            abort: None,
+            payload_len,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![Box::new(inner) as Box<dyn Transport>])),
+        };
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(factory));
+        mgr.connect(cameo_info()).unwrap();
+
+        let err = drive(&mgr).unwrap_err();
+        assert_eq!(err, expect);
+        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn unplug_during_each_active_state_reports_disconnected() {
+        let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
+        let puma_caps = MachineCaps { supports_speed: false, supports_force: false, needs_operator_pass_confirm: true };
+
+        // Transmitting: the very first write (session_begin) fails.
+        assert_unplug_surfaces_typed_error(
+            cameo_caps,
+            VecDeque::from(vec![Err(TransportError::NotFound)]),
+            VecDeque::new(),
+            0,
+            |mgr| mgr.cut(one_pass_job()).map(|_| ()),
+            DeviceError::Disconnected,
+        );
+
+        // AwaitingCompletion: session_begin + pass bytes land, then confirm_pass_done's
+        // session_end write fails.
+        assert_unplug_surfaces_typed_error(
+            puma_caps,
+            VecDeque::from(vec![Ok(3), Err(TransportError::Io("cable pulled".into()))]),
+            VecDeque::new(),
+            1,
+            |mgr| {
+                mgr.cut(one_pass_job())?;
+                mgr.confirm_pass_done()
+            },
+            DeviceError::Io("cable pulled".into()),
+        );
+
+        // WaitingForColorSwap: pass 1 completes and parks (empty pass_park is a
+        // no-op write), then resume's pass-2 transmit fails.
+        assert_unplug_surfaces_typed_error(
+            cameo_caps,
+            VecDeque::from(vec![Ok(3), Ok(1), Err(TransportError::NotFound)]),
+            VecDeque::from(vec![Ok(b"0\x03".to_vec())]),
+            1,
+            |mgr| {
+                mgr.cut(two_pass_job())?;
+                mgr.resume()
+            },
+            DeviceError::Disconnected,
+        );
+    }
+
+    #[test]
+    fn shutdown_mid_job_cancels_and_joins() {
+        let (factory, _written) = factory_with_ready_reads(1);
+        let (mgr, events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+        let job_id = mgr.cut(two_pass_job()).unwrap();
+        wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        drain(&events);
+
+        let start = std::time::Instant::now();
+        mgr.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(2), "shutdown should cancel and join promptly");
+
+        let evs = drain(&events);
+        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
+        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Cancelled { .. }))));
+        assert!(evs.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Idle))));
     }
 }

@@ -43,6 +43,12 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
     setPreview(null);
     if (final !== value) onChange(final);
   };
+  // A canceled pointer (OS gesture, window blur, lost capture) abandons the scrub:
+  // discard the preview without committing, so no stuck drag state lingers.
+  const onPointerCancel = () => {
+    drag.current = null;
+    setPreview(null);
+  };
 
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted)" }}>
@@ -50,6 +56,8 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+        onLostPointerCapture={onPointerCancel}
         style={{ cursor: disabled ? "default" : "ew-resize", userSelect: "none", width: 12 }}
       >
         {label}

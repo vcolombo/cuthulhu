@@ -3,6 +3,8 @@ use geometry::Polyline;
 use std::collections::VecDeque;
 use std::time::Duration;
 
+pub mod manager;
+
 pub struct Job { pub polylines: Vec<Polyline>, pub settings: Settings }
 
 #[derive(Clone, Debug, PartialEq)]

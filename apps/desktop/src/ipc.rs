@@ -93,12 +93,13 @@ pub fn list_devices(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<Device
     Ok(dev.list_devices())
 }
 
-#[tauri::command]
+// async: worker may be busy mid-transmit, and USB open has real latency.
+#[tauri::command(async)]
 pub fn connect_device(dev: tauri::State<DeviceManagerHandle>, info: DeviceInfo) -> Result<(), IpcError> {
     dev.connect(info)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
     dev.disconnect()
 }

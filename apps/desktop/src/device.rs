@@ -131,10 +131,23 @@ impl DeviceManagerHandle {
     }
 
     /// Called by the event bridge thread for every event it forwards; updates
-    /// the cache on `StateChanged`, ignored for every other event kind.
+    /// the cache on `StateChanged`. Also synthesizes `Transmitting` from
+    /// `Progress` — the worker sets `Transmitting` directly and only emits
+    /// `Progress` ticks while it holds, so without this arm the cache never
+    /// observes an in-flight transmit and `is_active` stays stuck. Every
+    /// other event kind is ignored.
     pub fn record_state(&self, event: &DeviceEvent) {
-        if let DeviceEventKind::StateChanged(s) = &event.kind {
-            *self.state_cache.lock().unwrap() = s.clone();
+        match &event.kind {
+            DeviceEventKind::StateChanged(s) => *self.state_cache.lock().unwrap() = s.clone(),
+            DeviceEventKind::Progress { pass_index, submitted_bytes, total_bytes } => {
+                *self.state_cache.lock().unwrap() = DeviceState::Transmitting {
+                    job_id: event.job_id,
+                    pass_index: *pass_index,
+                    submitted_bytes: *submitted_bytes,
+                    total_bytes: *total_bytes,
+                };
+            }
+            _ => {}
         }
     }
 
@@ -440,5 +453,17 @@ mod tests {
         request.passes[0].color = Some(0xDEADBEEF); // doesn't match any planned pass
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "unknown_pass_color");
+    }
+
+    #[test]
+    fn progress_event_marks_cache_transmitting() {
+        let dev = test_device_setup();
+        assert!(!is_active(&dev.cached_state()));
+        let event = DeviceEvent {
+            job_id: 1,
+            kind: DeviceEventKind::Progress { pass_index: 0, submitted_bytes: 10, total_bytes: 100 },
+        };
+        dev.record_state(&event);
+        assert!(is_active(&dev.cached_state()));
     }
 }

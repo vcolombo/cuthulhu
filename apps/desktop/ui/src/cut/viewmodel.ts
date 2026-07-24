@@ -140,6 +140,39 @@ export function acceptEvent(
 }
 
 /**
+ * What a device event means for the current job's lifecycle: whether it latches a
+ * completion/failure banner outcome, and whether it ends the job — releasing the
+ * job-id event filter (acceptEvent). The filter must be released the moment the
+ * job is over, or NO_JOB=0 lifecycle events (e.g. a reconnect after a failed
+ * resume) stay filtered for the rest of the session. The banner outcome is
+ * latched as separate state precisely so it can outlive that release.
+ *
+ * Cancelled arrives as a resting *state* (StateChanged), not a terminal event
+ * kind, so it releases the filter without latching an outcome — the Cancelled
+ * state itself is what the dialog displays.
+ */
+export function terminalTransition(
+  currentJobId: number | null,
+  ev: { job_id: number; kind: unknown }
+): { outcome: "complete" | "failed" | null; releaseJob: boolean } {
+  if (currentJobId === null || ev.job_id !== currentJobId) {
+    return { outcome: null, releaseJob: false };
+  }
+  const k = ev.kind;
+  if (k === "JobComplete") return { outcome: "complete", releaseJob: true };
+  if (typeof k === "object" && k !== null && "Failed" in k) {
+    return { outcome: "failed", releaseJob: true };
+  }
+  if (typeof k === "object" && k !== null && "StateChanged" in k) {
+    const s = (k as { StateChanged: unknown }).StateChanged;
+    if (typeof s === "object" && s !== null && "Cancelled" in s) {
+      return { outcome: null, releaseJob: true };
+    }
+  }
+  return { outcome: null, releaseJob: false };
+}
+
+/**
  * Convert PassVm[] to CutRequest for transmission to Rust backend.
  * Maps camelCase PassVm to snake_case ConfiguredPassDto fields.
  *

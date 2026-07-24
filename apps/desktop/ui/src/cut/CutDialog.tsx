@@ -33,8 +33,8 @@ type Props = {
   artboard: { x: number; y: number; w: number; h: number };
   docMachineId: string | null;
   deviceState: ipc.DeviceState;
-  lastEvent: ipc.DeviceEvent | null;
-  jobId: number | null;
+  cutOutcome: "complete" | "failed" | null;
+  clearCutOutcome: () => void;
   setJobId: (id: number | null) => void;
   refreshDeviceState: () => void;
   onConvertMachine: (machineId: string) => void;
@@ -78,8 +78,8 @@ export function CutDialog({
   artboard,
   docMachineId,
   deviceState,
-  lastEvent,
-  jobId,
+  cutOutcome,
+  clearCutOutcome,
   setJobId,
   refreshDeviceState,
   onConvertMachine,
@@ -102,10 +102,11 @@ export function CutDialog({
     // is still connected — seed it from the manager's own cache so Start Cut isn't
     // stuck disabled.
     ipc.getConnectedDevice().then(setConnected).catch((e) => onError(ipc.ipcErrorMessage(e)));
-    // A stale jobId from a previous dialog session (or a previous cut that finished
-    // while this dialog was closed) must not make a leftover Idle/Cancelled state
-    // read as "just completed" on reopen — see justCompleted below.
+    // A stale jobId or latched outcome from a previous dialog session must not
+    // leak into this one: reopening the dialog starts fresh, so a prior cut's
+    // "Job complete"/"Cut failed" banner doesn't reappear.
     setJobId(null);
+    clearCutOutcome();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -154,23 +155,25 @@ export function CutDialog({
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
   const phase = dialogPhase(deviceState);
   const buttons = dialogButtons(phase);
-  // Idle only reads as "job complete" once a job has actually run in this dialog
-  // session — jobId is reset to null on mount (above) and on every new cut() call
-  // (in startCut below), so a stale prior job's Idle can't read as a fresh
-  // completion, and the banner stays visible until the next cut or dialog close.
-  // ponytail: jobId is NOT reset when a job reaches its terminal event, so NO_JOB=0
-  // lifecycle events (e.g. a reconnect) after a completed job are filtered by
-  // acceptEvent until the dialog is reopened — acceptable; reopening reseeds state.
-  const justCompleted = jobId !== null && phase.kind === "idle";
-  const failed = lastEvent && jobId !== null && lastEvent.job_id === jobId && typeof lastEvent.kind === "object" && "Failed" in lastEvent.kind;
+  // The banner keys off cutOutcome, which App.tsx latches from the job's own
+  // terminal event — decoupled from jobId, which is the *event-filter* id and is
+  // released the moment the job ends (so NO_JOB=0 lifecycle events keep flowing).
+  // Deriving the banner from jobId + an Idle state was wrong twice over: it either
+  // flashed for one render (jobId cleared on completion) or showed "Job complete"
+  // for a *failed* job whose lagging state cache read Idle (jobId retained).
+  // Cleared on mount (above) and on every new cut (startCut below).
+  const justCompleted = cutOutcome === "complete";
+  const failed = cutOutcome === "failed";
 
   const startCut = () => {
     if (!connected || planRevision === null) return;
     // Resets on every new cut() call: without this, a second cut in the same
     // dialog session keeps the finished first job's id around, so acceptEvent
     // (App.tsx) rejects every event the new job emits until it happens to reuse
-    // the old id (it never does — ids are strictly increasing).
+    // the old id (it never does — ids are strictly increasing). The previous
+    // outcome banner also clears — a new cut supersedes it.
     setJobId(null);
+    clearCutOutcome();
     const request = toCutRequest(connected.instance_id, planRevision, rows);
     ipc
       .cut(request)

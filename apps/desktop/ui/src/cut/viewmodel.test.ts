@@ -6,6 +6,7 @@ import {
   effectiveSettings,
   fieldDisabled,
   acceptEvent,
+  terminalTransition,
   toCutRequest,
   dialogPhase,
   canStartCut,
@@ -243,6 +244,64 @@ describe("acceptEvent", () => {
 
   it("rejects stale event with different numbers", () => {
     expect(acceptEvent(10, { job_id: 9 })).toBe(false);
+  });
+});
+
+describe("terminalTransition", () => {
+  it("latches complete and releases the job on the job's own JobComplete", () => {
+    expect(terminalTransition(5, { job_id: 5, kind: "JobComplete" })).toEqual({
+      outcome: "complete",
+      releaseJob: true,
+    });
+  });
+
+  it("latches failed and releases the job on the job's own Failed", () => {
+    expect(terminalTransition(5, { job_id: 5, kind: { Failed: "Timeout" } })).toEqual({
+      outcome: "failed",
+      releaseJob: true,
+    });
+  });
+
+  it("releases the job without an outcome when the state rests on Cancelled", () => {
+    const kind = { StateChanged: { Cancelled: { job_id: 5, pass_index: 0, submitted_bytes: 10, completion_known: true } } };
+    expect(terminalTransition(5, { job_id: 5, kind })).toEqual({
+      outcome: null,
+      releaseJob: true,
+    });
+  });
+
+  it("ignores terminal events from another job", () => {
+    expect(terminalTransition(5, { job_id: 4, kind: "JobComplete" })).toEqual({
+      outcome: null,
+      releaseJob: false,
+    });
+  });
+
+  it("ignores everything when no job is active", () => {
+    expect(terminalTransition(null, { job_id: 0, kind: "JobComplete" })).toEqual({
+      outcome: null,
+      releaseJob: false,
+    });
+  });
+
+  it("does not release on non-terminal events for the current job", () => {
+    expect(terminalTransition(5, { job_id: 5, kind: { Progress: { pass_index: 0, submitted_bytes: 1, total_bytes: 2 } } })).toEqual({
+      outcome: null,
+      releaseJob: false,
+    });
+    expect(terminalTransition(5, { job_id: 5, kind: { StateChanged: "Idle" } })).toEqual({
+      outcome: null,
+      releaseJob: false,
+    });
+  });
+
+  it("releasing the job makes later NO_JOB lifecycle events acceptable again", () => {
+    // The regression this guards: a failed job's id stayed pinned as the event
+    // filter, so a reconnect's NO_JOB=0 lifecycle events were dropped forever.
+    const t = terminalTransition(5, { job_id: 5, kind: { Failed: "Timeout" } });
+    expect(t.releaseJob).toBe(true);
+    const releasedJobId = t.releaseJob ? null : 5;
+    expect(acceptEvent(releasedJobId, { job_id: 0 })).toBe(true);
   });
 });
 

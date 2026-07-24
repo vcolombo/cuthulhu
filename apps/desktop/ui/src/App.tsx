@@ -6,7 +6,7 @@ import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
-import { acceptEvent } from "./cut/viewmodel";
+import { acceptEvent, terminalTransition } from "./cut/viewmodel";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
@@ -151,7 +151,11 @@ export function App() {
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
   const [deviceState, setDeviceState] = useState<ipc.DeviceState>("Disconnected");
-  const [lastEvent, setLastEvent] = useState<ipc.DeviceEvent | null>(null);
+  // Latched terminal outcome of the most recent cut, kept separate from jobId: the
+  // completion/failure banner must outlive the event-filter id, which is released
+  // the moment the job ends (terminalTransition in the listener below) so NO_JOB=0
+  // lifecycle events — e.g. a reconnect after a failed resume — keep flowing.
+  const [cutOutcome, setCutOutcome] = useState<"complete" | "failed" | null>(null);
   const [jobId, setJobId] = useState<number | null>(null);
   const jobIdRef = useRef<number | null>(null);
   useEffect(() => {
@@ -209,10 +213,12 @@ export function App() {
     const unlisten = listen<ipc.DeviceEvent>("device-event", (e) => {
       const ev = e.payload;
       if (!acceptEvent(jobIdRef.current, ev)) return;
-      setLastEvent(ev);
       if (typeof ev.kind === "object" && "StateChanged" in ev.kind) {
         setDeviceState(ev.kind.StateChanged);
       }
+      const t = terminalTransition(jobIdRef.current, ev);
+      if (t.outcome) setCutOutcome(t.outcome);
+      if (t.releaseJob) setJobId(null);
     });
     return () => {
       unlisten.then((f) => f());
@@ -462,8 +468,8 @@ export function App() {
           artboard={doc.artboard}
           docMachineId={doc.machine?.id ?? null}
           deviceState={deviceState}
-          lastEvent={lastEvent}
-          jobId={jobId}
+          cutOutcome={cutOutcome}
+          clearCutOutcome={() => setCutOutcome(null)}
           setJobId={setJobId}
           refreshDeviceState={refreshDeviceState}
           onConvertMachine={(machineId) => run(() => ipc.setMachine({ machineId }))}

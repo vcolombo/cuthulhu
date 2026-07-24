@@ -157,6 +157,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
   let nextJobId = 1;
   let jobId: number | null = null;
   let planPasses: { color: number | null; enabled: boolean }[] = [];
+  let failNextResume = false;
 
   function ipcError(code: string, message: string) {
     return { code, message };
@@ -233,6 +234,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
         deviceState = "Idle";
         emit("JobComplete");
         emit({ StateChanged: "Idle" });
+        // Production releases the job id once the job is over: all later lifecycle
+        // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
+        // mock keeps stamping finished-job ids on lifecycle events production
+        // would never stamp — hiding event-filter bugs from these tests.
+        jobId = null;
       } else {
         const next = enabledIndices[pos + 1];
         deviceState = { WaitingForColorSwap: { job_id: jobId, next_pass_index: next } };
@@ -246,12 +252,19 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
     connect_device: (a) => {
       const info = a.info as DeviceInfo;
       connected = info;
+      // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
+      // emitting them here (instead of silently mutating deviceState) is what lets
+      // these tests catch a frontend that filters lifecycle events out.
+      deviceState = "Connecting";
+      emit({ StateChanged: "Connecting" });
       deviceState = "Idle";
+      emit({ StateChanged: "Idle" });
       return null;
     },
     disconnect_device: () => {
       connected = null;
       deviceState = "Disconnected";
+      emit({ StateChanged: "Disconnected" });
       return null;
     },
     get_device_state: () => deviceState,
@@ -285,14 +298,35 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       const submittedBytes = s.Transmitting?.submitted_bytes ?? 0;
       deviceState = { Cancelled: { job_id: jobId, pass_index: passIndex, submitted_bytes: submittedBytes, completion_known: true } };
       emit({ StateChanged: deviceState });
+      jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
       return null;
     },
     resume_cut: () => {
       const s = deviceState as { WaitingForColorSwap?: { next_pass_index: number } };
       const nextIndex = s.WaitingForColorSwap?.next_pass_index;
       if (nextIndex === undefined) throw ipcError("device_error", "not waiting for color swap");
+      if (failNextResume) {
+        // Async failure, as in production: resume_cut returns Ok and the failure
+        // arrives via the event stream (Failed carries the job's id, then the
+        // device rests in Error). Job over — id released so later lifecycle
+        // events go out as NO_JOB=0.
+        failNextResume = false;
+        setTimeout(() => {
+          emit({ Failed: "Timeout" });
+          deviceState = { Error: "Timeout" };
+          emit({ StateChanged: deviceState });
+          jobId = null;
+        }, 50);
+        return null;
+      }
       const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
       runPass(nextIndex, enabledIndices);
+      return null;
+    },
+    // Test hook (no production counterpart): arms a one-shot failure for the next
+    // resume_cut so tests can drive the failed-job → reconnect recovery path.
+    __test_fail_next_resume: () => {
+      failNextResume = true;
       return null;
     },
     confirm_pass_done: () => {
@@ -465,4 +499,31 @@ test("reopened dialog does not show stale Job complete from a prior cycle", asyn
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Cut" }).click();
   await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  // Arm a one-shot async resume failure, then resume: the Failed event must show
+  // "Cut failed" — never "Job complete", which the old jobId+Idle-derived banner
+  // produced once a lagging state cache read Idle for the failed job.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Job complete")).toHaveCount(0);
+
+  // Recover by reconnecting (the other listed device). The connect lifecycle
+  // events carry NO_JOB=0 and must not be filtered by the failed job's id. Note
+  // this mock's get_device_state poll isn't lagging like production's cache, so
+  // it can also rescue this assertion — the filter-release behavior itself is
+  // pinned by the terminalTransition unit tests in viewmodel.test.ts.
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });

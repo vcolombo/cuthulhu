@@ -93,20 +93,22 @@ pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
     Some(m)
 }
 
-/// Shape's outline in its own local space, in mm, matching `Rect { x:0, y:0, w, h }` bounds
-/// convention (an ellipse of radii rx,ry centered at (rx,ry) has the same 0,0-origin bounds).
-fn shape_to_path(node: &Node) -> Option<Path> {
-    let p = match &node.kind {
-        NodeKind::Shape(ShapeKind::Rect { w, h }) => rect_path(0.0, 0.0, *w, *h),
-        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => ellipse_path(*rx, *ry, *rx, *ry),
-        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok()?,
-        _ => return None,
-    };
-    Some(p.transformed(&node.transform))
+/// Shape's outline in its own local space (node's own transform NOT applied), in mm,
+/// matching `Rect { x:0, y:0, w, h }` bounds convention (an ellipse of radii rx,ry
+/// centered at (rx,ry) has the same 0,0-origin bounds).
+fn local_shape_path(node: &Node) -> Option<Path> {
+    match &node.kind {
+        NodeKind::Shape(ShapeKind::Rect { w, h }) => Some(rect_path(0.0, 0.0, *w, *h)),
+        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => Some(ellipse_path(*rx, *ry, *rx, *ry)),
+        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok(),
+        _ => None,
+    }
 }
 
 /// Replace `ids` (>= 2 shape nodes) with a single Path node holding the boolean-op result.
-/// The result is appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
+/// Inputs are flattened via each node's world transform (so nodes at different nesting
+/// depths combine correctly), and the result is mapped back into the destination parent's
+/// space before being appended under the parent of `ids[0]`. Mints `NodeId(u64::MAX)` as a
 /// placeholder for the new node's id — `Editor::boolean` overwrites it before commit.
 pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, CmdError> {
     let mut seen = HashSet::new();
@@ -114,16 +116,23 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     if ids.len() < 2 { return Err(CmdError::EmptySelection); }
     let mut paths = vec![];
     for &id in &ids {
-        paths.push(shape_to_path(doc.get(id).ok_or(CmdError::NotFound)?).ok_or(CmdError::NotFound)?);
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        let local = local_shape_path(node).ok_or(CmdError::NotFound)?;
+        let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
+        paths.push(local.transformed(&world));
     }
     let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
-    let parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
+    let dest_inv = dest_world.inverse()
+        .ok_or_else(|| CmdError::Geometry("degenerate destination transform".into()))?;
+    let result_local = result.transformed(&dest_inv);
     let mut ops: Vec<NodeOp> = ids.iter()
         .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
         .collect();
     ops.push(NodeOp::Add {
-        parent,
-        node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result.to_svg() }),
+        parent: dest_parent,
+        node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result_local.to_svg() }),
         index: usize::MAX,
     });
     Ok(Delta(ops))
@@ -213,6 +222,36 @@ mod tests {
         assert_eq!(kids.len(), 1);
         assert!(matches!(ed.doc.get(kids[0]).unwrap().kind,
             NodeKind::Shape(ShapeKind::Path { .. })));
+    }
+
+    #[test]
+    fn boolean_inputs_use_world_space_and_result_lands_in_parent_space() {
+        let mut ed = Editor::new();
+        // group translated (100,0); two 10x10 rects inside at local x=0 and x=5 (overlapping)
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine::translate(100.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        let mut nb = Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        nb.transform = Affine::translate(5.0, 0.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid, node: nb, index: 1 }]));
+
+        ed.boolean(&[a, b], geometry::BoolOp::Union).unwrap();
+        let kids = ed.doc.get(gid).unwrap().children.clone();
+        assert_eq!(kids.len(), 1, "result should replace both inputs under the group");
+        let result = ed.doc.get(kids[0]).unwrap();
+        let d = match &result.kind {
+            NodeKind::Shape(ShapeKind::Path { d }) => d.clone(),
+            other => panic!("expected Path, got {other:?}"),
+        };
+        // Path data is in the group's LOCAL space: union of x 0..15 — not 100..115.
+        let bounds = geometry::Path::from_svg(&d).unwrap().bounds();
+        assert!((bounds.x - 0.0).abs() < 0.5, "x={} (world coords leaked in)", bounds.x);
+        assert!((bounds.w - 15.0).abs() < 0.5, "w={}", bounds.w);
     }
 
     #[test]

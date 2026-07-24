@@ -114,7 +114,12 @@ pub fn plan_from_svg(
 }
 
 /// Parse an 8-hex-digit `RRGGBBAA` string into a `0xRRGGBBAA` color.
+/// Parses an 8-digit `RRGGBBAA` hex color. The length check is required: without
+/// it a 6-digit `RRGGBB` parses as `0x00RRGGBB` and silently matches nothing.
 pub fn parse_hex_color(s: &str) -> Result<u32, String> {
+    if s.len() != 8 {
+        return Err(format!("bad color '{s}': expected 8 hex digits (RRGGBBAA)"));
+    }
     u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
 }
 
@@ -168,6 +173,13 @@ mod tests {
         );
         assert!(check_interactive(false, 1).is_ok());
         assert!(check_interactive(true, 2).is_ok());
+    }
+
+    #[test]
+    fn parse_hex_color_requires_eight_digits() {
+        assert_eq!(parse_hex_color("ff0000ff"), Ok(0xFF0000FF));
+        assert!(parse_hex_color("ff0000").is_err(), "6-digit RRGGBB must be rejected, not zero-padded");
+        assert!(parse_hex_color("nothex12").is_err());
     }
 
     #[test]

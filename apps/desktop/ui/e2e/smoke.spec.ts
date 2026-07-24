@@ -412,6 +412,26 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
 });
 
+test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText(/complete/i)).toBeVisible();
+
+  // Second cut in the same session: without resetting jobId at the top of
+  // startCut, this job's own events would still carry the first job's stale
+  // id and get filtered out by acceptEvent, so this would hang forever.
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
+});
+
 test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

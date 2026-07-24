@@ -150,13 +150,34 @@ export function CutDialog({
   const phase = dialogPhase(deviceState);
   const buttons = dialogButtons(phase);
   // Idle only reads as "job complete" once a job has actually run in this dialog
-  // session — jobId is reset to null on mount (above) and on every new cut() call
-  // (in startCut below), so a stale prior job's Idle can't read as a fresh completion.
+  // session — jobId is reset to null on mount (above), on every new cut() call (in
+  // startCut below), and when the current job hits a terminal event (useEffect
+  // below), so a stale prior job's Idle can't read as a fresh completion.
   const justCompleted = jobId !== null && phase.kind === "idle";
   const failed = lastEvent && jobId !== null && lastEvent.job_id === jobId && typeof lastEvent.kind === "object" && "Failed" in lastEvent.kind;
 
+  // Also reset once the current job actually finishes (not just at the next cut()
+  // or the next mount): otherwise jobId stays pinned to the finished job and
+  // acceptEvent (App.tsx) keeps rejecting every later NO_JOB=0 lifecycle event
+  // (e.g. a reconnect) for the rest of this dialog session.
+  // ponytail: this makes the "Job complete"/"Cut failed" banner above flash for one
+  // render then clear (justCompleted/failed both key off jobId) — accepted, since the
+  // alternative is decoupling the banner from jobId entirely, which is more plumbing
+  // than this fix asked for.
+  useEffect(() => {
+    if (jobId === null || !lastEvent || lastEvent.job_id !== jobId) return;
+    const k = lastEvent.kind;
+    const terminal = k === "JobComplete" || (typeof k === "object" && "Failed" in k);
+    if (terminal) setJobId(null);
+  }, [lastEvent, jobId, setJobId]);
+
   const startCut = () => {
     if (!connected || planRevision === null) return;
+    // Resets on every new cut() call: without this, a second cut in the same
+    // dialog session keeps the finished first job's id around, so acceptEvent
+    // (App.tsx) rejects every event the new job emits until it happens to reuse
+    // the old id (it never does — ids are strictly increasing).
+    setJobId(null);
     const request = toCutRequest(connected.instance_id, planRevision, rows);
     ipc
       .cut(request)

@@ -58,7 +58,9 @@ export class Canvas2DRenderer implements Renderer {
     }
 
     for (const node of this.scene.nodes) {
-      const stroke = this.selected.has(node.id) ? accent : text;
+      const selected = this.selected.has(node.id);
+      const stroke = selected ? accent : text;
+      const lineWidth = selected ? 2 : 1;
       if (node.shape && node.world) {
         ctx.save();
         const [a, b, c, d, e, f] = node.world;
@@ -72,7 +74,7 @@ export class Canvas2DRenderer implements Renderer {
         ctx.strokeStyle = stroke;
         // ponytail: lineWidth is in local units, so a scaled node gets a scaled
         // stroke; screen-constant strokes need lineWidth / scale once zoom lands.
-        ctx.lineWidth = 1;
+        ctx.lineWidth = lineWidth;
         if (node.shape.t === "path") {
           ctx.stroke(new Path2D(node.shape.d));
         } else {
@@ -82,7 +84,7 @@ export class Canvas2DRenderer implements Renderer {
       } else {
         // Nodes without geometry (tests, mocks) keep the SP3 bounds outline.
         ctx.strokeStyle = stroke;
-        ctx.lineWidth = 1;
+        ctx.lineWidth = lineWidth;
         ctx.strokeRect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
       }
     }

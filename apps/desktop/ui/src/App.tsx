@@ -56,7 +56,7 @@ function toggleId(ids: number[], id: number): number[] {
 function shapeBounds(kind: ShapeKindJson) {
   if ("Rect" in kind) return { x: 0, y: 0, w: kind.Rect.w, h: kind.Rect.h };
   if ("Ellipse" in kind) {
-    // Canonical convention (see crates/document/src/commands.rs shape_to_path): an
+    // Canonical convention (see crates/document/src/commands.rs local_shape_path): an
     // Ellipse's local space is centered at (rx, ry), bounds 0..2rx / 0..2ry.
     return { x: 0, y: 0, w: kind.Ellipse.rx * 2, h: kind.Ellipse.ry * 2 };
   }

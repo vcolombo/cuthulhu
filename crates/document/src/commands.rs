@@ -13,7 +13,8 @@ pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result
 }
 
 /// Apply world-space transform `m` to each node by composing it with the node's existing local transform.
-/// The new transform applies the node's existing transform first, then the world-space transform.
+/// Converts the world-space matrix into the node's parent space so that new_world = old_world.then(m)
+/// holds under transformed ancestors.
 pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let mut ops = vec![];
@@ -37,13 +38,34 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
 
 pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    let selected: HashSet<NodeId> = ids.iter().copied().collect();
+    let has_selected_ancestor = |id: NodeId| {
+        let mut cur = id;
+        while let Some(pid) = parent_of(doc, cur) {
+            if selected.contains(&pid) { return true; }
+            cur = pid;
+        }
+        false
+    };
+    // Emit a subtree's Removes children-first so each Remove still has its parent
+    // in the map, and the inverse delta (reversed Adds) restores parents first.
+    fn push_subtree(doc: &Document, id: NodeId, parent: NodeId, ops: &mut Vec<NodeOp>)
+        -> Result<(), CmdError> {
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        for &child in &node.children {
+            push_subtree(doc, child, id, ops)?;
+        }
+        ops.push(NodeOp::Remove { parent, id });
+        Ok(())
+    }
     let mut ops = vec![];
     let mut seen = HashSet::new();
     for &id in ids {
-        if !seen.insert(id) { continue; } // skip duplicates
+        if !seen.insert(id) || has_selected_ancestor(id) { continue; }
         let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
-        ops.push(NodeOp::Remove { parent, id });
+        push_subtree(doc, id, parent, &mut ops)?;
     }
+    if ops.is_empty() { return Err(CmdError::EmptySelection); }
     Ok(Delta(ops))
 }
 
@@ -309,5 +331,40 @@ mod tests {
         let after_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
         // world moved exactly 10mm — NOT 20mm (the double-application bug this fixes)
         assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0));
+    }
+
+    #[test]
+    fn deleting_group_removes_descendants_and_undo_restores_structure() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::container(gid, NodeKind::Group), index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 1.0, h: 1.0 }), index: 0 }]));
+
+        ed.commit(delete_nodes(&ed.doc, &[gid]).unwrap());
+        assert!(ed.doc.get(gid).is_none());
+        assert!(ed.doc.get(cid).is_none(), "descendants must not be orphaned");
+
+        ed.undo();
+        assert!(ed.doc.get(gid).is_some());
+        assert!(ed.doc.get(cid).is_some());
+        assert_eq!(ed.doc.get(gid).unwrap().children, vec![cid]);
+    }
+
+    #[test]
+    fn selecting_group_and_child_together_does_not_panic() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::container(gid, NodeKind::Group), index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 1.0, h: 1.0 }), index: 0 }]));
+        // group first, child second — the ordering that panicked before
+        ed.commit(delete_nodes(&ed.doc, &[gid, cid]).unwrap());
+        assert!(ed.doc.get(gid).is_none());
+        assert!(ed.doc.get(cid).is_none());
     }
 }

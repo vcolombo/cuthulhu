@@ -2,7 +2,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import * as ipc from "./ipc";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { hitTest, type Scene } from "./render/hittest";
+import { hitTest, type Scene, type ShapeGeom } from "./render/hittest";
+import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
@@ -59,10 +60,17 @@ function shapeBounds(kind: ShapeKindJson) {
     // Ellipse's local space is centered at (rx, ry), bounds 0..2rx / 0..2ry.
     return { x: 0, y: 0, w: kind.Ellipse.rx * 2, h: kind.Ellipse.ry * 2 };
   }
-  // ponytail: Text nodes are converted server-side into a Path before insertion (add_text
-  // mints a Path node), and precise Path bounds need a bbox pass over the outline — a
-  // placeholder box covers both cases until that lands.
-  return { x: 0, y: 0, w: 10, h: 10 };
+  // Text nodes are converted server-side into a Path before insertion (add_text mints a
+  // Path node), so this is the real Path bounds path too.
+  if ("Path" in kind) return pathBounds(kind.Path.d) ?? { x: 0, y: 0, w: 0, h: 0 };
+  return { x: 0, y: 0, w: 0, h: 0 }; // bare Text kind shouldn't reach here at runtime
+}
+
+function shapeGeom(kind: ShapeKindJson): ShapeGeom | undefined {
+  if ("Rect" in kind) return { t: "rect", w: kind.Rect.w, h: kind.Rect.h };
+  if ("Ellipse" in kind) return { t: "ellipse", rx: kind.Ellipse.rx, ry: kind.Ellipse.ry };
+  if ("Path" in kind) return { t: "path", d: kind.Path.d };
+  return undefined;
 }
 
 const IDENTITY_AFFINE6: Affine6 = [1, 0, 0, 1, 0, 0];
@@ -111,7 +119,12 @@ function buildScene(doc: DocSnapshot): Scene {
       const ys = corners.map((c) => c.y);
       const x = Math.min(...xs);
       const y = Math.min(...ys);
-      nodes.push({ id: n.id, bounds: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y } });
+      nodes.push({
+        id: n.id,
+        bounds: { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y },
+        shape: shapeGeom(n.kind.Shape),
+        world,
+      });
     } else {
       for (const child of n.children) walk(child, world);
     }

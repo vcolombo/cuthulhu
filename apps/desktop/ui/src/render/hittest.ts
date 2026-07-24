@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 export type Bounds = { x: number; y: number; w: number; h: number };
-export type SceneNode = { id: number; bounds: Bounds };
+export type Affine6 = [number, number, number, number, number, number];
+export type ShapeGeom =
+  | { t: "rect"; w: number; h: number }
+  | { t: "ellipse"; rx: number; ry: number }
+  | { t: "path"; d: string };
+export type SceneNode = { id: number; bounds: Bounds; shape?: ShapeGeom; world?: Affine6 };
 export type Scene = { nodes: SceneNode[] };
 
 export function hitTest(scene: Scene, x: number, y: number): number | null {

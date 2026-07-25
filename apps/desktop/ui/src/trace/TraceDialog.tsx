@@ -61,17 +61,26 @@ export function TraceDialog({ path, onInsert, onClose }: {
   const debouncer = useMemo(() => makeDebouncer(300), []);
 
   useEffect(() => {
-    ipc.loadImagePreview({ path }).then(setSourceUrl, () => setSourceUrl(null));
+    // Guard the thumbnail against out-of-order resolution too: `path` cannot change without
+    // unmounting today, but that is a property of the caller, not of this component.
+    let ignore = false;
+    ipc.loadImagePreview({ path }).then(
+      (url) => { if (!ignore) setSourceUrl(url); },
+      () => { if (!ignore) setSourceUrl(null); },
+    );
+    return () => { ignore = true; };
   }, [path]);
 
   useEffect(() => {
-    // Invalidate here, not inside the debounced callback: a control change must retire any
-    // in-flight request immediately. Bumping only on fire leaves a window up to the debounce
-    // interval where a response for the previous settings still matches and renders as ready —
-    // enabling Insert with an SVG that no longer matches the sliders.
+    // Both statements must run here, not inside the debounced callback:
+    //   - bumping the id retires any in-flight request, so a late response is rejected;
+    //   - clearing to `tracing` retires the *displayed* result.
+    // Doing only the first still leaves the previous SVG on screen with Insert enabled for the
+    // length of the debounce, so a click in that window inserts geometry the sliders no longer
+    // describe. The shown result is stale the instant a control moves; say so immediately.
     const id = ++latestId.current;
+    setPreview({ kind: "tracing" });
     debouncer.schedule(() => {
-      setPreview({ kind: "tracing" });
       ipc.traceImage({ path, opts: toOptionsDto(controls) }).then(
         (r) => setPreview((prev) => acceptResult(id, latestId.current, r, prev)),
         (e) => setPreview((prev) => acceptError(id, latestId.current, ipc.ipcErrorMessage(e), prev)),

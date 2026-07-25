@@ -187,10 +187,16 @@ fn canonical(path: &PathBuf) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
-fn ensure_authorized(auth: &AuthorizedImages, path: &PathBuf) -> Result<(), String> {
+/// Returns the *resolved* path to read, so the caller opens exactly what was authorized.
+///
+/// Returning `()` and letting the caller re-open its own argument would leave a window between
+/// the check and the read: the caller's path is resolved twice, and a symlink that pointed at an
+/// authorized file for the check can be retargeted before the open. Reading the already-resolved
+/// path removes that step entirely.
+fn authorized_path(auth: &AuthorizedImages, path: &PathBuf) -> Result<PathBuf, String> {
     let real = canonical(path)?;
     if auth.0.lock().unwrap().contains(&real) {
-        Ok(())
+        Ok(real)
     } else {
         Err("that image was not selected in this session".into())
     }
@@ -236,8 +242,8 @@ pub fn trace_image(
     path: PathBuf,
     opts: trace::TraceOptions,
 ) -> Result<trace::TraceResult, String> {
-    ensure_authorized(&auth, &path)?;
-    let bytes = read_image_file(&path)?;
+    let real = authorized_path(&auth, &path)?;
+    let bytes = read_image_file(&real)?;
     trace::trace(&bytes, &opts).map_err(|e| e.to_string())
 }
 
@@ -248,8 +254,8 @@ pub fn load_image_preview(
     auth: tauri::State<AuthorizedImages>,
     path: PathBuf,
 ) -> Result<String, String> {
-    ensure_authorized(&auth, &path)?;
-    let bytes = read_image_file(&path)?;
+    let real = authorized_path(&auth, &path)?;
+    let bytes = read_image_file(&real)?;
     let png = trace::preview_png(&bytes).map_err(|e| e.to_string())?;
     use base64::Engine as _;
     Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))

@@ -6,6 +6,34 @@ use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, Transpo
 use std::io::IsTerminal;
 use std::sync::Arc;
 
+/// Matches the ceiling the desktop applies before decoding. The CLI is a second entry point into
+/// the same tracer, so without it one of the two ways in has no bound at all.
+const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read an image file, refusing anything past the ceiling.
+///
+/// Reads through a single open handle rather than stat-then-read: a separate size check describes
+/// whatever the pathname pointed at when it ran, not necessarily what gets read afterwards, so a
+/// file that grows in between would sail past the limit it was just measured against. `take`
+/// bounds the read itself, which holds no matter what the size was.
+fn read_image_capped(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    // One byte past the ceiling, so hitting it is distinguishable from landing exactly on it.
+    file.take(MAX_INPUT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_INPUT_FILE_BYTES {
+        return Err(format!(
+            "file is too large to open: over {} MiB",
+            MAX_INPUT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
+}
+
 #[derive(Parser)]
 #[command(name = "cuthulhu", about = "SVG → cutter byte streams")]
 struct Cli {
@@ -136,7 +164,7 @@ fn run() -> Result<(), String> {
                 length_threshold: detail,
                 color_precision: colors,
             };
-            let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            let bytes = read_image_capped(&file)?;
             let result = trace::trace(&bytes, &opts).map_err(|e| match e {
                 trace::TraceError::EmptyResult =>
                     "nothing traced — lower --speckle or lower --detail".to_string(),

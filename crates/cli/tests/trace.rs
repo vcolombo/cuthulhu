@@ -65,3 +65,24 @@ fn trace_reports_empty_result_without_writing() {
     assert!(stderr.to_lowercase().contains("nothing traced"), "stderr: {stderr}");
     assert!(!out.exists());
 }
+
+/// The desktop caps what it reads before decoding; the CLI is a second entry point into the same
+/// tracer and had no ceiling at all, so a huge file was pulled into memory in full before the
+/// decoder ever got to reject it. Uses a sparse file, so the test costs no real disk.
+#[test]
+fn trace_refuses_a_file_larger_than_the_read_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.png");
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(300 * 1024 * 1024).unwrap();
+    drop(f);
+    let out = dir.path().join("out.svg");
+    let output = bin()
+        .args(["trace", big.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("too large"), "expected a size error, got: {err}");
+    assert!(!out.exists(), "no file written on failure");
+}

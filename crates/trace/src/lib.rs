@@ -207,6 +207,13 @@ fn flatten_onto_white(img: &mut image::RgbaImage) {
 pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
     validate(opts)?;
     let (mut rgba, downscaled) = decode_and_downscale(image_bytes)?;
+    // Nothing visible means nothing to cut. This has to be decided before flattening, which
+    // erases the distinction by making every transparent pixel opaque white — and in colour mode
+    // vtracer then clusters that white into a path of its own, which `strip_empty_paths` strokes.
+    // The result would be a cut rectangle traced from an image that shows nothing at all.
+    if rgba.pixels().all(|p| p[3] == 0) {
+        return Err(TraceError::EmptyResult);
+    }
     flatten_onto_white(&mut rgba);
     let (width, height) = (rgba.width(), rgba.height());
 
@@ -421,14 +428,33 @@ mod tests {
     /// (0,0,0,0) reaches it as solid black and an invisible image traces to a filled canvas.
     /// Since every traced path is now stroked, that phantom shape is cut geometry: loading a
     /// transparent PNG would put a rectangle through the material.
+    /// Both modes, because the failure differs by mode and testing only one hides the other:
+    /// binary reads transparent black as artwork, while color clusters the flattened background
+    /// into a white path. Either way the result is a stroked, cuttable canvas rectangle.
     #[test]
     fn a_fully_transparent_image_traces_to_nothing() {
         let img = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
-        let opts = TraceOptions { mode: TraceMode::Binary, ..TraceOptions::default() };
-        assert!(
-            matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
-            "a transparent image must trace to nothing, not to a cuttable rectangle",
-        );
+        for mode in [TraceMode::Binary, TraceMode::Color] {
+            let opts = TraceOptions { mode, ..TraceOptions::default() };
+            assert!(
+                matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
+                "{mode:?}: a transparent image must trace to nothing, not to a cuttable rectangle",
+            );
+        }
+    }
+
+    /// A transparent image is empty whatever its RGB happens to be: exporters vary between
+    /// (0,0,0,0) and (255,255,255,0), and neither is artwork.
+    #[test]
+    fn transparency_is_empty_regardless_of_its_hidden_color() {
+        for hidden in [[0, 0, 0, 0], [255, 255, 255, 0], [17, 200, 90, 0]] {
+            let img = RgbaImage::from_pixel(32, 32, image::Rgba(hidden));
+            let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+            assert!(
+                matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
+                "hidden colour {hidden:?} must still count as empty",
+            );
+        }
     }
 
     /// The ordinary case for a logo: opaque artwork on a transparent background, which exporters

@@ -15,7 +15,7 @@ pub fn import_svg(
                 d: path.to_svg(),
             });
             node.style = Style {
-                stroke: hint.stroke.or(Some(0x000000FF)),
+                stroke: hint.stroke,
                 fill: hint.fill,
             };
             NodeOp::Add {

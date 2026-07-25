@@ -5,8 +5,9 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri() {
-  type Node = { id: number; kind: unknown; transform: number[]; style: unknown; children: number[] };
+function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
+  type Style = { stroke: number | null; fill: number | null };
+  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -15,15 +16,19 @@ function installMockTauri() {
   };
 
   const machines = [
-    { id: "cameo5_alpha", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
-    { id: "puma_iv", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
+    { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
+    { id: "puma", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
   ];
+
+  // Mirrors document::Style::default() — a freshly-added shape has an opaque black
+  // stroke and is cuttable by default.
+  const DEFAULT_STYLE: Style = { stroke: 0x000000ff, fill: null };
 
   let nextId = 1;
   const freshDoc = (): Doc => {
     const rootId = nextId++;
     return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: {}, children: [] } },
+      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [] } },
       root: rootId,
       artboard: { x: 0, y: 0, w: 330, h: 3000 },
       machine: null,
@@ -32,19 +37,53 @@ function installMockTauri() {
   let doc = freshDoc();
   let saved: Doc | null = null;
 
+  // Seed two differently-stroked rects synchronously (bypassing invoke) so the doc is
+  // already populated by the time App.tsx's mount effect calls snapshot() — avoids a
+  // race between an async seed and React's first fetch.
+  if (opts?.seedTwoColorRects) {
+    const redId = nextId++;
+    doc.nodes[redId] = {
+      id: redId,
+      kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 0, 0],
+      style: { stroke: 0xff0000ff, fill: null },
+      children: [],
+    };
+    const greenId = nextId++;
+    doc.nodes[greenId] = {
+      id: greenId,
+      kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 0, 0],
+      style: { stroke: 0x00ff00ff, fill: null },
+      children: [],
+    };
+    doc.nodes[doc.root].children.push(redId, greenId);
+  }
+
+  // Bumped on every doc mutation; string-compared against CutRequest.doc_revision
+  // to emulate the real stale_plan check (device.rs's prepare_cut).
+  let revision = 0;
+
   const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
-    new_doc: () => JSON.stringify((doc = freshDoc())),
+    new_doc: () => {
+      doc = freshDoc();
+      revision++;
+      return JSON.stringify(doc);
+    },
     snapshot: () => JSON.stringify(doc),
     add_primitive: (a) => {
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style: {}, children: [] };
+      const style = a.stroke !== undefined ? { stroke: a.stroke as number | null, fill: null } : DEFAULT_STYLE;
+      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [] };
       doc.nodes[a.parent as number].children.push(id);
+      revision++;
       return {};
     },
     add_text: (a) => {
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: {}, children: [] };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
       doc.nodes[a.parent as number].children.push(id);
+      revision++;
       return {};
     },
     commit_transform: (a) => {
@@ -63,19 +102,30 @@ function installMockTauri() {
         delete doc.nodes[id];
         for (const n of Object.values(doc.nodes)) n.children = n.children.filter((c) => c !== id);
       }
+      revision++;
       return {};
     },
-    reorder: () => ({}),
+    reorder: () => {
+      revision++;
+      return {};
+    },
     undo: () => null,
     redo: () => null,
-    boolean_op: () => ({}),
-    import_svg: () => [{}, []],
+    boolean_op: () => {
+      revision++;
+      return {};
+    },
+    import_svg: () => {
+      revision++;
+      return [{}, []];
+    },
     save_project: () => {
       saved = JSON.parse(JSON.stringify(doc));
       return null;
     },
     load_project: () => {
       if (saved) doc = JSON.parse(JSON.stringify(saved));
+      revision++;
       return JSON.stringify(doc);
     },
     set_machine: (a) => {
@@ -83,25 +133,250 @@ function installMockTauri() {
       if (!m) throw new Error("unknown machine");
       doc.machine = m;
       doc.artboard = { x: 0, y: 0, w: m.width_mm, h: m.height_mm };
+      revision++;
       return null;
     },
     list_machines: () => machines,
   };
+
+  // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
+  // order and driver-core::manager's DeviceState/DeviceEvent shapes closely enough to
+  // drive the cut dialog through a real state machine. ---
+
+  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean };
+  type DeviceState = unknown;
+  type DeviceEvent = { job_id: number; kind: unknown };
+
+  const devices: DeviceInfo[] = [
+    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false },
+    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true },
+  ];
+
+  let connected: DeviceInfo | null = null;
+  let deviceState: DeviceState = "Disconnected";
+  let nextJobId = 1;
+  let jobId: number | null = null;
+  let planPasses: { color: number | null; enabled: boolean }[] = [];
+  let failNextResume = false;
+
+  function ipcError(code: string, message: string) {
+    return { code, message };
+  }
+
+  function planFromDoc() {
+    // Mirrors crates/cutplan/src/passes.rs's plan_passes: preorder walk, group Shape
+    // leaf nodes by full stroke color (0-alpha counts as no stroke), first-seen order.
+    const byColor = new Map<number, { color: number; node_ids: number[] }>();
+    let skipped = 0;
+    const walk = (id: number) => {
+      const n = doc.nodes[id];
+      if (!n) return;
+      const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
+      if (isShape) {
+        const stroke = n.style.stroke;
+        if (stroke === null || stroke === undefined || (stroke & 0xff) === 0) {
+          skipped++;
+        } else {
+          const existing = byColor.get(stroke);
+          if (existing) existing.node_ids.push(id);
+          else byColor.set(stroke, { color: stroke, node_ids: [id] });
+        }
+      }
+      for (const c of n.children) walk(c);
+    };
+    walk(doc.root);
+    const passes = [...byColor.values()].map((p) => ({ color: p.color, shape_count: p.node_ids.length, node_ids: p.node_ids }));
+    return { passes, skipped_no_stroke: skipped, doc_revision: String(revision), travel: [] as [number, number, number, number][] };
+  }
+
+  // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
+  // calls transformCallback(handler) to get a numeric id (stored in callbacksById),
+  // then invoke("plugin:event|listen", {event, handler: id}) associates that id with
+  // an event name (eventNameToIds). Emitting calls the stored callback directly, like
+  // the real event bridge thread does via window["_" + id](payload).
+  const callbacksById = new Map<number, (e: unknown) => void>();
+  const eventNameToIds = new Map<string, number[]>();
+  let nextCallbackId = 1;
+
+  function emit(kind: unknown) {
+    const ev: DeviceEvent = { job_id: jobId ?? 0, kind };
+    for (const id of eventNameToIds.get("device-event") ?? []) {
+      callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
+    }
+  }
+
+  // Drives the scripted pass sequence for one pass, then either pauses at
+  // WaitingForColorSwap (more enabled passes remain) or completes the job — matching
+  // execute_cut's documented behavior of blocking until the next pause point.
+  //
+  // The initial Transmitting(0 bytes) StateChanged fires synchronously (matches real
+  // execute_cut, which enters Transmitting immediately) but everything after it is
+  // deferred a tick: in production, event delivery crosses real async Tauri IPC (worker
+  // thread -> event bridge -> window.emit/listen), giving React's setJobId(null)/
+  // jobIdRef sync effect time to commit before any event arrives. This mock's invoke()
+  // used to run every command fully synchronously in the same call stack as the click
+  // handler, so a second cut's events could arrive before React had committed the new
+  // jobId — a mock-fidelity gap, not a production bug. The setTimeout also makes
+  // Transmitting observable to Playwright's polling assertions instead of being
+  // superseded within the same synchronous burst.
+  function runPass(passIndex: number, enabledIndices: number[]) {
+    const total = 100;
+    deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: 0, total_bytes: total } };
+    emit({ StateChanged: deviceState });
+    setTimeout(() => {
+      deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: total, total_bytes: total } };
+      emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
+      emit({ PassComplete: passIndex });
+
+      const pos = enabledIndices.indexOf(passIndex);
+      const isLast = pos === enabledIndices.length - 1;
+      if (isLast) {
+        deviceState = "Idle";
+        emit("JobComplete");
+        emit({ StateChanged: "Idle" });
+        // Production releases the job id once the job is over: all later lifecycle
+        // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
+        // mock keeps stamping finished-job ids on lifecycle events production
+        // would never stamp — hiding event-filter bugs from these tests.
+        jobId = null;
+      } else {
+        const next = enabledIndices[pos + 1];
+        deviceState = { WaitingForColorSwap: { job_id: jobId, next_pass_index: next } };
+        emit({ StateChanged: deviceState });
+      }
+    }, 50);
+  }
+
+  Object.assign(commands, {
+    list_devices: () => devices,
+    connect_device: (a) => {
+      const info = a.info as DeviceInfo;
+      connected = info;
+      // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
+      // emitting them here (instead of silently mutating deviceState) is what lets
+      // these tests catch a frontend that filters lifecycle events out.
+      deviceState = "Connecting";
+      emit({ StateChanged: "Connecting" });
+      deviceState = "Idle";
+      emit({ StateChanged: "Idle" });
+      return null;
+    },
+    disconnect_device: () => {
+      connected = null;
+      deviceState = "Disconnected";
+      emit({ StateChanged: "Disconnected" });
+      return null;
+    },
+    get_device_state: () => deviceState,
+    get_connected_device: () => connected,
+    plan_cut: () => planFromDoc(),
+    cut: (a) => {
+      const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
+      if (!connected) throw ipcError("not_connected", "no device connected");
+      if (connected.instance_id !== request.device_instance_id) {
+        throw ipcError("device_mismatch", "connected device changed since planning");
+      }
+      const plan = planFromDoc();
+      if (plan.doc_revision !== request.doc_revision) {
+        throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+      }
+      if (doc.machine && doc.machine.id !== connected.machine_id) {
+        throw ipcError("machine_mismatch", "document is set up for a different machine");
+      }
+      planPasses = request.passes;
+      jobId = nextJobId++;
+      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
+      if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
+      runPass(enabledIndices[0], enabledIndices);
+      return jobId;
+    },
+    cancel_cut: () => {
+      // Mirrors driver-core::manager: cancel is unconditional and lands on the
+      // Cancelled resting state (no auto-Idle) — not a jump straight to Idle.
+      const s = deviceState as { Transmitting?: { pass_index: number; submitted_bytes: number }; WaitingForColorSwap?: { next_pass_index: number } };
+      const passIndex = s.Transmitting?.pass_index ?? s.WaitingForColorSwap?.next_pass_index ?? 0;
+      const submittedBytes = s.Transmitting?.submitted_bytes ?? 0;
+      deviceState = { Cancelled: { job_id: jobId, pass_index: passIndex, submitted_bytes: submittedBytes, completion_known: true } };
+      emit({ StateChanged: deviceState });
+      jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
+      return null;
+    },
+    resume_cut: () => {
+      const s = deviceState as { WaitingForColorSwap?: { next_pass_index: number } };
+      const nextIndex = s.WaitingForColorSwap?.next_pass_index;
+      if (nextIndex === undefined) throw ipcError("device_error", "not waiting for color swap");
+      if (failNextResume) {
+        // Async failure, as in production: resume_cut returns Ok and the failure
+        // arrives via the event stream (Failed carries the job's id, then the
+        // device rests in Error). Job over — id released so later lifecycle
+        // events go out as NO_JOB=0.
+        failNextResume = false;
+        setTimeout(() => {
+          emit({ Failed: "Timeout" });
+          deviceState = { Error: "Timeout" };
+          emit({ StateChanged: deviceState });
+          jobId = null;
+        }, 50);
+        return null;
+      }
+      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
+      runPass(nextIndex, enabledIndices);
+      return null;
+    },
+    // Test hook (no production counterpart): arms a one-shot failure for the next
+    // resume_cut so tests can drive the failed-job → reconnect recovery path.
+    __test_fail_next_resume: () => {
+      failNextResume = true;
+      return null;
+    },
+    confirm_pass_done: () => {
+      deviceState = "Idle";
+      emit({ StateChanged: "Idle" });
+      return null;
+    },
+    list_presets: () => [],
+    save_preset: () => null,
+    delete_preset: () => null,
+  } as Record<string, (args: Record<string, unknown>) => unknown>);
 
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args: Record<string, unknown> = {}) => {
       if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
         return Promise.resolve("/mock/cuthulhu-project.cut");
       }
+      if (cmd === "plugin:event|listen") {
+        const id = args.handler as number;
+        const event = args.event as string;
+        const ids = eventNameToIds.get(event) ?? [];
+        ids.push(id);
+        eventNameToIds.set(event, ids);
+        return Promise.resolve(id);
+      }
+      if (cmd === "plugin:event|unlisten") {
+        for (const ids of eventNameToIds.values()) {
+          const i = ids.indexOf(args.eventId as number);
+          if (i >= 0) ids.splice(i, 1);
+        }
+        return Promise.resolve(null);
+      }
       const fn = commands[cmd];
       if (!fn) return Promise.reject(new Error(`unmocked command: ${cmd}`));
       try {
         return Promise.resolve(fn(args));
       } catch (e) {
-        return Promise.reject(e instanceof Error ? e.message : String(e));
+        return Promise.reject(e instanceof Error ? e.message : e);
       }
     },
-    transformCallback: () => 0,
+    transformCallback: (callback: (e: unknown) => void) => {
+      const id = nextCallbackId++;
+      callbacksById.set(id, callback);
+      return id;
+    },
+  };
+  // @tauri-apps/api/event's unlisten() path touches this directly; stub it so a
+  // listener cleanup (e.g. on unmount) doesn't throw.
+  (window as unknown as { __TAURI_EVENT_PLUGIN_INTERNALS__: unknown }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener: () => {},
   };
 }
 
@@ -122,4 +397,133 @@ test("new doc → add rect → save → reload keeps the rect", async ({ page })
 
   await page.getByRole("button", { name: "Reload" }).click();
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
+});
+
+test("two-color doc cuts through swap and resume", async ({ page }) => {
+  // Two differently-stroked rects are seeded synchronously inside the mock (no stroke
+  // picker exists in the UI) so App.tsx's initial snapshot() already sees them.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText(/complete/i)).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByText("Cancelled")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("transmitting shows a Cancel button and progress so the GUI can cancel mid-cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+});
+
+test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText(/complete/i)).toBeVisible();
+
+  // Second cut in the same session: without resetting jobId at the top of
+  // startCut, this job's own events would still carry the first job's stale
+  // id and get filtered out by acceptEvent, so this would hang forever.
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
+});
+
+test("reopening the dialog after connect recovers the connected device", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByText("connected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // Without get_connected_device seeding this on mount, the reopened dialog's local
+  // `connected` state comes back null even though the backend is still connected,
+  // leaving Start Cut stuck disabled and the device row stuck on "Connect".
+  await expect(page.getByText("connected")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText(/complete/i)).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  // Arm a one-shot async resume failure, then resume: the Failed event must show
+  // "Cut failed" — never "Job complete", which the old jobId+Idle-derived banner
+  // produced once a lagging state cache read Idle for the failed job.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Job complete")).toHaveCount(0);
+
+  // Recover by reconnecting (the other listed device). The connect lifecycle
+  // events carry NO_JOB=0 and must not be filtered by the failed job's id. Note
+  // this mock's get_device_state poll isn't lagging like production's cache, so
+  // it can also rescue this assertion — the filter-release behavior itself is
+  // pinned by the terminalTransition unit tests in viewmodel.test.ts.
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });

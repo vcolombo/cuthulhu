@@ -26,10 +26,16 @@ fn traced_svg_imports_cleanly_in_both_modes() {
         // Importing cleanly is not enough to be cuttable. `cutplan` groups by stroke and skips
         // shapes that have none, so a trace that imports as fill-only geometry plans zero
         // passes and silently cannot be cut at all.
+        // Mirrors `plan_passes`, which skips on `stroke.filter(|c| c & 0xFF != 0)`: a present but
+        // fully transparent stroke is skipped exactly like an absent one, so asserting only
+        // `is_some()` would pass for geometry the planner still refuses to cut.
         for (i, (_, hint)) in imp.paths.iter().enumerate() {
+            let stroke = hint.stroke.unwrap_or_else(|| {
+                panic!("{mode:?}: imported path {i} has no stroke, so the cut planner would skip it")
+            });
             assert!(
-                hint.stroke.is_some(),
-                "{mode:?}: imported path {i} has no stroke, so the cut planner would skip it",
+                stroke & 0xFF != 0,
+                "{mode:?}: imported path {i} has a fully transparent stroke ({stroke:#010x}), which the cut planner skips too",
             );
         }
     }

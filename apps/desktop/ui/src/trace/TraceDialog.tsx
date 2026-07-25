@@ -110,7 +110,7 @@ export function TraceDialog({ path, onInsert, onClose }: {
 
         {preview.kind === "ready" ? (
           <div style={{ fontSize: 12, color: "var(--muted)" }}>
-            {preview.pathCount} paths
+            {preview.pathCount} {preview.pathCount === 1 ? "path" : "paths"}
             {preview.downscaled ? " — large image reduced to 2048 px for tracing" : ""}
           </div>
         ) : null}

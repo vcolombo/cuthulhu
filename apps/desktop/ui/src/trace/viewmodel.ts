@@ -4,14 +4,16 @@ export type TraceControls = {
   mode: "binary" | "color";
   speckle: number;   // 0–16
   smoothing: number; // 0–180
-  detail: number;    // 3.5–10
+  detail: number;    // 3.5–10, user-facing: higher = more detail
   colors: number;    // 1–8
 };
 
-export const defaultControls: TraceControls = { mode: "binary", speckle: 4, smoothing: 60, detail: 4, colors: 6 };
+export const defaultControls: TraceControls = { mode: "binary", speckle: 4, smoothing: 60, detail: 9.5, colors: 6 };
 
 export function toOptionsDto(c: TraceControls) {
-  return { mode: c.mode, filterSpeckle: c.speckle, cornerThreshold: c.smoothing, lengthThreshold: c.detail, colorPrecision: c.colors };
+  // vtracer's length_threshold is inverse to detail (lower threshold = more detail),
+  // so flip the user-facing slider value onto the 3.5–10 threshold range.
+  return { mode: c.mode, filterSpeckle: c.speckle, cornerThreshold: c.smoothing, lengthThreshold: 13.5 - c.detail, colorPrecision: c.colors };
 }
 
 export type PreviewState =

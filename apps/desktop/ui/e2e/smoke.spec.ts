@@ -547,7 +547,7 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
   await page.getByRole("button", { name: "Trace" }).click();
   await expect(page.getByRole("dialog", { name: "Trace image" })).toBeVisible();
   await expect(page.getByAltText("Traced preview")).toBeVisible();
-  await expect(page.getByText("1 paths")).toBeVisible();
+  await expect(page.getByText("1 path")).toBeVisible();
   await page.getByRole("button", { name: "Insert" }).click();
   await expect(page.getByRole("dialog", { name: "Trace image" })).not.toBeVisible();
   // import_svg mock was invoked — it adds a node to doc, so the layer list reflects the

@@ -10,6 +10,9 @@ describe("toOptionsDto", () => {
       mode: "binary", filterSpeckle: 4, cornerThreshold: 60, lengthThreshold: 4, colorPrecision: 6,
     });
   });
+  it("inverts detail onto vtracer's length_threshold", () => {
+    expect(toOptionsDto({ ...defaultControls, detail: 3.5 }).lengthThreshold).toBe(10);
+  });
 });
 
 describe("staleness", () => {

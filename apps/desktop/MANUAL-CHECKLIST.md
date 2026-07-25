@@ -35,12 +35,22 @@
 - [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).
       (Not reachable on a real Mac: the OS always exposes serial ports, so unverified puma candidates always populate the list — every /dev/cu.* shows as its own "puma (unverified serial device)" row, which is itself a polish candidate. Empty-state render covered by the e2e mock test.)
 
-## SP5 Trace
+## SP5 Trace — verified 2026-07-25 against a packaged `cargo tauri build` bundle
 
-- [ ] Trace a real logo PNG in binary mode — preview updates live as sliders move; Insert lands correctly sized paths on the canvas; one undo removes them all.
+- [x] Trace a real logo PNG in binary mode — preview updates live as sliders move; Insert lands correctly sized paths on the canvas; one undo removes them all.
+      (512×512 logo inserted at W=H=135.46666666666667 mm — exactly 512 px ÷ 96 dpi × 25.4, so the px→mm mapping is right. Moving Detail re-traced live; Binary→Color went 2→37 paths. One undo cleared both paths.)
 - [ ] Trace a multi-color image in color mode — one path per color; colors match; cut-by-color in the Cut dialog lists the traced colors as passes.
-- [ ] Trace a photo larger than 2048 px — "reduced to 2048 px" note appears; app stays responsive.
-- [ ] Max speckle filter on a small image — "Nothing traced" hint (not an error banner); lowering the slider recovers the preview.
-- [ ] Pick a non-image file via the picker filter bypass (rename a .txt to .png) — error banner in dialog, dialog still usable.
-- [ ] **In a packaged build (`tauri build`, not `tauri dev`)** — both the source thumbnail and the traced preview actually render. The e2e suite runs against Vite and never applies the Tauri CSP, so a missing `img-src 'self' data:` blocks both images with green tests. Check the webview console for CSP violations.
-- [ ] Trace a fine-detail image (dithered scan, halftone, or a one-pixel checkerboard ≥512 px) — a tracer failure shows as an error banner; the app does not crash or hang.
+      (**Fails the cut-by-color clause.** Trace itself is correct: a 4-color image gives exactly 4 paths and the fills round-trip exactly (#FFD600/#CC0000/#0066CC/#009944). But vtracer emits `fill`-only paths and `cutplan::plan_cut` groups by *stroke*, skipping shapes whose stroke is `None`. So the Cut dialog reports "Not cut: 4 shapes" and lists **zero** passes — traced geometry is not cuttable at all. Device-free repro: `cuthulhu cut traced.svg --device cameo5 --by-color --dry-run` → `error: no cuttable paths in SVG`; the same file with `fill=`→`stroke=` yields the expected 4 passes. Contradicts the trace spec, which says color mode "feeds SP4 cut-by-color directly".)
+- [x] Trace a photo larger than 2048 px — "reduced to 2048 px" note appears; app stays responsive.
+      (7952×5304 photo → "926 paths — large image reduced to 2048 px for tracing", matching the CLI. Slider moves stayed responsive and re-traced, 926→208 paths.)
+- [x] Max speckle filter on a small image — "Nothing traced" hint (not an error banner); lowering the slider recovers the preview.
+      (Shown as muted hint text, not the red error style. Lowering speckle to 1 recovered 36 paths, matching the CLI.)
+- [x] Pick a non-image file via the picker filter bypass (rename a .txt to .png) — error banner in dialog, dialog still usable.
+      (Banner: "could not read image: The image format could not be determined". Controls still responded afterwards — the mode radio toggled fine.)
+- [x] **In a packaged build (`tauri build`, not `tauri dev`)** — both the source thumbnail and the traced preview actually render. The e2e suite runs against Vite and never applies the Tauri CSP, so a missing `img-src 'self' data:` blocks both images with green tests. Check the webview console for CSP violations.
+      (Both images render in the bundled .app; the configured `img-src 'self' data:` is sufficient for the base64 thumbnail and the SVG data URL. No image was blocked.)
+- [x] Trace a fine-detail image (dithered scan, halftone, or a one-pixel checkerboard ≥512 px) — a tracer failure shows as an error banner; the app does not crash or hang.
+      (512×512 one-pixel checkerboard: "trace failed: tracer failed on this image; try a lower detail setting". The `catch_unwind` around `vtracer::convert` holds in a release bundle — process stayed alive and the UI stayed responsive.)
+
+Driving note: WebKit range inputs ignore both synthetic `click at` positioning and AX `set value`. The
+reliable way to move a slider is AX `set focused to true` on it, then arrow-key key codes.

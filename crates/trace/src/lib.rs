@@ -78,10 +78,13 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
         .map_err(|e| TraceError::Decode(e.to_string()))?
         .into_dimensions()
         .map_err(|e| TraceError::Decode(e.to_string()))?;
-    let needed = w0 as u64 * h0 as u64 * 4;
+    // 8 bytes/px, not 4: a 16-bit-per-channel PNG decodes to RGBA16, double the size of the
+    // RGBA8 we ultimately convert to. Estimating at 4 would let such an image allocate twice
+    // the ceiling before we ever see it.
+    let needed = w0 as u64 * h0 as u64 * 8;
     if needed > MAX_DECODE_ALLOC {
         return Err(TraceError::Decode(format!(
-            "image is too large to decode: {w0}×{h0} needs {} MiB",
+            "image is too large to decode: {w0}×{h0} needs up to {} MiB",
             needed / (1024 * 1024)
         )));
     }

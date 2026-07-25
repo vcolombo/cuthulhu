@@ -198,3 +198,27 @@ export async function pickOpenPath(): Promise<string | null> {
   const r = await dialogOpen({ multiple: false, filters: CUT_FILTER });
   return typeof r === "string" ? r : null;
 }
+
+// --- trace wire types ---
+
+export type TraceOptionsDto = {
+  mode: "binary" | "color";
+  filterSpeckle: number;
+  cornerThreshold: number;
+  lengthThreshold: number;
+  colorPrecision: number;
+};
+export type TraceResultDto = { svg: string; pathCount: number; widthPx: number; heightPx: number; downscaled: boolean };
+
+const IMAGE_FILTER = [{ name: "Images", extensions: ["png", "jpg", "jpeg", "gif", "bmp"] }];
+
+export async function traceImage(args: { path: string; opts: TraceOptionsDto }): Promise<TraceResultDto> {
+  return invoke("trace_image", args);
+}
+export async function loadImagePreview(args: { path: string }): Promise<string> {
+  return invoke("load_image_preview", args);
+}
+export async function pickImagePath(): Promise<string | null> {
+  const r = await dialogOpen({ multiple: false, filters: IMAGE_FILTER });
+  return typeof r === "string" ? r : null;
+}

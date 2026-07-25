@@ -73,6 +73,42 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
     Ok((resized.to_rgba8(), true))
 }
 
+pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
+    validate(opts)?;
+    let (rgba, downscaled) = decode_and_downscale(image_bytes)?;
+    let (width, height) = (rgba.width(), rgba.height());
+
+    let mut img = vtracer::ColorImage::new();
+    img.pixels = rgba.into_raw();
+    img.width = width as usize;
+    img.height = height as usize;
+
+    let config = vtracer::Config {
+        color_mode: match opts.mode {
+            TraceMode::Binary => vtracer::ColorMode::Binary,
+            TraceMode::Color => vtracer::ColorMode::Color,
+        },
+        hierarchical: vtracer::Hierarchical::Stacked,
+        filter_speckle: opts.filter_speckle as usize,
+        color_precision: opts.color_precision as i32,
+        corner_threshold: opts.corner_threshold as i32,
+        length_threshold: opts.length_threshold,
+        ..vtracer::Config::default()
+    };
+
+    let svg_file = vtracer::convert(img, config).map_err(TraceError::Trace)?;
+    if svg_file.paths.is_empty() {
+        return Err(TraceError::EmptyResult);
+    }
+    Ok(TraceResult {
+        path_count: svg_file.paths.len(),
+        svg: svg_file.to_string(),
+        width_px: width,
+        height_px: height,
+        downscaled,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +166,59 @@ mod tests {
     #[test]
     fn empty_result_displays_empty_sentinel() {
         assert_eq!(TraceError::EmptyResult.to_string(), "empty");
+    }
+
+    /// 100×100 image split into 4 solid 50×50 quadrants: red, green, blue, white.
+    fn quadrants() -> RgbaImage {
+        RgbaImage::from_fn(100, 100, |x, y| match (x < 50, y < 50) {
+            (true, true) => image::Rgba([255, 0, 0, 255]),
+            (false, true) => image::Rgba([0, 128, 0, 255]),
+            (true, false) => image::Rgba([0, 0, 255, 255]),
+            (false, false) => image::Rgba([255, 255, 255, 255]),
+        })
+    }
+
+    #[test]
+    fn binary_trace_of_black_square_yields_paths() {
+        let bytes = png_bytes(&black_square(128, 128, 64));
+        let r = trace(&bytes, &TraceOptions::default()).unwrap();
+        assert!(r.path_count >= 1);
+        assert!(r.svg.contains("<path"));
+        assert_eq!((r.width_px, r.height_px), (128, 128));
+        assert!(!r.downscaled);
+    }
+
+    #[test]
+    fn color_trace_yields_multiple_fills() {
+        let opts = TraceOptions { mode: TraceMode::Color, filter_speckle: 0, ..TraceOptions::default() };
+        let r = trace(&png_bytes(&quadrants()), &opts).unwrap();
+        assert!(r.path_count >= 2);
+        // At least two distinct fill colors among the emitted paths.
+        let fills: std::collections::HashSet<&str> = r.svg.match_indices("fill=\"")
+            .map(|(i, _)| { let rest = &r.svg[i + 6..]; &rest[..rest.find('"').unwrap()] })
+            .collect();
+        assert!(fills.len() >= 2, "fills: {fills:?}");
+    }
+
+    #[test]
+    fn trace_is_deterministic() {
+        let bytes = png_bytes(&black_square(128, 128, 64));
+        let a = trace(&bytes, &TraceOptions::default()).unwrap();
+        let b = trace(&bytes, &TraceOptions::default()).unwrap();
+        assert_eq!(a.svg, b.svg);
+    }
+
+    #[test]
+    fn speckle_filter_can_empty_the_result() {
+        // Whole image is smaller than a 16px speckle after the square shrinks to 4px.
+        let bytes = png_bytes(&black_square(64, 64, 4));
+        let opts = TraceOptions { filter_speckle: 16, ..TraceOptions::default() };
+        assert!(matches!(trace(&bytes, &opts), Err(TraceError::EmptyResult)));
+    }
+
+    #[test]
+    fn trace_rejects_invalid_options_before_decoding() {
+        let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
+        assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
     }
 }

@@ -126,11 +126,51 @@ fn strip_empty_paths(svg: &str) -> (String, usize) {
                 continue;
             }
             kept += 1;
+            out.push_str(&mirror_fill_onto_stroke(line));
+            out.push('\n');
+            continue;
         }
         out.push_str(line);
         out.push('\n');
     }
     (out, kept)
+}
+
+/// Read the value of `name="..."` from one element's source line.
+fn attr_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!("{name}=\"");
+    let start = line.find(&key)? + key.len();
+    let rest = &line[start..];
+    Some(&rest[..rest.find('"')?])
+}
+
+/// Copy a path's `fill` onto a `stroke` of the same colour.
+///
+/// vtracer describes a region by the colour that fills it, which is the right model for an
+/// image and the wrong one for a cutter: a blade follows an outline. `cutplan::plan_cut` groups
+/// shapes by stroke and counts a strokeless shape into `skipped_no_stroke`, so fill-only trace
+/// output plans zero passes — every traced shape is reported as "not cut". Mirroring the colour
+/// onto the stroke is what makes a trace reach the machine, and it keeps the fill so the
+/// preview still reads as the picture the user traced.
+///
+/// Done here rather than in `import_svg` or `plan_cut` on purpose. "Filled but unstroked means
+/// do not cut" is a deliberate distinction downstream — it is how an imported SVG says which of
+/// its shapes are cut lines — so the colour has to be promoted at the point where it is known
+/// to describe cuttable geometry, not by weakening that rule for every document.
+fn mirror_fill_onto_stroke(line: &str) -> String {
+    // Leave a path that already carries a stroke alone: re-adding one would emit the attribute
+    // twice and make the SVG invalid.
+    if line.contains("stroke=\"") {
+        return line.to_string();
+    }
+    match attr_value(line, "fill") {
+        Some(fill) => line.replacen(
+            &format!("fill=\"{fill}\""),
+            &format!("fill=\"{fill}\" stroke=\"{fill}\""),
+            1,
+        ),
+        None => line.to_string(),
+    }
 }
 
 pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
@@ -324,6 +364,33 @@ mod tests {
                 assert_eq!(r.path_count, r.svg.matches("<path").count(), "path_count disagrees with real paths");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// vtracer describes regions with `fill` alone, but a cutter follows outlines: `cutplan`
+    /// groups shapes by *stroke* and counts anything with no stroke as not cut. Fill-only trace
+    /// output therefore plans zero passes, so nothing traced can be cut at all. Every emitted
+    /// path has to carry a stroke matching its fill for the trace to reach the machine.
+    #[test]
+    fn traced_paths_are_stroked_so_they_can_be_cut() {
+        fn attr<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+            let key = format!("{name}=\"");
+            let start = line.find(&key)? + key.len();
+            let rest = &line[start..];
+            Some(&rest[..rest.find('"')?])
+        }
+
+        for mode in [TraceMode::Binary, TraceMode::Color] {
+            let opts = TraceOptions { mode, filter_speckle: 0, ..TraceOptions::default() };
+            let r = trace(&png_bytes(&quadrants()), &opts).unwrap();
+            let paths: Vec<&str> =
+                r.svg.lines().filter(|l| l.trim_start().starts_with("<path")).collect();
+            assert!(!paths.is_empty(), "{mode:?}: no paths emitted");
+            for p in paths {
+                let fill = attr(p, "fill")
+                    .unwrap_or_else(|| panic!("{mode:?}: path carries no fill: {p}"));
+                assert_eq!(attr(p, "stroke"), Some(fill), "{mode:?}: stroke must match fill: {p}");
+            }
         }
     }
 

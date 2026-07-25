@@ -23,5 +23,14 @@ fn traced_svg_imports_cleanly_in_both_modes() {
             .unwrap_or_else(|e| panic!("{mode:?}: importer rejected trace output: {e:?}"));
         assert_eq!(imp.skipped, Vec::<String>::new(), "{mode:?}: importer skipped elements");
         assert!(!imp.paths.is_empty(), "{mode:?}: importer produced no paths");
+        // Importing cleanly is not enough to be cuttable. `cutplan` groups by stroke and skips
+        // shapes that have none, so a trace that imports as fill-only geometry plans zero
+        // passes and silently cannot be cut at all.
+        for (i, (_, hint)) in imp.paths.iter().enumerate() {
+            assert!(
+                hint.stroke.is_some(),
+                "{mode:?}: imported path {i} has no stroke, so the cut planner would skip it",
+            );
+        }
     }
 }

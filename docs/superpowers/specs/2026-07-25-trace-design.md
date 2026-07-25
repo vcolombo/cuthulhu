@@ -86,7 +86,16 @@ load_image_preview(path: PathBuf) -> Result<String, String>
 
 It returns a `data:<mime>;base64,…` URL, so the source bitmap **does** cross IPC, base64-encoded (~1.37× the file size). This is a deliberate departure from `convertFileSrc`, which would require asset-protocol scope configuration for arbitrary user-picked paths and is awkward to mock in the e2e suite. The cost is that a large source image is briefly held as a base64 string in the webview; the `MAX_DIM` cap bounds tracing, not this preview.
 
-Both commands read any path the webview supplies. That does not widen the trust boundary today — the webview loads only bundled local UI, paths originate from the native picker, and `load_project` already exposes an arbitrary-read primitive to the same code. It stops being true if remote or untrusted content is ever rendered in the webview, which SP6 (print & cut) should treat as a precondition to re-check.
+Both commands read any path the webview supplies, so both are constrained to return only image-derived data:
+
+- `trace_image` returns SVG, and a path that does not decode as an image errors.
+- `load_image_preview` re-encodes through the decoder and returns a PNG, rather than the file's original bytes.
+
+That distinction is load-bearing. Returning raw bytes would have made the thumbnail command a general "read any file, hand back its contents" primitive, which the app did not previously have. `load_project` is **not** an equivalent primitive despite also taking a caller-supplied path: it opens the file as a zip and requires a `manifest.json` member, so a non-project path fails without disclosing anything. An earlier draft of this spec claimed otherwise and was wrong.
+
+Both commands also refuse files over 256 MiB before reading them, since the decoder's ceiling only applies once the bytes are already in memory.
+
+What remains is that a compromised renderer could read *image* files outside the picker's selection. Closing that needs paths authorized by the picker rather than trusted from the caller — worth doing if untrusted content is ever rendered in the webview, which SP6 (print & cut) should treat as a precondition to re-check.
 
 Rendering these data URLs requires `img-src 'self' data:` in the Tauri CSP (`apps/desktop/tauri.conf.json`); under the default `default-src 'self'` both previews are blocked in a packaged build.
 

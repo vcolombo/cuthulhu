@@ -104,6 +104,22 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
     Ok((resized.to_rgba8(), true))
 }
 
+/// Decode an image, apply the same ceiling and downscale as tracing, and re-encode it as PNG.
+///
+/// The desktop thumbnail goes through this instead of returning the file's raw bytes. Handing
+/// back raw bytes makes the command a general "read any file and give me its contents" primitive
+/// — a non-image path succeeds just as readily as an image one. Round-tripping through the
+/// decoder means only real image data can ever come back, and the payload is bounded by
+/// `MAX_DIM` rather than by the source file's size.
+pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
+    let (rgba, _) = decode_and_downscale(image_bytes)?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| TraceError::Trace(e.to_string()))?;
+    Ok(out.into_inner())
+}
+
 pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
     validate(opts)?;
     let (rgba, downscaled) = decode_and_downscale(image_bytes)?;
@@ -261,6 +277,15 @@ mod tests {
     fn trace_rejects_invalid_options_before_decoding() {
         let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
         assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
+    }
+
+    /// The thumbnail path must not become a way to read non-image files: anything that is not
+    /// decodable image data has to fail rather than come back as content.
+    #[test]
+    fn preview_png_refuses_non_image_data() {
+        assert!(matches!(preview_png(b"root:x:0:0:root:/root:/bin/sh\n"), Err(TraceError::Decode(_))));
+        let ok = preview_png(&png_bytes(&black_square(64, 64, 16))).unwrap();
+        assert_eq!(&ok[1..4], b"PNG");
     }
 
     /// A 20000×20000 PNG is 75 KB compressed but 1.6 GB as RGBA. Without a decode-time

@@ -167,21 +167,35 @@ pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
 
-#[tauri::command(async)]
-pub fn trace_image(path: PathBuf, opts: trace::TraceOptions) -> Result<trace::TraceResult, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    trace::trace(&bytes, &opts).map_err(|e| e.to_string())
+/// Cap on the source file both trace commands will pull into memory. The decoder's own ceiling
+/// only applies once the bytes are already resident, so without this a huge file exhausts memory
+/// before it can be rejected for not being a usable image.
+const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn read_image_file(path: &PathBuf) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if meta.len() > MAX_INPUT_FILE_BYTES {
+        return Err(format!(
+            "file is too large to open: {} MiB",
+            meta.len() / (1024 * 1024)
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
 #[tauri::command(async)]
+pub fn trace_image(path: PathBuf, opts: trace::TraceOptions) -> Result<trace::TraceResult, String> {
+    let bytes = read_image_file(&path)?;
+    trace::trace(&bytes, &opts).map_err(|e| e.to_string())
+}
+
+/// Returns the source thumbnail as a re-encoded PNG data URL — never the file's original bytes,
+/// so a path that is not a decodable image yields an error rather than its contents.
+#[tauri::command(async)]
 pub fn load_image_preview(path: PathBuf) -> Result<String, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        _ => "image/png",
-    };
+    let bytes = read_image_file(&path)?;
+    let png = trace::preview_png(&bytes).map_err(|e| e.to_string())?;
     use base64::Engine as _;
-    Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+    Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))
 }

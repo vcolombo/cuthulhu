@@ -106,13 +106,6 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
     Ok((resized.to_rgba8(), true))
 }
 
-/// Decode an image, apply the same ceiling and downscale as tracing, and re-encode it as PNG.
-///
-/// The desktop thumbnail goes through this instead of returning the file's raw bytes. Handing
-/// back raw bytes makes the command a general "read any file and give me its contents" primitive
-/// — a non-image path succeeds just as readily as an image one. Round-tripping through the
-/// decoder means only real image data can ever come back, and the payload is bounded by
-/// `MAX_DIM` rather than by the source file's size.
 /// Drop `<path>` elements that carry no geometry, returning the cleaned SVG and the number of
 /// paths that actually draw something. vtracer writes one element per line, so this is a line
 /// filter; a path is empty when its `d` attribute is `d=""`.
@@ -173,6 +166,13 @@ fn mirror_fill_onto_stroke(line: &str) -> String {
     }
 }
 
+/// Decode an image, apply the same ceiling and downscale as tracing, and re-encode it as PNG.
+///
+/// The desktop thumbnail goes through this instead of returning the file's raw bytes. Handing
+/// back raw bytes makes the command a general "read any file and give me its contents" primitive
+/// — a non-image path succeeds just as readily as an image one. Round-tripping through the
+/// decoder means only real image data can ever come back, and the payload is bounded by
+/// `MAX_DIM` rather than by the source file's size.
 pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
     let (rgba, _) = decode_and_downscale(image_bytes)?;
     let mut out = std::io::Cursor::new(Vec::new());

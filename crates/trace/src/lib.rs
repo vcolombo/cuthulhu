@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_DIM: u32 = 2048;
 
+/// Ceiling on what the decoder may allocate for one image. Applied during decode, so a
+/// compressed bomb is rejected before its raw buffer exists — `MAX_DIM` only bounds what
+/// vtracer sees, which is far too late. Sized to clear an ordinary large photo (a 6000×4000
+/// RGBA frame is ~96 MiB) while refusing the pathological cases.
+const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceMode { Binary, Color }
@@ -64,7 +70,29 @@ pub(crate) fn validate(opts: &TraceOptions) -> Result<(), TraceError> {
 }
 
 pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bool), TraceError> {
-    let img = image::load_from_memory(bytes).map_err(|e| TraceError::Decode(e.to_string()))?;
+    // Read the header alone and reject oversized images before decoding. `image`'s own
+    // `Limits::max_alloc` is not enforced on every decoder path, so the explicit check is what
+    // actually holds: without it a compressed bomb allocates its full raw buffer first.
+    let (w0, h0) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| TraceError::Decode(e.to_string()))?
+        .into_dimensions()
+        .map_err(|e| TraceError::Decode(e.to_string()))?;
+    let needed = w0 as u64 * h0 as u64 * 4;
+    if needed > MAX_DECODE_ALLOC {
+        return Err(TraceError::Decode(format!(
+            "image is too large to decode: {w0}×{h0} needs {} MiB",
+            needed / (1024 * 1024)
+        )));
+    }
+
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| TraceError::Decode(e.to_string()))?;
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| TraceError::Decode(e.to_string()))?;
     let (w, h) = (img.width(), img.height());
     if w.max(h) <= MAX_DIM {
         return Ok((img.to_rgba8(), false));
@@ -96,7 +124,17 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
         ..vtracer::Config::default()
     };
 
-    let svg_file = vtracer::convert(img, config).map_err(TraceError::Trace)?;
+    // visioncortex (vtracer's clustering layer) panics on some valid high-frequency images —
+    // a 512×512 one-pixel checkerboard overflows in clusters.rs. An unwind here would abort the
+    // CLI and take down the Tauri command, so contain it and report it as a normal trace failure.
+    // The default panic hook still prints the raw panic to stderr before we swallow the unwind;
+    // that noise is cosmetic. Silencing it means swapping the process-global hook, which would
+    // also hide genuine panics on other threads for the duration — not worth the trade.
+    let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vtracer::convert(img, config)
+    }))
+    .map_err(|_| TraceError::Trace("tracer failed on this image; try a lower detail setting".into()))?;
+    let svg_file = converted.map_err(TraceError::Trace)?;
     if svg_file.paths.is_empty() {
         return Err(TraceError::EmptyResult);
     }
@@ -220,5 +258,25 @@ mod tests {
     fn trace_rejects_invalid_options_before_decoding() {
         let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
         assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
+    }
+
+    /// A 20000×20000 PNG is 75 KB compressed but 1.6 GB as RGBA. Without a decode-time
+    /// allocation limit this exhausts memory before `MAX_DIM` downscaling ever runs.
+    #[test]
+    fn decode_rejects_a_decompression_bomb() {
+        let bytes = include_bytes!("../tests/fixtures/bomb-20000x20000.png");
+        assert!(matches!(decode_and_downscale(bytes), Err(TraceError::Decode(_))));
+    }
+
+    /// visioncortex overflows on this input; the panic must surface as a typed error
+    /// rather than unwinding out of the CLI or the Tauri command.
+    #[test]
+    fn trace_contains_tracer_panic_on_high_frequency_image() {
+        let bytes = include_bytes!("../tests/fixtures/checker-512.png");
+        let opts = TraceOptions { filter_speckle: 0, ..TraceOptions::default() };
+        match trace(bytes, &opts) {
+            Err(TraceError::Trace(_)) | Err(TraceError::EmptyResult) => {}
+            other => panic!("expected a typed error, got {other:?}"),
+        }
     }
 }

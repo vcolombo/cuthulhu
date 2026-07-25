@@ -273,7 +273,7 @@ export function CutDialog({
             const forceDisabled = fieldDisabled("force", caps);
             return (
               <div
-                key={i}
+                key={row.color ?? "none"}
                 data-testid="cut-pass-row"
                 style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, border: "1px solid var(--border)", padding: 6 }}
               >

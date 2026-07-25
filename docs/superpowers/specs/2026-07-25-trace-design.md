@@ -99,6 +99,8 @@ Neither command trusts the caller's path on its own. The native picker lives in 
 
 This is why the picker is not the `tauri-plugin-dialog` call it was in the first draft: a picker running in the webview proves nothing to the backend.
 
+**Accepted residual:** resolving a path and opening it are not one atomic step, so a file replaced between the check and the read would be the one that gets traced. This is deliberately not defended against. The renderer cannot replace files — it reaches the filesystem only through these commands — so exploiting it requires a separate local process with write access to the user's files, which can already read those files without involving this app. No privilege boundary is crossed. The atomic alternative, pinning the `(dev, ino)` recorded at pick time and verifying it against the opened handle, would reject an image the user legitimately re-saved between picking and tracing, since editors commonly write-then-rename and change the inode. That is a real failure on an ordinary path traded against an attack that gains nothing.
+
 Rendering these data URLs requires `img-src 'self' data:` in the Tauri CSP (`apps/desktop/tauri.conf.json`); under the default `default-src 'self'` both previews are blocked in a packaged build.
 
 ### UI: `TraceDialog.tsx` + `trace/viewmodel.ts`

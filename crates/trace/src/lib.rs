@@ -81,7 +81,9 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
     // 8 bytes/px, not 4: a 16-bit-per-channel PNG decodes to RGBA16, double the size of the
     // RGBA8 we ultimately convert to. Estimating at 4 would let such an image allocate twice
     // the ceiling before we ever see it.
-    let needed = w0 as u64 * h0 as u64 * 8;
+    // Saturating, not wrapping: the product only stays inside u64 because PNG's own header
+    // limits happen to bound it, which is not a property this code should depend on.
+    let needed = (w0 as u64).saturating_mul(h0 as u64).saturating_mul(8);
     if needed > MAX_DECODE_ALLOC {
         return Err(TraceError::Decode(format!(
             "image is too large to decode: {w0}×{h0} needs up to {} MiB",
@@ -111,6 +113,26 @@ pub(crate) fn decode_and_downscale(bytes: &[u8]) -> Result<(image::RgbaImage, bo
 /// — a non-image path succeeds just as readily as an image one. Round-tripping through the
 /// decoder means only real image data can ever come back, and the payload is bounded by
 /// `MAX_DIM` rather than by the source file's size.
+/// Drop `<path>` elements that carry no geometry, returning the cleaned SVG and the number of
+/// paths that actually draw something. vtracer writes one element per line, so this is a line
+/// filter; a path is empty when its `d` attribute is `d=""`.
+fn strip_empty_paths(svg: &str) -> (String, usize) {
+    let mut out = String::with_capacity(svg.len());
+    let mut kept = 0usize;
+    for line in svg.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("<path") {
+            if trimmed.contains("d=\"\"") {
+                continue;
+            }
+            kept += 1;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    (out, kept)
+}
+
 pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
     let (rgba, _) = decode_and_downscale(image_bytes)?;
     let mut out = std::io::Cursor::new(Vec::new());
@@ -154,12 +176,19 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     }))
     .map_err(|_| TraceError::Trace("tracer failed on this image; try a lower detail setting".into()))?;
     let svg_file = converted.map_err(TraceError::Trace)?;
-    if svg_file.paths.is_empty() {
+    // vtracer emits a `<path d="">` element for every cluster it could not turn into geometry,
+    // and on high-frequency input nearly all of them can be empty — a 256×256 checkerboard at
+    // speckle 0 yields 32768 paths that draw nothing. Counting those would report a wildly
+    // inflated `path_count` and call an empty trace a success. They are invisible downstream
+    // too: usvg discards them before `fileio::svg_to_paths` builds its node list, so they never
+    // appear in the `skipped` warnings the Insert path relies on to report loss.
+    let (svg, path_count) = strip_empty_paths(&svg_file.to_string());
+    if path_count == 0 {
         return Err(TraceError::EmptyResult);
     }
     Ok(TraceResult {
-        path_count: svg_file.paths.len(),
-        svg: svg_file.to_string(),
+        path_count,
+        svg,
         width_px: width,
         height_px: height,
         downscaled,
@@ -277,6 +306,34 @@ mod tests {
     fn trace_rejects_invalid_options_before_decoding() {
         let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
         assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
+    }
+
+    /// A 256×256 one-pixel checkerboard at speckle 0 makes vtracer emit tens of thousands of
+    /// geometry-free paths. Reporting those as a successful trace is a lie the importer cannot
+    /// detect, because usvg drops them before `skipped` is ever computed.
+    #[test]
+    fn geometry_free_paths_do_not_count_as_a_trace() {
+        let img = RgbaImage::from_fn(256, 256, |x, y| {
+            if (x + y) % 2 == 0 { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
+        });
+        let opts = TraceOptions { mode: TraceMode::Binary, filter_speckle: 0, ..TraceOptions::default() };
+        match trace(&png_bytes(&img), &opts) {
+            Err(TraceError::EmptyResult) => {}
+            Ok(r) => {
+                assert!(!r.svg.contains("d=\"\""), "empty paths survived into the output");
+                assert_eq!(r.path_count, r.svg.matches("<path").count(), "path_count disagrees with real paths");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strip_empty_paths_counts_only_real_geometry() {
+        let svg = "<svg>\n<path d=\"M0 0 L1 1 Z\" fill=\"#000\"/>\n<path d=\"\" fill=\"#111\"/>\n</svg>";
+        let (out, n) = strip_empty_paths(svg);
+        assert_eq!(n, 1);
+        assert!(!out.contains("d=\"\""));
+        assert!(out.contains("M0 0 L1 1 Z"));
     }
 
     /// The thumbnail path must not become a way to read non-image files: anything that is not

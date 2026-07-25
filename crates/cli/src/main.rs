@@ -49,6 +49,29 @@ enum Command {
     },
     /// List known devices
     ListDevices,
+    /// Trace a bitmap image (PNG/JPEG/GIF/BMP) into an SVG of cuttable paths
+    Trace {
+        /// Input image file
+        file: std::path::PathBuf,
+        /// Output SVG path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+        /// binary (single-color silhouette) or color (one path per color cluster)
+        #[arg(long, default_value = "binary")]
+        mode: String,
+        /// Ignore speckles up to this size in px (0–16)
+        #[arg(long, default_value_t = 4)]
+        speckle: u8,
+        /// Corner threshold in degrees (0–180); higher = smoother
+        #[arg(long, default_value_t = 60)]
+        smoothing: u8,
+        /// Segment length threshold (3.5–10.0); lower = more detail
+        #[arg(long, default_value_t = 4.0)]
+        detail: f64,
+        /// Color precision in bits (1–8, color mode only)
+        #[arg(long, default_value_t = 6)]
+        colors: u8,
+    },
 }
 
 fn main() {
@@ -98,6 +121,29 @@ fn run() -> Result<(), String> {
                 let p = d.driver().profile().clone();
                 println!("{}\t{}\t{} x {} mm", p.id, p.name, p.width_mm, p.height_mm);
             }
+            Ok(())
+        }
+        Command::Trace { file, output, mode, speckle, smoothing, detail, colors } => {
+            let mode = match mode.as_str() {
+                "binary" => trace::TraceMode::Binary,
+                "color" => trace::TraceMode::Color,
+                other => return Err(format!("--mode must be binary or color, got {other}")),
+            };
+            let opts = trace::TraceOptions {
+                mode,
+                filter_speckle: speckle,
+                corner_threshold: smoothing,
+                length_threshold: detail,
+                color_precision: colors,
+            };
+            let bytes = std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            let result = trace::trace(&bytes, &opts).map_err(|e| match e {
+                trace::TraceError::EmptyResult =>
+                    "nothing traced — lower --speckle or lower --detail".to_string(),
+                other => other.to_string(),
+            })?;
+            std::fs::write(&output, result.svg).map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+            println!("{} paths → {}", result.path_count, output.display());
             Ok(())
         }
     }

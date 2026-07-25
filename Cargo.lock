@@ -510,6 +510,9 @@ dependencies = [
  "driver-silhouette",
  "fileio",
  "geometry",
+ "image 0.25.10",
+ "tempfile",
+ "trace",
 ]
 
 [[package]]

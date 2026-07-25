@@ -56,6 +56,8 @@ Internals:
 
 - `image` crate decodes PNG/JPEG/GIF/BMP → RGBA.
 - Images over **2048 px max-dimension are downscaled** to fit (aspect preserved) before tracing. Bounds trace time; not an error.
+- Dimensions are read from the header **before** decoding, and an image whose raw RGBA buffer would exceed **512 MiB** is rejected as `Decode`. The downscale cap bounds what vtracer sees, not what the decoder allocates, so without this a compressed bomb (a 75 KB 20000×20000 PNG expands to 1.6 GB) exhausts memory first.
+- vtracer's clustering layer panics on some valid high-frequency inputs (a 512×512 one-pixel checkerboard overflows in `visioncortex`). The conversion runs inside `catch_unwind` and a panic surfaces as `TraceError::Trace`, so neither the CLI nor the Tauri command aborts.
 - vtracer `convert(ColorImage, Config)`; non-exposed knobs pinned: `mode: Spline`, `hierarchical: Stacked`, `layer_difference`, `splice_threshold`, `max_iterations`, `path_precision` at vtracer defaults.
 - Options validated to the ranges above; out-of-range → `TraceError::InvalidOption` naming the field and range.
 - Zero paths traced → `TraceError::EmptyResult`.
@@ -73,14 +75,27 @@ One new async command:
 trace_image(path: PathBuf, opts: TraceOptions) -> Result<TraceResult, String>
 ```
 
-Rust reads the file — bitmap bytes never cross IPC; only the small SVG string returns. Insert is the **existing** `import_svg` command called from the UI with the returned SVG string as bytes, parent = document root.
+Rust reads the file, so the *trace* path never sends bitmap bytes across IPC — only the SVG string returns. Insert is the **existing** `import_svg` command called from the UI with that SVG string as bytes, parent = document root.
+
+A second command backs the source-image thumbnail:
+
+```rust
+#[tauri::command(async)]
+load_image_preview(path: PathBuf) -> Result<String, String>
+```
+
+It returns a `data:<mime>;base64,…` URL, so the source bitmap **does** cross IPC, base64-encoded (~1.37× the file size). This is a deliberate departure from `convertFileSrc`, which would require asset-protocol scope configuration for arbitrary user-picked paths and is awkward to mock in the e2e suite. The cost is that a large source image is briefly held as a base64 string in the webview; the `MAX_DIM` cap bounds tracing, not this preview.
+
+Both commands read any path the webview supplies. That does not widen the trust boundary today — the webview loads only bundled local UI, paths originate from the native picker, and `load_project` already exposes an arbitrary-read primitive to the same code. It stops being true if remote or untrusted content is ever rendered in the webview, which SP6 (print & cut) should treat as a precondition to re-check.
+
+Rendering these data URLs requires `img-src 'self' data:` in the Tauri CSP (`apps/desktop/tauri.conf.json`); under the default `default-src 'self'` both previews are blocked in a packaged build.
 
 ### UI: `TraceDialog.tsx` + `trace/viewmodel.ts`
 
 CutDialog pattern (dialog + pure viewmodel + tests).
 
 - Entry: TopBar "Trace…" button → native file picker (`tauri-plugin-dialog`, image-extension filters).
-- Layout: source bitmap (`<img>` via `convertFileSrc`) beside traced preview (SVG data URL); mode toggle (Binary/Color); sliders: Ignore speckles, Smoothing, Detail, and Colors (enabled in color mode only). The Detail slider displays an inverted scale of `length_threshold` (slider up = more detail = lower threshold), so the empty-state hint "raise detail" is directionally correct.
+- Layout: source bitmap (`<img>` via `load_image_preview`'s base64 data URL) beside traced preview (SVG data URL); mode toggle (Binary/Color); sliders: Ignore speckles, Smoothing, Detail, and Colors (enabled in color mode only). The Detail slider displays an inverted scale of `length_threshold` (slider up = more detail = lower threshold), so the empty-state hint "raise detail" is directionally correct.
 - Slider/mode changes re-trace after **300 ms debounce**; a monotonic request id discards stale responses (SP4 job-id pattern).
 - Insert button → `import_svg` → dialog closes. Path count is shown in the dialog before inserting; import-side skips surface through the existing StatusBar error channel ("Inserted with M element(s) skipped"). Undo removes the whole insertion (single Delta).
 

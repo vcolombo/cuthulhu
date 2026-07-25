@@ -28,6 +28,15 @@ describe("staleness", () => {
     expect(acceptError(2, 2, "empty", { kind: "tracing" })).toEqual({ kind: "empty" });
     expect(acceptError(2, 2, "trace failed: x", { kind: "tracing" })).toEqual({ kind: "error", message: "trace failed: x" });
   });
+  // Models the dialog's ordering contract: a control change bumps the id up front, so a
+  // response for the superseded request is rejected even though its own trace is still running.
+  // Bumping only when the debounce fires would let this land and enable Insert on stale geometry.
+  it("rejects an in-flight response once a newer request has been issued", () => {
+    const inFlightId = 1;
+    const afterControlChange = 2; // id bumped by the control change, before any new trace fires
+    const prev = { kind: "tracing" as const };
+    expect(acceptResult(inFlightId, afterControlChange, ready, prev)).toBe(prev);
+  });
 });
 
 describe("svgDataUrl", () => {

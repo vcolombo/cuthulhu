@@ -42,3 +42,5 @@
 - [ ] Trace a photo larger than 2048 px — "reduced to 2048 px" note appears; app stays responsive.
 - [ ] Max speckle filter on a small image — "Nothing traced" hint (not an error banner); lowering the slider recovers the preview.
 - [ ] Pick a non-image file via the picker filter bypass (rename a .txt to .png) — error banner in dialog, dialog still usable.
+- [ ] **In a packaged build (`tauri build`, not `tauri dev`)** — both the source thumbnail and the traced preview actually render. The e2e suite runs against Vite and never applies the Tauri CSP, so a missing `img-src 'self' data:` blocks both images with green tests. Check the webview console for CSP violations.
+- [ ] Trace a fine-detail image (dithered scan, halftone, or a one-pixel checkerboard ≥512 px) — a tracer failure shows as an error banner; the app does not crash or hang.

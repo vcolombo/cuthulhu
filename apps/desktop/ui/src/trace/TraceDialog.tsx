@@ -65,12 +65,16 @@ export function TraceDialog({ path, onInsert, onClose }: {
   }, [path]);
 
   useEffect(() => {
+    // Invalidate here, not inside the debounced callback: a control change must retire any
+    // in-flight request immediately. Bumping only on fire leaves a window up to the debounce
+    // interval where a response for the previous settings still matches and renders as ready —
+    // enabling Insert with an SVG that no longer matches the sliders.
+    const id = ++latestId.current;
     debouncer.schedule(() => {
-      const id = ++latestId.current;
       setPreview({ kind: "tracing" });
       ipc.traceImage({ path, opts: toOptionsDto(controls) }).then(
         (r) => setPreview((prev) => acceptResult(id, latestId.current, r, prev)),
-        (e) => setPreview((prev) => acceptError(id, latestId.current, String(e), prev)),
+        (e) => setPreview((prev) => acceptError(id, latestId.current, ipc.ipcErrorMessage(e), prev)),
       );
     });
     return () => debouncer.cancel();

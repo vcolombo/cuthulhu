@@ -38,6 +38,11 @@ impl Driver for SilhouetteDriver {
         // ponytail: no documented safe-park command yet; head stays put between passes — hardware checklist validates
         Vec::new()
     }
+    fn status_query(&self) -> Vec<u8> {
+        // ESC ENQ, not the bare-ENQ default: the Silhouette dialect frames its
+        // status query as 1b 05. [src: Graphtec.py L176 (GPL-2.0+)]
+        vec![0x1b, 0x05]
+    }
     fn session_end(&self) -> Vec<u8> {
         let mut out = Vec::new();
         push("SO0", &mut out);
@@ -56,6 +61,12 @@ mod tests {
     fn square() -> Vec<Point> {
         [(0.0,0.0),(20.0,0.0),(20.0,20.0),(0.0,20.0),(0.0,0.0)]
             .iter().map(|&(x,y)| Point{x,y}).collect()
+    }
+
+    #[test]
+    fn status_query_is_esc_enq() {
+        // 1b 05 per the protocol doc; a bare 0x05 gets no reply from the device.
+        assert_eq!(SilhouetteDriver::new().status_query(), vec![0x1b, 0x05]);
     }
 
     #[test]

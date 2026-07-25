@@ -29,6 +29,13 @@ pub trait Driver {
     fn session_begin(&self) -> Vec<u8>;
     fn encode_pass(&self, pass: &Job) -> Result<Vec<u8>, DriverError>;
     fn pass_park(&self) -> Vec<u8>;
+    /// Bytes that query device status for completion polling; the device replies
+    /// with a single status char (`0` ready / `1` moving / `2` unloaded) plus a
+    /// terminator. Default is a bare ENQ; drivers whose dialect frames it
+    /// differently (e.g. Silhouette's ESC-prefixed `1b 05`) override this.
+    fn status_query(&self) -> Vec<u8> {
+        vec![0x05]
+    }
     fn session_end(&self) -> Vec<u8>;
     fn abort_bytes(&self) -> Option<Vec<u8>>;
 }

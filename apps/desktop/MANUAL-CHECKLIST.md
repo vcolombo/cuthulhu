@@ -9,13 +9,17 @@
 
 ## SP4 — Cut workflow
 
-### Hardware: Cameo 5 (closes SP4)
-- [ ] One prologue and one epilogue verified on-device across a 2-pass job.
-- [ ] Moving→ready ENQ status polling observed between passes.
-- [ ] Safe park sequence verified between passes (pen-up, no media movement).
-- [ ] Registered two-color overlay cut aligns correctly on the device.
-- [ ] Cancel mid-cut stops the machine (best-effort abort behavior).
-- [ ] Unplug mid-cut results in device error plus graceful recovery.
+### Hardware: Cameo 5 (closes SP4) — verified 2026-07-24 on Cameo 5 Alpha Plus (0x3844:0x0002)
+- [x] One prologue and one epilogue verified on-device across a 2-pass job.
+      (Dry-run bytes: ESC EOT + J1 only on pass 1; SO0/FN0 only after pass 2. On-device 2-pass job completed through swap/resume.)
+- [x] Moving→ready ENQ status polling observed between passes.
+      (Required a fix found by this checklist: the query must be ESC ENQ `1b 05`, not bare `0x05` — bare ENQ gets no reply and times out the 60s poll cap.)
+- [x] Safe park sequence verified between passes (pen-up, no media movement).
+- [x] Registered two-color overlay cut aligns correctly on the device.
+- [x] Cancel mid-cut stops the machine (best-effort abort behavior).
+      (Host lands on Cancelled promptly; Silhouette has no abort command, so the machine finishes its already-buffered moves before stopping.)
+- [x] Unplug mid-cut results in device error plus graceful recovery.
+      (Typed `Io("Unknown")` error, no panic/hang; replug + fresh cut succeeded. nusb's disconnect error string is opaque — polish candidate.)
 
 ### Hardware: Puma IV (non-blocking)
 - [ ] Multi-color cut via operator-confirmed pass completion (manual "pass done" button).

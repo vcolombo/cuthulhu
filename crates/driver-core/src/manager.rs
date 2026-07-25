@@ -272,10 +272,15 @@ fn resolve_pass_completion(
             return Ok(PassCompletion::Cancelled);
         }
         let iter_start = Instant::now();
-        write_all(transport, &[0x05]).map_err(DeviceError::from)?; // ENQ status query
+        write_all(transport, &driver.status_query()).map_err(DeviceError::from)?;
         let mut buf = [0u8; 8];
         match transport.read(&mut buf, interval) {
             Ok(n) if n > 0 && buf[0] == b'0' => return Ok(PassCompletion::Ready),
+            // Unloaded media can never become ready on its own — fail with a
+            // real reason instead of silently polling out the 60s deadline.
+            Ok(n) if n > 0 && buf[0] == b'2' => {
+                return Err(DeviceError::Io("media unloaded".to_string()))
+            }
             Ok(_) => {} // not-ready reply (e.g. still moving); keep polling
             Err(TransportError::Timeout) => {} // no reply within the interval; keep polling
             Err(e) => return Err(DeviceError::from(e)), // hard transport error: fail fast
@@ -402,7 +407,7 @@ fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Tra
     let interval = Duration::from_millis(250);
     for _ in 0..ATTEMPTS {
         let iter_start = Instant::now();
-        if write_all(transport, &[0x05]).is_err() {
+        if write_all(transport, &driver.status_query()).is_err() {
             return false;
         }
         let mut buf = [0u8; 8];
@@ -1151,6 +1156,27 @@ mod tests {
             },
             DeviceError::Disconnected,
         );
+    }
+
+    #[test]
+    fn unloaded_media_fails_fast_instead_of_polling_out_the_deadline() {
+        struct UnloadedFactory;
+        impl DeviceBackendFactory for UnloadedFactory {
+            fn list_devices(&self) -> Vec<DeviceInfo> { vec![cameo_info()] }
+            fn driver_for(&self, _m: &str) -> Option<Box<dyn Driver + Send>> { Some(fake_driver()) }
+            fn open_transport(&self, _i: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+                let mut reads = VecDeque::new();
+                reads.push_back(Ok(b"2\x03".to_vec())); // status: unloaded
+                Ok(Box::new(MockTransport { reads, ..Default::default() }))
+            }
+        }
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(UnloadedFactory));
+        mgr.connect(cameo_info()).unwrap();
+        let start = std::time::Instant::now();
+        let err = mgr.cut(two_pass_job()).unwrap_err();
+        assert_eq!(err, DeviceError::Io("media unloaded".to_string()));
+        // The whole point: an unloaded reply must not silently poll out the 60s cap.
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

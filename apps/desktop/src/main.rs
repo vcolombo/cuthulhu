@@ -27,6 +27,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppState::new()))
         .manage(dev_handle)
+        .manage(ipc::AuthorizedImages::default())
         .invoke_handler(tauri::generate_handler![
             ipc::new_doc,
             ipc::snapshot,
@@ -58,6 +59,7 @@ fn main() {
             ipc::delete_preset,
             ipc::trace_image,
             ipc::load_image_preview,
+            ipc::pick_image,
             force_quit,
         ])
         .on_window_event(|window, event| {

@@ -95,7 +95,9 @@ That distinction is load-bearing. Returning raw bytes would have made the thumbn
 
 Both commands also refuse files over 256 MiB before reading them, since the decoder's ceiling only applies once the bytes are already in memory.
 
-What remains is that a compromised renderer could read *image* files outside the picker's selection. Closing that needs paths authorized by the picker rather than trusted from the caller — worth doing if untrusted content is ever rendered in the webview, which SP6 (print & cut) should treat as a precondition to re-check.
+Neither command trusts the caller's path on its own. The native picker lives in Rust as `pick_image`, which records each canonicalized selection in per-session state; `trace_image` and `load_image_preview` both refuse a path that is not in that set. Selection by the user is therefore what grants access, and the renderer cannot authorize a path — only ask that one be authorized by the user choosing it. Paths are canonicalized on both sides of the check so an authorized file cannot be re-reached under a different spelling via `..` segments or a symlink.
+
+This is why the picker is not the `tauri-plugin-dialog` call it was in the first draft: a picker running in the webview proves nothing to the backend.
 
 Rendering these data URLs requires `img-src 'self' data:` in the Tauri CSP (`apps/desktop/tauri.conf.json`); under the default `default-src 'self'` both previews are blocked in a packaged build.
 

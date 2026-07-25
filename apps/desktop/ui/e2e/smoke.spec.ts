@@ -346,15 +346,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
     list_presets: () => [],
     save_preset: () => null,
     delete_preset: () => null,
+    // The picker now lives in Rust so the backend, not the caller, decides what is readable.
+    pick_image: () => "/tmp/fake.png",
   } as Record<string, (args: Record<string, unknown>) => unknown>);
 
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args: Record<string, unknown> = {}) => {
       if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
-        const filters = (args.options as { filters?: { name: string }[] } | undefined)?.filters;
-        if (filters?.some((f) => f.name === "Images")) {
-          return Promise.resolve("/tmp/fake.png");
-        }
         return Promise.resolve("/mock/cuthulhu-project.cut");
       }
       if (cmd === "plugin:event|listen") {

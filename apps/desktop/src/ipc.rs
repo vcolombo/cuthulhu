@@ -172,6 +172,52 @@ pub fn delete_preset(id: String) -> Result<(), IpcError> {
 /// before it can be rejected for not being a usable image.
 const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Paths the user has actually chosen in the native picker this session.
+///
+/// The trace commands take a path from the webview, so without this any code running there could
+/// name an arbitrary file and read image content back out. The set is only ever added to by
+/// `pick_image`, which is the picker itself — the renderer cannot authorize a path, only ask for
+/// one to be authorized by the user choosing it.
+#[derive(Default)]
+pub struct AuthorizedImages(pub Mutex<std::collections::HashSet<PathBuf>>);
+
+/// Canonicalized so an authorized file cannot be re-reached under a different spelling
+/// (`..` segments, a symlink, a relative path) and miss the membership check.
+fn canonical(path: &PathBuf) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+fn ensure_authorized(auth: &AuthorizedImages, path: &PathBuf) -> Result<(), String> {
+    let real = canonical(path)?;
+    if auth.0.lock().unwrap().contains(&real) {
+        Ok(())
+    } else {
+        Err("that image was not selected in this session".into())
+    }
+}
+
+/// Open the native image picker and record what the user chose. This lives in Rust rather than
+/// in the webview precisely so that selection, not the caller's say-so, is what grants access.
+#[tauri::command(async)]
+pub fn pick_image(
+    app: tauri::AppHandle,
+    auth: tauri::State<AuthorizedImages>,
+) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp"])
+        .blocking_pick_file();
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("could not resolve the selected file: {e}"))?;
+    let real = canonical(&path)?;
+    auth.0.lock().unwrap().insert(real.clone());
+    Ok(Some(real))
+}
+
 fn read_image_file(path: &PathBuf) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -185,7 +231,12 @@ fn read_image_file(path: &PathBuf) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command(async)]
-pub fn trace_image(path: PathBuf, opts: trace::TraceOptions) -> Result<trace::TraceResult, String> {
+pub fn trace_image(
+    auth: tauri::State<AuthorizedImages>,
+    path: PathBuf,
+    opts: trace::TraceOptions,
+) -> Result<trace::TraceResult, String> {
+    ensure_authorized(&auth, &path)?;
     let bytes = read_image_file(&path)?;
     trace::trace(&bytes, &opts).map_err(|e| e.to_string())
 }
@@ -193,7 +244,11 @@ pub fn trace_image(path: PathBuf, opts: trace::TraceOptions) -> Result<trace::Tr
 /// Returns the source thumbnail as a re-encoded PNG data URL — never the file's original bytes,
 /// so a path that is not a decodable image yields an error rather than its contents.
 #[tauri::command(async)]
-pub fn load_image_preview(path: PathBuf) -> Result<String, String> {
+pub fn load_image_preview(
+    auth: tauri::State<AuthorizedImages>,
+    path: PathBuf,
+) -> Result<String, String> {
+    ensure_authorized(&auth, &path)?;
     let bytes = read_image_file(&path)?;
     let png = trace::preview_png(&bytes).map_err(|e| e.to_string())?;
     use base64::Engine as _;

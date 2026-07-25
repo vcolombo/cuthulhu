@@ -14,6 +14,7 @@ type Props = {
   onRedo: () => void;
   onImportFile: (file: File) => void;
   onCut: () => void;
+  onTrace: () => void;
 };
 
 const btn: CSSProperties = {
@@ -36,6 +37,7 @@ export function TopBar({
   onRedo,
   onImportFile,
   onCut,
+  onTrace,
 }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   return (
@@ -70,6 +72,9 @@ export function TopBar({
           if (file) onImportFile(file);
         }}
       />
+      <button aria-label="Trace" style={btn} onClick={onTrace}>
+        Trace…
+      </button>
       <div style={{ flex: 1 }} />
       <select
         aria-label="Machine"

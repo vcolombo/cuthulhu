@@ -838,6 +838,7 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cutplan",
  "document",
  "driver-core",
@@ -850,6 +851,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "trace",
 ]
 
 [[package]]

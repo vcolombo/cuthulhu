@@ -166,3 +166,22 @@ pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
 pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
+
+#[tauri::command(async)]
+pub fn trace_image(path: PathBuf, opts: trace::TraceOptions) -> Result<trace::TraceResult, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    trace::trace(&bytes, &opts).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+pub fn load_image_preview(path: PathBuf) -> Result<String, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mime = match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    };
+    use base64::Engine as _;
+    Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
+}

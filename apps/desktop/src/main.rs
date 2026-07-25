@@ -56,6 +56,8 @@ fn main() {
             ipc::list_presets,
             ipc::save_preset,
             ipc::delete_preset,
+            ipc::trace_image,
+            ipc::load_image_preview,
             force_quit,
         ])
         .on_window_event(|window, event| {

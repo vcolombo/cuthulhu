@@ -82,7 +82,7 @@ CutDialog pattern (dialog + pure viewmodel + tests).
 - Entry: TopBar "Trace…" button → native file picker (`tauri-plugin-dialog`, image-extension filters).
 - Layout: source bitmap (`<img>` via `convertFileSrc`) beside traced preview (SVG data URL); mode toggle (Binary/Color); sliders: Ignore speckles, Smoothing, Detail, and Colors (enabled in color mode only).
 - Slider/mode changes re-trace after **300 ms debounce**; a monotonic request id discards stale responses (SP4 job-id pattern).
-- Insert button → `import_svg` → StatusBar "Inserted N paths (M skipped)" → dialog closes. Undo removes the whole insertion (single Delta).
+- Insert button → `import_svg` → dialog closes. Path count is shown in the dialog before inserting; import-side skips surface through the existing StatusBar error channel ("Inserted with M element(s) skipped"). Undo removes the whole insertion (single Delta).
 
 ### CLI
 

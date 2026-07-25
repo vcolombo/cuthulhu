@@ -25,9 +25,12 @@
 - [ ] Multi-color cut via operator-confirmed pass completion (manual "pass done" button).
 - [ ] Host-queue drain ≠ cutter completion — explicitly verified that operator must confirm motion stopped before proceeding.
 
-### GUI verification
-- [ ] Open Cut dialog on a 2-color document — displays 2 passes with correct color swatches.
-- [ ] Preview shows order badges at shape start points and dashed travel lines in planned order (reordering passes does not yet update the travel lines — deferred).
-- [ ] Material preset selection works; per-pass override fields functional (subject to machine capabilities).
-- [ ] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
+### GUI verification — verified 2026-07-24 in the real app (imported 2-color SVG, Cameo 5 connected)
+- [x] Open Cut dialog on a 2-color document — displays 2 passes with correct color swatches.
+- [x] Preview shows order badges at shape start points and dashed travel lines in planned order (reordering passes does not yet update the travel lines — deferred).
+      (Badges/travel render, but the preview scales to the full 330×3000mm artboard so small docs are tiny — polish candidate: fit-to-content zoom.)
+- [x] Material preset selection works; per-pass override fields functional (subject to machine capabilities).
+      (Builtin presets appear after connect; picking Cardstock auto-fills force from the preset while a typed speed override wins.)
+- [x] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
 - [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).
+      (Not reachable on a real Mac: the OS always exposes serial ports, so unverified puma candidates always populate the list — every /dev/cu.* shows as its own "puma (unverified serial device)" row, which is itself a polish candidate. Empty-state render covered by the e2e mock test.)

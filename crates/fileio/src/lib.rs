@@ -96,8 +96,8 @@ fn walk(group: &usvg::Group, out: &mut Vec<(Path, StyleHint)>, skipped: &mut Vec
                     }
                 }
                 let hint = StyleHint {
-                    stroke: p.stroke().map(|s| paint_rgba(s.paint())),
-                    fill: p.fill().map(|f| paint_rgba(f.paint())),
+                    stroke: p.stroke().map(|s| paint_rgba(s.paint(), s.opacity())),
+                    fill: p.fill().map(|f| paint_rgba(f.paint(), f.opacity())),
                 };
                 out.push((Path { segs }, hint));
             }
@@ -118,7 +118,16 @@ fn mm_transformed(p: usvg::tiny_skia_path::Point, t: &usvg::Transform) -> Point 
 fn lerp23(from: Point, to: Point) -> Point {
     Point { x: from.x + 2.0 / 3.0 * (to.x - from.x), y: from.y + 2.0 / 3.0 * (to.y - from.y) }
 }
-fn paint_rgba(_paint: &usvg::Paint) -> u32 { 0x000000FF } // ponytail: solid-black default; real color mapping later
+fn paint_rgba(paint: &usvg::Paint, opacity: usvg::Opacity) -> u32 {
+    match paint {
+        usvg::Paint::Color(c) => {
+            let a = (opacity.get() * 255.0).round() as u32;
+            ((c.red as u32) << 24) | ((c.green as u32) << 16) | ((c.blue as u32) << 8) | a
+        }
+        // Gradients/patterns can't drive a blade; fall back to opaque black so the shape still cuts visibly.
+        _ => 0x000000FF,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +212,17 @@ mod tests {
         let svg = doc_to_svg(&doc);
         assert!(svg.contains("M12,0"), "expected composed point M12,0: {svg}");
         assert!(!svg.contains("M22,0"), "order looks swapped (parent applied before child): {svg}");
+    }
+    #[test]
+    fn import_preserves_stroke_colors_and_none() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="10">
+        <rect width="10" height="10" stroke="#ff0000" fill="none"/>
+        <rect x="10" width="10" height="10" stroke="#0000ff" fill="none"/>
+        <rect x="20" width="10" height="10" fill="#00ff00"/></svg>"##;
+        let imp = svg_to_paths(svg).unwrap();
+        let strokes: Vec<Option<u32>> = imp.paths.iter().map(|(_, h)| h.stroke).collect();
+        assert!(strokes.contains(&Some(0xFF0000FF)), "red stroke preserved: {strokes:?}");
+        assert!(strokes.contains(&Some(0x0000FFFF)), "blue stroke preserved");
+        assert!(strokes.contains(&None), "no-stroke shape stays None");
     }
 }

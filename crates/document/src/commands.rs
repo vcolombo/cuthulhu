@@ -95,13 +95,16 @@ pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
 
 /// Shape's outline in its own local space (node's own transform NOT applied), in mm,
 /// matching `Rect { x:0, y:0, w, h }` bounds convention (an ellipse of radii rx,ry
-/// centered at (rx,ry) has the same 0,0-origin bounds).
-fn local_shape_path(node: &Node) -> Option<Path> {
+/// centered at (rx,ry) has the same 0,0-origin bounds). `None` for containers (Group/Layer).
+/// Text converts via `geometry::text_to_path`; font/parse failures come back as `Err`.
+pub fn shape_outline(node: &Node) -> Result<Option<Path>, String> {
     match &node.kind {
-        NodeKind::Shape(ShapeKind::Rect { w, h }) => Some(rect_path(0.0, 0.0, *w, *h)),
-        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => Some(ellipse_path(*rx, *ry, *rx, *ry)),
-        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).ok(),
-        _ => None,
+        NodeKind::Shape(ShapeKind::Rect { w, h }) => Ok(Some(rect_path(0.0, 0.0, *w, *h))),
+        NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => Ok(Some(ellipse_path(*rx, *ry, *rx, *ry))),
+        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).map(Some).map_err(|e| format!("{e:?}")),
+        NodeKind::Shape(ShapeKind::Text { family, size_mm, text }) =>
+            text_to_path(family, *size_mm, text).map(Some).map_err(|e| format!("{e:?}")),
+        _ => Ok(None),
     }
 }
 
@@ -117,7 +120,7 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     let mut paths = vec![];
     for &id in &ids {
         let node = doc.get(id).ok_or(CmdError::NotFound)?;
-        let local = local_shape_path(node).ok_or(CmdError::NotFound)?;
+        let local = shape_outline(node).map_err(CmdError::Geometry)?.ok_or(CmdError::NotFound)?;
         let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
         paths.push(local.transformed(&world));
     }

@@ -13,6 +13,7 @@ type Props = {
   onUndo: () => void;
   onRedo: () => void;
   onImportFile: (file: File) => void;
+  onCut: () => void;
 };
 
 const btn: CSSProperties = {
@@ -34,6 +35,7 @@ export function TopBar({
   onUndo,
   onRedo,
   onImportFile,
+  onCut,
 }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   return (
@@ -92,6 +94,9 @@ export function TopBar({
       </button>
       <button aria-label="Reload" style={btn} onClick={onReload} disabled={!canReload}>
         Reload
+      </button>
+      <button aria-label="Cut" style={btn} onClick={onCut}>
+        Cut
       </button>
     </div>
   );

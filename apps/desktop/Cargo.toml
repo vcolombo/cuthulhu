@@ -19,6 +19,10 @@ tauri-build = "2"
 geometry = { path = "../../crates/geometry" }
 document = { path = "../../crates/document" }
 fileio = { path = "../../crates/fileio" }
+cutplan = { path = "../../crates/cutplan" }
+driver-core = { path = "../../crates/driver-core" }
+driver-silhouette = { path = "../../crates/driver-silhouette" }
+driver-hpgl = { path = "../../crates/driver-hpgl" }
 tauri = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

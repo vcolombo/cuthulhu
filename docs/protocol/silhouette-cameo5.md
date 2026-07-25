@@ -82,6 +82,19 @@ Cameo 4/5 have two holders).
 | Orientation | `TB50,0` / `TB50,1` | Portrait / landscape | `[src: Graphtec.py L871 (GPL-2.0+)]` |
 | Set origin / feed | `SO0`, `FN0` | End-of-job home + feed out | `[src: Graphtec.py L1476-1478, L1482-1488 (GPL-2.0+)]` |
 
+## Settings ranges
+
+Documented numeric constraints on cut parameters, sourced from the Cameo/Puma driver tables
+in `fablabnbg/inkscape-silhouette` (GPL-2.0+). **To be confirmed by hardware capture.**
+
+| Parameter | Range | Source |
+|-----------|-------|--------|
+| **Speed** (`!<speed>,<tool>`) | 1–30 | Cameo 4/5 driver tables; `[src: inkscape-silhouette Cameo driver]` |
+| **Pressure/Force** (`FX<pressure>,<tool>`) | 1–33 | Cameo 4/5 driver tables; `[src: inkscape-silhouette Cameo driver]` |
+
+These bounds apply to Silhouette Cameo 4 and 5 variants; GCC Puma (HPGL dialect) has separate bounds
+documented in `gcc-hpgl.md`.
+
 ## Minimal cut job sequence
 
 Order the driver emits for a plain cut (no registration): `[src: Graphtec.py L784, L845-882, L946-1122, L1219-1290, L1476-1488 (GPL-2.0+)]`

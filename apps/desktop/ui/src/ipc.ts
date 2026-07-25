@@ -66,6 +66,128 @@ export async function listMachines() {
   return invoke("list_machines", {});
 }
 
+// --- device / cut / preset wire types (mirror driver-core::manager + desktop::device) ---
+
+export type TransportKind =
+  | { Usb: { locator: string } }
+  | { Serial: { path: string; baud: number } };
+
+export type DeviceInfo = {
+  instance_id: string;
+  machine_id: string;
+  transport: TransportKind;
+  candidate: boolean;
+};
+
+export type DeviceError =
+  | "Disconnected"
+  | "Busy"
+  | "Timeout"
+  | "WriteZero"
+  | { Io: string };
+
+export type DeviceState =
+  | "Disconnected"
+  | "Connecting"
+  | "Idle"
+  | { Transmitting: { job_id: number; pass_index: number; submitted_bytes: number; total_bytes: number } }
+  | { AwaitingCompletion: { job_id: number; pass_index: number } }
+  | { WaitingForColorSwap: { job_id: number; next_pass_index: number } }
+  | { CancelRequested: { job_id: number } }
+  | { Stopping: { job_id: number } }
+  | { Cancelled: { job_id: number; pass_index: number; submitted_bytes: number; completion_known: boolean } }
+  | "Disconnecting"
+  | { Error: DeviceError };
+
+export type DeviceEventKind =
+  | { StateChanged: DeviceState }
+  | { Progress: { pass_index: number; submitted_bytes: number; total_bytes: number } }
+  | { PassComplete: number }
+  | "JobComplete"
+  | { Failed: DeviceError };
+
+export type DeviceEvent = { job_id: number; kind: DeviceEventKind };
+
+export type PlanCutPassSummary = { color: number | null; shape_count: number; node_ids: number[] };
+
+export type PlanCutResponse = {
+  passes: PlanCutPassSummary[];
+  skipped_no_stroke: number;
+  doc_revision: string;
+  travel: [number, number, number, number][];
+};
+
+export type IpcError = { code: string; message: string };
+
+// Real IpcError-derived commands reject with the serialized {code,message}
+// object itself (not a string) — String(e) on those yields "[object Object]".
+// Older doc-editing commands still reject with a plain string. Handle both.
+export function ipcErrorMessage(e: unknown): string {
+  if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
+  return String(e);
+}
+
+export function ipcErrorCode(e: unknown): string | null {
+  if (e && typeof e === "object" && "code" in e) return String((e as { code: unknown }).code);
+  return null;
+}
+
+export async function listDevices(): Promise<DeviceInfo[]> {
+  return invoke("list_devices", {});
+}
+
+export async function connectDevice(info: DeviceInfo): Promise<void> {
+  return invoke("connect_device", { info });
+}
+
+export async function disconnectDevice(): Promise<void> {
+  return invoke("disconnect_device", {});
+}
+
+export async function getDeviceState(): Promise<DeviceState> {
+  return invoke("get_device_state", {});
+}
+
+export async function getConnectedDevice(): Promise<DeviceInfo | null> {
+  return invoke("get_connected_device", {});
+}
+
+export async function forceQuit(): Promise<void> {
+  return invoke("force_quit", {});
+}
+
+export async function planCut(): Promise<PlanCutResponse> {
+  return invoke("plan_cut", {});
+}
+
+export async function cut(request: Args): Promise<number> {
+  return invoke("cut", { request });
+}
+
+export async function cancelCut(): Promise<void> {
+  return invoke("cancel_cut", {});
+}
+
+export async function resumeCut(): Promise<void> {
+  return invoke("resume_cut", {});
+}
+
+export async function confirmPassDone(): Promise<void> {
+  return invoke("confirm_pass_done", {});
+}
+
+export async function listPresets(machineId: string) {
+  return invoke("list_presets", { machineId });
+}
+
+export async function savePreset(p: Args) {
+  return invoke("save_preset", { p });
+}
+
+export async function deletePreset(id: string) {
+  return invoke("delete_preset", { id });
+}
+
 const CUT_FILTER = [{ name: "cuthulhu project", extensions: ["cut"] }];
 
 export async function pickSavePath(): Promise<string | null> {

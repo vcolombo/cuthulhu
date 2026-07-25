@@ -115,7 +115,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       revision++;
       return {};
     },
-    import_svg: () => {
+    import_svg: (a) => {
+      const id = nextId++;
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
+      doc.nodes[a.parent as number].children.push(id);
       revision++;
       return [{}, []];
     },
@@ -137,6 +140,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       return null;
     },
     list_machines: () => machines,
+    trace_image: () => ({
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
+      pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
+    }),
+    load_image_preview: () =>
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
   };
 
   // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
@@ -342,6 +351,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
     invoke: (cmd: string, args: Record<string, unknown> = {}) => {
       if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
+        const filters = (args.options as { filters?: { name: string }[] } | undefined)?.filters;
+        if (filters?.some((f) => f.name === "Images")) {
+          return Promise.resolve("/tmp/fake.png");
+        }
         return Promise.resolve("/mock/cuthulhu-project.cut");
       }
       if (cmd === "plugin:event|listen") {
@@ -526,4 +539,18 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // pinned by the terminalTransition unit tests in viewmodel.test.ts.
   await page.getByRole("button", { name: "Connect", exact: false }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("trace dialog: preview appears and insert adds paths", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Trace" }).click();
+  await expect(page.getByRole("dialog", { name: "Trace image" })).toBeVisible();
+  await expect(page.getByAltText("Traced preview")).toBeVisible();
+  await expect(page.getByText("1 paths")).toBeVisible();
+  await page.getByRole("button", { name: "Insert" }).click();
+  await expect(page.getByRole("dialog", { name: "Trace image" })).not.toBeVisible();
+  // import_svg mock was invoked — it adds a node to doc, so the layer list reflects the
+  // insert, same observable-effect assertion the "new doc → add rect" test above uses.
+  await expect(page.getByTestId("layer-row")).toHaveCount(1);
 });

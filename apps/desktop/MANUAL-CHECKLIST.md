@@ -34,3 +34,11 @@
 - [x] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
 - [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).
       (Not reachable on a real Mac: the OS always exposes serial ports, so unverified puma candidates always populate the list — every /dev/cu.* shows as its own "puma (unverified serial device)" row, which is itself a polish candidate. Empty-state render covered by the e2e mock test.)
+
+## SP5 Trace
+
+- [ ] Trace a real logo PNG in binary mode — preview updates live as sliders move; Insert lands correctly sized paths on the canvas; one undo removes them all.
+- [ ] Trace a multi-color image in color mode — one path per color; colors match; cut-by-color in the Cut dialog lists the traced colors as passes.
+- [ ] Trace a photo larger than 2048 px — "reduced to 2048 px" note appears; app stays responsive.
+- [ ] Max speckle filter on a small image — "Nothing traced" hint (not an error banner); lowering the slider recovers the preview.
+- [ ] Pick a non-image file via the picker filter bypass (rename a .txt to .png) — error banner in dialog, dialog still usable.

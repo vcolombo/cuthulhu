@@ -182,9 +182,32 @@ pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
     Ok(out.into_inner())
 }
 
+/// Composite onto white so transparency reads as background.
+///
+/// vtracer takes the raw channel bytes and never looks at alpha, and exporters write transparent
+/// regions as `(0,0,0,0)`. Left as-is, the transparent background of an ordinary logo is
+/// indistinguishable from black artwork: it merges into the shape and the whole canvas traces as
+/// one filled rectangle. Because every emitted path is stroked, that rectangle is a cut line —
+/// an invisible image would put a rectangle through the material.
+fn flatten_onto_white(img: &mut image::RgbaImage) {
+    for px in img.pixels_mut() {
+        let a = px[3] as u32;
+        if a == 255 {
+            continue;
+        }
+        for c in 0..3 {
+            // Standard source-over composite against opaque white, rounded rather than truncated
+            // so a fully opaque channel survives the round trip unchanged.
+            px[c] = ((px[c] as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+        }
+        px[3] = 255;
+    }
+}
+
 pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
     validate(opts)?;
-    let (rgba, downscaled) = decode_and_downscale(image_bytes)?;
+    let (mut rgba, downscaled) = decode_and_downscale(image_bytes)?;
+    flatten_onto_white(&mut rgba);
     let (width, height) = (rgba.width(), rgba.height());
 
     let mut img = vtracer::ColorImage::new();
@@ -392,6 +415,44 @@ mod tests {
                 assert_eq!(attr(p, "stroke"), Some(fill), "{mode:?}: stroke must match fill: {p}");
             }
         }
+    }
+
+    /// vtracer reads raw channel values and ignores alpha, so a fully transparent pixel
+    /// (0,0,0,0) reaches it as solid black and an invisible image traces to a filled canvas.
+    /// Since every traced path is now stroked, that phantom shape is cut geometry: loading a
+    /// transparent PNG would put a rectangle through the material.
+    #[test]
+    fn a_fully_transparent_image_traces_to_nothing() {
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
+        let opts = TraceOptions { mode: TraceMode::Binary, ..TraceOptions::default() };
+        assert!(
+            matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
+            "a transparent image must trace to nothing, not to a cuttable rectangle",
+        );
+    }
+
+    /// The ordinary case for a logo: opaque artwork on a transparent background, which exporters
+    /// write as `(0,0,0,0)` — transparent *black*. Read without alpha that is indistinguishable
+    /// from the artwork itself, so the background merges into the shape and the trace becomes a
+    /// filled canvas. Transparent has to behave exactly like the white background it stands in for.
+    #[test]
+    fn a_transparent_background_traces_like_a_white_one() {
+        let shape = |bg: image::Rgba<u8>| {
+            RgbaImage::from_fn(128, 128, |x, y| {
+                if (32..96).contains(&x) && (32..96).contains(&y) {
+                    image::Rgba([0, 0, 0, 255])
+                } else {
+                    bg
+                }
+            })
+        };
+        let opts = TraceOptions { mode: TraceMode::Binary, ..TraceOptions::default() };
+        let transparent = trace(&png_bytes(&shape(image::Rgba([0, 0, 0, 0]))), &opts).unwrap();
+        let white = trace(&png_bytes(&shape(image::Rgba([255, 255, 255, 255]))), &opts).unwrap();
+        assert_eq!(
+            transparent.svg, white.svg,
+            "a transparent background must trace like a white one, not merge into the artwork",
+        );
     }
 
     #[test]

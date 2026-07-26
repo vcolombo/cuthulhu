@@ -42,6 +42,18 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
+      # dist/ is committed because tauri::generate_context! reads frontendDist at compile time,
+      # so the rust job (which installs no Node) needs it present to build at all. That makes it
+      # an artifact git can hold stale: change ui/src, commit without bundling, and a packaged
+      # build ships a frontend nobody wrote. The build above just regenerated it, so any
+      # difference here means the committed copy did not match ui/src.
+      - name: Fail if the committed bundle is stale
+        run: |
+          if [ -n "$(git status --porcelain -- dist)" ]; then
+            echo "::error::apps/desktop/ui/dist does not match a fresh build of ui/src. Run 'npm --prefix apps/desktop/ui run build' and commit the result."
+            git status --short -- dist
+            exit 1
+          fi
       - name: Unit tests
         run: npm test
       - name: Install Playwright browsers

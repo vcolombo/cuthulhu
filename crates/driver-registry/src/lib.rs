@@ -9,6 +9,12 @@ use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Transport, Transport
 use driver_hpgl::HpglDriver;
 use driver_silhouette::SilhouetteDriver;
 
+// Enumeration and resolution have to agree on these, and only the resolution
+// half is reachable from a test — `list_devices` talks to real hardware. One
+// binding each keeps the two halves from drifting where nothing would catch it.
+const CAMEO5: &str = "cameo5";
+const PUMA: &str = "puma";
+
 /// Enumerates attached USB/serial hardware and builds the driver for it.
 pub struct HardwareBackendFactory;
 
@@ -18,14 +24,14 @@ impl DeviceBackendFactory for HardwareBackendFactory {
             .into_iter()
             .map(|locator| DeviceInfo {
                 instance_id: format!("usb:{locator}"),
-                machine_id: "cameo5".into(),
+                machine_id: CAMEO5.into(),
                 transport: TransportKind::Usb { locator },
                 candidate: false, // USB is discriminated by VID/PID — not a guess
             })
             .collect();
         devices.extend(driver_hpgl::list_ports().into_iter().map(|path| DeviceInfo {
             instance_id: format!("serial:{path}"),
-            machine_id: "puma".into(),
+            machine_id: PUMA.into(),
             transport: TransportKind::Serial { path, baud: 9600 },
             candidate: true, // any serial port could be a Puma — needs operator confirmation
         }));
@@ -34,8 +40,8 @@ impl DeviceBackendFactory for HardwareBackendFactory {
 
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
         match machine_id {
-            "cameo5" => Some(Box::new(SilhouetteDriver::new())),
-            "puma" => Some(Box::new(HpglDriver::new())),
+            CAMEO5 => Some(Box::new(SilhouetteDriver::new())),
+            PUMA => Some(Box::new(HpglDriver::new())),
             _ => None,
         }
     }
@@ -52,14 +58,16 @@ impl DeviceBackendFactory for HardwareBackendFactory {
 mod tests {
     use super::*;
 
-    /// The machine ids in `list_devices` and `driver_for` are string literals,
-    /// and so are the ids the drivers put in their own `MachineProfile`. This
-    /// pins them together: an enumerated device must resolve to a driver that
-    /// answers to the same id, or a connect would hand the wrong encoder to a
-    /// machine. Unknown ids must stay unresolvable rather than defaulting.
+    /// `CAMEO5`/`PUMA` tie enumeration to resolution, but each driver still
+    /// spells its own id independently in its `MachineProfile`. This pins that
+    /// third copy to the other two: an enumerated device must resolve to a
+    /// driver that answers to the same id, or a connect would hand the wrong
+    /// encoder to a machine. Unknown ids must stay unresolvable rather than
+    /// defaulting — which also proves the `match` arms above are const
+    /// patterns and not catch-all bindings.
     #[test]
     fn enumerated_machine_ids_resolve_to_drivers_that_claim_them() {
-        for id in ["cameo5", "puma"] {
+        for id in [CAMEO5, PUMA] {
             let driver = HardwareBackendFactory.driver_for(id).expect("known machine id");
             assert_eq!(driver.profile().id, id);
         }

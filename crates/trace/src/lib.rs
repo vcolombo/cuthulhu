@@ -205,6 +205,25 @@ fn flatten_onto_white(img: &mut image::RgbaImage) {
     }
 }
 
+/// Append one fully transparent row so vtracer keys transparency out.
+///
+/// Colour mode only removes transparent regions when `should_key_image` says the frame has enough
+/// of them: it counts transparent pixels on five sampled scanlines and needs 20% of two widths.
+/// A small hole misses that bar, so its raw RGB survives as ordinary artwork — a `(0,0,0,0)`
+/// island traces to a black shape and, being stroked, cuts. One transparent row lands on the
+/// last sampled scanline and contributes a full width of transparent pixels, which clears the
+/// threshold for any image, and keying then applies to *every* transparent pixel including
+/// interior ones. The row itself is keyed away, so it contributes no geometry; only the emitted
+/// `height` has to be put back.
+fn pad_with_transparent_row(img: &image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = (img.width(), img.height());
+    let mut padded = image::RgbaImage::from_pixel(w, h + 1, image::Rgba([0, 0, 0, 0]));
+    for (x, y, px) in img.enumerate_pixels() {
+        padded.put_pixel(x, y, *px);
+    }
+    padded
+}
+
 pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
     validate(opts)?;
     let (mut rgba, downscaled) = decode_and_downscale(image_bytes)?;
@@ -225,10 +244,17 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     }
     let (width, height) = (rgba.width(), rgba.height());
 
+    // Colour mode leans on vtracer's keying, which is threshold-gated, so force it whenever the
+    // image has any transparency at all rather than only when enough of it lands on the sampled
+    // scanlines. Binary mode has already had its transparency composited away.
+    let padded = opts.mode == TraceMode::Color && rgba.pixels().any(|p| p[3] == 0);
+    let fed = if padded { pad_with_transparent_row(&rgba) } else { rgba };
+    let (fed_width, fed_height) = (fed.width(), fed.height());
+
     let mut img = vtracer::ColorImage::new();
-    img.pixels = rgba.into_raw();
-    img.width = width as usize;
-    img.height = height as usize;
+    img.pixels = fed.into_raw();
+    img.width = fed_width as usize;
+    img.height = fed_height as usize;
 
     let config = vtracer::Config {
         color_mode: match opts.mode {
@@ -260,9 +286,19 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     // inflated `path_count` and call an empty trace a success. They are invisible downstream
     // too: usvg discards them before `fileio::svg_to_paths` builds its node list, so they never
     // appear in the `skipped` warnings the Insert path relies on to report loss.
-    let (svg, path_count) = strip_empty_paths(&svg_file.to_string());
+    let (mut svg, path_count) = strip_empty_paths(&svg_file.to_string());
     if path_count == 0 {
         return Err(TraceError::EmptyResult);
+    }
+    if padded {
+        // Undo the extra row in the viewport so the SVG describes the source image. Only the
+        // `<svg>` element carries a height, and geometry is in absolute coordinates, so trimming
+        // the viewport moves nothing.
+        svg = svg.replacen(
+            &format!("height=\"{fed_height}\""),
+            &format!("height=\"{height}\""),
+            1,
+        );
     }
     Ok(TraceResult {
         path_count,
@@ -472,6 +508,32 @@ mod tests {
             !r.svg.to_uppercase().contains("#FFFFFF"),
             "the transparent background came back as a white path:\n{}",
             r.svg,
+        );
+    }
+
+    /// vtracer only keys transparency once enough of it shows up on the five scanlines
+    /// `should_key_image` samples, so a small interior hole falls under the threshold and its raw
+    /// RGB is traced as artwork — a `(0,0,0,0)` island becomes a stroked black shape that cuts,
+    /// indistinguishable from an opaque one. Keying has to happen for any transparency at all,
+    /// and the padding used to force it must not show up in the result.
+    #[test]
+    fn a_transparent_island_is_keyed_out_below_the_keying_threshold() {
+        let img = RgbaImage::from_fn(100, 100, |x, y| {
+            if (45..55).contains(&x) && (45..55).contains(&y) {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+        let r = trace(&png_bytes(&img), &opts).expect("the opaque background should trace");
+        assert_eq!(r.path_count, 1, "the invisible island became geometry:\n{}", r.svg);
+        assert!(!r.svg.contains("#000000"), "the island was traced as black:\n{}", r.svg);
+        assert_eq!((r.width_px, r.height_px), (100, 100), "reported size must be the source size");
+        assert!(
+            r.svg.contains("height=\"100\""),
+            "padding leaked into the emitted SVG:\n{}",
+            r.svg.lines().take(4).collect::<Vec<_>>().join("\n"),
         );
     }
 

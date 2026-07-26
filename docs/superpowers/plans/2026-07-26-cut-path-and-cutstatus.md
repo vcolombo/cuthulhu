@@ -667,30 +667,37 @@ git commit -m "Test the plain cut path against a fake device, which nothing coul
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `crates/cli/tests/dry_run.rs`:
+The test asserts behaviour that does **not** hold yet: today `--dry-run` goes through
+`build_bytes`, which runs no preflight and cheerfully prints bytes for geometry off the
+bed. Add to `crates/cli/tests/dry_run.rs`:
 
 ```rust
-/// A plain `--dry-run` must print the same framing a real plain cut sends:
-/// one session_begin, one pass, one session_end, no inter-pass park.
+/// A dry run must refuse what a real cut would refuse. Through `build_bytes` it did
+/// not: off-bed geometry printed bytes, so `--dry-run` reported a cut that
+/// `--by-color` and the desktop would both have rejected.
 #[test]
-fn plain_dry_run_frames_a_single_pass() {
-    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
-        <rect width="10" height="10" fill="#ff0000"/></svg>"#;
-    let plan = cli::pipeline::plan_plain_cut(svg, cli::pipeline::Device::Puma, &driver_core::Settings::default(), false)
-        .expect("plan");
-    let driver = cli::pipeline::Device::Puma.driver();
-    let bytes = cli::pipeline::pass_stream_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1).expect("bytes");
-    let text = String::from_utf8(bytes).expect("hpgl is ascii");
-    assert!(text.starts_with("IN;"), "session must open: {text}");
-    assert!(text.ends_with("PU;"), "session must close: {text}");
-    assert!(text.contains("PD"), "geometry must be present: {text}");
+fn plain_dry_run_refuses_geometry_off_the_bed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let svg = dir.path().join("off-bed.svg");
+    std::fs::write(&svg, br#"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+        <rect x="9000" width="500" height="5" fill="#000000"/></svg>"#).expect("write");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cuthulhu"))
+        .args(["cut", svg.to_str().unwrap(), "--device", "cameo5", "--dry-run"])
+        .output()
+        .expect("run");
+
+    assert!(!out.status.success(), "off-bed dry run must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("outside"), "expected a bounds refusal, got: {err}");
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p cli --test dry_run plain_dry_run_frames_a_single_pass`
-Expected: FAIL — `plan_plain_cut` not found, until Task 2 is in. With Task 2 in, it should pass immediately; if it does, delete nothing yet and continue to Step 3.
+Run: `cargo test -p cli --test dry_run plain_dry_run_refuses_geometry_off_the_bed`
+Expected: FAIL — the command succeeds and prints hex, because `build_bytes` never
+preflights. That failure is the reason this task exists.
 
 - [ ] **Step 3: Delete build_bytes and its test**
 
@@ -1181,15 +1188,15 @@ git commit -m "Publish the cut status so reading it does not wait on the worker"
 
 ---
 
-### Task 11: Make DeviceState private and rework the manager's tests
+### Task 11: Rework the manager's tests onto CutStatus
 
 **Files:**
-- Modify: `crates/driver-core/src/manager.rs` (`DeviceState` visibility, delete `snapshot`, tests at 661-1301)
+- Modify: `crates/driver-core/src/manager.rs` (tests at 661-1301)
 - Test: same file
 
 **Interfaces:**
-- Removes: `DeviceManager::snapshot`, and `DeviceState`/`DeviceEventKind::StateChanged`'s public visibility. `DeviceState` becomes `pub(crate)`.
-- Keeps public: `DeviceError`, `DeviceEvent`, `DeviceEventKind`, `CutPass`.
+- Consumes: `DeviceManager::status`, `Phase`, `CutStatus` (Tasks 9-10).
+- Changes nothing public. `DeviceState` and `snapshot()` stay for now — Task 14 closes them once the last caller has converted, so every commit in between builds and the workspace stays green throughout.
 
 Every scenario the deleted TypeScript tests covered must exist here as a Rust test — written failing first. Those are: a stale job's events are filtered; `Cancelled` is terminal; and lifecycle events (`job_id` 0) are accepted again once a job is released.
 
@@ -1256,9 +1263,9 @@ Add the helper the suite needs, replacing `wait_for_state` (`manager.rs:872`):
 Run: `cargo test -p driver-core`
 Expected: FAIL — `wait_for_phase` / `Phase` not in scope in the test module until imported; then the three new tests fail on assertions if the filtering is not already correct.
 
-- [ ] **Step 3: Rework the suite and close the visibility**
+- [ ] **Step 3: Rework the suite**
 
-1. Change `pub enum DeviceState` to `pub(crate) enum DeviceState` and delete `DeviceManager::snapshot`.
+1. Leave `DeviceState` and `snapshot()` exactly as they are; Task 14 removes them.
 2. Replace every `mgr.snapshot()` assertion in the test module with a `mgr.status()` assertion on `phase`/`actions`/`pass`/`sent`.
 3. Replace the `WRITE_CHUNK` assertions (`manager.rs:1083`, `:1119`, `:1136`, `:1143`) with assertions on `status().sent` — the byte progression is now observable through the interface, so the private constant no longer needs to be reachable from a test:
 
@@ -1273,17 +1280,14 @@ Expected: FAIL — `wait_for_phase` / `Phase` not in scope in the test module un
 
 - [ ] **Step 4: Run the suite**
 
-Run: `cargo test -p driver-core`
-Expected: PASS. Then prove the surface is closed:
-
-Run: `grep -rn "DeviceState" crates/cli/src apps/desktop/src`
-Expected: no matches once Tasks 12-14 land. At this point it will still match — that is expected and those tasks fix it; `cargo test --workspace` will not pass again until Task 14.
+Run: `cargo test --workspace --locked`
+Expected: PASS. Nothing public changed, so every caller still builds.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/driver-core/src/manager.rs
-git commit -m "Keep the device state machine inside driver-core, where callers cannot copy it"
+git commit -m "Test the device manager through the status it reports"
 ```
 
 ---
@@ -1424,15 +1428,19 @@ git commit -m "Render the cut dialog from the status it is given, not from a cop
 
 ---
 
-### Task 14: Point the CLI loop at CutStatus
+### Task 14: Point the CLI loop at CutStatus, then close the surface
 
 **Files:**
 - Modify: `crates/cli/src/cut.rs` (the loop from Task 4)
+- Modify: `crates/driver-core/src/manager.rs` (`DeviceState` visibility, delete `snapshot`)
 - Test: `crates/cli/tests/plain_cut.rs` (existing tests must still pass)
 
 **Interfaces:**
 - Consumes: `driver_core::{CutStatus, Phase}`.
-- Removes: the CLI's last use of `DeviceState`.
+- Removes: the CLI's last use of `DeviceState`; then `DeviceManager::snapshot` and `DeviceState`'s public visibility (`pub` → `pub(crate)`).
+- Keeps public: `DeviceError`, `DeviceEvent`, `DeviceEventKind`, `CutPass`.
+
+This is the last caller, so the surface closes here — every commit before this one builds, and this one both converts the final caller and makes the old surface unreachable.
 
 - [ ] **Step 1: Rewrite the loop**
 
@@ -1470,18 +1478,28 @@ git commit -m "Render the cut dialog from the status it is given, not from a cop
 - [ ] **Step 2: Run the suite**
 
 Run: `cargo test --workspace --locked`
-Expected: PASS — the whole workspace is green again for the first time since Task 11.
+Expected: PASS.
 
-- [ ] **Step 3: Prove the state machine is not reachable outside driver-core**
+- [ ] **Step 3: Close the old surface**
+
+In `crates/driver-core/src/manager.rs`, change `pub enum DeviceState` to
+`pub(crate) enum DeviceState` and delete `DeviceManager::snapshot`. Nothing outside
+`driver-core` should reference either any more — if the build fails here, a caller was
+missed in Tasks 11-13 and that is exactly what this step is for.
+
+- [ ] **Step 4: Prove the state machine is not reachable outside driver-core**
+
+Run: `cargo test --workspace --locked`
+Expected: PASS.
 
 Run: `grep -rn "DeviceState\|AwaitingCompletion\|WaitingForColorSwap\|CancelRequested" crates/cli/src apps/desktop/src apps/desktop/ui/src`
 Expected: no matches.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/cli/src/cut.rs
-git commit -m "Drive the CLI cut from the status the device reports"
+git add crates/cli/src/cut.rs crates/driver-core/src/manager.rs
+git commit -m "Drive the CLI cut from the reported status, and shut the state machine in"
 ```
 
 ---
@@ -1531,6 +1549,8 @@ git commit -m "Name the value a cut reports, and list what a human still has to 
 
 **Two additions beyond the agreed shape, both forced by the code.** `Phase` includes `Disconnected`/`Connecting`/`Disconnecting` because the dialog maps them today. `plan_plain_cut` needs an explicit empty-document check, or an SVG with no paths reports `UnknownPassColor` instead of "no cuttable paths".
 
-**Sequencing warning.** The workspace does not compile between Task 11 and Task 14 — `DeviceState` goes private before its last callers are converted. That is the cost of the single-change decision; do not stop for the day inside that window.
+**Sequencing.** `status()` is added alongside the existing surface (Task 10), every caller converts while both compile (Tasks 11-13), and `DeviceState` goes private in the same task that converts the last caller (Task 14). Every commit builds and `cargo test --workspace --locked` passes at every task boundary, so the history stays bisectable. The branch never lands with both surfaces public, which is what the single-change decision was about.
+
+**Two plan-vs-rubric conflicts resolved before execution.** Task 4 ships an untested extraction by design — Task 5 is its test, and a reviewer should not treat the absence as a finding. Task 6's test asserts a refusal that does not happen today (off-bed geometry printing bytes through `build_bytes`), so it is genuinely red before the deletion and green after.
 
 **Not in this plan.** Review candidate 2 (resolved `Settings` and `MachineCaps` across the seam) and its `effectiveSettings`/`fieldDisabled` deletions. Candidates 4-10. Issue #68.

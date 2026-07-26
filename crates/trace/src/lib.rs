@@ -182,13 +182,14 @@ pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
     Ok(out.into_inner())
 }
 
-/// Composite onto white so transparency reads as background.
+/// Composite onto white so transparency reads as background. Binary mode only — see `trace`.
 ///
-/// vtracer takes the raw channel bytes and never looks at alpha, and exporters write transparent
-/// regions as `(0,0,0,0)`. Left as-is, the transparent background of an ordinary logo is
-/// indistinguishable from black artwork: it merges into the shape and the whole canvas traces as
-/// one filled rectangle. Because every emitted path is stroked, that rectangle is a cut line —
-/// an invisible image would put a rectangle through the material.
+/// vtracer's binary path is `to_binary_image(|x| x.r < 128)`: it thresholds on the red channel
+/// and never looks at alpha, and exporters write transparent regions as `(0,0,0,0)`. A
+/// transparent background is therefore indistinguishable from black artwork there — it merges
+/// into the shape and the whole canvas traces as one filled rectangle. Because every emitted
+/// path is stroked, that rectangle is a cut line, so an invisible image would put a rectangle
+/// through the material.
 fn flatten_onto_white(img: &mut image::RgbaImage) {
     for px in img.pixels_mut() {
         let a = px[3] as u32;
@@ -214,7 +215,14 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     if rgba.pixels().all(|p| p[3] == 0) {
         return Err(TraceError::EmptyResult);
     }
-    flatten_onto_white(&mut rgba);
+    // Only binary mode needs this. Colour mode already keys transparency out — vtracer replaces
+    // every fully transparent pixel with a colour absent from the image and has visioncortex drop
+    // that colour, so the background produces no cluster. Flattening first would hide the alpha
+    // it looks for, and the manufactured white would come back as a stroked path the cut planner
+    // reports as a pass. Binary mode has no such handling and needs the composite.
+    if opts.mode == TraceMode::Binary {
+        flatten_onto_white(&mut rgba);
+    }
     let (width, height) = (rgba.width(), rgba.height());
 
     let mut img = vtracer::ColorImage::new();
@@ -441,6 +449,30 @@ mod tests {
                 "{mode:?}: a transparent image must trace to nothing, not to a cuttable rectangle",
             );
         }
+    }
+
+    /// Colour mode keys transparency out on its own: vtracer swaps every fully transparent pixel
+    /// for an unused colour and tells visioncortex to drop it, so a transparent background yields
+    /// no cluster at all. Flattening it to white first destroys that — the background arrives
+    /// opaque, is clustered like any other colour, and comes back as a stroked path, which the
+    /// cut planner then reports as a pass. The artwork alone must survive.
+    #[test]
+    fn a_transparent_background_is_not_a_path_in_color_mode() {
+        let img = RgbaImage::from_fn(128, 128, |x, y| {
+            if (32..96).contains(&x) && (32..96).contains(&y) {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            }
+        });
+        let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+        let r = trace(&png_bytes(&img), &opts).expect("the opaque square should trace");
+        assert_eq!(r.path_count, 1, "expected only the square, got {} paths:\n{}", r.path_count, r.svg);
+        assert!(
+            !r.svg.to_uppercase().contains("#FFFFFF"),
+            "the transparent background came back as a white path:\n{}",
+            r.svg,
+        );
     }
 
     /// A transparent image is empty whatever its RGB happens to be: exporters vary between

@@ -146,6 +146,28 @@ pub fn plan_cut_from_svg(
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
 
+/// Plan a plain cut: all geometry, one pass, validated through `plan_cut` — the
+/// same entry point the desktop and `--by-color` use.
+pub fn plan_plain_cut(
+    svg: &[u8],
+    device: Device,
+    settings: &Settings,
+    allow_out_of_bounds: bool,
+) -> Result<cutplan::CutPlan, String> {
+    let doc = doc_from_svg_all_cuttable(svg)?;
+    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
+    // Checked here rather than left to `plan_cut`: with no passes at all, asking for
+    // CUT_STROKE is an unmatched colour, and "no pass matches color" describes the
+    // request instead of the file.
+    if planned.passes.is_empty() {
+        return Err("no cuttable paths in SVG".into());
+    }
+    let passes = vec![cutplan::PassSelection { color: Some(CUT_STROKE), settings: settings.clone() }];
+    let driver = device.driver();
+    let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
+    cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
+}
+
 /// `CutError` as something to print at a terminal. Out-of-bounds names the
 /// escape hatch, since that is the one refusal an operator may reasonably
 /// want to overrule.
@@ -294,6 +316,37 @@ mod tests {
         let planned = cutplan::plan_passes(&doc).expect("plan");
         assert_eq!(planned.passes.len(), 1, "all geometry belongs to one pass");
         assert_eq!(planned.passes[0].color, Some(CUT_STROKE));
+    }
+
+    #[test]
+    fn plain_cut_plans_one_pass() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="#ff0000"/></svg>"##;
+        let plan = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect("plan");
+        assert_eq!(plan.passes.len(), 1);
+    }
+
+    /// The whole point of the change: the plain path is preflighted. A shape past the
+    /// bed's edge was silently sent to the machine before.
+    #[test]
+    fn plain_cut_refuses_out_of_bounds_geometry() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+            <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
+        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false)
+            .expect_err("out of bounds must be refused");
+        assert!(err.contains("outside"), "unexpected message: {err}");
+        // ...and the escape hatch works, now that there is a check to overrule.
+        assert!(plan_plain_cut(svg, Device::Cameo5, &Settings::default(), true).is_ok());
+    }
+
+    /// With no paths at all, `plan_passes` yields no passes, so the requested colour
+    /// matches nothing. Without the empty check that surfaces as `UnknownPassColor`,
+    /// which reads as an internal error rather than "there is nothing here".
+    #[test]
+    fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
+        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect_err("empty");
+        assert_eq!(err, "no cuttable paths in SVG");
     }
 
     #[test]

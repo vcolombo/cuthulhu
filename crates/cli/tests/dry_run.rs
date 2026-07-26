@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use cli::pipeline::{build_bytes, pass_stream_bytes, plan_cut_from_svg, Device};
+use cli::pipeline::{pass_stream_bytes, plan_cut_from_svg, Device};
 use driver_core::Settings;
 
+/// A dry run must refuse what a real cut would refuse. Through `build_bytes` it did
+/// not: off-bed geometry printed bytes, so `--dry-run` reported a cut that
+/// `--by-color` and the desktop would both have rejected.
 #[test]
-fn hpgl_dry_run_matches_documented_stream() {
-    let svg = std::fs::read("tests/fixtures/square.svg").unwrap();
-    let bytes = build_bytes(&svg, Device::Puma, &Settings::default()).unwrap();
-    // 20 user-units = 20px → 20*25.4/96 mm → ×1016/25.4 = 20*1016/96 ≈ 212 units.
-    let s = String::from_utf8(bytes).unwrap();
-    assert!(s.starts_with("IN;PU0,0;PD212,0;") || s.starts_with("IN;PU0,0;PD211,0;"), "{s}");
-    assert!(s.ends_with("PU;"));
+fn plain_dry_run_refuses_geometry_off_the_bed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let svg = dir.path().join("off-bed.svg");
+    std::fs::write(&svg, br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+        <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##).expect("write");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cuthulhu"))
+        .args(["cut", svg.to_str().unwrap(), "--device", "cameo5", "--dry-run"])
+        .output()
+        .expect("run");
+
+    assert!(!out.status.success(), "off-bed dry run must fail");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("outside"), "expected a bounds refusal, got: {err}");
 }
 
 #[test]

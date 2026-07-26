@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
 use cli::cut::format_pass_color;
-use cli::pipeline::{build_bytes, check_color_flag_scope, check_interactive, pass_stream_bytes, plan_cut_from_svg, Device};
+use cli::pipeline::{check_color_flag_scope, check_interactive, pass_stream_bytes, plan_cut_from_svg, plan_plain_cut, Device};
 use driver_registry::HardwareBackendFactory;
 use driver_core::manager::{DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};
@@ -131,11 +131,14 @@ fn run() -> Result<(), String> {
             let settings = Settings { speed, force, repeat_count: 1 };
 
             if !by_color {
-                let bytes = build_bytes(&svg, device, &settings)?;
+                let plan = plan_plain_cut(&svg, device, &settings, allow_out_of_bounds)?;
+                let driver = device.driver();
+                let bytes = pass_stream_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
                 if dry_run {
                     print_hex_ascii(&bytes);
                     return Ok(());
                 }
+                // transmit path lands in Task 7
                 let mut transport: Box<dyn Transport> = match device {
                     Device::Cameo5 => Box::new(
                         driver_silhouette::UsbTransport::open()

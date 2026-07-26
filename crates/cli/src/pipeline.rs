@@ -24,20 +24,6 @@ impl Device {
     }
 }
 
-pub fn build_bytes(svg: &[u8], device: Device, settings: &Settings) -> Result<Vec<u8>, String> {
-    let imp = fileio::svg_to_paths(svg).map_err(|e| format!("SVG parse: {e:?}"))?;
-    let polylines = imp.paths.iter()
-        .flat_map(|(path, _)| path.flatten(0.1))
-        .collect::<Vec<_>>();
-    if polylines.is_empty() { return Err("no cuttable paths in SVG".into()); }
-    let job = Job { polylines, settings: settings.clone() };
-    let d = device.driver();
-    let mut bytes = d.session_begin();
-    bytes.extend(d.encode_pass(&job).map_err(|e| format!("encode: {e:?}"))?);
-    bytes.extend(d.session_end());
-    Ok(bytes)
-}
-
 /// Bytes for pass `i` of `total`, framed exactly as `DeviceManager` transmits
 /// them: `session_begin` before the first pass, `pass_park` between passes,
 /// `session_end` after the last. Keeps `cut --by-color --dry-run` output

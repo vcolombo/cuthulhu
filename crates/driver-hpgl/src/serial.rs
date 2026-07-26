@@ -46,7 +46,23 @@ pub fn list_ports() -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub struct SerialTransport { port: Box<dyn serialport::SerialPort> }
+/// Maps a serial I/O failure to a transport error, using `still_present` (whether the OS
+/// still lists the port) to tell an unplugged cable from a device-side error.
+///
+/// A vanished port is reported as a disconnect even when the failure was a timeout: the
+/// completion poll treats `Timeout` as "keep polling" until its deadline, so a device that
+/// has been unplugged would otherwise burn that whole deadline before failing.
+fn classify_io_error(e: std::io::Error, still_present: bool) -> TransportError {
+    if !still_present {
+        return TransportError::Disconnected;
+    }
+    match e.kind() {
+        std::io::ErrorKind::TimedOut => TransportError::Timeout,
+        _ => TransportError::Io(e.to_string()),
+    }
+}
+
+pub struct SerialTransport { port: Box<dyn serialport::SerialPort>, path: String }
 impl SerialTransport {
     pub fn open(port: &str, baud: u32) -> Result<SerialTransport, TransportError> {
         let p = serialport::new(port, baud)
@@ -55,21 +71,31 @@ impl SerialTransport {
             .stop_bits(serialport::StopBits::One)
             .timeout(Duration::from_secs(5))
             .open().map_err(|e| TransportError::Io(e.to_string()))?;
-        Ok(SerialTransport { port: p })
+        Ok(SerialTransport { port: p, path: port.to_string() })
+    }
+
+    /// Whether the OS still lists this transport's port.
+    ///
+    /// Enumerates raw rather than through `list_ports`, which drops dial-in duplicates and
+    /// system pseudo-ports: a transport opened on a path the filter hides (the CLI takes any
+    /// `--port`) must not read as unplugged.
+    fn still_present(&self) -> bool {
+        serialport::available_ports()
+            .map(|ports| ports.iter().any(|p| p.port_name == self.path))
+            .unwrap_or(true) // enumeration itself failed — do not call that a disconnect
     }
 }
 impl Transport for SerialTransport {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, TransportError> {
         use std::io::Write;
-        self.port.write_all(bytes).map_err(|e| TransportError::Io(e.to_string()))?;
+        self.port.write_all(bytes).map_err(|e| classify_io_error(e, self.still_present()))?;
         Ok(bytes.len())
     }
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
         self.port.set_timeout(timeout).map_err(|e| TransportError::Io(e.to_string()))?;
         match self.port.read(buf) {
             Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(TransportError::Timeout),
-            Err(e) => Err(TransportError::Io(e.to_string())),
+            Err(e) => Err(classify_io_error(e, self.still_present())),
         }
     }
 }
@@ -77,6 +103,43 @@ impl Transport for SerialTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::io::ErrorKind;
+    #[test]
+    fn vanished_port_is_a_disconnect_whatever_the_os_said() {
+        // Unplugging a USB-serial adapter surfaces as ENXIO, EIO or BrokenPipe depending on
+        // platform and timing. None of those names the cause; enumeration does.
+        for kind in [ErrorKind::Other, ErrorKind::BrokenPipe, ErrorKind::NotFound] {
+            assert_eq!(
+                classify_io_error(io::Error::new(kind, "boom"), false),
+                TransportError::Disconnected,
+                "{kind:?} on a port the OS no longer lists is a disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_on_a_present_port_stays_a_timeout_but_on_a_gone_one_does_not() {
+        // The completion poll treats Timeout as "keep polling" until its deadline. A device
+        // that has been unplugged would burn that whole deadline before failing.
+        assert_eq!(
+            classify_io_error(io::Error::new(ErrorKind::TimedOut, "timed out"), true),
+            TransportError::Timeout
+        );
+        assert_eq!(
+            classify_io_error(io::Error::new(ErrorKind::TimedOut, "timed out"), false),
+            TransportError::Disconnected
+        );
+    }
+
+    #[test]
+    fn present_port_keeps_the_os_message() {
+        match classify_io_error(io::Error::new(ErrorKind::PermissionDenied, "access denied"), true) {
+            TransportError::Io(msg) => assert!(msg.contains("access denied"), "got: {msg}"),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
     #[test]
     fn usable_ports_drops_system_ports_and_dialin_duplicates() {
         // Real enumeration from a macOS dev machine, plus a USB-serial adapter.

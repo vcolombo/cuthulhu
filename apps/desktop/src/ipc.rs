@@ -326,7 +326,9 @@ mod tests {
     }
 
     /// Exercises the real `MAX_INPUT_FILE_BYTES`, which the `read_capped` tests deliberately do
-    /// not. Sparse, so it costs no disk: `set_len` past the ceiling without writing a byte.
+    /// not. `set_len` extends the file without writing a byte, so on a filesystem with sparse-file
+    /// support (ext4 on CI, APFS locally) this costs no disk. Sparseness is the filesystem's call,
+    /// not a guarantee of the call itself — where it is absent the test is merely slow.
     #[test]
     fn read_image_file_refuses_a_file_past_the_ceiling() {
         let dir = tempfile::tempdir().unwrap();

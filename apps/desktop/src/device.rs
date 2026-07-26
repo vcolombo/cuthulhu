@@ -233,7 +233,11 @@ impl DeviceManagerHandle {
         };
         let opts = PlanOptions { passes, expect_revision: Some(expected), allow_out_of_bounds: false };
 
-        let plan = plan_cut(&app.editor.doc, &profile, &caps, &opts).map_err(map_cut_error)?;
+        // Planned here, at cut time, against the live document — `expect_revision`
+        // is what refuses the cut if that is no longer the document the UI planned.
+        let planned = plan_passes(&app.editor.doc)
+            .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
+        let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
         Ok(plan.cut_passes())
     }
 
@@ -266,7 +270,6 @@ pub fn is_active(state: &DeviceState) -> bool {
 /// `stale_plan` is the one the frontend actually keys off (CutDialog.tsx).
 fn map_cut_error(e: CutError) -> IpcError {
     match e {
-        CutError::Plan(e) => IpcError::new("plan_error", format!("{e:?}")),
         CutError::StalePlan { .. } => {
             IpcError::new("stale_plan", "document changed since the cut was planned")
         }

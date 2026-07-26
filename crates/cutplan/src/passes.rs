@@ -18,8 +18,19 @@ pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 /// Every `ColorPass` a document contains, in first-seen order — an inventory of
 /// what *could* be cut. Nothing here is selected, configured or checked; that is
 /// `plan_cut`'s job, and what it returns is a `CutPlan`.
+///
+/// This is everything a cut needs to know about the document, which is why
+/// `plan_cut` takes one of these rather than a `Document`: the geometry that
+/// gets validated is the geometry that gets cut, and nobody plans twice.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub struct DocumentPasses { pub passes: Vec<ColorPass>, pub skipped_no_stroke: usize, pub doc_revision: u64 }
+pub struct DocumentPasses {
+    pub passes: Vec<ColorPass>,
+    pub skipped_no_stroke: usize,
+    pub doc_revision: u64,
+    /// The machine the document targets, if it names one. Carried here because
+    /// preflight checks it and `plan_cut` no longer sees the `Document`.
+    pub machine_id: Option<String>,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum PlanError { BadShape(NodeId, String), MissingNode(NodeId), CycleDetected }
@@ -73,7 +84,12 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
         }
     }
 
-    Ok(DocumentPasses { passes, skipped_no_stroke, doc_revision: doc_revision(doc) })
+    Ok(DocumentPasses {
+        passes,
+        skipped_no_stroke,
+        doc_revision: doc_revision(doc),
+        machine_id: doc.machine.as_ref().map(|m| m.id.clone()),
+    })
 }
 
 /// Travel (non-cutting) moves needed to visit every shape across `configured` passes,

@@ -144,12 +144,9 @@ pub fn plan_cut_from_svg(
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg(svg)?;
-    // Planned twice on purpose. --order and --skip-color name colours, so the
-    // colours have to be known before a selection can be built, and plan_cut
-    // plans again inside. Taking a DocumentPasses here instead would save the
-    // second walk at the cost of letting a caller validate a different document
-    // than it planned -- the traversal is cheap next to the SVG parse already
-    // done above, and one entry point is worth more than one traversal.
+    // Planned once: --order and --skip-color name colours, so the colours have
+    // to be known before a selection can be built, and plan_cut cuts the very
+    // passes handed to it here.
     let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
     let colors = pass_order(&planned.passes, skip_colors, order)?;
 
@@ -163,7 +160,7 @@ pub fn plan_cut_from_svg(
     let driver = device.driver();
     // No revision to be stale against: the document was imported a few lines ago.
     let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
-    cutplan::plan_cut(&doc, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
+    cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
 
 /// `CutError` as something to print at a terminal. Out-of-bounds names the
@@ -172,7 +169,6 @@ pub fn plan_cut_from_svg(
 fn describe_cut_error(e: cutplan::CutError) -> String {
     use cutplan::preflight::PreflightError as P;
     match e {
-        cutplan::CutError::Plan(e) => format!("plan: {e:?}"),
         cutplan::CutError::StalePlan { .. } => "document changed while planning".into(),
         cutplan::CutError::UnknownPassColor(c) => format!("no pass matches color {c:?}"),
         cutplan::CutError::Preflight(P::NothingToCut) => "no cuttable paths in SVG".into(),

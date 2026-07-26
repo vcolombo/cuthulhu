@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -144,8 +144,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean }) {
       svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
       pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
     }),
-    load_image_preview: () =>
-      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    load_image_preview: () => {
+      if (opts?.failImagePreview) throw new Error("could not read image: broken thumbnail");
+      return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    },
   };
 
   // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
@@ -551,4 +553,20 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
   // import_svg mock was invoked — it adds a node to doc, so the layer list reflects the
   // insert, same observable-effect assertion the "new doc → add rect" test above uses.
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
+});
+
+// The traced pane covers the common case where a file fails to decode, because both commands
+// fail together. It does not cover a thumbnail that fails on its own — re-encoding the preview
+// can fail while the trace succeeds — and the design spec promises every error path surfaces
+// rather than turning into an empty pane.
+test("trace dialog: a failed source thumbnail surfaces instead of blanking", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { failImagePreview: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Trace" }).click();
+  const dialog = page.getByRole("dialog", { name: "Trace image" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(/broken thumbnail/)).toBeVisible();
+  // The trace itself still succeeded, so the dialog stays usable.
+  await expect(page.getByText("1 path")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Insert" })).toBeEnabled();
 });

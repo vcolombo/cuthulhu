@@ -57,6 +57,7 @@ export function TraceDialog({ path, onInsert, onClose }: {
   const [controls, setControls] = useState<TraceControls>(defaultControls);
   const [preview, setPreview] = useState<PreviewState>({ kind: "idle" });
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
   const latestId = useRef(0);
   const debouncer = useMemo(() => makeDebouncer(300), []);
 
@@ -65,8 +66,11 @@ export function TraceDialog({ path, onInsert, onClose }: {
     // unmounting today, but that is a property of the caller, not of this component.
     let ignore = false;
     ipc.loadImagePreview({ path }).then(
-      (url) => { if (!ignore) setSourceUrl(url); },
-      () => { if (!ignore) setSourceUrl(null); },
+      (url) => { if (!ignore) { setSourceUrl(url); setSourceError(null); } },
+      // Say why the thumbnail is missing rather than leaving an empty pane. Usually the trace
+      // fails for the same reason and reports it, but not always — re-encoding the preview can
+      // fail on its own, and then a blank pane beside a successful trace explains nothing.
+      (e) => { if (!ignore) { setSourceUrl(null); setSourceError(ipc.ipcErrorMessage(e)); } },
     );
     return () => { ignore = true; };
   }, [path]);
@@ -112,6 +116,7 @@ export function TraceDialog({ path, onInsert, onClose }: {
         <div style={{ display: "flex", gap: 10 }}>
           <div style={previewPane}>
             {sourceUrl ? <img src={sourceUrl} alt="Source" style={{ maxWidth: "100%", maxHeight: 200 }} /> : null}
+            {sourceError !== null ? <span style={{ color: "var(--cut)" }}>{sourceError}</span> : null}
           </div>
           <div style={previewPane}>
             {preview.kind === "ready" && <img src={svgDataUrl(preview.svg)} alt="Traced preview" style={{ maxWidth: "100%", maxHeight: 200 }} />}

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::pipeline::{build_bytes, check_color_flag_scope, check_interactive, format_pass_color, pass_stream_bytes, plan_cut_from_svg, Device};
+use cli::cut::format_pass_color;
+use cli::pipeline::{build_bytes, check_color_flag_scope, check_interactive, pass_stream_bytes, plan_cut_from_svg, Device};
 use driver_registry::HardwareBackendFactory;
 use driver_core::manager::{DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};

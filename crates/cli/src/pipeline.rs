@@ -225,14 +225,6 @@ pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> 
     Ok(())
 }
 
-/// `#RRGGBB` for the operator prompt — drop the alpha byte.
-pub fn format_pass_color(color: Option<u32>) -> String {
-    match color {
-        Some(c) => format!("#{:06x}", c >> 8),
-        None => "none".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

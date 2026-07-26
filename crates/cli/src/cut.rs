@@ -38,6 +38,14 @@ impl Operator {
     }
 }
 
+/// `#RRGGBB` for the operator prompt — drop the alpha byte.
+pub fn format_pass_color(color: Option<u32>) -> String {
+    match color {
+        Some(c) => format!("#{:06x}", c >> 8),
+        None => "none".into(),
+    }
+}
+
 /// Connect, cut, and drive the job to its end. `Ok(())` covers a completed cut
 /// and a cancelled one; a device fault is an `Err`.
 pub fn run(
@@ -62,14 +70,29 @@ pub fn run(
     loop {
         match mgr.snapshot() {
             DeviceState::WaitingForColorSwap { next_pass_index, .. } => {
-                let prompt = format!("Pass {}/{}: swap tool, press Enter to resume", next_pass_index + 1, total);
+                // A bad index can't happen on the normal path — `next_pass_index` comes from
+                // the same plan — but the prompt is cosmetic, so a mismatch degrades to "none"
+                // rather than panicking a process mid-cut.
+                let color = format_pass_color(plan.passes.get(next_pass_index).and_then(|p| p.color));
+                let prompt = format!(
+                    "Pass {}/{} (color {}): swap tool, press Enter to resume",
+                    next_pass_index + 1,
+                    total,
+                    color,
+                );
                 if !operator.wait_ack(&prompt, &mgr) {
                     continue; // re-check snapshot: cancel() already landed
                 }
                 mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
             }
             DeviceState::AwaitingCompletion { pass_index, .. } => {
-                let prompt = format!("Pass {}/{} cutting; press Enter once the machine finishes", pass_index + 1, total);
+                let color = format_pass_color(plan.passes.get(pass_index).and_then(|p| p.color));
+                let prompt = format!(
+                    "Pass {}/{} (color {}) cutting; press Enter once the machine finishes",
+                    pass_index + 1,
+                    total,
+                    color,
+                );
                 if !operator.wait_ack(&prompt, &mgr) {
                     continue;
                 }

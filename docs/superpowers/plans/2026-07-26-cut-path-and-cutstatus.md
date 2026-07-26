@@ -138,8 +138,8 @@ In `crates/cli/src/pipeline.rs`, inside the test module:
     /// skips strokeless shapes — must not change what it cuts.
     #[test]
     fn fill_only_svg_plans_exactly_one_pass() {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
-            <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"#;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="##ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"#;
         let doc = doc_from_svg_all_cuttable(svg).expect("import");
         let planned = cutplan::plan_passes(&doc).expect("plan");
         assert_eq!(planned.passes.len(), 1, "all geometry belongs to one pass");
@@ -212,8 +212,8 @@ Three behaviours: one pass, preflight actually refuses, and an empty file report
 ```rust
     #[test]
     fn plain_cut_plans_one_pass() {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
-            <rect width="5" height="5" fill="#ff0000"/></svg>"#;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="##ff0000"/></svg>"#;
         let plan = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect("plan");
         assert_eq!(plan.passes.len(), 1);
     }
@@ -222,8 +222,8 @@ Three behaviours: one pass, preflight actually refuses, and an empty file report
     /// bed's edge was silently sent to the machine before.
     #[test]
     fn plain_cut_refuses_out_of_bounds_geometry() {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
-            <rect x="9000" width="500" height="5" fill="#000000"/></svg>"#;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+            <rect x="9000" width="500" height="5" fill="##000000"/></svg>"#;
         let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false)
             .expect_err("out of bounds must be refused");
         assert!(err.contains("outside"), "unexpected message: {err}");
@@ -236,7 +236,7 @@ Three behaviours: one pass, preflight actually refuses, and an empty file report
     /// which reads as an internal error rather than "there is nothing here".
     #[test]
     fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"#;
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
         let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect_err("empty");
         assert_eq!(err, "no cuttable paths in SVG");
     }
@@ -541,8 +541,8 @@ use driver_core::{
     MockTransport, Settings, Transport, TransportError, TransportKind,
 };
 
-const SQUARE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
-    <rect width="10" height="10" fill="#ff0000"/></svg>"#;
+const SQUARE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
+    <rect width="10" height="10" fill="##ff0000"/></svg>"#;
 
 struct FakeDriver {
     profile: MachineProfile,
@@ -625,8 +625,8 @@ fn a_plain_cut_sends_one_framed_pass() {
 /// Preflight refusals must happen before a transport is ever opened.
 #[test]
 fn geometry_off_the_bed_never_reaches_a_transport() {
-    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
-        <rect x="9000" width="500" height="5" fill="#000000"/></svg>"#;
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+        <rect x="9000" width="500" height="5" fill="##000000"/></svg>"#;
     assert!(plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).is_err());
 }
 ```
@@ -679,8 +679,8 @@ bed. Add to `crates/cli/tests/dry_run.rs`:
 fn plain_dry_run_refuses_geometry_off_the_bed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let svg = dir.path().join("off-bed.svg");
-    std::fs::write(&svg, br#"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
-        <rect x="9000" width="500" height="5" fill="#000000"/></svg>"#).expect("write");
+    std::fs::write(&svg, br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+        <rect x="9000" width="500" height="5" fill="##000000"/></svg>"#).expect("write");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cuthulhu"))
         .args(["cut", svg.to_str().unwrap(), "--device", "cameo5", "--dry-run"])

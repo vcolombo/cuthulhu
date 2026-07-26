@@ -196,12 +196,22 @@ pub fn parse_hex_color(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
 }
 
-/// `--allow-out-of-bounds` relaxes a preflight rule, and only `--by-color`
-/// cuts are preflighted. Accepting it on the plain path would say a check was
-/// overruled when no check ran.
-pub fn check_out_of_bounds_scope(allow_out_of_bounds: bool, by_color: bool) -> Result<(), String> {
-    if allow_out_of_bounds && !by_color {
-        return Err("--allow-out-of-bounds applies to --by-color cuts; the plain cut path runs no preflight".into());
+/// `--skip-color` and `--order` select and sequence colours, which only a
+/// `--by-color` cut has. A plain cut puts every colour in one pass, so these
+/// flags cannot do anything there and are refused rather than ignored.
+pub fn check_color_flag_scope(
+    skip_colors: &[String],
+    order: &Option<String>,
+    by_color: bool,
+) -> Result<(), String> {
+    if by_color {
+        return Ok(());
+    }
+    if !skip_colors.is_empty() {
+        return Err("--skip-color applies to --by-color cuts; a plain cut is one pass over every colour".into());
+    }
+    if order.is_some() {
+        return Err("--order applies to --by-color cuts; a plain cut is one pass over every colour".into());
     }
     Ok(())
 }
@@ -280,15 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn allow_out_of_bounds_without_by_color_is_an_error() {
-        // Silently accepting it would imply preflight ran and was relaxed, when
-        // the plain cut path runs no preflight at all.
-        assert!(check_out_of_bounds_scope(true, false).is_err());
-        assert!(check_out_of_bounds_scope(true, true).is_ok());
-        assert!(check_out_of_bounds_scope(false, false).is_ok());
-    }
-
-    #[test]
     fn noninteractive_multicolor_is_error() {
         assert_eq!(
             check_interactive(false, 2),
@@ -347,6 +348,21 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
         let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect_err("empty");
         assert_eq!(err, "no cuttable paths in SVG");
+    }
+
+    /// `--skip-color` and `--order` name colours, and a plain cut deliberately
+    /// collapses every colour into one pass. Accepting them silently — which is what
+    /// happened before — reports success for a flag that did nothing.
+    #[test]
+    fn colour_flags_are_refused_without_by_color() {
+        let red = vec!["FF0000FF".to_string()];
+        let err = check_color_flag_scope(&red, &None, false).expect_err("must refuse");
+        assert!(err.contains("--skip-color"), "unexpected message: {err}");
+        let err = check_color_flag_scope(&[], &Some("FF0000FF".into()), false).expect_err("must refuse");
+        assert!(err.contains("--order"), "unexpected message: {err}");
+        // Both are fine with --by-color, and absence is fine either way.
+        assert!(check_color_flag_scope(&red, &Some("FF0000FF".into()), true).is_ok());
+        assert!(check_color_flag_scope(&[], &None, false).is_ok());
     }
 
     #[test]

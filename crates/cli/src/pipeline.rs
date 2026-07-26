@@ -191,6 +191,16 @@ pub fn parse_hex_color(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
 }
 
+/// `--allow-out-of-bounds` relaxes a preflight rule, and only `--by-color`
+/// cuts are preflighted. Accepting it on the plain path would say a check was
+/// overruled when no check ran.
+pub fn check_out_of_bounds_scope(allow_out_of_bounds: bool, by_color: bool) -> Result<(), String> {
+    if allow_out_of_bounds && !by_color {
+        return Err("--allow-out-of-bounds applies to --by-color cuts; the plain cut path runs no preflight".into());
+    }
+    Ok(())
+}
+
 /// `--by-color` needs a human at the keyboard between passes; a plan with
 /// only one pass never pauses, so it's allowed even without a TTY.
 pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> {
@@ -262,6 +272,15 @@ mod tests {
         </svg>"##;
         let err = plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, false).unwrap_err();
         assert_eq!(err, "no cuttable paths in SVG");
+    }
+
+    #[test]
+    fn allow_out_of_bounds_without_by_color_is_an_error() {
+        // Silently accepting it would imply preflight ran and was relaxed, when
+        // the plain cut path runs no preflight at all.
+        assert!(check_out_of_bounds_scope(true, false).is_err());
+        assert!(check_out_of_bounds_scope(true, true).is_ok());
+        assert!(check_out_of_bounds_scope(false, false).is_ok());
     }
 
     #[test]

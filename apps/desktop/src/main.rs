@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
-use desktop::device::{is_active, DesktopBackendFactory, DeviceManagerHandle};
+use desktop::device::{is_active, DeviceManagerHandle};
+use driver_registry::HardwareBackendFactory;
 use desktop::ipc;
 use desktop::state::AppState;
 
@@ -21,7 +22,7 @@ fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
 }
 
 fn main() {
-    let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(DesktopBackendFactory));
+    let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

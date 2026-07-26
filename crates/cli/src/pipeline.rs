@@ -1,48 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Job, Settings, Transport, TransportError, TransportKind};
-use driver_hpgl::HpglDriver;
-use driver_silhouette::SilhouetteDriver;
-
-/// The CLI's `DeviceBackendFactory`: enumerates real USB/serial hardware and builds the
-/// in-tree drivers. `Device::driver()` routes through this so the `cut` command exercises
-/// the same contract a future `DeviceManager` will use.
-pub struct CliBackendFactory;
-
-impl DeviceBackendFactory for CliBackendFactory {
-    fn list_devices(&self) -> Vec<DeviceInfo> {
-        let mut devices: Vec<DeviceInfo> = driver_silhouette::list_locators()
-            .into_iter()
-            .map(|locator| DeviceInfo {
-                instance_id: format!("usb:{locator}"),
-                machine_id: "cameo5".into(),
-                transport: TransportKind::Usb { locator },
-                candidate: false, // USB is discriminated by VID/PID — not a guess
-            })
-            .collect();
-        devices.extend(driver_hpgl::list_ports().into_iter().map(|path| DeviceInfo {
-            instance_id: format!("serial:{path}"),
-            machine_id: "puma".into(),
-            transport: TransportKind::Serial { path, baud: 9600 },
-            candidate: true, // any serial port could be a Puma — needs operator confirmation
-        }));
-        devices
-    }
-
-    fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        match machine_id {
-            "cameo5" => Some(Box::new(SilhouetteDriver::new())),
-            "puma" => Some(Box::new(HpglDriver::new())),
-            _ => None,
-        }
-    }
-
-    fn open_transport(&self, info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
-        match &info.transport {
-            TransportKind::Usb { locator } => Ok(Box::new(driver_silhouette::UsbTransport::open_at(locator)?)),
-            TransportKind::Serial { path, baud } => Ok(Box::new(driver_hpgl::SerialTransport::open(path, *baud)?)),
-        }
-    }
-}
+use driver_core::{DeviceBackendFactory, Driver, Job, Settings};
+use driver_registry::HardwareBackendFactory;
 
 #[derive(Clone, Copy)]
 pub enum Device { Cameo5, Puma }
@@ -61,7 +19,7 @@ impl Device {
         }
     }
     pub fn driver(&self) -> Box<dyn Driver> {
-        CliBackendFactory.driver_for(self.machine_id())
+        HardwareBackendFactory.driver_for(self.machine_id())
             .expect("Device variant always maps to a known machine_id")
     }
 }
@@ -301,17 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn factory_resolves_drivers_for_known_machine_ids_only() {
-        let f = CliBackendFactory;
-        assert!(f.driver_for("cameo5").is_some());
-        assert!(f.driver_for("puma").is_some());
-        assert!(f.driver_for("unknown").is_none());
-    }
-
-    #[test]
     fn device_driver_routes_through_the_factory() {
-        // Regression guard: Device::driver() must keep resolving via CliBackendFactory,
-        // not a hardcoded match, so the cut path and the enumeration path agree.
+        // Regression guard: Device::driver() must keep resolving via the shared
+        // registry, not a hardcoded match, so the cut path and the enumeration
+        // path agree. (Which ids the registry knows is its own test.)
         assert_eq!(Device::Cameo5.driver().profile().id, "cameo5");
         assert_eq!(Device::Puma.driver().profile().id, "puma");
     }

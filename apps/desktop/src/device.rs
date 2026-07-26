@@ -8,7 +8,7 @@ use cutplan::presets::{
 };
 use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceEventKind, DeviceManager, DeviceState};
-use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Transport, TransportError, TransportKind};
+use driver_core::{DeviceBackendFactory, DeviceInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -37,47 +37,6 @@ pub struct ConfiguredPassDto {
     pub speed: Option<u32>,
     pub force: Option<u32>,
     pub repeat_count: Option<u32>,
-}
-
-/// Mirrors `cli::pipeline::CliBackendFactory` (Task 5) — same driver/transport
-/// resolution, duplicated rather than shared since the CLI factory lives in a
-/// binary crate `desktop` can't depend on.
-pub struct DesktopBackendFactory;
-
-impl DeviceBackendFactory for DesktopBackendFactory {
-    fn list_devices(&self) -> Vec<DeviceInfo> {
-        let mut devices: Vec<DeviceInfo> = driver_silhouette::list_locators()
-            .into_iter()
-            .map(|locator| DeviceInfo {
-                instance_id: format!("usb:{locator}"),
-                machine_id: "cameo5".into(),
-                transport: TransportKind::Usb { locator },
-                candidate: false,
-            })
-            .collect();
-        devices.extend(driver_hpgl::list_ports().into_iter().map(|path| DeviceInfo {
-            instance_id: format!("serial:{path}"),
-            machine_id: "puma".into(),
-            transport: TransportKind::Serial { path, baud: 9600 },
-            candidate: true,
-        }));
-        devices
-    }
-
-    fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        match machine_id {
-            "cameo5" => Some(Box::new(driver_silhouette::SilhouetteDriver::new())),
-            "puma" => Some(Box::new(driver_hpgl::HpglDriver::new())),
-            _ => None,
-        }
-    }
-
-    fn open_transport(&self, info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
-        match &info.transport {
-            TransportKind::Usb { locator } => Ok(Box::new(driver_silhouette::UsbTransport::open_at(locator)?)),
-            TransportKind::Serial { path, baud } => Ok(Box::new(driver_hpgl::SerialTransport::open(path, *baud)?)),
-        }
-    }
 }
 
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
@@ -362,7 +321,7 @@ pub fn delete_preset(id: &str) -> Result<(), IpcError> {
 mod tests {
     use super::*;
     use cutplan::DocumentPasses;
-    use driver_core::{Job, MachineCaps, MachineProfile};
+    use driver_core::{Driver, Job, MachineCaps, MachineProfile, Transport, TransportError, TransportKind};
 
     struct TestDriver { profile: MachineProfile, caps: MachineCaps }
     impl Driver for TestDriver {

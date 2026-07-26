@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::pipeline::{build_bytes, check_interactive, check_out_of_bounds_scope, format_pass_color, pass_stream_bytes, plan_cut_from_svg, CliBackendFactory, Device};
+use cli::pipeline::{build_bytes, check_interactive, check_out_of_bounds_scope, format_pass_color, pass_stream_bytes, plan_cut_from_svg, Device};
+use driver_registry::HardwareBackendFactory;
 use driver_core::manager::{DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};
 use std::io::IsTerminal;
@@ -222,7 +223,7 @@ fn cut_by_color(
     }
 
     let info = resolve_device_info(device, port.as_deref(), baud)?;
-    let factory: Arc<dyn DeviceBackendFactory> = Arc::new(CliBackendFactory);
+    let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
     let (mgr, _events) = DeviceManager::spawn(factory);
     let mgr = Arc::new(mgr);
     mgr.connect(info).map_err(|e| format!("connect: {e:?}"))?;
@@ -277,7 +278,7 @@ fn cut_by_color(
 
 fn resolve_device_info(device: Device, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
     match device {
-        Device::Cameo5 => CliBackendFactory
+        Device::Cameo5 => HardwareBackendFactory
             .list_devices()
             .into_iter()
             .find(|d| d.machine_id == "cameo5")

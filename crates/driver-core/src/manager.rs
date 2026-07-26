@@ -37,7 +37,7 @@ pub enum DeviceError { Disconnected, Busy, Timeout, WriteZero, Io(String) }
 impl From<TransportError> for DeviceError {
     fn from(e: TransportError) -> Self {
         match e {
-            TransportError::NotFound => DeviceError::Disconnected,
+            TransportError::NotFound | TransportError::Disconnected => DeviceError::Disconnected,
             TransportError::Timeout => DeviceError::Timeout,
             TransportError::WriteZero => DeviceError::WriteZero,
             TransportError::Io(s) => DeviceError::Io(s),

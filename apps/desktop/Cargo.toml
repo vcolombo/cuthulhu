@@ -23,7 +23,9 @@ cutplan = { path = "../../crates/cutplan" }
 driver-core = { path = "../../crates/driver-core" }
 driver-silhouette = { path = "../../crates/driver-silhouette" }
 driver-hpgl = { path = "../../crates/driver-hpgl" }
+trace = { path = "../../crates/trace" }
 tauri = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"

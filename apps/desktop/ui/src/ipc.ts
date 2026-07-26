@@ -198,3 +198,27 @@ export async function pickOpenPath(): Promise<string | null> {
   const r = await dialogOpen({ multiple: false, filters: CUT_FILTER });
   return typeof r === "string" ? r : null;
 }
+
+// --- trace wire types ---
+
+export type TraceOptionsDto = {
+  mode: "binary" | "color";
+  filterSpeckle: number;
+  cornerThreshold: number;
+  lengthThreshold: number;
+  colorPrecision: number;
+};
+export type TraceResultDto = { svg: string; pathCount: number; widthPx: number; heightPx: number; downscaled: boolean };
+
+
+export async function traceImage(args: { path: string; opts: TraceOptionsDto }): Promise<TraceResultDto> {
+  return invoke("trace_image", args);
+}
+export async function loadImagePreview(args: { path: string }): Promise<string> {
+  return invoke("load_image_preview", args);
+}
+// Goes through Rust rather than the dialog plugin directly: the backend records what the user
+// picked and refuses to trace anything else, so choosing the file here is what grants access.
+export async function pickImagePath(): Promise<string | null> {
+  return invoke("pick_image", {});
+}

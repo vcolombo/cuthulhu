@@ -166,3 +166,97 @@ pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
 pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
+
+/// Cap on the source file both trace commands will pull into memory. The decoder's own ceiling
+/// only applies once the bytes are already resident, so without this a huge file exhausts memory
+/// before it can be rejected for not being a usable image.
+const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Paths the user has actually chosen in the native picker this session.
+///
+/// The trace commands take a path from the webview, so without this any code running there could
+/// name an arbitrary file and read image content back out. The set is only ever added to by
+/// `pick_image`, which is the picker itself — the renderer cannot authorize a path, only ask for
+/// one to be authorized by the user choosing it.
+#[derive(Default)]
+pub struct AuthorizedImages(pub Mutex<std::collections::HashSet<PathBuf>>);
+
+/// Canonicalized so an authorized file cannot be re-reached under a different spelling
+/// (`..` segments, a symlink, a relative path) and miss the membership check.
+fn canonical(path: &PathBuf) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Returns the *resolved* path to read, so the caller opens exactly what was authorized.
+///
+/// Returning `()` and letting the caller re-open its own argument would leave a window between
+/// the check and the read: the caller's path is resolved twice, and a symlink that pointed at an
+/// authorized file for the check can be retargeted before the open. Reading the already-resolved
+/// path removes that step entirely.
+fn authorized_path(auth: &AuthorizedImages, path: &PathBuf) -> Result<PathBuf, String> {
+    let real = canonical(path)?;
+    if auth.0.lock().unwrap().contains(&real) {
+        Ok(real)
+    } else {
+        Err("that image was not selected in this session".into())
+    }
+}
+
+/// Open the native image picker and record what the user chose. This lives in Rust rather than
+/// in the webview precisely so that selection, not the caller's say-so, is what grants access.
+#[tauri::command(async)]
+pub fn pick_image(
+    app: tauri::AppHandle,
+    auth: tauri::State<AuthorizedImages>,
+) -> Result<Option<PathBuf>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp"])
+        .blocking_pick_file();
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("could not resolve the selected file: {e}"))?;
+    let real = canonical(&path)?;
+    auth.0.lock().unwrap().insert(real.clone());
+    Ok(Some(real))
+}
+
+fn read_image_file(path: &PathBuf) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if meta.len() > MAX_INPUT_FILE_BYTES {
+        return Err(format!(
+            "file is too large to open: {} MiB",
+            meta.len() / (1024 * 1024)
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+#[tauri::command(async)]
+pub fn trace_image(
+    auth: tauri::State<AuthorizedImages>,
+    path: PathBuf,
+    opts: trace::TraceOptions,
+) -> Result<trace::TraceResult, String> {
+    let real = authorized_path(&auth, &path)?;
+    let bytes = read_image_file(&real)?;
+    trace::trace(&bytes, &opts).map_err(|e| e.to_string())
+}
+
+/// Returns the source thumbnail as a re-encoded PNG data URL — never the file's original bytes,
+/// so a path that is not a decodable image yields an error rather than its contents.
+#[tauri::command(async)]
+pub fn load_image_preview(
+    auth: tauri::State<AuthorizedImages>,
+    path: PathBuf,
+) -> Result<String, String> {
+    let real = authorized_path(&auth, &path)?;
+    let bytes = read_image_file(&real)?;
+    let png = trace::preview_png(&bytes).map_err(|e| e.to_string())?;
+    use base64::Engine as _;
+    Ok(format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png)))
+}

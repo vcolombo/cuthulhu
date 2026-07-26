@@ -20,5 +20,10 @@ cutplan = { path = "../cutplan" }
 driver-core = { path = "../driver-core" }
 driver-silhouette = { path = "../driver-silhouette" }
 driver-hpgl = { path = "../driver-hpgl" }
+trace = { path = "../trace" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"

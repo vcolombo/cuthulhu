@@ -13,6 +13,7 @@ import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
+import { TraceDialog } from "./trace/TraceDialog";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -150,6 +151,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
+  const [tracePath, setTracePath] = useState<string | null>(null);
   const [deviceState, setDeviceState] = useState<ipc.DeviceState>("Disconnected");
   // Latched terminal outcome of the most recent cut, kept separate from jobId: the
   // completion/failure banner must outlive the event-filter id, which is released
@@ -380,6 +382,21 @@ export function App() {
     });
   };
 
+  const onTrace = () =>
+    run(async () => {
+      const p = await ipc.pickImagePath();
+      if (p) setTracePath(p);
+    });
+
+  const onTraceInsert = (svg: string) => {
+    run(async () => {
+      const bytes = Array.from(new TextEncoder().encode(svg));
+      const [, skipped] = (await ipc.importSvg({ bytes, parent: root })) as [unknown, string[]];
+      if (skipped.length > 0) setError(`Inserted with ${skipped.length} element(s) skipped: ${skipped.join(", ")}`);
+    });
+    setTracePath(null);
+  };
+
   return (
     <div
       style={{
@@ -424,6 +441,7 @@ export function App() {
           onRedo={() => run(() => ipc.redo())}
           onImportFile={onImportFile}
           onCut={() => setCutOpen(true)}
+          onTrace={onTrace}
         />
       </div>
       <ToolRail
@@ -476,6 +494,9 @@ export function App() {
           onError={setError}
           onClose={() => setCutOpen(false)}
         />
+      ) : null}
+      {tracePath !== null ? (
+        <TraceDialog path={tracePath} onInsert={onTraceInsert} onClose={() => setTracePath(null)} />
       ) : null}
     </div>
   );

@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn each_job_carries_its_passs_geometry_and_settings() {
+    fn each_job_carries_its_own_pass_geometry_and_settings() {
         let doc = doc_with_rects(&[(RED, 0.0, 0.0), (RED, 10.0, 0.0), (BLUE, 20.0, 0.0)]);
         let settings = Settings { speed: Some(5), force: Some(20), repeat_count: 2 };
         let sel = vec![PassSelection { color: Some(RED), settings: settings.clone() }];

@@ -144,6 +144,12 @@ pub fn plan_cut_from_svg(
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg(svg)?;
+    // Planned twice on purpose. --order and --skip-color name colours, so the
+    // colours have to be known before a selection can be built, and plan_cut
+    // plans again inside. Taking a DocumentPasses here instead would save the
+    // second walk at the cost of letting a caller validate a different document
+    // than it planned -- the traversal is cheap next to the SVG parse already
+    // done above, and one entry point is worth more than one traversal.
     let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
     let colors = pass_order(&planned.passes, skip_colors, order)?;
 

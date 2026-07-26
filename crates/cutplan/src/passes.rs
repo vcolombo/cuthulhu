@@ -15,14 +15,17 @@ pub struct PlannedShape { pub node_id: NodeId, pub polylines: Vec<Polyline> }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 
+/// Every `ColorPass` a document contains, in first-seen order — an inventory of
+/// what *could* be cut. Nothing here is selected, configured or checked; that is
+/// `plan_cut`'s job, and what it returns is a `CutPlan`.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub struct PlannedCut { pub passes: Vec<ColorPass>, pub skipped_no_stroke: usize, pub doc_revision: u64 }
+pub struct DocumentPasses { pub passes: Vec<ColorPass>, pub skipped_no_stroke: usize, pub doc_revision: u64 }
 
 #[derive(Debug, PartialEq)]
 pub enum PlanError { BadShape(NodeId, String), MissingNode(NodeId), CycleDetected }
 
 /// Hash of the document's JSON snapshot — cheap staleness check for a previously
-/// computed `PlannedCut` (recompute if this no longer matches `doc_revision(doc)`).
+/// computed `DocumentPasses` (recompute if this no longer matches `doc_revision(doc)`).
 pub fn doc_revision(doc: &Document) -> u64 {
     let mut hasher = DefaultHasher::new();
     doc.snapshot_json().hash(&mut hasher);
@@ -33,7 +36,7 @@ pub fn doc_revision(doc: &Document) -> u64 {
 /// (`None` or alpha-0 strokes are skipped, not cut), and flatten each shape's outline
 /// under its accumulated world transform. Iterative (explicit stack) so depth is not
 /// bounded by the Rust call stack; a `visited` set catches cycles in malformed docs.
-pub fn plan_passes(doc: &Document) -> Result<PlannedCut, PlanError> {
+pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut stack: Vec<(NodeId, Affine)> = vec![(doc.root, Affine::identity())];
     let mut passes: Vec<ColorPass> = vec![];
@@ -70,7 +73,7 @@ pub fn plan_passes(doc: &Document) -> Result<PlannedCut, PlanError> {
         }
     }
 
-    Ok(PlannedCut { passes, skipped_no_stroke, doc_revision: doc_revision(doc) })
+    Ok(DocumentPasses { passes, skipped_no_stroke, doc_revision: doc_revision(doc) })
 }
 
 /// Travel (non-cutting) moves needed to visit every shape across `configured` passes,

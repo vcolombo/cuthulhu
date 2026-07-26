@@ -304,7 +304,7 @@ pub struct PlanCutPassSummary {
     pub node_ids: Vec<document::NodeId>,
 }
 
-/// Summarizes `plan_passes` output for the UI — not the raw `PlannedCut`
+/// Summarizes `plan_passes` output for the UI — not the raw `DocumentPasses`
 /// (which carries full flattened polylines the cut dialog doesn't need).
 pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, IpcError> {
     let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
@@ -358,7 +358,7 @@ pub fn delete_preset(id: &str) -> Result<(), IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutplan::PlannedCut;
+    use cutplan::DocumentPasses;
     use driver_core::{Job, MachineCaps, MachineProfile};
 
     struct TestDriver { profile: MachineProfile, caps: MachineCaps }
@@ -401,11 +401,11 @@ mod tests {
         dev
     }
 
-    fn plan_for(app: &AppState) -> PlannedCut {
+    fn plan_for(app: &AppState) -> DocumentPasses {
         plan_passes(&app.editor.doc).unwrap()
     }
 
-    fn request_from(plan: PlannedCut) -> CutRequest {
+    fn request_from(plan: DocumentPasses) -> CutRequest {
         CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: plan.doc_revision.to_string(),

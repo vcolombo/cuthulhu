@@ -63,6 +63,31 @@ pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     Ok(doc)
 }
 
+/// The stroke a plain cut gives every imported path. Opaque black, matching
+/// `document::Style::default()`.
+pub const CUT_STROKE: u32 = 0x000000FF;
+
+/// Import `svg` for a plain (non-`--by-color`) cut: every path gets the same
+/// stroke, so `plan_passes` finds all of it and groups it into exactly one
+/// `ColorPass`.
+///
+/// This is what the plain path has always meant — cut everything in the file,
+/// in one pass — stated explicitly so the cut can go through `plan_cut` and be
+/// preflighted. It deliberately does not touch `plan_passes`' stroke rule; see
+/// issue #68 for whether that rule should change at all.
+pub fn doc_from_svg_all_cuttable(svg: &[u8]) -> Result<document::Document, String> {
+    let mut doc = document::Document::new();
+    let (mut delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
+        .map_err(|e| format!("SVG parse: {e:?}"))?;
+    for op in delta.0.iter_mut() {
+        if let document::NodeOp::Add { node, .. } = op {
+            node.style.stroke = Some(CUT_STROKE);
+        }
+    }
+    doc.apply(delta);
+    Ok(doc)
+}
+
 /// The colours to cut, in cut order: apply `--order` (listed colours to the
 /// front, in listed sequence; the rest keep their relative order) and then
 /// `--skip-color`, in that order per the brief.
@@ -256,6 +281,19 @@ mod tests {
         assert_eq!(parse_hex_color("ff0000ff"), Ok(0xFF0000FF));
         assert!(parse_hex_color("ff0000").is_err(), "6-digit RRGGBB must be rejected, not zero-padded");
         assert!(parse_hex_color("nothex12").is_err());
+    }
+
+    /// A fill-only SVG is what Illustrator, Inkscape and most clipart emit. The plain
+    /// cut path has always cut it, so routing that path through `plan_passes` — which
+    /// skips strokeless shapes — must not change what it cuts.
+    #[test]
+    fn fill_only_svg_plans_exactly_one_pass() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
+        let doc = doc_from_svg_all_cuttable(svg).expect("import");
+        let planned = cutplan::plan_passes(&doc).expect("plan");
+        assert_eq!(planned.passes.len(), 1, "all geometry belongs to one pass");
+        assert_eq!(planned.passes[0].color, Some(CUT_STROKE));
     }
 
     #[test]

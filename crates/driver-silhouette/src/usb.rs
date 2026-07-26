@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use driver_core::{Transport, TransportError};
-use nusb::transfer::RequestBuffer;
+use nusb::transfer::{RequestBuffer, TransferError};
 use std::time::Duration;
 
 const VID: u16 = 0x3844;
@@ -10,6 +10,20 @@ const EP_IN: u8 = 0x82;
 
 pub struct UsbTransport {
     iface: nusb::Interface,
+    locator: String,
+}
+
+/// Maps a nusb transfer failure to a transport error, using `still_enumerated` (whether the
+/// device is still listed by the OS) to tell a disconnect from a device-side fault.
+///
+/// nusb reports an unplug as `Disconnected` on some platforms but as `Unknown` on macOS, so
+/// the error code alone cannot answer "is the cable still in?" — enumeration can.
+fn classify_transfer_error(e: TransferError, still_enumerated: bool) -> TransportError {
+    match e {
+        TransferError::Disconnected => TransportError::Disconnected,
+        _ if !still_enumerated => TransportError::Disconnected,
+        other => TransportError::Io(other.to_string()),
+    }
 }
 
 /// Locators ("bus:address") for every enumerated Cameo device, in enumeration order.
@@ -47,7 +61,12 @@ impl UsbTransport {
         let iface = dev
             .claim_interface(0)
             .map_err(|e| TransportError::Io(e.to_string()))?;
-        Ok(UsbTransport { iface })
+        Ok(UsbTransport { iface, locator: locator.to_string() })
+    }
+
+    /// Whether this transport's device is still enumerated by the OS.
+    fn still_enumerated(&self) -> bool {
+        list_locators().contains(&self.locator)
     }
 }
 
@@ -55,7 +74,7 @@ impl Transport for UsbTransport {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, TransportError> {
         let xfer = self.iface.bulk_out(EP_OUT, bytes.to_vec());
         let completion = futures_lite::future::block_on(xfer);
-        completion.status.map_err(|e| TransportError::Io(format!("{e:?}")))?;
+        completion.status.map_err(|e| classify_transfer_error(e, self.still_enumerated()))?;
         Ok(bytes.len())
     }
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
@@ -75,7 +94,7 @@ impl Transport for UsbTransport {
 
         match rx.recv_timeout(timeout) {
             Ok(completion) => {
-                completion.status.map_err(|e| TransportError::Io(format!("{e:?}")))?;
+                completion.status.map_err(|e| classify_transfer_error(e, self.still_enumerated()))?;
                 let data = completion.data;
                 let n = data.len();
                 buf[..n].copy_from_slice(&data);
@@ -94,11 +113,45 @@ mod tests {
     use super::*;
     #[test]
     fn open_without_device_reports_not_found() {
-        // CI has no Cameo attached → must be a typed NotFound, never a panic.
+        // Only meaningful with no Cameo attached (CI, and dev machines between hardware
+        // runs). Skip rather than fail when one is plugged in — the assertion is about the
+        // empty-enumeration path, not about the developer's desk.
+        if !list_locators().is_empty() {
+            eprintln!("skipped: a Cameo is attached");
+            return;
+        }
         match UsbTransport::open() {
             Err(TransportError::NotFound) => {}
             Err(e) => panic!("expected NotFound, got: {e:?}"),
             Ok(_) => panic!("device unexpectedly found"),
+        }
+    }
+
+    #[test]
+    fn gone_device_classifies_as_disconnected_whatever_the_transfer_error() {
+        // macOS reports a mid-transfer unplug as Unknown, Linux as Disconnected; both mean
+        // the cable is out, and the operator must be told that rather than "Unknown".
+        assert_eq!(
+            classify_transfer_error(TransferError::Disconnected, true),
+            TransportError::Disconnected
+        );
+        assert_eq!(
+            classify_transfer_error(TransferError::Unknown, false),
+            TransportError::Disconnected
+        );
+    }
+
+    #[test]
+    fn present_device_keeps_a_readable_fault_message() {
+        // Still enumerated → a genuine device-side fault, reported with nusb's Display text
+        // rather than the bare Debug name.
+        let err = classify_transfer_error(TransferError::Stall, true);
+        match err {
+            TransportError::Io(msg) => {
+                assert!(!msg.is_empty(), "fault message must not be empty");
+                assert_ne!(msg, "Stall", "expected Display text, not the Debug variant name");
+            }
+            other => panic!("expected Io, got: {other:?}"),
         }
     }
     #[test]

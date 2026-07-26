@@ -33,7 +33,7 @@
       (Builtin presets appear after connect; picking Cardstock auto-fills force from the preset while a typed speed override wins.)
 - [x] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
 - [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).
-      (Not reachable on a real Mac: the OS always exposes serial ports, so unverified puma candidates always populate the list — every /dev/cu.* shows as its own "puma (unverified serial device)" row, which is itself a polish candidate. Empty-state render covered by the e2e mock test.)
+      (Was unreachable on a real Mac — the OS always exposes serial ports, so every /dev/cu.* and its /dev/tty. twin showed as its own "puma (unverified serial device)" row. Fixed for #10: `list_ports` now drops dial-in duplicates and the macOS system pseudo-ports, so the list is empty on a Mac with no cutter and no paired Bluetooth serial device. The empty-state message itself is new and unverified — no automated test covers it, so this item needs a real run.)
 
 ## SP5 Trace — verified 2026-07-25 against a packaged `cargo tauri build` bundle
 

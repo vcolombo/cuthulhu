@@ -21,7 +21,7 @@ pub struct MachineCaps { pub supports_speed: bool, pub supports_force: bool, pub
 #[derive(Debug, PartialEq)]
 pub enum DriverError { UnsupportedGeometry, Encode(String) }
 #[derive(Debug, PartialEq)]
-pub enum TransportError { NotFound, Timeout, WriteZero, Io(String) }
+pub enum TransportError { NotFound, Disconnected, Timeout, WriteZero, Io(String) }
 
 pub trait Driver {
     fn profile(&self) -> &MachineProfile;

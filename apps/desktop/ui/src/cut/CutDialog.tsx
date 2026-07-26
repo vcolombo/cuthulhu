@@ -231,6 +231,11 @@ export function CutDialog({
 
         <div>
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>Device</div>
+          {devices.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--muted)" }}>
+              No devices found — connect a cutter and reopen this dialog.
+            </div>
+          ) : null}
           {devices.map((d) => (
             <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
               <span>

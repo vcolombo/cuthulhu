@@ -33,13 +33,15 @@ any implementation is meaningful.
 | `code-review` | Surfaced by an automated or human review of a pull request. |
 
 Provenance is for filtering a whole sweep in or out at once. A backlog of forty parity items
-should not drown five architecture findings, and vice versa:
+should not drown five architecture findings, and vice versa. These are issue-search queries, and
+each one is copyable as written — GitHub search has no comment syntax, so nothing may be appended
+to them:
 
-```
-label:architecture-review label:refactor   # ready to implement
-label:architecture-review                  # everything that review produced
--label:parity-review                       # everything that was not a parity sweep
-```
+| Query | Returns |
+|---|---|
+| `label:architecture-review label:refactor` | The findings ready to implement. |
+| `label:architecture-review` | Everything that review produced, decisions included. |
+| `-label:parity-review` | Everything that was not part of the parity sweep. |
 
 **Do not guess.** Apply a provenance label only when the issue body says where it came from, or
 when you filed it yourself and know. Issues #11 and #13 deliberately carry no provenance label:

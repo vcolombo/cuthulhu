@@ -6,6 +6,7 @@ use std::time::Duration;
 
 pub mod manager;
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Job { pub polylines: Vec<Polyline>, pub settings: Settings }
 
 #[derive(Clone, Debug, PartialEq)]

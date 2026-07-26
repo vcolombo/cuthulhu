@@ -240,23 +240,36 @@ fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> std::io::Result<Option<
     Ok(Some(bytes))
 }
 
+fn too_large() -> String {
+    format!(
+        "file is too large to open: over {} MiB",
+        MAX_INPUT_FILE_BYTES / (1024 * 1024)
+    )
+}
+
 /// Read an authorized image, refusing anything past the ceiling.
 ///
-/// One open handle, bounded by `read_capped`, rather than `metadata` followed by a separate
-/// `std::fs::read`. Two pathname resolutions describe two moments: the size that passed the check
-/// belonged to whatever the path pointed at then, and a file that grew in between was read in full
-/// anyway. Bounding the read itself holds whatever the size was, or became.
+/// Everything happens through one open handle, rather than `std::fs::metadata` followed by a
+/// separate `std::fs::read`. Two *pathname* resolutions describe two moments: the size that passed
+/// the check belonged to whatever the path pointed at then, and a file that grew in between was
+/// read in full anyway.
+///
+/// The size check itself is not the problem and is kept — `File::metadata` is `fstat` on the
+/// handle, so it cannot describe a different file than the one about to be read. It earns its
+/// place by refusing an oversized file for the cost of a syscall, instead of allocating the whole
+/// ceiling first only to throw it away.
 fn read_image_file(path: &PathBuf) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    // A failed fstat is not fatal: this is a fast path, and `read_capped` below is the real bound.
+    if file.metadata().is_ok_and(|m| m.len() > MAX_INPUT_FILE_BYTES) {
+        return Err(too_large());
+    }
     match read_capped(file, MAX_INPUT_FILE_BYTES)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?
     {
         Some(bytes) => Ok(bytes),
-        None => Err(format!(
-            "file is too large to open: over {} MiB",
-            MAX_INPUT_FILE_BYTES / (1024 * 1024)
-        )),
+        None => Err(too_large()),
     }
 }
 
@@ -306,19 +319,29 @@ mod tests {
     /// in this wiring breaks every trace.
     #[test]
     fn read_image_file_returns_the_contents_of_a_small_file() {
-        let path = std::env::temp_dir().join("cuthulhu-read-image-file-test.bin");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
         std::fs::write(&path, b"not an image, but bytes are bytes").unwrap();
-        let got = read_image_file(&path).expect("a small file must be readable");
-        std::fs::remove_file(&path).ok();
-        assert_eq!(got, b"not an image, but bytes are bytes");
+        assert_eq!(read_image_file(&path).unwrap(), b"not an image, but bytes are bytes");
+    }
+
+    /// Exercises the real `MAX_INPUT_FILE_BYTES`, which the `read_capped` tests deliberately do
+    /// not. Sparse, so it costs no disk: `set_len` past the ceiling without writing a byte.
+    #[test]
+    fn read_image_file_refuses_a_file_past_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        std::fs::File::create(&path).unwrap().set_len(MAX_INPUT_FILE_BYTES + 1).unwrap();
+        let err = read_image_file(&path).expect_err("a file past the ceiling must be refused");
+        assert!(err.contains("too large"), "error should say why: {err}");
     }
 
     #[test]
     fn read_image_file_reports_a_missing_path_with_its_name() {
-        let path = std::env::temp_dir().join("cuthulhu-definitely-absent.bin");
-        std::fs::remove_file(&path).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.bin");
         let err = read_image_file(&path).expect_err("a missing file must error");
-        assert!(err.contains("cuthulhu-definitely-absent.bin"), "error should name the file: {err}");
+        assert!(err.contains("absent.bin"), "error should name the file: {err}");
     }
 
     #[test]

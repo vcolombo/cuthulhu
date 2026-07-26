@@ -12,14 +12,22 @@ const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Read an image file, refusing anything past the ceiling.
 ///
-/// Reads through a single open handle rather than stat-then-read: a separate size check describes
-/// whatever the pathname pointed at when it ran, not necessarily what gets read afterwards, so a
-/// file that grows in between would sail past the limit it was just measured against. `take`
-/// bounds the read itself, which holds no matter what the size was.
+/// Everything goes through a single open handle rather than stat-then-read on the pathname: a
+/// separate size check describes whatever the pathname pointed at when it ran, not necessarily
+/// what gets read afterwards, so a file that grows in between would sail past the limit it was
+/// just measured against. `fstat` on the handle cannot drift like that, and refuses an oversized
+/// file for a syscall instead of an allocation; `take` is what actually bounds the read.
 fn read_image_capped(path: &std::path::Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    // A failed fstat is not fatal: this is a fast path, and the capped read below is the bound.
+    if file.metadata().is_ok_and(|m| m.len() > MAX_INPUT_FILE_BYTES) {
+        return Err(format!(
+            "file is too large to open: over {} MiB",
+            MAX_INPUT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
     let mut bytes = Vec::new();
     // One byte past the ceiling, so hitting it is distinguishable from landing exactly on it.
     file.take(MAX_INPUT_FILE_BYTES + 1)

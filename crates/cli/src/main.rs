@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::pipeline::{build_bytes, check_interactive, cutpass_from_color_pass, format_pass_color, pass_stream_bytes, plan_from_svg, CliBackendFactory, Device};
-use driver_core::manager::{CutPass, DeviceManager, DeviceState};
+use cli::pipeline::{build_bytes, check_interactive, format_pass_color, pass_stream_bytes, plan_cut_from_svg, CliBackendFactory, Device};
+use driver_core::manager::{DeviceManager, DeviceState};
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -82,6 +82,9 @@ enum Command {
         /// Comma-separated color order (RRGGBBAA,...) for --by-color passes
         #[arg(long)]
         order: Option<String>,
+        /// Send --by-color geometry that falls outside the machine's cutting area
+        #[arg(long)]
+        allow_out_of_bounds: bool,
     },
     /// List known devices
     ListDevices,
@@ -119,7 +122,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Cut { file, device, dry_run, speed, force, port, baud, by_color, skip_color, order } => {
+        Command::Cut { file, device, dry_run, speed, force, port, baud, by_color, skip_color, order, allow_out_of_bounds } => {
             let device = Device::from_id(&device)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
             let settings = Settings { speed, force, repeat_count: 1 };
@@ -150,7 +153,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
 
-            cut_by_color(&svg, device, &settings, &skip_color, order, dry_run, port, baud)
+            cut_by_color(&svg, device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
         }
         Command::ListDevices => {
             for d in [Device::Cameo5, Device::Puma] {
@@ -195,18 +198,18 @@ fn cut_by_color(
     dry_run: bool,
     port: Option<String>,
     baud: u32,
+    allow_out_of_bounds: bool,
 ) -> Result<(), String> {
-    let passes = plan_from_svg(svg, skip_color, order)?;
-    if passes.is_empty() {
-        return Err("no cuttable paths in SVG".into());
-    }
+    // Preflight runs here, before the dry-run branch, so a dry run and a real
+    // cut always agree on whether the job is acceptable at all.
+    let plan = plan_cut_from_svg(svg, device, settings, skip_color, order, allow_out_of_bounds)?;
+    let passes = &plan.passes;
 
     if dry_run {
         let d = device.driver();
         for (i, pass) in passes.iter().enumerate() {
             println!("-- pass {}/{} (color {}) --", i + 1, passes.len(), format_pass_color(pass.color));
-            let cutpass = cutpass_from_color_pass(pass, settings);
-            let bytes = pass_stream_bytes(d.as_ref(), &cutpass.job, i, passes.len())?;
+            let bytes = pass_stream_bytes(d.as_ref(), &pass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }
         return Ok(());
@@ -229,8 +232,7 @@ fn cut_by_color(
     let ctrlc_mgr = mgr.clone();
     ctrlc::set_handler(move || ctrlc_mgr.cancel()).map_err(|e| format!("ctrlc: {e}"))?;
 
-    let cutpasses: Vec<CutPass> = passes.iter().map(|p| cutpass_from_color_pass(p, settings)).collect();
-    mgr.cut(cutpasses).map_err(|e| format!("cut: {e:?}"))?;
+    mgr.cut(plan.cut_passes()).map_err(|e| format!("cut: {e:?}"))?;
 
     loop {
         match mgr.snapshot() {

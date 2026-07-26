@@ -447,14 +447,22 @@ pub fn run(
     loop {
         match mgr.snapshot() {
             DeviceState::WaitingForColorSwap { next_pass_index, .. } => {
-                let prompt = format!("Pass {}/{}: swap tool, press Enter to resume", next_pass_index + 1, total);
+                // The colour is why the operator is being interrupted — it says which
+                // one to load — so it comes from the plan being cut, not a side list.
+                let prompt = format!(
+                    "Pass {}/{} (color {}): swap tool, press Enter to resume",
+                    next_pass_index + 1, total, pass_color(plan, next_pass_index),
+                );
                 if !operator.wait_ack(&prompt, &mgr) {
                     continue; // re-check snapshot: cancel() already landed
                 }
                 mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
             }
             DeviceState::AwaitingCompletion { pass_index, .. } => {
-                let prompt = format!("Pass {}/{} cutting; press Enter once the machine finishes", pass_index + 1, total);
+                let prompt = format!(
+                    "Pass {}/{} (color {}) cutting; press Enter once the machine finishes",
+                    pass_index + 1, total, pass_color(plan, pass_index),
+                );
                 if !operator.wait_ack(&prompt, &mgr) {
                     continue;
                 }
@@ -473,6 +481,17 @@ pub fn run(
         }
     }
 }
+
+/// The colour of pass `i`, for a prompt. Out-of-range cannot happen for a plan
+/// the manager is cutting, but a prompt is no place to panic if it did.
+fn pass_color(plan: &cutplan::CutPlan, i: usize) -> String {
+    plan.passes.get(i).map(|p| format_pass_color(p.color)).unwrap_or_else(|| "?".into())
+}
+
+/// Also moved here from `main.rs`, so the prompt wording lives beside the loop
+/// that prints it. `main.rs` calls `cut::format_pass_color` until Task 7 removes
+/// its copy of the loop.
+pub fn format_pass_color(color: Option<u32>) -> String { /* body unchanged from main.rs */ }
 
 /// Block until the operator presses Enter (`true`) or a cancel lands via
 /// Ctrl-C/`DeviceManager::cancel` (`false`). The reader thread is left parked on

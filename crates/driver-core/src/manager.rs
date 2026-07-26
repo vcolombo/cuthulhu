@@ -294,6 +294,44 @@ fn resolve_pass_completion(
     }
 }
 
+/// How long a candidate device gets to answer the connect-time status query.
+// ponytail: one fixed budget for every candidate. A real cutter answers an ENQ in
+// milliseconds, so this is generous; a device slower than this reads as "not a cutter" and
+// the operator sees a refusal they can retry. Make it per-driver if a real machine ever
+// needs longer.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Confirms an operator-picked candidate is actually a cutter before reporting it connected.
+///
+/// Serial ports carry no VID/PID, so a candidate is a guess: any device that accepts bytes
+/// can be selected, and connect otherwise "succeeds" against a label printer or a debug
+/// console. The failure then surfaces much later, as a cut that transmits in full and times
+/// out waiting for a status reply — or, once registration exists, as an optical-registration
+/// failure the operator will blame on marks, paper or lighting.
+///
+/// The status query the completion poll already relies on doubles as the identity check: a
+/// cutter answers it with a status char (`0` ready / `1` moving / `2` unloaded), and nothing
+/// else is accepted as proof.
+fn probe_is_cutter(
+    transport: &mut dyn Transport,
+    driver: &dyn Driver,
+    info: &DeviceInfo,
+) -> Result<(), DeviceError> {
+    let where_ = &info.instance_id;
+    write_all(transport, &driver.status_query()).map_err(DeviceError::from)?;
+    let mut buf = [0u8; 8];
+    match transport.read(&mut buf, PROBE_TIMEOUT) {
+        Ok(n) if n > 0 && (b'0'..=b'2').contains(&buf[0]) => Ok(()),
+        Ok(n) if n > 0 => Err(DeviceError::Io(format!(
+            "{where_} answered a status query with something other than a status: not a cutter, or not one this driver speaks"
+        ))),
+        Ok(_) | Err(TransportError::Timeout) => Err(DeviceError::Io(format!(
+            "{where_} did not answer a status query, so it cannot be confirmed as a cutter"
+        ))),
+        Err(e) => Err(DeviceError::from(e)),
+    }
+}
+
 /// A pass has finished (confirmed ready, one way or another): emit
 /// `PassComplete`, then either park for a color swap or close the session.
 fn finish_pass(
@@ -453,12 +491,21 @@ fn worker_loop(
                     continue;
                 }
                 emit(&mut state, DeviceState::Connecting, &events);
-                let outcome = factory.open_transport(&info).map_err(DeviceError::from).and_then(|t| {
-                    factory
-                        .driver_for(&info.machine_id)
-                        .ok_or_else(|| DeviceError::Io(format!("no driver for machine `{}`", info.machine_id)))
-                        .map(|d| (t, d))
-                });
+                let outcome = factory
+                    .open_transport(&info)
+                    .map_err(DeviceError::from)
+                    .and_then(|t| {
+                        factory
+                            .driver_for(&info.machine_id)
+                            .ok_or_else(|| DeviceError::Io(format!("no driver for machine `{}`", info.machine_id)))
+                            .map(|d| (t, d))
+                    })
+                    .and_then(|(mut t, d)| {
+                        if info.candidate {
+                            probe_is_cutter(t.as_mut(), d.as_ref(), &info)?;
+                        }
+                        Ok((t, d))
+                    });
                 match outcome {
                     Ok((t, d)) => {
                         transport = Some(t);
@@ -800,8 +847,10 @@ mod tests {
     }
 
     /// A machine that needs an operator to confirm each pass by hand — no
-    /// status polling. Reads stay empty on purpose: a bug that polled anyway
-    /// would hit an immediate `TransportError::Timeout` and surface fast.
+    /// status polling. The one scripted read is the connect-time probe reply, which a
+    /// candidate device owes before it is accepted; reads stay empty after that on purpose,
+    /// so a bug that polled anyway would hit an immediate `TransportError::Timeout` and
+    /// surface fast.
     struct PumaFactory;
     impl DeviceBackendFactory for PumaFactory {
         fn list_devices(&self) -> Vec<DeviceInfo> { vec![puma_info()] }
@@ -812,7 +861,7 @@ mod tests {
             ))
         }
         fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
-            Ok(Box::new(MockTransport::default()))
+            Ok(Box::new(MockTransport { reads: VecDeque::from(vec![Ok(b"0\r".to_vec())]), ..Default::default() }))
         }
     }
 
@@ -892,6 +941,57 @@ mod tests {
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::JobComplete)));
+        mgr.shutdown();
+    }
+
+    /// A factory whose single transport answers `reads` — enough to script what a device
+    /// says (or refuses to say) when the manager probes it on connect.
+    fn probe_factory(info: DeviceInfo, reads: Vec<Result<Vec<u8>, TransportError>>) -> Arc<ScriptedFactory> {
+        Arc::new(ScriptedFactory {
+            info,
+            profile: MachineProfile { id: "puma".into(), name: "Puma".into(), width_mm: 300.0, height_mm: 1000.0 },
+            caps: MachineCaps { supports_speed: false, supports_force: false, needs_operator_pass_confirm: true },
+            abort: None,
+            payload_len: 8,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![
+                Box::new(MockTransport { reads: reads.into(), ..Default::default() }) as Box<dyn Transport>,
+            ])),
+        })
+    }
+
+    #[test]
+    fn candidate_device_answering_status_connects() {
+        let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), vec![Ok(b"0\r".to_vec())]));
+        mgr.connect(puma_info()).unwrap();
+        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn silent_candidate_device_is_refused_instead_of_connected() {
+        // A serial port that accepts bytes and answers nothing could be any device at all:
+        // a label printer, a debug console. Connecting would let a cut job transmit into it.
+        let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), Vec::new()));
+        let err = mgr.connect(puma_info()).unwrap_err();
+        assert!(matches!(err, DeviceError::Io(_)), "refusal must carry a reason, got {err:?}");
+        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn candidate_device_answering_junk_is_refused() {
+        let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), vec![Ok(b"BROTHER".to_vec())]));
+        assert!(mgr.connect(puma_info()).is_err(), "a reply that is not a status char proves nothing");
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn vid_pid_matched_device_connects_without_being_probed() {
+        // USB identity is settled by enumeration, so no bytes are owed on connect. This
+        // transport scripts no reads at all: a probe would time out and fail the connect.
+        let (mgr, _events) = DeviceManager::spawn(probe_factory(cameo_info(), Vec::new()));
+        mgr.connect(cameo_info()).unwrap();
         mgr.shutdown();
     }
 

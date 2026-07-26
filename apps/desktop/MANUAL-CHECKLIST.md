@@ -52,5 +52,16 @@
 - [x] Trace a fine-detail image (dithered scan, halftone, or a one-pixel checkerboard ≥512 px) — a tracer failure shows as an error banner; the app does not crash or hang.
       (512×512 one-pixel checkerboard: "trace failed: tracer failed on this image; try a lower detail setting". The `catch_unwind` around `vtracer::convert` holds in a release bundle — process stayed alive and the UI stayed responsive.)
 
+## Device layer — pre-SP6 fixes (unverified)
+
+Everything here is hardware behavior that no automated test reaches. All of it wants a run
+before SP6 leans on device connection and mid-job disconnect detection.
+
+- [ ] Connect to a real Puma IV over serial — the connect-time probe is answered and the device reaches Idle with no visible delay.
+- [ ] Connect to a serial device that is not a cutter (a paired Bluetooth device is the easy case) — refused with a message naming the port, and the dialog stays usable afterwards. Confirm the device itself was not disturbed by the one status byte the probe writes.
+- [ ] Unplug the Cameo mid-cut — the job fails as a disconnect, not `Io("Unknown")`.
+- [ ] Unplug a USB-serial adapter mid-cut — the job fails promptly as a disconnect rather than waiting out the completion-poll deadline.
+- [ ] With no cutter attached and no paired Bluetooth serial device, the cut dialog shows the "No devices found" empty state.
+
 Driving note: WebKit range inputs ignore both synthetic `click at` positioning and AX `set value`. The
 reliable way to move a slider is AX `set focused to true` on it, then arrow-key key codes.

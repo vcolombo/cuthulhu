@@ -46,6 +46,24 @@ pub fn list_ports() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether `path` names one of the `enumerated` ports, resolving symlinks before deciding.
+///
+/// A port can be opened through an alias — Linux's `/dev/serial/by-id/usb-...` is the stable
+/// name to prefer — while enumeration reports the underlying `/dev/ttyUSB0`. Comparing the
+/// two verbatim would call a healthy device unplugged and turn its every read timeout into a
+/// disconnect, which is worse than the opaque error this whole check exists to fix.
+///
+/// A path that resolves to nothing is absent: the device node itself is gone.
+fn port_is_present(path: &str, enumerated: &[String]) -> bool {
+    if enumerated.iter().any(|p| p == path) {
+        return true;
+    }
+    let Ok(ours) = std::fs::canonicalize(path) else { return false };
+    enumerated
+        .iter()
+        .any(|p| std::fs::canonicalize(p).map(|other| other == ours).unwrap_or(false))
+}
+
 /// Maps a serial I/O failure to a transport error, using `still_present` (whether the OS
 /// still lists the port) to tell an unplugged cable from a device-side error.
 ///
@@ -80,9 +98,15 @@ impl SerialTransport {
     /// system pseudo-ports: a transport opened on a path the filter hides (the CLI takes any
     /// `--port`) must not read as unplugged.
     fn still_present(&self) -> bool {
-        serialport::available_ports()
-            .map(|ports| ports.iter().any(|p| p.port_name == self.path))
-            .unwrap_or(true) // enumeration itself failed — do not call that a disconnect
+        match serialport::available_ports() {
+            Ok(ports) => {
+                let names: Vec<String> = ports.into_iter().map(|p| p.port_name).collect();
+                port_is_present(&self.path, &names)
+            }
+            // Enumeration itself failed — an unreadable port table is not evidence the
+            // cable is out.
+            Err(_) => true,
+        }
     }
 }
 impl Transport for SerialTransport {
@@ -92,7 +116,9 @@ impl Transport for SerialTransport {
         Ok(bytes.len())
     }
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
-        self.port.set_timeout(timeout).map_err(|e| TransportError::Io(e.to_string()))?;
+        // Classified like the read below: if the port vanished, set_timeout is where the
+        // failure lands first, and it should say disconnect rather than Io.
+        self.port.set_timeout(timeout).map_err(|e| classify_io_error(e.into(), self.still_present()))?;
         match self.port.read(buf) {
             Ok(n) => Ok(n),
             Err(e) => Err(classify_io_error(e, self.still_present())),
@@ -105,6 +131,26 @@ mod tests {
     use super::*;
     use std::io;
     use std::io::ErrorKind;
+    #[cfg(unix)]
+    #[test]
+    fn a_port_opened_through_an_alias_counts_as_present() {
+        // Linux exposes stable aliases like /dev/serial/by-id/usb-FTDI-..., while
+        // available_ports reports the underlying /dev/ttyUSB0. Comparing the names verbatim
+        // calls a healthy device unplugged, which turns its every read timeout into a
+        // disconnect and fails the job on the first poll.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("ttyUSB0");
+        std::fs::write(&real, b"").unwrap();
+        let alias = dir.path().join("by-id-usb-cutter");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let enumerated = vec![real.to_string_lossy().into_owned()];
+
+        assert!(port_is_present(&alias.to_string_lossy(), &enumerated), "alias resolves to an enumerated port");
+        assert!(port_is_present(&real.to_string_lossy(), &enumerated), "the plain name still matches");
+        let absent = dir.path().join("ttyUSB9");
+        assert!(!port_is_present(&absent.to_string_lossy(), &enumerated), "a path that resolves to nothing is absent");
+    }
+
     #[test]
     fn vanished_port_is_a_disconnect_whatever_the_os_said() {
         // Unplugging a USB-serial adapter surfaces as ENXIO, EIO or BrokenPipe depending on

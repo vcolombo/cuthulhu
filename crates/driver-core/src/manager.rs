@@ -295,11 +295,10 @@ fn resolve_pass_completion(
 }
 
 /// How long a candidate device gets to answer the connect-time status query.
-///
-/// ponytail: one fixed budget for every candidate. A real cutter answers an ENQ in
-/// milliseconds, so this is generous; a device slower than this reads as "not a cutter" and
-/// the operator sees a refusal they can retry. Make it per-driver if a real machine ever
-/// needs longer.
+// ponytail: one fixed budget for every candidate. A real cutter answers an ENQ in
+// milliseconds, so this is generous; a device slower than this reads as "not a cutter" and
+// the operator sees a refusal they can retry. Make it per-driver if a real machine ever
+// needs longer.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// Confirms an operator-picked candidate is actually a cutter before reporting it connected.

@@ -507,6 +507,7 @@ dependencies = [
  "document",
  "driver-core",
  "driver-hpgl",
+ "driver-registry",
  "driver-silhouette",
  "fileio",
  "geometry",
@@ -842,8 +843,7 @@ dependencies = [
  "cutplan",
  "document",
  "driver-core",
- "driver-hpgl",
- "driver-silhouette",
+ "driver-registry",
  "fileio",
  "geometry",
  "serde",
@@ -982,6 +982,15 @@ dependencies = [
  "geometry",
  "serialport",
  "tempfile",
+]
+
+[[package]]
+name = "driver-registry"
+version = "0.1.0"
+dependencies = [
+ "driver-core",
+ "driver-hpgl",
+ "driver-silhouette",
 ]
 
 [[package]]

@@ -326,9 +326,10 @@ mod tests {
     }
 
     /// Exercises the real `MAX_INPUT_FILE_BYTES`, which the `read_capped` tests deliberately do
-    /// not. `set_len` extends the file without writing a byte, so on a filesystem with sparse-file
-    /// support (ext4 on CI, APFS locally) this costs no disk. Sparseness is the filesystem's call,
-    /// not a guarantee of the call itself — where it is absent the test is merely slow.
+    /// not. `set_len` is `ftruncate(2)`: it moves the size, and the new region reads as zeros.
+    /// Whether those zeros occupy blocks is the filesystem's call, not the call's guarantee — on
+    /// ext4 (CI) and APFS (dev) the extension is a hole and costs nothing, while a filesystem
+    /// without sparse support writes a real quarter gigabyte and can fail on a small `TMPDIR`.
     #[test]
     fn read_image_file_refuses_a_file_past_the_ceiling() {
         let dir = tempfile::tempdir().unwrap();

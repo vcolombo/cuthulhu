@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use driver_core::Settings;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::fs;
@@ -25,6 +26,28 @@ pub enum PresetError {
     Corrupt(String),
     UnknownVersion(u32),
     Io(String),
+}
+
+/// Per-pass settings a caller wants applied on top of whatever preset is
+/// selected. Every field is optional: `None` means "defer to the preset".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SettingsOverride {
+    pub speed: Option<u32>,
+    pub force: Option<u32>,
+    pub repeat_count: Option<u32>,
+}
+
+/// Override fields win over the preset's; with neither, `Settings::default()`
+/// (repeat_count 1, no speed or force).
+pub fn resolve_settings(preset: Option<&MaterialPreset>, override_: &SettingsOverride) -> Settings {
+    Settings {
+        speed: override_.speed.or_else(|| preset.and_then(|p| p.settings.speed)),
+        force: override_.force.or_else(|| preset.and_then(|p| p.settings.force)),
+        repeat_count: override_
+            .repeat_count
+            .or_else(|| preset.map(|p| p.settings.repeat_count))
+            .unwrap_or(1),
+    }
 }
 
 pub fn builtin_presets() -> Vec<MaterialPreset> {
@@ -239,6 +262,26 @@ pub fn default_presets_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_override_field_beats_the_preset_and_a_missing_preset_falls_back_to_default() {
+        let preset = MaterialPreset {
+            id: "p1".into(),
+            name: "Test".into(),
+            machine_id: "cameo5".into(),
+            settings: PresetSettings { speed: Some(5), force: Some(20), repeat_count: 3 },
+            builtin: false,
+        };
+
+        let partial = SettingsOverride { speed: None, force: Some(25), repeat_count: None };
+        let resolved = resolve_settings(Some(&preset), &partial);
+        assert_eq!(resolved.force, Some(25), "override wins");
+        assert_eq!(resolved.speed, Some(5), "preset fills the gap");
+        assert_eq!(resolved.repeat_count, 3, "preset fills the gap");
+
+        let empty = SettingsOverride { speed: None, force: None, repeat_count: None };
+        assert_eq!(resolve_settings(None, &empty), Settings::default());
+    }
 
     #[test]
     fn first_run_save_creates_missing_parent_directory() {

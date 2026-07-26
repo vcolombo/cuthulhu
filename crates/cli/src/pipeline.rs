@@ -95,37 +95,90 @@ pub fn pass_stream_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> R
     Ok(bytes)
 }
 
-/// Import `svg` into a fresh `Document`, plan passes, then apply `--order`
-/// (reorder listed colors to the front, in listed sequence; unlisted passes
-/// keep their original relative order after) and `--skip-color` (drop
-/// matching passes), in that order per the brief.
-pub fn plan_from_svg(
-    svg: &[u8],
-    skip_colors: &[String],
-    order: Option<String>,
-) -> Result<Vec<cutplan::ColorPass>, String> {
+/// Import `svg` into a fresh `Document` — the CLI has no editing model, so a
+/// cut is planned against a document that exists only for this command.
+pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     let mut doc = document::Document::new();
     let (delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
         .map_err(|e| format!("SVG parse: {e:?}"))?;
     doc.apply(delta);
-    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
-    let mut passes = planned.passes;
+    Ok(doc)
+}
+
+/// The colours to cut, in cut order: apply `--order` (listed colours to the
+/// front, in listed sequence; the rest keep their relative order) and then
+/// `--skip-color`, in that order per the brief.
+pub fn pass_order(
+    planned: &[cutplan::ColorPass],
+    skip_colors: &[String],
+    order: Option<String>,
+) -> Result<Vec<Option<u32>>, String> {
+    let mut colors: Vec<Option<u32>> = planned.iter().map(|p| p.color).collect();
 
     if let Some(order) = order {
         let wanted: Vec<u32> = order.split(',').map(|s| parse_hex_color(s.trim())).collect::<Result<_, _>>()?;
         let mut front = vec![];
         for color in wanted {
-            if let Some(i) = passes.iter().position(|p| p.color == Some(color)) {
-                front.push(passes.remove(i));
+            if let Some(i) = colors.iter().position(|c| *c == Some(color)) {
+                front.push(colors.remove(i));
             }
         }
-        front.extend(passes);
-        passes = front;
+        front.extend(colors);
+        colors = front;
     }
 
     let skip: Vec<u32> = skip_colors.iter().map(|s| parse_hex_color(s)).collect::<Result<_, _>>()?;
-    passes.retain(|p| !p.color.is_some_and(|c| skip.contains(&c)));
-    Ok(passes)
+    colors.retain(|c| !c.is_some_and(|c| skip.contains(&c)));
+    Ok(colors)
+}
+
+/// Plan a `--by-color` cut from an SVG: import, order, select, and validate
+/// through `cutplan::plan_cut` — the same entry point the desktop uses, so the
+/// CLI gets preflight rather than sending unchecked geometry at the machine.
+pub fn plan_cut_from_svg(
+    svg: &[u8],
+    device: Device,
+    settings: &Settings,
+    skip_colors: &[String],
+    order: Option<String>,
+    allow_out_of_bounds: bool,
+) -> Result<cutplan::CutPlan, String> {
+    let doc = doc_from_svg(svg)?;
+    // Planned once: --order and --skip-color name colours, so the colours have
+    // to be known before a selection can be built, and plan_cut cuts the very
+    // passes handed to it here.
+    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
+    let colors = pass_order(&planned.passes, skip_colors, order)?;
+
+    // One `--speed`/`--force` pair applies to every pass; the CLI has no
+    // per-pass settings and no presets.
+    let passes = colors
+        .into_iter()
+        .map(|color| cutplan::PassSelection { color, settings: settings.clone() })
+        .collect();
+
+    let driver = device.driver();
+    // No revision to be stale against: the document was imported a few lines ago.
+    let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
+    cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
+}
+
+/// `CutError` as something to print at a terminal. Out-of-bounds names the
+/// escape hatch, since that is the one refusal an operator may reasonably
+/// want to overrule.
+fn describe_cut_error(e: cutplan::CutError) -> String {
+    use cutplan::preflight::PreflightError as P;
+    match e {
+        cutplan::CutError::StalePlan { .. } => "document changed while planning".into(),
+        cutplan::CutError::UnknownPassColor(c) => format!("no pass matches color {c:?}"),
+        cutplan::CutError::Preflight(P::NothingToCut) => "no cuttable paths in SVG".into(),
+        cutplan::CutError::Preflight(P::OutOfBounds { node, bounds }) => format!(
+            "shape {node:?} lies outside the {} x {} mm cutting area — pass --allow-out-of-bounds to send it anyway",
+            bounds.2, bounds.3,
+        ),
+        cutplan::CutError::Preflight(P::SettingsOutOfRange(m)) => m.into(),
+        cutplan::CutError::Preflight(e) => format!("preflight: {e:?}"),
+    }
 }
 
 /// Parse an 8-hex-digit `RRGGBBAA` string into a `0xRRGGBBAA` color.
@@ -136,6 +189,16 @@ pub fn parse_hex_color(s: &str) -> Result<u32, String> {
         return Err(format!("bad color '{s}': expected 8 hex digits (RRGGBBAA)"));
     }
     u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
+}
+
+/// `--allow-out-of-bounds` relaxes a preflight rule, and only `--by-color`
+/// cuts are preflighted. Accepting it on the plain path would say a check was
+/// overruled when no check ran.
+pub fn check_out_of_bounds_scope(allow_out_of_bounds: bool, by_color: bool) -> Result<(), String> {
+    if allow_out_of_bounds && !by_color {
+        return Err("--allow-out-of-bounds applies to --by-color cuts; the plain cut path runs no preflight".into());
+    }
+    Ok(())
 }
 
 /// `--by-color` needs a human at the keyboard between passes; a plan with
@@ -155,12 +218,6 @@ pub fn format_pass_color(color: Option<u32>) -> String {
     }
 }
 
-/// Flatten one `ColorPass`'s shapes into a single `Job` for `DeviceManager::cut`.
-pub fn cutpass_from_color_pass(pass: &cutplan::ColorPass, settings: &Settings) -> driver_core::manager::CutPass {
-    let polylines = pass.shapes.iter().flat_map(|s| s.polylines.clone()).collect();
-    driver_core::manager::CutPass { job: Job { polylines, settings: settings.clone() } }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,12 +229,58 @@ mod tests {
         </svg>"##
     }
 
+    fn cut_settings() -> Settings {
+        Settings { speed: None, force: None, repeat_count: 1 }
+    }
+
     #[test]
     fn by_color_plans_from_svg_respects_skip_and_order() {
-        let svg = two_color_svg();
-        let plan = plan_from_svg(svg, &["ff0000ff".into()], Some("0000ffff,ff0000ff".into())).unwrap();
-        assert_eq!(plan.len(), 1, "red skipped"); // order flag applied before skip filter
-        assert_eq!(plan[0].color, Some(0x0000FFFF));
+        let doc = doc_from_svg(two_color_svg()).unwrap();
+        let planned = cutplan::plan_passes(&doc).unwrap();
+        let colors = pass_order(&planned.passes, &["ff0000ff".into()], Some("0000ffff,ff0000ff".into())).unwrap();
+        assert_eq!(colors.len(), 1, "red skipped"); // order flag applied before skip filter
+        assert_eq!(colors[0], Some(0x0000FFFF));
+    }
+
+    #[test]
+    fn out_of_bounds_geometry_is_refused_unless_allowed() {
+        // 1512px @96dpi = 400mm wide, past the Cameo's 330mm bed.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect width="1512" height="10" stroke="#ff0000" fill="none"/>
+        </svg>"##;
+
+        let err = plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, false).unwrap_err();
+        assert!(err.contains("outside"), "expected an out-of-bounds refusal, got: {err}");
+
+        assert!(
+            plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, true).is_ok(),
+            "--allow-out-of-bounds must let it through",
+        );
+    }
+
+    #[test]
+    fn settings_out_of_range_are_refused_before_reaching_the_machine() {
+        let bad = Settings { speed: Some(99), force: None, repeat_count: 1 };
+        let err = plan_cut_from_svg(two_color_svg(), Device::Cameo5, &bad, &[], None, false).unwrap_err();
+        assert!(err.contains("speed"), "expected a settings-range refusal, got: {err}");
+    }
+
+    #[test]
+    fn an_svg_with_nothing_stroked_is_refused_by_name() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect width="5" height="5" fill="#ff0000"/>
+        </svg>"##;
+        let err = plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, false).unwrap_err();
+        assert_eq!(err, "no cuttable paths in SVG");
+    }
+
+    #[test]
+    fn allow_out_of_bounds_without_by_color_is_an_error() {
+        // Silently accepting it would imply preflight ran and was relaxed, when
+        // the plain cut path runs no preflight at all.
+        assert!(check_out_of_bounds_scope(true, false).is_err());
+        assert!(check_out_of_bounds_scope(true, true).is_ok());
+        assert!(check_out_of_bounds_scope(false, false).is_ok());
     }
 
     #[test]

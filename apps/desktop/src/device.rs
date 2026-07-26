@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::sync::{Arc, Mutex};
 
-use cutplan::preflight::{preflight, ConfiguredPass, PreflightError};
-use cutplan::presets::{default_presets_path, load_presets, save_user_presets, MaterialPreset};
-use cutplan::{plan_passes, ColorPass};
+use cutplan::preflight::PreflightError;
+use cutplan::presets::{
+    default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
+    SettingsOverride,
+};
+use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceEventKind, DeviceManager, DeviceState};
-use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Job, Settings, Transport, TransportError, TransportKind};
+use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Transport, TransportError, TransportKind};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -181,18 +184,15 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// Locks `app`'s document just long enough to plan + revalidate, resolve
-    /// presets/overrides, and run preflight — returns an owned `Vec<CutPass>`
-    /// with no remaining borrow of `app`, so the caller drops the document
-    /// lock *before* calling `execute_cut` (which blocks on the worker
-    /// thread). Never touches `AppStateHandle`'s mutex beyond that.
+    /// Locks `app`'s document just long enough for `cutplan::plan_cut` to plan,
+    /// revalidate and preflight it — returns an owned `Vec<CutPass>` with no
+    /// remaining borrow of `app`, so the caller drops the document lock
+    /// *before* calling `execute_cut` (which blocks on the worker thread).
+    /// Never touches `AppStateHandle`'s mutex beyond that.
+    ///
+    /// What stays here is what `cutplan` cannot know: which device is plugged
+    /// in, which driver serves it, and where the presets file lives.
     pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<Vec<CutPass>, IpcError> {
-        let planned = plan_passes(&app.editor.doc)
-            .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
-        if planned.doc_revision.to_string() != request.doc_revision {
-            return Err(IpcError::new("stale_plan", "document changed since the cut was planned"));
-        }
-
         let connected = self.connected.lock().unwrap().clone()
             .ok_or_else(|| IpcError::new("not_connected", "no device connected"))?;
         if connected.instance_id != request.device_instance_id {
@@ -204,7 +204,9 @@ impl DeviceManagerHandle {
         let profile = driver.profile().clone();
         let caps = driver.caps();
 
-        let presets: Vec<MaterialPreset> = if request.passes.iter().any(|p| p.preset_id.is_some()) {
+        // Only enabled passes are cut, so only their presets are worth reading.
+        let enabled = || request.passes.iter().filter(|p| p.enabled);
+        let presets: Vec<MaterialPreset> = if enabled().any(|p| p.preset_id.is_some()) {
             let path = default_presets_path()
                 .ok_or_else(|| IpcError::new("no_config_dir", "cannot resolve presets file location"))?;
             load_presets(&path).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
@@ -212,24 +214,31 @@ impl DeviceManagerHandle {
             Vec::new()
         };
 
-        let mut configured: Vec<ConfiguredPass> = Vec::with_capacity(request.passes.len());
-        for dto in &request.passes {
-            let pass = planned.passes.iter().find(|p| p.color == dto.color).ok_or_else(|| {
-                IpcError::new("unknown_pass_color", format!("no planned pass matches color {:?}", dto.color))
-            })?;
-            let preset = dto.preset_id.as_deref().and_then(|id| presets.iter().find(|p| p.id == id));
-            configured.push(ConfiguredPass { pass, settings: resolve_settings(preset, dto), enabled: dto.enabled });
-        }
+        let passes: Vec<PassSelection> = enabled()
+            .map(|dto| {
+                let preset = dto.preset_id.as_deref().and_then(|id| presets.iter().find(|p| p.id == id));
+                let override_ = SettingsOverride {
+                    speed: dto.speed,
+                    force: dto.force,
+                    repeat_count: dto.repeat_count,
+                };
+                PassSelection { color: dto.color, settings: resolve_settings(preset, &override_) }
+            })
+            .collect();
 
-        let doc_machine_id = app.editor.doc.machine.as_ref().map(|m| m.id.as_str());
-        preflight(&configured, &profile, &caps, doc_machine_id, false).map_err(map_preflight_error)?;
+        // The wire carries the revision as a string. One that isn't a u64 was
+        // never issued by `doc_revision`, so it cannot be the current plan.
+        let Ok(expected) = request.doc_revision.parse::<u64>() else {
+            return Err(IpcError::new("stale_plan", "cut request carries an unrecognized plan revision"));
+        };
+        let opts = PlanOptions { passes, expect_revision: Some(expected), allow_out_of_bounds: false };
 
-        Ok(configured.iter().filter(|c| c.enabled).map(|c| CutPass {
-            job: Job {
-                polylines: c.pass.shapes.iter().flat_map(|s| s.polylines.iter().cloned()).collect(),
-                settings: c.settings.clone(),
-            },
-        }).collect())
+        // Planned here, at cut time, against the live document — `expect_revision`
+        // is what refuses the cut if that is no longer the document the UI planned.
+        let planned = plan_passes(&app.editor.doc)
+            .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
+        let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
+        Ok(plan.cut_passes())
     }
 
     /// Submits already-planned passes to the device manager. Blocks until the
@@ -250,21 +259,25 @@ impl DeviceManagerHandle {
     }
 }
 
-/// Override fields win over the resolved preset's; missing both falls back
-/// to `Settings::default()` (repeat_count 1).
-fn resolve_settings(preset: Option<&MaterialPreset>, dto: &ConfiguredPassDto) -> Settings {
-    Settings {
-        speed: dto.speed.or_else(|| preset.and_then(|p| p.settings.speed)),
-        force: dto.force.or_else(|| preset.and_then(|p| p.settings.force)),
-        repeat_count: dto.repeat_count.or_else(|| preset.map(|p| p.settings.repeat_count)).unwrap_or(1),
-    }
-}
-
 /// True while a cut job is mid-flight — used by the window close handler to
 /// decide whether to block the close and ask the UI to confirm.
 pub fn is_active(state: &DeviceState) -> bool {
     use DeviceState::*;
     matches!(state, Transmitting { .. } | AwaitingCompletion { .. } | WaitingForColorSwap { .. } | CancelRequested { .. } | Stopping { .. })
+}
+
+/// Every way `plan_cut` can refuse, as an IPC code the UI can branch on.
+/// `stale_plan` is the one the frontend actually keys off (CutDialog.tsx).
+fn map_cut_error(e: CutError) -> IpcError {
+    match e {
+        CutError::StalePlan { .. } => {
+            IpcError::new("stale_plan", "document changed since the cut was planned")
+        }
+        CutError::UnknownPassColor(color) => {
+            IpcError::new("unknown_pass_color", format!("no planned pass matches color {color:?}"))
+        }
+        CutError::Preflight(e) => map_preflight_error(e),
+    }
 }
 
 fn map_preflight_error(e: PreflightError) -> IpcError {
@@ -294,7 +307,7 @@ pub struct PlanCutPassSummary {
     pub node_ids: Vec<document::NodeId>,
 }
 
-/// Summarizes `plan_passes` output for the UI — not the raw `PlannedCut`
+/// Summarizes `plan_passes` output for the UI — not the raw `DocumentPasses`
 /// (which carries full flattened polylines the cut dialog doesn't need).
 pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, IpcError> {
     let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
@@ -348,8 +361,8 @@ pub fn delete_preset(id: &str) -> Result<(), IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutplan::PlannedCut;
-    use driver_core::{MachineCaps, MachineProfile};
+    use cutplan::DocumentPasses;
+    use driver_core::{Job, MachineCaps, MachineProfile};
 
     struct TestDriver { profile: MachineProfile, caps: MachineCaps }
     impl Driver for TestDriver {
@@ -391,11 +404,11 @@ mod tests {
         dev
     }
 
-    fn plan_for(app: &AppState) -> PlannedCut {
+    fn plan_for(app: &AppState) -> DocumentPasses {
         plan_passes(&app.editor.doc).unwrap()
     }
 
-    fn request_from(plan: PlannedCut) -> CutRequest {
+    fn request_from(plan: DocumentPasses) -> CutRequest {
         CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: plan.doc_revision.to_string(),
@@ -414,23 +427,6 @@ mod tests {
         app.add_rect(5.0, 5.0);
         let err = dev.cut_from_request(&app, request_from(plan)).unwrap_err();
         assert_eq!(err.code, "stale_plan");
-    }
-
-    #[test]
-    fn preset_and_override_resolution_prefers_override() {
-        let preset = MaterialPreset {
-            id: "p1".into(), name: "Test".into(), machine_id: "cameo5".into(),
-            settings: cutplan::presets::PresetSettings { speed: Some(5), force: Some(20), repeat_count: 1 },
-            builtin: false,
-        };
-        let dto = ConfiguredPassDto {
-            color: Some(0x000000FF), enabled: true, preset_id: Some("p1".into()),
-            speed: None, force: Some(25), repeat_count: None,
-        };
-        let settings = resolve_settings(Some(&preset), &dto);
-        assert_eq!(settings.force, Some(25));
-        assert_eq!(settings.speed, Some(5));
-        assert_eq!(settings.repeat_count, 1);
     }
 
     #[test]

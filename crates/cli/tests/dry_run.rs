@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use cli::pipeline::{build_bytes, cutpass_from_color_pass, pass_stream_bytes, plan_from_svg, Device};
+use cli::pipeline::{build_bytes, pass_stream_bytes, plan_cut_from_svg, Device};
 use driver_core::Settings;
 
 #[test]
@@ -20,17 +20,17 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
         <path d="M0 0 L20 0" stroke="#ff0000"/>
         <path d="M0 10 L20 10" stroke="#00ff00"/>
     </svg>"##;
-    let passes = plan_from_svg(svg, &[], None).unwrap();
+    // Planned through the same entry point `cut --by-color` uses, preflight included.
+    let plan = plan_cut_from_svg(svg, Device::Puma, &Settings::default(), &[], None, false).unwrap();
+    let passes = &plan.passes;
     assert_eq!(passes.len(), 2);
 
     let d = Device::Puma.driver();
-    let settings = Settings::default();
     let streams: Vec<String> = passes
         .iter()
         .enumerate()
         .map(|(i, pass)| {
-            let cutpass = cutpass_from_color_pass(pass, &settings);
-            String::from_utf8(pass_stream_bytes(d.as_ref(), &cutpass.job, i, passes.len()).unwrap()).unwrap()
+            String::from_utf8(pass_stream_bytes(d.as_ref(), &pass.job, i, passes.len()).unwrap()).unwrap()
         })
         .collect();
 
@@ -44,14 +44,8 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
     // catch a stream that wrongly closes the session between passes.
     let cameo = Device::Cameo5.driver();
     let contains = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    let c0 = {
-        let cutpass = cutpass_from_color_pass(&passes[0], &settings);
-        pass_stream_bytes(cameo.as_ref(), &cutpass.job, 0, passes.len()).unwrap()
-    };
-    let c1 = {
-        let cutpass = cutpass_from_color_pass(&passes[1], &settings);
-        pass_stream_bytes(cameo.as_ref(), &cutpass.job, 1, passes.len()).unwrap()
-    };
+    let c0 = pass_stream_bytes(cameo.as_ref(), &passes[0].job, 0, passes.len()).unwrap();
+    let c1 = pass_stream_bytes(cameo.as_ref(), &passes[1].job, 1, passes.len()).unwrap();
     assert!(!contains(&c0, b"FN0"), "pass 0 must not close the session");
     assert!(contains(&c1, b"FN0"), "last pass must close the session");
 }

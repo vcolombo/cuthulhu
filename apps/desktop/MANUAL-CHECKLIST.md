@@ -65,3 +65,12 @@ before SP6 leans on device connection and mid-job disconnect detection.
 
 Driving note: WebKit range inputs ignore both synthetic `click at` positioning and AX `set value`. The
 reliable way to move a slider is AX `set focused to true` on it, then arrow-key key codes.
+
+## CLI plain cut path (architecture review candidate 3)
+
+- [ ] `cuthulhu cut fill-only.svg --device cameo5 --dry-run` — a fill-only SVG still produces bytes (one pass).
+- [ ] `cuthulhu cut off-bed.svg --device cameo5` — refused with the out-of-bounds message, nothing sent.
+- [ ] `cuthulhu cut off-bed.svg --device cameo5 --allow-out-of-bounds` — sends.
+- [ ] `cuthulhu cut a.svg --skip-color FF0000FF` — refused, naming `--by-color`.
+- [ ] On hardware: a plain cut on the Cameo 5 completes, and Ctrl-C mid-cut stops it.
+- [ ] Scripted (stdin redirected from /dev/null): `cuthulhu cut a.svg --device puma --port …` completes without blocking, and prints the completion-not-verified note.

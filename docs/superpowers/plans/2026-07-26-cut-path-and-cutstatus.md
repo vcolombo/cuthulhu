@@ -1112,8 +1112,10 @@ git commit -m "Say where a cut has got to and what may be done next, in one valu
 
 **Interfaces:**
 - Consumes: `status_of` (Task 9).
-- Produces: `impl DeviceManager { pub fn status(&self) -> CutStatus }`, and `DeviceEvent` gains `pub status: CutStatus`.
-- Note: `snapshot()` stays for now so the existing tests keep compiling; Task 11 removes it.
+- Produces: `impl DeviceManager { pub fn status(&self) -> CutStatus }`.
+- Note: `snapshot()` stays for now so the existing tests keep compiling; Task 14 removes it.
+- **`DeviceEvent` does not gain its `status` field here.** `apps/desktop/src/device.rs`'s `progress_event_marks_cache_transmitting` test builds `DeviceEvent` as a struct literal, so a new required field breaks `apps/` — which this task may not touch. Task 12 adds the field, because it deletes that test anyway (it covers the `Transmitting` synthesis that Task 12 removes).
+- `status()` must not outlive its worker: a panicked worker would otherwise leave the published cell frozen on `Sending` with a live cancel button, and after Task 14 there is no other read path to notice.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1319,7 +1321,11 @@ git commit -m "Test the device manager through the status it reports"
 
 **Interfaces:**
 - Consumes: `DeviceManager::status`, `CutStatus::is_active` (Tasks 9-10).
-- Produces: `ipc::get_device_state` returns `CutStatus`; `DeviceManagerHandle::status()` replaces `cached_state()`.
+- Produces: `ipc::get_device_state` returns `CutStatus`; `DeviceManagerHandle::status()` replaces `cached_state()`; `DeviceEvent` gains `pub status: CutStatus`.
+
+**Carried over from Task 10:** add `pub status: CutStatus` to `DeviceEvent` in `crates/driver-core/src/manager.rs` here. Task 10 could not, because `progress_event_marks_cache_transmitting` in `apps/desktop/src/device.rs` builds the struct literally — and that test covers the `Transmitting` synthesis this task deletes, so it goes away in the same change. The field is what lets the UI render from the event it just received instead of polling after it.
+
+**One ordering wrinkle to respect, not to fix here:** the worker emits `JobComplete` before the state becomes `Idle`, so the status attached to that event still reads `Sending`. Terminal-ness therefore comes from `phase` reaching `Done`/`Idle` on a later status, never from the event kind. Task 13's UI must key on phase for that reason.
 
 - [ ] **Step 1: Write the failing test**
 

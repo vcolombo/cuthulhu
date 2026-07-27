@@ -19,8 +19,6 @@ fileio = { path = "../fileio" }
 cutplan = { path = "../cutplan" }
 driver-core = { path = "../driver-core" }
 driver-registry = { path = "../driver-registry" }
-driver-silhouette = { path = "../driver-silhouette" }
-driver-hpgl = { path = "../driver-hpgl" }
 trace = { path = "../trace" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"

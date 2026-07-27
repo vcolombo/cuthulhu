@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::cut::format_pass_color;
+use cli::cut::{self, format_pass_color};
 use cli::pipeline::{check_color_flag_scope, check_interactive, pass_stream_bytes, plan_cut_from_svg, plan_plain_cut, Device};
 use driver_registry::HardwareBackendFactory;
-use driver_core::manager::{DeviceManager, DeviceState};
-use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, Transport, TransportKind};
+use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, TransportKind};
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -115,6 +114,12 @@ enum Command {
     },
 }
 
+/// A terminal means a human can answer the machine's pauses; anything else
+/// (a script, a CI job) must not be left blocking on stdin.
+fn operator() -> cut::Operator {
+    if std::io::stdin().is_terminal() { cut::Operator::Interactive } else { cut::Operator::Unattended }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -132,31 +137,15 @@ fn run() -> Result<(), String> {
 
             if !by_color {
                 let plan = plan_plain_cut(&svg, device, &settings, allow_out_of_bounds)?;
-                let driver = device.driver();
-                let bytes = pass_stream_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
                 if dry_run {
+                    let driver = device.driver();
+                    let bytes = pass_stream_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
                     print_hex_ascii(&bytes);
                     return Ok(());
                 }
-                // transmit path lands in Task 7
-                let mut transport: Box<dyn Transport> = match device {
-                    Device::Cameo5 => Box::new(
-                        driver_silhouette::UsbTransport::open()
-                            .map_err(|e| format!("open USB: {e:?}"))?,
-                    ),
-                    Device::Puma => {
-                        let port = port.ok_or("--port required for serial devices")?;
-                        Box::new(
-                            driver_hpgl::SerialTransport::open(&port, baud)
-                                .map_err(|e| format!("open {port}: {e:?}"))?,
-                        )
-                    }
-                };
-                // write_all, not a single write(): a partial write would silently
-                // truncate the job while still reporting the full byte count.
-                driver_core::write_all(transport.as_mut(), &bytes).map_err(|e| format!("write: {e:?}"))?;
-                println!("sent {} bytes", bytes.len());
-                return Ok(());
+                let info = resolve_device_info(device, port.as_deref(), baud)?;
+                let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
+                return cut::run(&plan, info, factory, operator());
             }
 
             cut_by_color(&svg, device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
@@ -228,56 +217,7 @@ fn cut_by_color(
 
     let info = resolve_device_info(device, port.as_deref(), baud)?;
     let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
-    let (mgr, _events) = DeviceManager::spawn(factory);
-    let mgr = Arc::new(mgr);
-    mgr.connect(info).map_err(|e| format!("connect: {e:?}"))?;
-
-    // ponytail: the handler holds a permanent Arc clone for the life of the
-    // process, so `mgr` is never uniquely owned again — skip a graceful
-    // `shutdown()` and let the (short-lived CLI) process exit reap the worker.
-    let ctrlc_mgr = mgr.clone();
-    ctrlc::set_handler(move || ctrlc_mgr.cancel()).map_err(|e| format!("ctrlc: {e}"))?;
-
-    mgr.cut(plan.cut_passes()).map_err(|e| format!("cut: {e:?}"))?;
-
-    loop {
-        match mgr.snapshot() {
-            DeviceState::WaitingForColorSwap { next_pass_index, .. } => {
-                println!(
-                    "Pass {}/{} (color {}): swap tool, press Enter to resume",
-                    next_pass_index + 1,
-                    passes.len(),
-                    format_pass_color(passes[next_pass_index].color),
-                );
-                if !wait_for_enter_or_cancel(&mgr) {
-                    continue; // re-check snapshot: cancel() already landed
-                }
-                mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
-            }
-            DeviceState::AwaitingCompletion { pass_index, .. } => {
-                println!(
-                    "Pass {}/{} (color {}) cutting; press Enter once the machine finishes",
-                    pass_index + 1,
-                    passes.len(),
-                    format_pass_color(passes[pass_index].color),
-                );
-                if !wait_for_enter_or_cancel(&mgr) {
-                    continue;
-                }
-                mgr.confirm_pass_done().map_err(|e| format!("confirm: {e:?}"))?;
-            }
-            DeviceState::Idle => {
-                println!("done: {} passes cut", passes.len());
-                return Ok(());
-            }
-            DeviceState::Cancelled { pass_index, submitted_bytes, .. } => {
-                println!("cancelled at pass {pass_index} ({submitted_bytes} bytes sent)");
-                return Ok(());
-            }
-            DeviceState::Error(e) => return Err(format!("device error: {e:?}")),
-            _ => return Err("unexpected device state".into()),
-        }
-    }
+    cut::run(&plan, info, factory, operator())
 }
 
 fn resolve_device_info(device: Device, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
@@ -296,27 +236,6 @@ fn resolve_device_info(device: Device, port: Option<&str>, baud: u32) -> Result<
                 candidate: true,
             })
         }
-    }
-}
-
-/// Block until the operator presses Enter (`true`) or a cancel lands via
-/// Ctrl-C/`DeviceManager::cancel` (`false`). The reader thread is left
-/// parked on stdin if cancel wins — fine for a process that's about to exit.
-fn wait_for_enter_or_cancel(mgr: &DeviceManager) -> bool {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::stdin().read_line(&mut buf);
-        let _ = tx.send(());
-    });
-    loop {
-        if rx.try_recv().is_ok() {
-            return true;
-        }
-        if matches!(mgr.snapshot(), DeviceState::Cancelled { .. }) {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

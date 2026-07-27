@@ -1152,6 +1152,12 @@ mod tests {
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job1 && matches!(e.kind, DeviceEventKind::JobComplete)));
         assert!(evs.iter().any(|e| e.job_id == job2 && matches!(e.kind, DeviceEventKind::JobComplete)));
+        // Distinct ids alone would still let a listener see job 1's tail after job 2
+        // had started, which is why the desktop UI used to filter on job id at all.
+        // One worker sending every event in order down one channel is what let that
+        // filtering go, so it is asserted here rather than left to a comment.
+        let first2 = evs.iter().position(|e| e.job_id == job2).expect("job2 reported");
+        assert!(evs[first2..].iter().all(|e| e.job_id != job1), "no job-1 event may follow job 2's first");
         mgr.shutdown();
     }
 
@@ -1329,7 +1335,10 @@ mod tests {
         // and `thread::scope` would hang the suite instead of failing it.
         let (mid_transmit, job_id) = thread::scope(|scope| {
             let cut_thread = scope.spawn(|| mgr.cut(one_pass_job()).unwrap());
-            ready_rx.recv().unwrap(); // worker is blocked mid-write on chunk 2
+            // Timed out, not blocking: the sender lives in a transport the still-running
+            // worker owns, so a gate the worker never reaches (a changed chunk size, a
+            // smaller payload) must fail this test rather than hang the suite.
+            ready_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("worker reached the gated write");
             let mid_transmit = mgr.status();
             mgr.cancel();
             proceed_tx.send(()).unwrap();
@@ -1586,7 +1595,9 @@ mod tests {
             scope.spawn(|| {
                 let _ = mgr.cut(one_pass_job());
             });
-            ready_rx.recv().unwrap(); // the worker is now parked inside the chunk-2 write
+            // Timed out for the same reason as `assert_cancel_mid_transmit`'s gate: an
+            // unreached gate must fail this test rather than hang the suite.
+            ready_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("worker reached the gated write");
             let s = mgr.status();
             proceed_tx.send(()).unwrap();
             s

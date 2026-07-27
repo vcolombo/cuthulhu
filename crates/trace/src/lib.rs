@@ -9,6 +9,65 @@ pub const MAX_DIM: u32 = 2048;
 /// RGBA frame is ~96 MiB) while refusing the pathological cases.
 const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 
+/// Ceiling on the source *file*, as opposed to `MAX_DECODE_ALLOC`'s ceiling on what decoding it may
+/// allocate. The decoder's limit only applies once the bytes are already resident, so without this
+/// a huge file exhausts memory before it can be rejected for not being a usable image.
+pub const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn too_large() -> TraceError {
+    TraceError::Input(format!(
+        "file is too large to open: over {} MiB",
+        MAX_INPUT_FILE_BYTES / (1024 * 1024)
+    ))
+}
+
+/// Read a whole stream, refusing input longer than `cap` bytes.
+///
+/// `cap` is a parameter rather than the constant so the bound can be exercised with a handful of
+/// bytes instead of a quarter gigabyte.
+fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    // One byte past the ceiling, so landing exactly on it is distinguishable from exceeding it,
+    // and so an oversized input costs one extra byte rather than its whole length.
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Read an image file, refusing anything past the ceiling.
+///
+/// Everything happens through one open handle, rather than `std::fs::metadata` followed by a
+/// separate `std::fs::read`. Two *pathname* resolutions describe two moments: the size that passed
+/// the check belonged to whatever the path pointed at then, and a file that grew in between was
+/// read in full anyway.
+///
+/// The size check itself is not the problem and is kept — `File::metadata` is `fstat` on the
+/// handle, so it cannot describe a different file than the one about to be read. It earns its
+/// place by refusing an oversized file for the cost of a syscall, instead of allocating the whole
+/// ceiling first only to throw it away.
+///
+/// Takes the path the caller means to open, and opens exactly that. The desktop authorizes first
+/// and passes the already-canonical path it got back, so its check and this open are one
+/// resolution; handing an unresolved path here instead would reopen the window
+/// `apps/desktop/src/ipc.rs`'s `authorized_path` exists to close.
+pub fn read_image(path: &std::path::Path) -> Result<Vec<u8>, TraceError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| TraceError::Input(format!("cannot read {}: {e}", path.display())))?;
+    // A failed fstat is not fatal: this is a fast path, and `read_capped` below is the real bound.
+    if file.metadata().is_ok_and(|m| m.len() > MAX_INPUT_FILE_BYTES) {
+        return Err(too_large());
+    }
+    match read_capped(file, MAX_INPUT_FILE_BYTES)
+        .map_err(|e| TraceError::Input(format!("cannot read {}: {e}", path.display())))?
+    {
+        Some(bytes) => Ok(bytes),
+        None => Err(too_large()),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceMode { Binary, Color }
@@ -30,10 +89,12 @@ impl Default for TraceOptions {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum TraceError { InvalidOption(String), Decode(String), Trace(String), EmptyResult }
+pub enum TraceError { Input(String), InvalidOption(String), Decode(String), Trace(String), EmptyResult }
 impl std::fmt::Display for TraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Input's messages are already whole sentences naming the file, so a prefix would read twice.
+            TraceError::Input(m) => write!(f, "{m}"),
             TraceError::InvalidOption(m) => write!(f, "invalid option: {m}"),
             TraceError::Decode(m) => write!(f, "could not read image: {m}"),
             TraceError::Trace(m) => write!(f, "trace failed: {m}"),
@@ -611,5 +672,48 @@ mod tests {
             Err(TraceError::Trace(_)) | Err(TraceError::EmptyResult) => {}
             other => panic!("expected a typed error, got {other:?}"),
         }
+    }
+
+    /// The ceiling has to come from the read itself. A separate size check describes whatever the
+    /// pathname pointed at when it ran, so a file that grows between the check and the read is
+    /// read in full despite having just passed the limit — the cap is advisory rather than a
+    /// bound. Deliberately exercised through a plain reader, with no file and no metadata call,
+    /// because that is the property under test.
+    #[test]
+    fn read_capped_refuses_a_stream_longer_than_the_cap() {
+        use std::io::Read as _;
+        let over = std::io::repeat(b'x').take(9);
+        assert!(read_capped(over, 8).unwrap().is_none(), "9 bytes must be refused against a cap of 8");
+    }
+
+    /// Covers the glue the helper tests cannot: opening the path, threading the real ceiling
+    /// through, and handing back the bytes. Both trace entry points read through here, so a
+    /// mistake in this wiring breaks every trace.
+    #[test]
+    fn read_image_returns_the_contents_of_a_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
+        std::fs::write(&path, b"not an image, but bytes are bytes").unwrap();
+        assert_eq!(read_image(&path).unwrap(), b"not an image, but bytes are bytes");
+    }
+
+    /// Exercises the real `MAX_INPUT_FILE_BYTES`, which the `read_capped` tests deliberately do
+    /// not. The file is extended rather than written, so no quarter gigabyte ever moves through
+    /// this process. What it costs on disk is the filesystem's business — usually nothing, since
+    /// the range can be left unallocated, but `set_len` promises the size and never the storage.
+    #[test]
+    fn read_image_refuses_a_file_past_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        std::fs::File::create(&path).unwrap().set_len(MAX_INPUT_FILE_BYTES + 1).unwrap();
+        assert!(matches!(read_image(&path), Err(TraceError::Input(m)) if m.contains("too large")));
+    }
+
+    /// A path that does not exist is an input failure, not a decode failure: nothing was ever
+    /// handed to the decoder. The distinction is what `code()` will make visible to the desktop.
+    #[test]
+    fn read_image_reports_a_missing_file_as_input() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(read_image(&dir.path().join("nope.png")), Err(TraceError::Input(_))));
     }
 }

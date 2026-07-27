@@ -849,7 +849,6 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
- "tempfile",
  "trace",
 ]
 
@@ -4538,6 +4537,7 @@ dependencies = [
  "fileio",
  "image 0.25.10",
  "serde",
+ "tempfile",
  "vtracer",
 ]
 

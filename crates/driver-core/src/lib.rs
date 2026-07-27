@@ -18,7 +18,8 @@ impl Default for Settings { fn default() -> Self { Settings { speed: None, force
 #[derive(Clone, Debug, PartialEq)]
 pub struct MachineProfile { pub id: String, pub name: String, pub width_mm: f64, pub height_mm: f64 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MachineCaps { pub supports_speed: bool, pub supports_force: bool, pub needs_operator_pass_confirm: bool }
 
 #[derive(Debug, PartialEq)]

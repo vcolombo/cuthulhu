@@ -56,6 +56,7 @@ fn main() {
             ipc::resume_cut,
             ipc::confirm_pass_done,
             ipc::list_presets,
+            ipc::machine_caps,
             ipc::save_preset,
             ipc::delete_preset,
             ipc::trace_image,

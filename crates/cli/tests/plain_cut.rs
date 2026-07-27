@@ -16,8 +16,8 @@ use driver_core::{
 const SQUARE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
     <rect width="10" height="10" fill="#ff0000"/></svg>"##;
 
-/// Two stroke colours, so `--by-color` plans two passes and there is a second pass
-/// to be cancelled during.
+/// Two stroke colours, so `--by-color` plans the multi-pass cut an unattended run
+/// has to refuse.
 const TWO_COLORS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
     <rect width="5" height="5" fill="none" stroke="#ff0000"/>
     <rect x="6" width="5" height="5" fill="none" stroke="#0000ff"/></svg>"##;
@@ -84,50 +84,32 @@ impl DeviceBackendFactory for TestFactory {
     }
 }
 
-/// Hands out a transport that parks the worker inside the first write of the second
-/// pass and signals the test, so a cancel can land on a job that is genuinely
-/// mid-flight instead of racing a job that has already finished.
+/// Hands out a transport gated on the pass's first write, plus a driver shaped for
+/// the kind of cancel the test lands there. Both cancel tests need the worker held
+/// mid-flight, so a cancel meets a job that is genuinely running rather than racing
+/// one that has already finished.
 struct GateFactory {
     gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    /// `PAD` for a pass of several chunks, so the cancel lands between two of them;
+    /// 0 for a pass of one chunk, whose first write is also its last, so the cancel
+    /// is too late for `transmit_bytes`'s per-chunk flag check and the pass parks for
+    /// confirmation with the cancel queued behind it.
+    pad: usize,
+    /// Set by the test once it has cancelled; see `CANCEL_STALL`.
+    cancelled: Option<Arc<AtomicBool>>,
 }
 impl DeviceBackendFactory for GateFactory {
     fn list_devices(&self) -> Vec<DeviceInfo> { vec![info()] }
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        Some(Box::new(FakeDriver { profile: fake_profile(machine_id), pad: PAD, stall_encode: None }))
-    }
-    fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
-        Ok(Box::new(GateTransport {
-            inner: MockTransport::default(),
-            seen_park: false,
-            sync: self.gate.lock().unwrap().take(),
-        }))
-    }
-}
-
-/// Hands out an unpadded pass — one chunk, so its first write is also its last —
-/// gated on that write, plus a driver that stalls the cancel the test lands there.
-/// Together they park a pass for confirmation with a cancel already queued behind
-/// it, which is what a Ctrl-C during a scripted cut does.
-struct ParkedCancelFactory {
-    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
-    cancelled: Arc<AtomicBool>,
-}
-impl DeviceBackendFactory for ParkedCancelFactory {
-    fn list_devices(&self) -> Vec<DeviceInfo> { vec![info()] }
-    fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
         Some(Box::new(FakeDriver {
             profile: fake_profile(machine_id),
-            pad: 0,
-            stall_encode: Some(self.cancelled.clone()),
+            pad: self.pad,
+            stall_encode: self.cancelled.clone(),
         }))
     }
     fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
         Ok(Box::new(GateTransport {
             inner: MockTransport::default(),
-            // Already "past a park", so the gate arms on the very first write: the
-            // one chunk of pass 1. A cancel landing inside it is too late for
-            // `transmit_bytes`'s per-chunk flag check to see.
-            seen_park: true,
             sync: self.gate.lock().unwrap().take(),
         }))
     }
@@ -135,19 +117,16 @@ impl DeviceBackendFactory for ParkedCancelFactory {
 
 struct GateTransport {
     inner: MockTransport,
-    seen_park: bool,
     sync: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
 }
 impl Transport for GateTransport {
     fn write(&mut self, b: &[u8]) -> Result<usize, TransportError> {
-        // The park bytes close pass 1, so the write after them is pass 2 in flight.
-        if self.seen_park {
-            if let Some((ready, proceed)) = self.sync.take() {
-                let _ = ready.send(());
-                let _ = proceed.recv(); // held until the test has cancelled
-            }
+        // Arms on the first write of the one pass, which is where that pass is
+        // irrevocably in flight: bytes are on the wire and the machine is moving.
+        if let Some((ready, proceed)) = self.sync.take() {
+            let _ = ready.send(());
+            let _ = proceed.recv(); // held until the test has cancelled
         }
-        self.seen_park |= b.ends_with(b"PARK");
         self.inner.write(b)
     }
     fn read(&mut self, buf: &mut [u8], t: std::time::Duration) -> Result<usize, TransportError> {
@@ -205,18 +184,22 @@ fn a_plain_cut_sends_one_framed_pass() {
 /// installed a process-wide Ctrl-C handler that no test binary can install twice.
 #[test]
 fn a_cancel_part_way_through_is_not_reported_as_a_finished_cut() {
-    let plan = plan_cut_from_svg(TWO_COLORS, Device::Cameo5, &Settings::default(), &[], None, false).expect("plan");
-    assert_eq!(plan.passes.len(), 2, "two stroke colours, two passes");
+    let plan = plan_plain_cut(SQUARE, Device::Cameo5, &Settings::default(), false).expect("plan");
+    assert_eq!(plan.passes.len(), 1, "one pass: an unattended cut may not have more");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proceed_tx, proceed_rx) = mpsc::channel();
-    let factory = Arc::new(GateFactory { gate: Mutex::new(Some((ready_tx, proceed_rx))) });
+    let factory = Arc::new(GateFactory {
+        gate: Mutex::new(Some((ready_tx, proceed_rx))),
+        pad: PAD,
+        cancelled: None,
+    });
 
     // `run` still owns its manager; the device it hands out here is the only way to
     // stop the cut from outside — in `main` this becomes the Ctrl-C handler.
     let outcome = run(&plan, info(), factory, Operator::Unattended, |mgr| {
         std::thread::spawn(move || {
-            ready_rx.recv().expect("the second pass reached the wire");
+            ready_rx.recv().expect("the pass reached the wire");
             mgr.cancel();
             proceed_tx.send(()).expect("release the parked write");
         });
@@ -225,7 +208,7 @@ fn a_cancel_part_way_through_is_not_reported_as_a_finished_cut() {
     .expect("a cancelled cut is not an error");
 
     let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
-    assert_eq!(pass, 1, "cancelled during the second pass");
+    assert_eq!(pass, 1, "cancelled on the only pass, named as the prompts name it");
     assert!(sent > 0 && sent < PAD, "stopped part way through that pass, at {sent} bytes");
     assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
 }
@@ -240,20 +223,24 @@ fn a_cancel_part_way_through_is_not_reported_as_a_finished_cut() {
 /// `wait_for_enter_or_cancel` stops waiting once the job reports it was cancelled.
 #[test]
 fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
-    let plan = plan_cut_from_svg(TWO_COLORS, Device::Cameo5, &Settings::default(), &[], None, false).expect("plan");
-    assert_eq!(plan.passes.len(), 2, "a pass parked for confirmation needs a pass after it");
+    // One pass is enough to park: `resolve_pass_completion` returns `NeedsConfirm` on
+    // caps alone, with no regard for what follows. Only the *colour swap* park needs a
+    // pass after it, and an unattended cut may not have one.
+    let plan = plan_plain_cut(SQUARE, Device::Cameo5, &Settings::default(), false).expect("plan");
+    assert_eq!(plan.passes.len(), 1, "one pass: an unattended cut may not have more");
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proceed_tx, proceed_rx) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let factory = Arc::new(ParkedCancelFactory {
+    let factory = Arc::new(GateFactory {
         gate: Mutex::new(Some((ready_tx, proceed_rx))),
-        cancelled: cancelled.clone(),
+        pad: 0,
+        cancelled: Some(cancelled.clone()),
     });
 
     let outcome = run(&plan, info(), factory, Operator::Unattended, |mgr| {
         std::thread::spawn(move || {
-            ready_rx.recv().expect("the first pass reached the wire");
+            ready_rx.recv().expect("the pass reached the wire");
             mgr.cancel();
             cancelled.store(true, Ordering::SeqCst); // stall the recompute the cancel is about to do
             proceed_tx.send(()).expect("release the gated write");
@@ -263,9 +250,41 @@ fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
     .expect("a cancel while parked is an ending, not a fault");
 
     let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
-    assert_eq!(pass, 0, "cancelled on the first pass, so the second was never asked for");
+    assert_eq!(pass, 1, "cancelled on the only pass, named as the prompts name it");
     assert!(sent > 0, "that pass had already gone out in full when the cancel landed");
     assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
+}
+
+/// Every method panics, so any use of the device at all fails the test that holds it.
+struct NoDeviceFactory;
+impl DeviceBackendFactory for NoDeviceFactory {
+    fn list_devices(&self) -> Vec<DeviceInfo> { panic!("must be refused before the devices are listed") }
+    fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+        panic!("must be refused before a driver is built")
+    }
+    fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+        panic!("must be refused before a transport is opened")
+    }
+}
+
+/// `Unattended` answers every pause the instant it sees one, which is only safe while
+/// nothing follows that pause. On a machine that parks for confirmation the host knows
+/// it has stopped *transmitting*, not that the blade has stopped moving, so answering
+/// for an absent operator starts the next pass into a machine that may still be
+/// cutting; answering a colour swap is worse, resuming as though the tool had been
+/// changed. `check_interactive` refuses this earlier and more kindly, but the invariant
+/// belongs to the function that depends on it — a caller reaching `run` directly, as
+/// the review that prompted this did, must still be refused, and refused before any
+/// bytes can reach a blade.
+#[test]
+fn an_unattended_cut_refuses_more_than_one_pass() {
+    let plan = plan_cut_from_svg(TWO_COLORS, Device::Cameo5, &Settings::default(), &[], None, false).expect("plan");
+    assert_eq!(plan.passes.len(), 2, "two stroke colours, two passes");
+
+    let err = run(&plan, info(), Arc::new(NoDeviceFactory), Operator::Unattended, |_| Ok(()))
+        .expect_err("a pause nobody can answer is a refusal, not a cut");
+    assert!(err.contains("2 passes"), "names how many passes it refused: {err}");
+    assert!(err.contains("cannot answer a pause"), "names why it refused: {err}");
 }
 
 /// Preflight refusals must happen before a transport is ever opened.

@@ -17,6 +17,9 @@ use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Ended, Phase};
 /// which is exactly what the plain path did before it went through
 /// `DeviceManager` — the host queue draining is not the machine finishing, so it
 /// says so on stderr rather than pretending the cut is verified.
+///
+/// Answering a pause that way is only safe when nothing follows it, so `run` refuses
+/// an unattended cut of more than one pass.
 pub enum Operator {
     Interactive,
     Unattended,
@@ -46,8 +49,9 @@ pub fn format_pass_color(color: Option<u32>) -> String {
     }
 }
 
-/// Which pass to name in a prompt, counting from 1. A paused job always reports a
-/// position; `1` is only a fallback so a missing one cannot panic a live cut.
+/// Which pass to name to the operator, counting from 1. A paused or cancelled job
+/// always reports a position; `1` is only a fallback so a missing one cannot panic
+/// a live cut.
 fn pass_at(status: &CutStatus) -> usize {
     status.pass.map(|p| p.index + 1).unwrap_or(1)
 }
@@ -66,6 +70,9 @@ fn pass_color(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Completed { passes: usize },
+    /// `pass` counts from 1, like the prompts: an operator who was just told
+    /// "Pass 2/2 cutting" and cancelled must not then read "cancelled at pass 1".
+    /// Held 1-based in the type so no reader has to remember to add one.
     Cancelled { pass: usize, sent: usize },
 }
 
@@ -106,6 +113,18 @@ pub fn run(
     with_cancel: impl FnOnce(Arc<DeviceManager>) -> Result<(), String>,
 ) -> Result<Outcome, String> {
     let total = plan.passes.len();
+    // The invariant `Unattended` depends on, enforced where the dependency lives
+    // rather than only in `check_interactive` upstream. On a machine that parks for
+    // confirmation, "the host finished transmitting" is all the host knows — the
+    // blade may still be moving — so answering that pause without an operator starts
+    // the next pass into a machine that may still be cutting, and answering a colour
+    // swap resumes as though someone had changed the tool. One pass has neither
+    // hazard: nothing follows the pause it answers.
+    if matches!(operator, Operator::Unattended) && total > 1 {
+        return Err(format!(
+            "unattended cut: {total} passes, but an unattended run cannot answer a pause, and a pass after a pause needs one answered before it may start"
+        ));
+    }
     let (mgr, _events) = DeviceManager::spawn(factory);
     let mgr = Arc::new(mgr);
     mgr.connect(info).map_err(|e| format!("connect: {e:?}"))?;
@@ -144,7 +163,7 @@ pub fn run(
             Phase::Idle => {
                 return match status.ended {
                     Some(Ended::Cancelled) => Ok(Outcome::Cancelled {
-                        pass: status.pass.map(|p| p.index).unwrap_or(0),
+                        pass: pass_at(&status),
                         sent: status.sent.map(|b| b.sent).unwrap_or(0),
                     }),
                     Some(Ended::Completed) => Ok(Outcome::Completed { passes: total }),

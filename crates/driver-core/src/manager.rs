@@ -105,6 +105,13 @@ impl DeviceManager {
     /// waits out whatever transport write the worker is inside, this reads the cell
     /// the worker publishes.
     pub fn status(&self) -> CutStatus {
+        // A dead worker publishes nothing ever again, so the cell would freeze on
+        // whatever it last held — a UI left offering a cancel button for a cut that
+        // no longer has a thread behind it. `snapshot()` gets this for free from its
+        // channel error; this read path has to ask.
+        if self.handle.is_finished() {
+            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0);
+        }
         self.status.lock().unwrap().clone()
     }
 
@@ -1376,20 +1383,53 @@ mod tests {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(factory));
         mgr.connect(cameo_info()).unwrap();
 
-        thread::scope(|scope| {
+        // Read the status inside the gate, but assert outside it: an assertion that
+        // fired before releasing the gate would leave the cut thread parked forever
+        // and `thread::scope` would hang instead of failing.
+        let s = thread::scope(|scope| {
             scope.spawn(|| {
                 let _ = mgr.cut(one_pass_job());
             });
             ready_rx.recv().unwrap(); // the worker is now parked inside the chunk-2 write
             let s = mgr.status();
-            assert_eq!(s.phase, Phase::Sending, "status() must answer from published memory, not the worker");
-            assert!(s.actions.cancel, "a sending cut can be cancelled");
-            assert_eq!(s.pass, Some(PassPosition { index: 0, total: 1 }), "pass count comes from the submitted Vec");
             proceed_tx.send(()).unwrap();
+            s
         });
+        assert_eq!(s.phase, Phase::Sending, "status() must answer from published memory, not the worker");
+        assert!(s.actions.cancel, "a sending cut can be cancelled");
+        assert_eq!(s.pass, Some(PassPosition { index: 0, total: 1 }), "pass count comes from the submitted Vec");
+        // Chunk 1 landed before the gate caught chunk 2, so its per-chunk publish must
+        // already be in the cell — proving the in-loop publish, not just its event.
+        assert_eq!(s.sent.unwrap().sent, WRITE_CHUNK);
 
         assert_eq!(mgr.status().phase, Phase::Idle, "a finished job leaves no pass count behind");
         assert_eq!(mgr.status().pass, None);
+        mgr.shutdown();
+    }
+
+    /// A published cell only moves while something is publishing. Once the worker
+    /// is gone the last value would stand forever — `Idle` here, or worse a
+    /// `Sending` with a live cancel button — so `status()` must report the dead
+    /// worker instead. `snapshot()` gets this from its channel error; this is the
+    /// same promise for the read path that replaces it.
+    #[test]
+    fn status_reports_a_dead_worker_instead_of_the_frozen_cell() {
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(test_factory()));
+        mgr.connect(cameo_info()).unwrap();
+        assert_eq!(mgr.status().phase, Phase::Idle, "the cell holds a healthy state to be overridden");
+
+        // Kill the worker without consuming the manager, which `shutdown()` would.
+        mgr.cmd_tx.try_send(Command::Shutdown).unwrap();
+        for _ in 0..200 {
+            if mgr.status().phase == Phase::Failed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed, "a finished worker must not leave the cell reading Idle");
+        assert_eq!(s.error, Some(DeviceError::Disconnected), "and it must say why");
+        assert!(!s.actions.cut && !s.actions.cancel, "nothing can be done to a device with no worker");
         mgr.shutdown();
     }
 

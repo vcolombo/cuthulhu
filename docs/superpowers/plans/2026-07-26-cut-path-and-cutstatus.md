@@ -1323,6 +1323,8 @@ git commit -m "Test the device manager through the status it reports"
 - Consumes: `DeviceManager::status`, `CutStatus::is_active` (Tasks 9-10).
 - Produces: `ipc::get_device_state` returns `CutStatus`; `DeviceManagerHandle::status()` replaces `cached_state()`; `DeviceEvent` gains `pub status: CutStatus`.
 
+**Also required here, or Task 14 cannot close the surface:** `DeviceEventKind::StateChanged(DeviceState)` carries the internal enum in its payload, so `DeviceState` stays publicly reachable through the event stream no matter what Task 14 does to the type's visibility. Once `DeviceEvent` carries a `CutStatus`, that payload is redundant — drop it to a unit `StateChanged` variant and let the attached status say what changed. Task 11 confirmed three tests still name `DeviceState` solely through this payload; they convert with it.
+
 **Carried over from Task 10:** add `pub status: CutStatus` to `DeviceEvent` in `crates/driver-core/src/manager.rs` here. Task 10 could not, because `progress_event_marks_cache_transmitting` in `apps/desktop/src/device.rs` builds the struct literally — and that test covers the `Transmitting` synthesis this task deletes, so it goes away in the same change. The field is what lets the UI render from the event it just received instead of polling after it.
 
 **One ordering wrinkle to respect, not to fix here:** the worker emits `JobComplete` before the state becomes `Idle`, so the status attached to that event still reads `Sending`. Terminal-ness therefore comes from `phase` reaching `Done`/`Idle` on a later status, never from the event kind. Task 13's UI must key on phase for that reason.

@@ -1649,6 +1649,26 @@ Dialog (`apps/desktop/ui/src/cut/CutDialog.tsx`): **delete the latch entirely.**
 
 `ipc.ts`: drop `"Done"` from the `Phase` union, add `ended: "Completed" | "Cancelled" | null`. `smoke.spec.ts`: emit `ended` where the mock rests after a job, and add a case asserting a normally-completed cut reports completion — the mock previously could not express one.
 
+- [ ] **Step 5a: Make the terminal wording reachable from a test**
+
+Task 14 could only unit-test its terminal messages against a helper, because three things block an
+end-to-end test of `run`, all verified: the wording leaves via `println!` so nothing in-process can
+read it; `ctrlc::set_handler` is process-wide and errors on a second call, so no test binary can call
+`run` twice; and `run` owns its `DeviceManager` with no handle for a test to cancel through. Fix the
+first two here, since this task is rewriting that arm anyway:
+
+- `run` returns its outcome instead of printing it — `Ok(Outcome)` where `Outcome` names the ending
+  and carries what the message needs (`Completed { passes }`, `Cancelled { pass, sent }`). `main.rs`
+  does the printing. `ended_message` becomes a function of `Outcome`, and the tests move onto the
+  real loop rather than a helper beside it.
+- Move `ctrlc::set_handler` out of `run` and into `main.rs`. Installing a process-wide signal handler
+  is not a library function's business, and while it lives in `run` no test binary can drive the loop
+  more than once. `run` takes whatever cancel handle it needs from its caller.
+
+Then add the end-to-end test Task 14 could not write: a multi-pass `Unattended` cut, cancelled
+mid-job, asserting the returned outcome is the cancelled one. Leave the third blocker (`run` owning
+its manager) alone if the cancel handle above is enough to drive it.
+
 - [ ] **Step 6: Verify everything**
 
 ```bash

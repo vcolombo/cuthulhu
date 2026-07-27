@@ -13,3 +13,6 @@ apps/desktop/ui/playwright-report/
 
 # Local MCP config (contains API keys)
 .mcp.json
+
+# Agent scratch space: review diffs and briefs, megabytes of it, none of it source.
+.superpowers/

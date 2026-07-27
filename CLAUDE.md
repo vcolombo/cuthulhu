@@ -32,10 +32,16 @@ npx playwright install chromium          # once per checkout; e2e cannot launch 
 npm run e2e                              # playwright; boots `npm run dev` itself
 
 cargo tauri dev                          # from apps/desktop (cargo-tauri installed globally)
-cargo tauri build
+cargo tauri build                        # produces target/release/bundle/{macos,dmg}
 
 cd tools && python3 -m pytest            # spike tool tests
 ```
+
+`tauri.conf.json`'s `beforeDevCommand`/`beforeBuildCommand` are a bare `npm run build`, and that
+is correct: Tauri runs them from the **frontend** directory (`apps/desktop/ui`), not from the
+directory holding the config. Running `npm run build` yourself from `apps/desktop` does fail, which
+makes the hook look broken — it is not. Do not "fix" it with `--prefix ui`; that resolves to
+`ui/ui` and takes the packaged build down.
 
 Two CI gates that fail on ordinary-looking commits:
 

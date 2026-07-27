@@ -83,7 +83,7 @@ enum Command {
         /// Comma-separated color order (RRGGBBAA,...) for --by-color passes
         #[arg(long)]
         order: Option<String>,
-        /// Send --by-color geometry that falls outside the machine's cutting area
+        /// Send geometry that falls outside the machine's cutting area
         #[arg(long)]
         allow_out_of_bounds: bool,
     },

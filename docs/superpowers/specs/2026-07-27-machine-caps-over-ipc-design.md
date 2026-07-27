@@ -122,13 +122,21 @@ identity, not the driver's. Wrong owner: it would open a seventh home rather tha
 | `apps/desktop/src/device.rs` | New `DeviceManagerHandle::caps_for` (above) |
 | `apps/desktop/src/ipc.rs` | New `#[tauri::command] machine_caps(dev, machine_id)`, thin — logic stays in `device.rs` per `CLAUDE.md` |
 | `apps/desktop/src/main.rs:47-58` | Register `ipc::machine_caps` in the invoke handler |
-| `apps/desktop/ui/src/ipc.ts` | Move the `Caps` type here beside the other wire types; add `machineCaps(machineId)` beside `listPresets` |
-| `apps/desktop/ui/src/cut/viewmodel.ts:13-17` | Delete the local `Caps`, re-export it from `ipc` so `fieldDisabled`'s signature is untouched |
+| `apps/desktop/ui/src/ipc.ts` | Add `machineCaps(machineId)` beside `listPresets`, untyped to match it |
 | `apps/desktop/ui/src/cut/CutDialog.tsx:16-24,148` | Delete `CAPS`, `DEFAULT_CAPS`, the `ponytail:` comment; add caps state and the two fetches |
 | `apps/desktop/ui/e2e/smoke.spec.ts` | Add a deliberately constant `machine_caps` handler (see Testing) |
 | `apps/desktop/ui/dist/` | Rebuild and commit — CI gate |
 
-`ipc.ts` imports nothing local, so moving `Caps` there keeps the dependency pointing one way.
+`cut/viewmodel.ts` is **not** modified: `Caps` stays there. An earlier draft moved it to `ipc.ts` on the
+theory that wire types belong there, but `viewmodel.ts:19` already hosts `ConfiguredPassDto` and
+`CutRequest` under a "Wire types" heading, and `listPresets` (`ipc.ts:201-203`) declares no return
+type at all — `CutDialog` casts `p as Preset[]` with `Preset` defined in `viewmodel.ts`. `machineCaps`
+copies that: untyped in `ipc.ts`, cast to `Caps` at the call site.
+
+Following the existing pattern also avoids a real hazard. No unit test imports `ipc.ts` today, so
+making `viewmodel.ts` import it would newly pull `@tauri-apps/api/core` into vitest's module graph
+for `viewmodel.test.ts` — a new failure mode in the one test file this change most wants to leave
+alone.
 
 ## Error handling
 
@@ -177,8 +185,13 @@ Test 3 guards a silent, user-visible failure: drop the `rename_all` attribute an
 machine. Nothing catches that today — `Actions` and `CutStatus` carry the same attribute with no test
 pinning either.
 
+One test-infrastructure edit is required first: `TestFactory::driver_for` (`device.rs:308`) ignores
+its argument and returns `Some` for any id, so test 2 cannot fail against it. It gains a `match` on
+the id — which is also what the real registry does. Existing tests all use `cameo5` and stay green.
+
 Unchanged deliberately:
 
+- `crates/cutplan` and `apps/desktop/ui/src/cut/viewmodel.ts`, neither of which this change touches.
 - `viewmodel.test.ts`'s four `fieldDisabled` cases. The pure function that *applies* the rule was
   never the problem, only the literal that *supplied* it; needing to edit these would mean the seam
   was cut in the wrong place.

@@ -10,7 +10,7 @@ GCC Puma IV over HPGL/serial). A Rust workspace engine behind a Tauri + React sh
 that shares the same planning path.
 
 `README.md` is stale on status — it claims there is no app and no GUI. Both exist
-(`apps/desktop`, six crates, a working cut workflow and trace). Trust the code and
+(`apps/desktop`, ten crates, a working cut workflow and trace). Trust the code and
 `docs/superpowers/plans/` over the README's status block.
 
 `tools/` is the frozen Python protocol spike (USB decoder, HPGL/GPGL square senders). It is
@@ -28,6 +28,7 @@ npm run dev                              # vite dev server on :5173
 npm run build                            # tsc + vite build -> dist/ (must be committed)
 npm test                                 # vitest run
 npm test -- viewmodel                    # one file
+npx playwright install chromium          # once per checkout; e2e cannot launch without it
 npm run e2e                              # playwright; boots `npm run dev` itself
 
 cargo tauri dev                          # from apps/desktop (cargo-tauri installed globally)

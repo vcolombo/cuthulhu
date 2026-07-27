@@ -716,4 +716,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(read_image(&dir.path().join("nope.png")), Err(TraceError::Input(_))));
     }
+
+    #[test]
+    fn read_capped_accepts_a_stream_exactly_at_the_cap() {
+        use std::io::Read as _;
+        let exact = std::io::repeat(b'x').take(8);
+        assert_eq!(read_capped(exact, 8).unwrap().map(|b| b.len()), Some(8));
+    }
+
+    #[test]
+    fn read_image_reports_a_missing_path_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.bin");
+        assert!(matches!(read_image(&path), Err(TraceError::Input(m)) if m.contains("absent.bin")));
+    }
 }

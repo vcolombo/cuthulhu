@@ -192,6 +192,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let jobId: number | null = null;
   let planPasses: { color: number | null; enabled: boolean }[] = [];
   let failNextResume = false;
+  let failNextCut = false;
 
   function ipcError(code: string, message: string) {
     return { code, message };
@@ -333,6 +334,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       jobId = nextJobId++;
       const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
       if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
+      if (failNextCut) {
+        // The opening write dies: Sending and then Failed both go out in this same
+        // synchronous burst, so the only status the frontend ever commits is the failed
+        // one — the mid-flight status it faulted from never reaches a render.
+        failNextCut = false;
+        const id = jobId;
+        status = statusOf("Sending", { cancel: true }, { pass: { index: enabledIndices[0], total: enabledIndices.length }, sent: { sent: 0, total: 100 } });
+        emit("StateChanged");
+        emit({ Failed: "Timeout" });
+        status = statusOf("Failed", {}, { error: "Timeout" });
+        emit("StateChanged");
+        jobId = null;
+        return id;
+      }
       runPass(enabledIndices[0], enabledIndices);
       return jobId;
     },
@@ -341,9 +356,21 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // Cancelled resting state — phase Done, with Cut legal again (status.rs's
       // Cancelled arm), not a jump straight to Idle.
       const sent = status.sent?.sent ?? 0;
-      status = statusOf("Done", { cut: true }, { pass: status.pass, sent: { sent, total: sent } });
+      const pass = status.pass;
+      // CancelRequested then Stopping — two distinct internal states that both report
+      // phase Cancelling with *no* actions at all. The dialog has to survive losing
+      // every button for a moment, so the mock must not skip them.
+      status = statusOf("Cancelling");
       emit("StateChanged");
-      jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
+      status = statusOf("Cancelling");
+      emit("StateChanged");
+      // The worker only rests on Cancelled once it has woken and stopped, so the
+      // resting state lands a tick later, as it does in production.
+      setTimeout(() => {
+        status = statusOf("Done", { cut: true }, { pass, sent: { sent, total: sent } });
+        emit("StateChanged");
+        jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
+      }, 50);
       return null;
     },
     resume_cut: () => {
@@ -371,6 +398,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // resume_cut so tests can drive the failed-job → reconnect recovery path.
     __test_fail_next_resume: () => {
       failNextResume = true;
+      return null;
+    },
+    // Same, for a fault during the first pass of the next cut.
+    __test_fail_next_cut: () => {
+      failNextCut = true;
       return null;
     },
     confirm_pass_done: () => {
@@ -569,6 +601,44 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // comes back only because the reconnect's Idle status was accepted.
   await page.getByRole("button", { name: "Connect", exact: false }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// A fault whose mid-flight status never reaches a render: a banner that waits to be
+// handed a "a cut was running" status first shows nothing at all here.
+test("a cut that faults immediately still shows Cut failed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Job complete")).toHaveCount(0);
+});
+
+// Losing the device mid-pause abandons the job. The reconnect reports Idle — the same
+// phase a finished cut rests on — so a dialog that remembers "a cut was running" across
+// the disconnect declares a job that never finished complete.
+test("disconnecting mid-pause does not report the abandoned cut as complete", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  // No Disconnect control exists in the UI, so drive the command the way the device
+  // dropping out would: straight through the IPC surface.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
+  await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expect(page.getByText(/complete/i)).toHaveCount(0);
 });
 
 test("trace dialog: preview appears and insert adds paths", async ({ page }) => {

@@ -85,20 +85,21 @@ export function CutDialog({
   const [skippedNoStroke, setSkippedNoStroke] = useState(0);
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
-  // How the cut this dialog started ended. Latched because `Idle` means both "no cut
-  // yet" and "cut finished", so the phase alone cannot say which — and read off the
-  // status, never off an event kind: `JobComplete` is sent while the status still says
-  // `Sending`, so a kind-driven banner shows a finished job as still cutting.
-  const [outcome, setOutcome] = useState<"running" | "complete" | "failed" | null>(null);
+  // Completion is the one thing the status cannot say on its own: `Idle` means both "no
+  // cut yet" and "cut finished". Everything else the dialog reports comes straight off
+  // the phase — `Failed` in particular, so a fault still shows even if the status it
+  // faulted from never reached a render. Never keyed on an event kind: `JobComplete` is
+  // sent while the status still says `Sending`.
+  const [outcome, setOutcome] = useState<"running" | "complete" | null>(null);
   useEffect(() => {
     // The backend offering Cancel is what says a cut is under way; no phase table needed.
     if (status.actions.cancel) setOutcome("running");
-    else if (outcome === "running") {
-      if (status.phase === "Idle") setOutcome("complete");
-      else if (status.phase === "Failed") setOutcome("failed");
-      // `Done` is the cancelled resting state — the phase is the whole message, so it
-      // needs no banner of its own.
-      else if (status.phase === "Done") setOutcome(null);
+    else if (status.phase === "Idle") {
+      if (outcome === "running") setOutcome("complete");
+    } else {
+      // Cancelled, faulted, or the connection changed under it: whatever was running is
+      // no longer running and did not finish, so the next `Idle` must not read as one.
+      setOutcome(null);
     }
   }, [status, outcome]);
 
@@ -344,7 +345,7 @@ export function CutDialog({
           {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
           {status.phase === "Done" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
           {outcome === "complete" ? <span>Job complete</span> : null}
-          {outcome === "failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
+          {status.phase === "Failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
 
           <div style={{ flex: 1 }} />
 

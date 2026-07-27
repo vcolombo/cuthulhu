@@ -66,6 +66,25 @@ fn trace_reports_empty_result_without_writing() {
     assert!(!out.exists());
 }
 
+/// `--detail` is stated in the same units as the dialog's Detail slider: higher means more detail.
+/// It used to carry vtracer's threshold, which runs the other way, so the two interfaces gave
+/// opposite advice for the same failure. The bottom of the range must trace more coarsely than the
+/// top — fewer path commands for the same image.
+#[test]
+fn detail_reads_high_for_more_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = fixture_png(dir.path());
+    let commands = |detail: &str| {
+        let out = dir.path().join(format!("out-{detail}.svg"));
+        let status = bin().args([
+            "trace", input.to_str().unwrap(), "-o", out.to_str().unwrap(), "--detail", detail,
+        ]).status().unwrap();
+        assert!(status.success(), "--detail {detail} failed");
+        std::fs::read_to_string(&out).unwrap().matches('L').count()
+    };
+    assert!(commands("10") >= commands("3.5"), "higher --detail must not trace more coarsely");
+}
+
 /// The desktop caps what it reads before decoding; the CLI is a second entry point into the same
 /// tracer and had no ceiling at all, so a huge file was pulled into memory in full before the
 /// decoder ever got to reject it. Uses a sparse file, so the test costs no real disk.

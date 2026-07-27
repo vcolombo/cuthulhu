@@ -223,15 +223,28 @@ pub fn pick_image(
     Ok(Some(real))
 }
 
+/// The tracer's own description of what it accepts, so the dialog renders its controls from the
+/// module that enforces them rather than from a table typed to agree.
+#[tauri::command]
+pub fn trace_controls() -> Result<trace::TraceControlSpecs, IpcError> {
+    Ok(trace::control_specs())
+}
+
 #[tauri::command(async)]
 pub fn trace_image(
     auth: tauri::State<AuthorizedImages>,
     path: PathBuf,
-    opts: trace::TraceOptions,
-) -> Result<trace::TraceResult, String> {
-    let real = authorized_path(&auth, &path)?;
-    let bytes = trace::read_image(&real).map_err(|e| e.to_string())?;
-    trace::trace(&bytes, &opts).map_err(|e| e.to_string())
+    controls: trace::TraceControls,
+) -> Result<trace::TraceResult, IpcError> {
+    let real = authorized_path(&auth, &path).map_err(|m| IpcError::new("input", m))?;
+    let bytes = trace::read_image(&real).map_err(trace_error)?;
+    trace::trace(&bytes, &controls).map_err(trace_error)
+}
+
+/// Carry the tracer's own code across IPC, so the dialog branches on the kind of failure instead
+/// of matching the text of one.
+fn trace_error(e: trace::TraceError) -> IpcError {
+    IpcError::new(e.code(), e.to_string())
 }
 
 /// Returns the source thumbnail as a re-encoded PNG data URL — never the file's original bytes,

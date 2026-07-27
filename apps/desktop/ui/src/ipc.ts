@@ -95,13 +95,15 @@ export type Phase =
   | "AwaitingConfirmation"
   | "AwaitingColorSwap"
   | "Cancelling"
-  | "Done"
   | "Failed";
 
-/** Mirrors driver_core::CutStatus. The phase says where the cut is; actions say
- *  which buttons are legal. Nothing here needs interpreting. */
+/** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
+ *  says how the last job finished, which no phase can — a finished cut and a
+ *  cancelled one both rest on "Idle". Actions say which buttons are legal.
+ *  Nothing here needs interpreting, and nothing needs remembering. */
 export type CutStatus = {
   phase: Phase;
+  ended: "Completed" | "Cancelled" | null;
   actions: { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
   pass: { index: number; total: number } | null;
   sent: { sent: number; total: number } | null;
@@ -111,6 +113,7 @@ export type CutStatus = {
 /** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
 export const DISCONNECTED_STATUS: CutStatus = {
   phase: "Disconnected",
+  ended: null,
   actions: { cut: false, cancel: false, resume: false, confirm: false },
   pass: null,
   sent: null,

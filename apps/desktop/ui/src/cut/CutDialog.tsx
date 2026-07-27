@@ -85,23 +85,6 @@ export function CutDialog({
   const [skippedNoStroke, setSkippedNoStroke] = useState(0);
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
-  // Completion is the one thing the status cannot say on its own: `Idle` means both "no
-  // cut yet" and "cut finished". Everything else the dialog reports comes straight off
-  // the phase — `Failed` in particular, so a fault still shows even if the status it
-  // faulted from never reached a render. Never keyed on an event kind: `JobComplete` is
-  // sent while the status still says `Sending`.
-  const [outcome, setOutcome] = useState<"running" | "complete" | null>(null);
-  useEffect(() => {
-    // The backend offering Cancel is what says a cut is under way; no phase table needed.
-    if (status.actions.cancel) setOutcome("running");
-    else if (status.phase === "Idle") {
-      if (outcome === "running") setOutcome("complete");
-    } else {
-      // Cancelled, faulted, or the connection changed under it: whatever was running is
-      // no longer running and did not finish, so the next `Idle` must not read as one.
-      setOutcome(null);
-    }
-  }, [status, outcome]);
 
   useEffect(() => {
     ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
@@ -167,8 +150,6 @@ export function CutDialog({
 
   const startCut = () => {
     if (!connected || planRevision === null) return;
-    // A new cut supersedes the previous one's banner.
-    setOutcome(null);
     const request = toCutRequest(connected.instance_id, planRevision, rows);
     ipc.cut(request).catch((e) => {
       const code = ipc.ipcErrorCode(e);
@@ -343,8 +324,10 @@ export function CutDialog({
           ) : null}
           {status.phase === "Cancelling" ? <span>cancelling</span> : null}
           {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
-          {status.phase === "Done" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
-          {outcome === "complete" ? <span>Job complete</span> : null}
+          {/* How the last job ended comes from the backend, so the dialog remembers
+              nothing: no latch, no reading `actions.cancel` as a liveness bit. */}
+          {status.ended === "Cancelled" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
+          {status.ended === "Completed" ? <span>Job complete</span> : null}
           {status.phase === "Failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
 
           <div style={{ flex: 1 }} />

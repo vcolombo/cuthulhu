@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use driver_core::manager::DeviceManager;
-use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Phase};
+use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Ended, Phase};
 
 /// Who answers the machine's pauses.
 ///
@@ -61,43 +61,43 @@ fn pass_color(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
     format_pass_color(plan.passes.get(index).and_then(|p| p.color))
 }
 
+/// How the cut ended. Returned rather than printed so the wording is assertable
+/// against the real loop instead of a helper standing next to it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Completed { passes: usize },
+    Cancelled { pass: usize, sent: usize },
+}
+
 /// What to tell the operator once the job has ended.
-///
-/// The two terminal phases are different endings, not one: a job that ran to the
-/// end rests on `Idle`, while `Phase::Done` is reached by nothing but a cancel and
-/// carries where that cancel stopped. Returned rather than printed so the wording
-/// is assertable — `run` itself cannot be, since it owns the manager and installs a
-/// process-wide Ctrl-C handler.
-fn ended_message(status: &CutStatus, total: usize) -> String {
-    if status.phase == Phase::Idle {
-        return format!("done: {total} passes cut");
-    }
-    match (status.pass, status.sent) {
-        (Some(p), Some(b)) => format!("cancelled at pass {} ({} bytes sent)", p.index, b.sent),
-        // Off the normal path — the cancelled state populates both — but a missing
-        // number must not downgrade a cancellation into a report of a finished cut.
-        _ => "cancelled".to_string(),
+pub fn ended_message(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Completed { passes } => format!("done: {passes} passes cut"),
+        Outcome::Cancelled { pass, sent } => format!("cancelled at pass {pass} ({sent} bytes sent)"),
     }
 }
 
-/// Connect, cut, and drive the job to its end. `Ok(())` covers a completed cut
-/// and a cancelled one; a device fault is an `Err`.
+/// Connect, cut, and drive the job to its end, reporting how it ended. A cancelled
+/// cut is an `Outcome`, not an error; a device fault is an `Err`.
+///
+/// `with_cancel` is handed the connected device before any bytes go out, so the
+/// caller can stop the cut from outside: `main` turns it into the Ctrl-C handler, and
+/// a test uses it to cancel mid-job. Installing a process-wide signal handler is not
+/// a library function's business, and while it lived in here no test binary could
+/// drive this loop more than once.
 pub fn run(
     plan: &cutplan::CutPlan,
     info: DeviceInfo,
     factory: Arc<dyn DeviceBackendFactory>,
     operator: Operator,
-) -> Result<(), String> {
+    with_cancel: impl FnOnce(Arc<DeviceManager>) -> Result<(), String>,
+) -> Result<Outcome, String> {
     let total = plan.passes.len();
     let (mgr, _events) = DeviceManager::spawn(factory);
     let mgr = Arc::new(mgr);
     mgr.connect(info).map_err(|e| format!("connect: {e:?}"))?;
 
-    // ponytail: the handler holds a permanent Arc clone for the life of the
-    // process, so `mgr` is never uniquely owned again — skip a graceful
-    // `shutdown()` and let the (short-lived CLI) process exit reap the worker.
-    let ctrlc_mgr = mgr.clone();
-    ctrlc::set_handler(move || ctrlc_mgr.cancel()).map_err(|e| format!("ctrlc: {e}"))?;
+    with_cancel(mgr.clone())?;
 
     mgr.cut(plan.cut_passes()).map_err(|e| format!("cut: {e:?}"))?;
 
@@ -126,11 +126,16 @@ pub fn run(
                     mgr.confirm_pass_done().map_err(|e| format!("confirm: {e:?}"))?;
                 }
             }
-            // Both terminal phases: the operator has nothing left to answer, and
-            // `ended_message` says which ending it was.
-            Phase::Idle | Phase::Done => {
-                println!("{}", ended_message(&status, total));
-                return Ok(());
+            // Nothing is happening, so the job is over and the operator has nothing
+            // left to answer. `ended` is what says which ending it was.
+            Phase::Idle => {
+                return Ok(match status.ended {
+                    Some(Ended::Cancelled) => Outcome::Cancelled {
+                        pass: status.pass.map(|p| p.index).unwrap_or(0),
+                        sent: status.sent.map(|b| b.sent).unwrap_or(0),
+                    },
+                    _ => Outcome::Completed { passes: total },
+                })
             }
             Phase::Failed => return Err(format!("device error: {:?}", status.error)),
             // Sending / Cancelling / connection phases: nothing for the operator to do.
@@ -153,44 +158,11 @@ fn wait_for_enter_or_cancel(mgr: &DeviceManager) -> bool {
         if rx.try_recv().is_ok() {
             return true;
         }
-        // A cancelled job rests on `Done` — the operator is no longer being asked for
+        // A cancelled job is over — the operator is no longer being asked for
         // anything, so stop waiting on them.
-        if mgr.status().phase == Phase::Done {
+        if mgr.status().ended == Some(Ended::Cancelled) {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use driver_core::{Actions, ByteProgress, PassPosition};
-
-    fn terminal(phase: Phase, pass: Option<PassPosition>, sent: Option<ByteProgress>) -> CutStatus {
-        CutStatus { phase, actions: Actions { cut: true, ..Actions::default() }, pass, sent, error: None }
-    }
-
-    /// The regression this pins: a cancelled job reports `Phase::Done`, a completed one
-    /// `Phase::Idle`. Collapsing the two told an operator who hit Ctrl-C that every pass
-    /// had been cut.
-    #[test]
-    fn a_cancelled_job_is_not_reported_as_a_finished_one() {
-        let done = terminal(
-            Phase::Done,
-            Some(PassPosition { index: 1, total: 3 }),
-            Some(ByteProgress { sent: 4096, total: 4096 }),
-        );
-        assert_eq!(ended_message(&done, 3), "cancelled at pass 1 (4096 bytes sent)");
-
-        let idle = terminal(Phase::Idle, None, None);
-        assert_eq!(ended_message(&idle, 3), "done: 3 passes cut");
-    }
-
-    /// Off the normal path, but a cancellation missing its numbers must still read as a
-    /// cancellation — the one thing worse than a vague message is a wrong one.
-    #[test]
-    fn a_cancellation_without_numbers_still_says_cancelled() {
-        assert_eq!(ended_message(&terminal(Phase::Done, None, None), 2), "cancelled");
     }
 }

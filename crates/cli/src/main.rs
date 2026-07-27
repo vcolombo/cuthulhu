@@ -120,6 +120,24 @@ fn operator() -> cut::Operator {
     if std::io::stdin().is_terminal() { cut::Operator::Interactive } else { cut::Operator::Unattended }
 }
 
+/// Drive a planned cut on real hardware and report how it ended.
+///
+/// Ctrl-C is installed here rather than inside `cut::run`: a process-wide signal
+/// handler belongs to the binary, and `set_handler` errors on a second call, so a
+/// library function that installs one can only ever be called once per process.
+fn drive_cut(plan: &cutplan::CutPlan, device: Device, port: Option<&str>, baud: u32) -> Result<(), String> {
+    let info = resolve_device_info(device, port, baud)?;
+    let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
+    let outcome = cut::run(plan, info, factory, operator(), |mgr| {
+        // ponytail: the handler holds a permanent Arc clone for the life of the
+        // process, so the manager is never uniquely owned again — skip a graceful
+        // `shutdown()` and let the (short-lived CLI) process exit reap the worker.
+        ctrlc::set_handler(move || mgr.cancel()).map_err(|e| format!("ctrlc: {e}"))
+    })?;
+    println!("{}", cut::ended_message(&outcome));
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -143,9 +161,7 @@ fn run() -> Result<(), String> {
                     print_hex_ascii(&bytes);
                     return Ok(());
                 }
-                let info = resolve_device_info(device, port.as_deref(), baud)?;
-                let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
-                return cut::run(&plan, info, factory, operator());
+                return drive_cut(&plan, device, port.as_deref(), baud);
             }
 
             cut_by_color(&svg, device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
@@ -215,9 +231,7 @@ fn cut_by_color(
         std::process::exit(2);
     }
 
-    let info = resolve_device_info(device, port.as_deref(), baud)?;
-    let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
-    cut::run(&plan, info, factory, operator())
+    drive_cut(&plan, device, port.as_deref(), baud)
 }
 
 fn resolve_device_info(device: Device, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {

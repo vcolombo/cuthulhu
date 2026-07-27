@@ -161,6 +161,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
   type CutStatus = {
     phase: string;
+    ended: string | null;
     actions: Actions;
     pass: { index: number; total: number } | null;
     sent: { sent: number; total: number } | null;
@@ -171,6 +172,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const NO_ACTIONS: Actions = { cut: false, cancel: false, resume: false, confirm: false };
   const statusOf = (phase: string, actions: Partial<Actions> = {}, rest: Partial<CutStatus> = {}): CutStatus => ({
     phase,
+    ended: null,
     actions: { ...NO_ACTIONS, ...actions },
     pass: null,
     sent: null,
@@ -179,7 +181,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   });
   const DISCONNECTED = statusOf("Disconnected");
   const CONNECTING = statusOf("Connecting");
+  // `Idle` alone is a device that has cut nothing; a job that ran to the end rests on
+  // the same phase and says so through `ended`, which is the whole of the difference.
   const IDLE = statusOf("Idle", { cut: true });
+  const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
 
   const devices: DeviceInfo[] = [
     { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false },
@@ -275,7 +280,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         // "finished" would show a completed job as still cutting; only the Idle status
         // below says the job is over.
         emit("JobComplete");
-        status = IDLE;
+        status = COMPLETED;
         emit("StateChanged");
         // Production releases the job id once the job is over: all later lifecycle
         // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
@@ -353,8 +358,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     cancel_cut: () => {
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
-      // Cancelled resting state — phase Done, with Cut legal again (status.rs's
-      // Cancelled arm), not a jump straight to Idle.
+      // Cancelled resting state — nothing is happening, so the phase is Idle, but
+      // `ended` names the cancel and Cut is legal again (status.rs's Cancelled arm).
       const sent = status.sent?.sent ?? 0;
       const pass = status.pass;
       // CancelRequested then Stopping — two distinct internal states that both report
@@ -367,7 +372,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // The worker only rests on Cancelled once it has woken and stopped, so the
       // resting state lands a tick later, as it does in production.
       setTimeout(() => {
-        status = statusOf("Done", { cut: true }, { pass, sent: { sent, total: sent } });
+        status = statusOf("Idle", { cut: true }, { ended: "Cancelled", pass, sent: { sent, total: sent } });
         emit("StateChanged");
         jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
       }, 50);
@@ -406,7 +411,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     confirm_pass_done: () => {
-      status = IDLE;
+      status = COMPLETED;
       emit("StateChanged");
       return null;
     },
@@ -513,6 +518,24 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
+test("a cut that runs to the end reports completion, not a cancellation", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+
+  // The backend says which ending it was, so the two endings cannot be confused: this
+  // is the case the mock could not express while a finished cut only rested on `Idle`.
+  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByText("Cancelled")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
 test("transmitting shows a Cancel button and progress so the GUI can cancel mid-cut", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -561,7 +584,13 @@ test("reopening the dialog after connect recovers the connected device", async (
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
-test("reopened dialog does not show stale Job complete from a prior cycle", async ({ page }) => {
+// Inverted deliberately. While the dialog latched its own outcome, "did the last cut
+// finish?" was answered by how long the dialog had been mounted, so a reopened dialog
+// had to show nothing — and this test asserted that. The outcome now comes from the
+// device, so a reopened dialog reports what the device actually last did, for the same
+// reason a freshly opened one does. The guard against a *false* completion is
+// "disconnecting mid-pause" below: there the job never ended, and no banner appears.
+test("a reopened dialog reports the ending the device actually last had", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
@@ -571,11 +600,12 @@ test("reopened dialog does not show stale Job complete from a prior cycle", asyn
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
+  await expect(page.getByText("Job complete")).toBeVisible();
 
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Cut" }).click();
-  await expect(page.getByText(/complete/i)).toHaveCount(0);
+  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByText("Cancelled")).toHaveCount(0);
 });
 
 test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {

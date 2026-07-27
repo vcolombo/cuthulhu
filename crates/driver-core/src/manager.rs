@@ -8,9 +8,10 @@
 //! chunks and ENQ polls (for a busy worker), plus a queued `Command::Cancel`
 //! for a worker parked at `recv()` — see `DeviceManager::cancel`.
 
-use crate::status::{status_of, CutStatus};
+use crate::status::{status_of, CutStatus, Ended};
 use crate::{write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
 use serde::Serialize;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -103,7 +104,7 @@ impl DeviceManager {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let worker_flag = cancel_flag.clone();
         let status = Arc::new(Mutex::new(CutStatus::disconnected()));
-        let reporter = Reporter { events: event_tx, status: status.clone() };
+        let reporter = Reporter { events: event_tx, status: status.clone(), ended: Cell::new(None) };
         let handle = thread::spawn(move || worker_loop(cmd_rx, reporter, factory, worker_flag));
         (DeviceManager { cmd_tx, handle, cancel_flag, status }, event_rx)
     }
@@ -118,7 +119,7 @@ impl DeviceManager {
         // no longer has a thread behind it. `snapshot()` gets this for free from its
         // channel error; this read path has to ask.
         if self.handle.is_finished() {
-            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0);
+            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0, None);
         }
         self.status.lock().unwrap().clone()
     }
@@ -215,14 +216,25 @@ impl DeviceManager {
 struct Reporter {
     events: mpsc::Sender<DeviceEvent>,
     status: Arc<Mutex<CutStatus>>,
+    /// How the last job finished. Kept here rather than threaded through every
+    /// emit because this is the only thing that reads it, and because a job that
+    /// ran to the end rests on `DeviceState::Idle` — the outcome has nowhere else
+    /// to live. Touched only by the worker thread, hence `Cell`.
+    ended: Cell<Option<Ended>>,
 }
 
 impl Reporter {
+    /// A new job, or a lifecycle transition, has nothing to do with how the last
+    /// job ended: pass `None` so a fresh cut cannot report the previous outcome.
+    fn set_ended(&self, ended: Option<Ended>) {
+        self.ended.set(ended);
+    }
+
     /// Publishes the status, then sends the event. That order is what callers
     /// rely on: one woken by an event and calling `status()` cannot then see a
     /// value older than the event that woke it.
     fn emit(&self, state: &DeviceState, total_passes: usize, job_id: u64, kind: DeviceEventKind) {
-        let status = status_of(state, total_passes);
+        let status = status_of(state, total_passes, self.ended.get());
         // The guard dies at the end of this statement, so the lock is not held
         // across the send below — nor, anywhere in this worker, across a
         // transport write or read.
@@ -233,9 +245,11 @@ impl Reporter {
 }
 
 /// A lifecycle transition (connect/disconnect, or clearing a cancelled rest
-/// state) belongs to no job, so it reports no pass count — every state reachable
-/// this way has no pass position of its own.
+/// state) belongs to no job, so it reports no pass count and no outcome — every
+/// state reachable this way has no pass position of its own, and a freshly
+/// connected device has cut nothing.
 fn emit(state: &mut DeviceState, new: DeviceState, rep: &Reporter) {
+    rep.set_ended(None);
     emit_for(NO_JOB, state, new, 0, rep);
 }
 
@@ -417,6 +431,10 @@ fn finish_pass(
     } else {
         write_all(transport, &driver.session_end()).map_err(DeviceError::from)?;
         rep.emit(state, total_passes, job_id, DeviceEventKind::JobComplete);
+        // Set after `JobComplete` goes out, not before: that event still carries the
+        // mid-flight status, and a caller renders it — a "completed" outcome attached
+        // to a `Sending` phase would read as a cut both finishing and still running.
+        rep.set_ended(Some(Ended::Completed));
         // The job is over, so `Idle` reports no pass count. `total_passes` is a
         // parameter, not worker state, so nothing stale can outlive this call.
         emit_for(job_id, state, DeviceState::Idle, 0, rep);
@@ -478,6 +496,8 @@ fn pass_byte_len(driver: &(dyn Driver + Send), passes: &[CutPass], pass_index: u
 /// the device's readiness is actually known, then emit `Cancelled` and leave
 /// it as the resting state — `Cancelled` is what `snapshot()`/the next
 /// `Command::Cut` sees until a fresh job starts and transitions to `Idle`.
+/// Resting on a state of its own is why a cancel needs no remembered outcome:
+/// `status_of` reads the ending straight off `Cancelled`.
 fn perform_cancel(
     job_id: u64,
     pass_index: usize,
@@ -629,6 +649,7 @@ fn worker_loop(
                 // read from the job in hand at every emit, never cached on the worker.
                 let total_passes = passes.len();
                 cancel_flag.store(false, Ordering::SeqCst); // fresh job: clear any stale cancel from a prior one
+                rep.set_ended(None); // and the prior job's ending, or this one reports it as its own
                 // Idle/Cancelled both imply a successful prior connect, so both are Some.
                 let drv = driver.as_deref().expect("driver present while Idle");
                 let tr = transport.as_deref_mut().expect("transport present while Idle");
@@ -747,7 +768,7 @@ fn worker_loop(
 mod tests {
     use super::*;
     use crate::{
-        DriverError, MachineCaps, MachineProfile, MockTransport, PassPosition, Phase, Settings, TransportKind,
+        DriverError, Ended, MachineCaps, MachineProfile, MockTransport, PassPosition, Phase, Settings, TransportKind,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -982,6 +1003,20 @@ mod tests {
         }
     }
 
+    /// Like `wait_for_phase`, but for an ending. Every ending rests on `Phase::Idle`,
+    /// so the phase alone cannot say that a cancel has landed.
+    fn wait_for_ended(mgr: &DeviceManager, want: Ended) -> CutStatus {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = mgr.status();
+            if s.ended == Some(want) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "never ended {want:?}, last was {:?}/{:?}", s.phase, s.ended);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn drain(events: &mpsc::Receiver<DeviceEvent>) -> Vec<DeviceEvent> { events.try_iter().collect() }
 
     fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
@@ -1146,12 +1181,38 @@ mod tests {
         mgr.shutdown();
     }
 
+    /// The worker's half of the ending. A job that ran to the end rests on `Idle`,
+    /// which says nothing by itself, so the worker remembers `Completed` — and has to
+    /// forget it in the two places it would otherwise be read as this job's own: a
+    /// reconnect (a fresh device has cut nothing) and the next `cut`.
+    #[test]
+    fn a_completed_job_reports_completion_until_something_supersedes_it() {
+        let (factory, _written) = factory_with_ready_reads(2);
+        let (mgr, _events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+        assert_eq!(mgr.status().ended, None, "nothing has run yet");
+
+        mgr.cut(one_pass_job()).expect("cut");
+        let done = wait_for_ended(&mgr, Ended::Completed);
+        assert_eq!(done.phase, Phase::Idle, "phase says what is happening now: nothing");
+        assert_eq!(done.pass, None, "and a finished job leaves no pass position behind");
+
+        mgr.disconnect().expect("disconnect");
+        mgr.connect(cameo_info()).expect("reconnect");
+        assert_eq!(mgr.status().ended, None, "a fresh connection has cut nothing");
+
+        mgr.cut(two_pass_job()).expect("cut"); // parks for the swap, so it is still in flight
+        let parked = wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        assert_eq!(parked.ended, None, "a job in flight has not ended");
+        mgr.shutdown();
+    }
+
     /// Was `terminalTransition`'s Cancelled case. A cancel ends the job, but it
     /// arrives as a resting state rather than a terminal event kind — a caller
-    /// watching only for `JobComplete`/`Failed` waits forever. `phase`/`actions`
+    /// watching only for `JobComplete`/`Failed` waits forever. `ended`/`actions`
     /// say it outright.
     #[test]
-    fn a_cancelled_job_reports_done_and_allows_another_cut() {
+    fn a_cancelled_job_reports_cancelled_and_allows_another_cut() {
         // Reads: pass 1's completion poll, the post-cancel readiness check, then
         // the replacement job's own poll.
         let (factory, _written) = factory_with_ready_reads(3);
@@ -1162,7 +1223,7 @@ mod tests {
         wait_for_phase(&mgr, Phase::AwaitingColorSwap);
         mgr.cancel();
 
-        let s = wait_for_phase(&mgr, Phase::Done);
+        let s = wait_for_ended(&mgr, Ended::Cancelled);
         assert!(s.actions.cut, "another cut is legal after a cancel");
         mgr.cut(one_pass_job()).expect("and the manager honours what actions promised");
         mgr.shutdown();
@@ -1275,9 +1336,9 @@ mod tests {
             (mid_transmit, cut_thread.join().unwrap())
         });
 
-        // Cancelled is the resting state, and it reports as a terminal phase — so
-        // waiting on the published status is enough to know the cancel landed.
-        let at_cancel = wait_for_phase(&mgr, Phase::Done);
+        // Cancelled is the resting state, and it reports its ending — so waiting on
+        // the published status is enough to know the cancel landed.
+        let at_cancel = wait_for_ended(&mgr, Ended::Cancelled);
         let evs = drain(&events);
 
         let mid = mid_transmit.sent.expect("a transmitting cut reports bytes");
@@ -1583,14 +1644,10 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "shutdown should cancel and join promptly");
 
         let evs = drain(&events);
-        let changed_to = |phase| {
-            evs.iter().any(|e| {
-                e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged) && e.status.phase == phase
-            })
-        };
-        assert!(changed_to(Phase::Cancelling));
-        // Cancelled is the resting state post-shutdown (no further Cut arrives
-        // to lazily flip it back to Idle), and it reports as `Done`.
-        assert!(changed_to(Phase::Done));
+        let own = |e: &DeviceEvent| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged);
+        assert!(evs.iter().any(|e| own(e) && e.status.phase == Phase::Cancelling));
+        // Cancelled is the resting state post-shutdown (no further Cut arrives to
+        // lazily flip it back to Idle), and it reports how the job ended.
+        assert!(evs.iter().any(|e| own(e) && e.status.ended == Some(Ended::Cancelled)));
     }
 }

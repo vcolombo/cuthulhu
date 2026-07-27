@@ -18,7 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub enum DeviceState {
+/// The machine, in full detail. Deliberately crate-private: callers read
+/// `CutStatus`, so there is only ever one derivation of phase and legal actions.
+pub(crate) enum DeviceState {
     Disconnected,
     Connecting,
     Idle,
@@ -74,6 +76,7 @@ const NO_JOB: u64 = 0;
 enum Command {
     Connect { info: DeviceInfo, reply: mpsc::Sender<Result<(), DeviceError>> },
     Disconnect { reply: mpsc::Sender<Result<(), DeviceError>> },
+    #[cfg(test)]
     Snapshot { reply: mpsc::Sender<DeviceState> },
     Cut { passes: Vec<CutPass>, reply: mpsc::Sender<Result<u64, DeviceError>> },
     Cancel,
@@ -136,7 +139,11 @@ impl DeviceManager {
         self.call(|reply| Command::Disconnect { reply })?
     }
 
-    pub fn snapshot(&self) -> DeviceState {
+    /// The only observation point for detail `CutStatus` deliberately does not
+    /// carry (`completion_known`). Nothing shipping needs it, so it exists for
+    /// the tests in this file and nowhere else.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> DeviceState {
         self.call(|reply| Command::Snapshot { reply }).unwrap_or(DeviceState::Disconnected)
     }
 
@@ -555,6 +562,7 @@ fn worker_loop(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             Command::Shutdown => break,
+            #[cfg(test)]
             Command::Snapshot { reply } => {
                 let _ = reply.send(state.clone());
             }

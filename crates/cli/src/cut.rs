@@ -6,8 +6,8 @@
 //! the same code runs against hardware and against `MockTransport`.
 use std::sync::Arc;
 
-use driver_core::manager::{DeviceManager, DeviceState};
-use driver_core::{DeviceBackendFactory, DeviceInfo};
+use driver_core::manager::DeviceManager;
+use driver_core::{DeviceBackendFactory, DeviceInfo, Phase};
 
 /// Who answers the machine's pauses.
 ///
@@ -68,46 +68,44 @@ pub fn run(
     mgr.cut(plan.cut_passes()).map_err(|e| format!("cut: {e:?}"))?;
 
     loop {
-        match mgr.snapshot() {
-            DeviceState::WaitingForColorSwap { next_pass_index, .. } => {
-                // A bad index can't happen on the normal path — `next_pass_index` comes from
-                // the same plan — but the prompt is cosmetic, so a mismatch degrades to "none"
-                // rather than panicking a process mid-cut.
-                let color = format_pass_color(plan.passes.get(next_pass_index).and_then(|p| p.color));
+        let status = mgr.status();
+        // A bad index can't happen on the normal path — the reported position indexes
+        // the same plan — but the prompt is cosmetic, so a mismatch degrades to "none"
+        // rather than panicking a process mid-cut.
+        let pass_index = status.pass.map(|p| p.index).unwrap_or(0);
+        let color = format_pass_color(plan.passes.get(pass_index).and_then(|p| p.color));
+        match status.phase {
+            Phase::AwaitingColorSwap => {
                 let prompt = format!(
                     "Pass {}/{} (color {}): swap tool, press Enter to resume",
-                    next_pass_index + 1,
+                    pass_index + 1,
                     total,
                     color,
                 );
-                if !operator.wait_ack(&prompt, &mgr) {
-                    continue; // re-check snapshot: cancel() already landed
+                if operator.wait_ack(&prompt, &mgr) {
+                    mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
                 }
-                mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
             }
-            DeviceState::AwaitingCompletion { pass_index, .. } => {
-                let color = format_pass_color(plan.passes.get(pass_index).and_then(|p| p.color));
+            Phase::AwaitingConfirmation => {
                 let prompt = format!(
                     "Pass {}/{} (color {}) cutting; press Enter once the machine finishes",
                     pass_index + 1,
                     total,
                     color,
                 );
-                if !operator.wait_ack(&prompt, &mgr) {
-                    continue;
+                if operator.wait_ack(&prompt, &mgr) {
+                    mgr.confirm_pass_done().map_err(|e| format!("confirm: {e:?}"))?;
                 }
-                mgr.confirm_pass_done().map_err(|e| format!("confirm: {e:?}"))?;
             }
-            DeviceState::Idle => {
+            // A job that ran to the end rests on `Idle`; a cancelled one on `Done`.
+            // Either way the operator has nothing left to answer.
+            Phase::Idle | Phase::Done => {
                 println!("done: {total} passes cut");
                 return Ok(());
             }
-            DeviceState::Cancelled { pass_index, submitted_bytes, .. } => {
-                println!("cancelled at pass {pass_index} ({submitted_bytes} bytes sent)");
-                return Ok(());
-            }
-            DeviceState::Error(e) => return Err(format!("device error: {e:?}")),
-            _ => return Err("unexpected device state".into()),
+            Phase::Failed => return Err(format!("device error: {:?}", status.error)),
+            // Sending / Cancelling / connection phases: nothing for the operator to do.
+            _ => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
 }
@@ -126,7 +124,9 @@ fn wait_for_enter_or_cancel(mgr: &DeviceManager) -> bool {
         if rx.try_recv().is_ok() {
             return true;
         }
-        if matches!(mgr.snapshot(), DeviceState::Cancelled { .. }) {
+        // A cancelled job rests on `Done` — the operator is no longer being asked for
+        // anything, so stop waiting on them.
+        if mgr.status().phase == Phase::Done {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

@@ -308,7 +308,7 @@ mod tests {
         fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
             Some(Box::new(TestDriver {
                 profile: MachineProfile { id: "cameo5".into(), name: "Test Cameo".into(), width_mm: 500.0, height_mm: 500.0 },
-                // A machine that cannot be polled parks the cut at `AwaitingCompletion`
+                // A machine that cannot be polled parks the cut at `AwaitingConfirmation`
                 // instead of driving it to completion, so a cut submitted here stops at a
                 // stable mid-flight phase. `MockTransport` answers no status query, so a
                 // pollable machine would instead sit out the manager's 60s completion

@@ -738,6 +738,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    /// `FakeDriver`'s prologue. Named because two tests count it on the wire, and
+    /// one of them subtracts its length from a reported byte total.
+    const FAKE_SESSION_BEGIN: [u8; 2] = [0x1b, 0x04];
+
+    /// A payload big enough to need several chunk writes, so a gate on the second
+    /// write catches the worker mid-pass. How large a chunk the manager writes is
+    /// its own business; a test only needs a job that outgrows it.
+    const MULTI_CHUNK_PAYLOAD: usize = 64 * 1024;
+
     struct FakeDriver {
         profile: MachineProfile,
         caps: MachineCaps,
@@ -748,7 +757,7 @@ mod tests {
     impl Driver for FakeDriver {
         fn profile(&self) -> &MachineProfile { &self.profile }
         fn caps(&self) -> MachineCaps { self.caps }
-        fn session_begin(&self) -> Vec<u8> { vec![0x1b, 0x04] }
+        fn session_begin(&self) -> Vec<u8> { FAKE_SESSION_BEGIN.to_vec() }
         fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> { Ok(vec![0xAA; self.payload_len]) }
         fn pass_park(&self) -> Vec<u8> { self.park_bytes.clone() }
         fn session_end(&self) -> Vec<u8> { b"SO0".to_vec() }
@@ -817,9 +826,9 @@ mod tests {
     #[test]
     fn connect_transitions_disconnected_to_idle_and_events_fire() {
         let (mgr, events) = DeviceManager::spawn(Arc::new(test_factory()));
-        assert!(matches!(mgr.snapshot(), DeviceState::Disconnected));
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.connect(cameo_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Idle);
         let kinds: Vec<_> = events.try_iter().collect();
         assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Connecting))));
         assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Idle))));
@@ -830,9 +839,9 @@ mod tests {
     fn connect_failure_yields_error_state_and_reconnect_recovers() {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(FlakyOpenFactory::new()));
         assert!(mgr.connect(cameo_info()).is_err());
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
-        mgr.connect(cameo_info()).unwrap(); // recovery: a later successful connect clears Error
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Failed);
+        mgr.connect(cameo_info()).unwrap(); // recovery: a later successful connect clears the failure
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -849,7 +858,7 @@ mod tests {
         let (mgr, events) = DeviceManager::spawn(Arc::new(test_factory()));
         drop(events);
         mgr.connect(cameo_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -869,7 +878,7 @@ mod tests {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(test_factory()));
         mgr.connect(cameo_info()).unwrap();
         mgr.disconnect().unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Disconnected));
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.shutdown();
     }
 
@@ -942,14 +951,18 @@ mod tests {
     fn one_pass_job() -> Vec<CutPass> { vec![CutPass { job: empty_job() }] }
     fn two_pass_job() -> Vec<CutPass> { vec![CutPass { job: empty_job() }, CutPass { job: empty_job() }] }
 
-    fn wait_for_state(mgr: &DeviceManager, pred: impl Fn(&DeviceState) -> bool) {
-        for _ in 0..200 {
-            if pred(&mgr.snapshot()) {
-                return;
+    /// Polls `status()` — which never blocks, so this cannot itself be held up by
+    /// the worker it is waiting on — until the phase arrives.
+    fn wait_for_phase(mgr: &DeviceManager, want: Phase) -> CutStatus {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = mgr.status();
+            if s.phase == want {
+                return s;
             }
+            assert!(Instant::now() < deadline, "never reached {want:?}, last was {:?}", s.phase);
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for expected state; last snapshot: {:?}", mgr.snapshot());
     }
 
     fn drain(events: &mpsc::Receiver<DeviceEvent>) -> Vec<DeviceEvent> { events.try_iter().collect() }
@@ -969,9 +982,10 @@ mod tests {
         drain(&events); // discard connect-time (NO_JOB) events; only the job's own events matter below
 
         let job_id = mgr.cut(two_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        let parked = wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        assert_eq!(parked.pass, Some(PassPosition { index: 1, total: 2 }), "parked before pass 2 of 2");
         mgr.resume().unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         let evs = drain(&events);
         assert!(!evs.is_empty());
@@ -980,7 +994,7 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e.kind, DeviceEventKind::JobComplete)));
 
         let written = written.lock().unwrap();
-        assert_eq!(count_subseq(&written, &[0x1b, 0x04]), 1, "one prologue for the whole job");
+        assert_eq!(count_subseq(&written, &FAKE_SESSION_BEGIN), 1, "one prologue for the whole job");
         assert_eq!(count_subseq(&written, b"SO0"), 1, "one epilogue for the whole job");
         mgr.shutdown();
     }
@@ -995,8 +1009,8 @@ mod tests {
         let (factory2, _written2) = factory_with_ready_reads(1);
         let (mgr2, _events2) = DeviceManager::spawn(factory2);
         mgr2.connect(cameo_info()).unwrap();
-        mgr2.cut(two_pass_job()).unwrap(); // pauses in WaitingForColorSwap after pass 1
-        wait_for_state(&mgr2, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        mgr2.cut(two_pass_job()).unwrap(); // pauses for the color swap after pass 1
+        wait_for_phase(&mgr2, Phase::AwaitingColorSwap);
         assert_eq!(mgr2.cut(one_pass_job()).unwrap_err(), DeviceError::Busy); // job still active
 
         mgr.shutdown();
@@ -1008,9 +1022,10 @@ mod tests {
         let (mgr, events) = DeviceManager::spawn(Arc::new(PumaFactory));
         mgr.connect(puma_info()).unwrap();
         let job_id = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::AwaitingCompletion { .. }));
+        let awaiting = wait_for_phase(&mgr, Phase::AwaitingConfirmation);
+        assert!(awaiting.actions.confirm, "the operator is the only way this pass completes");
         mgr.confirm_pass_done().unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::JobComplete)));
@@ -1037,7 +1052,7 @@ mod tests {
     fn candidate_device_answering_status_connects() {
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), vec![Ok(b"0\r".to_vec())]));
         mgr.connect(puma_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -1048,7 +1063,9 @@ mod tests {
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), Vec::new()));
         let err = mgr.connect(puma_info()).unwrap_err();
         assert!(matches!(err, DeviceError::Io(_)), "refusal must carry a reason, got {err:?}");
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert!(matches!(s.error, Some(DeviceError::Io(_))), "and status must repeat the reason");
         mgr.shutdown();
     }
 
@@ -1075,14 +1092,80 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
 
         let job1 = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
         let job2 = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         assert_ne!(job1, job2);
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job1 && matches!(e.kind, DeviceEventKind::JobComplete)));
         assert!(evs.iter().any(|e| e.job_id == job2 && matches!(e.kind, DeviceEventKind::JobComplete)));
+        mgr.shutdown();
+    }
+
+    // --- what a caller used to have to work out for itself ----------------
+    // The three tests below were `acceptEvent` and `terminalTransition` in
+    // apps/desktop/ui/src/cut/viewmodel.ts: rules a caller re-derived because the
+    // manager did not state them. They belong here, against the manager, or the
+    // next caller re-derives them too.
+
+    /// Was `acceptEvent`. A caller should not have to track job ids to know an
+    /// event belongs to the job it is watching.
+    #[test]
+    fn events_from_a_finished_job_do_not_reopen_it() {
+        let (factory, _written) = factory_with_ready_reads(1);
+        let (mgr, events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        let job = mgr.cut(one_pass_job()).expect("cut");
+        let seen: Vec<DeviceEvent> = events.try_iter().collect();
+        assert!(
+            seen.iter().all(|e| e.job_id == job || e.job_id == NO_JOB),
+            "no event may carry a foreign job id: {:?}",
+            seen.iter().map(|e| e.job_id).collect::<Vec<_>>()
+        );
+        assert!(seen.iter().any(|e| e.job_id == job), "the job did report events of its own");
+        assert_eq!(mgr.status().phase, Phase::Idle, "the job is over");
+        mgr.shutdown();
+    }
+
+    /// Was `terminalTransition`'s Cancelled case. A cancel ends the job, but it
+    /// arrives as a resting state rather than a terminal event kind — a caller
+    /// watching only for `JobComplete`/`Failed` waits forever. `phase`/`actions`
+    /// say it outright.
+    #[test]
+    fn a_cancelled_job_reports_done_and_allows_another_cut() {
+        // Reads: pass 1's completion poll, the post-cancel readiness check, then
+        // the replacement job's own poll.
+        let (factory, _written) = factory_with_ready_reads(3);
+        let (mgr, _events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        mgr.cut(two_pass_job()).expect("cut"); // parks for the color swap, so there is a job to cancel
+        wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        mgr.cancel();
+
+        let s = wait_for_phase(&mgr, Phase::Done);
+        assert!(s.actions.cut, "another cut is legal after a cancel");
+        mgr.cut(one_pass_job()).expect("and the manager honours what actions promised");
+        mgr.shutdown();
+    }
+
+    /// Was the `NO_JOB` release case: the viewmodel's job filter outlived the job
+    /// and swallowed lifecycle events, so a disconnect went unnoticed.
+    #[test]
+    fn lifecycle_events_survive_a_finished_job() {
+        let (factory, _written) = factory_with_ready_reads(1);
+        let (mgr, events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        mgr.cut(one_pass_job()).expect("cut");
+        drain(&events); // the job's own events are not what this is about
+
+        mgr.disconnect().expect("disconnect");
+        let after = drain(&events);
+        assert!(after.iter().any(|e| e.job_id == NO_JOB), "disconnect must be reported");
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.shutdown();
     }
 
@@ -1140,8 +1223,10 @@ mod tests {
 
     /// Cuts a large single-pass job on a `GateTransport` gated at the second
     /// chunk write, releases it after calling `cancel()` mid-transmit, then
-    /// asserts: no further payload bytes land, exactly one `abort_bytes` write
-    /// went out, and the final `Cancelled` event carries `expect_completion_known`.
+    /// asserts: transmission advanced by exactly one more chunk and then stopped,
+    /// the reported byte total matches what actually landed on the wire, exactly
+    /// one `abort_bytes` write went out, and the final `Cancelled` event carries
+    /// `expect_completion_known`.
     fn assert_cancel_mid_transmit(caps: MachineCaps, ready_reads: Vec<Result<Vec<u8>, TransportError>>, expect_completion_known: bool) {
         let mirror = Arc::new(Mutex::new(Vec::new()));
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -1153,7 +1238,7 @@ mod tests {
             profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
             caps,
             abort: Some(b"PU;".to_vec()),
-            payload_len: WRITE_CHUNK * 3,
+            payload_len: MULTI_CHUNK_PAYLOAD,
             park_bytes: Vec::new(),
             transports: Mutex::new(VecDeque::from(vec![Box::new(gate) as Box<dyn Transport>])),
         };
@@ -1161,36 +1246,56 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
         drain(&events);
 
-        thread::scope(|scope| {
+        // Read inside the gate but assert outside it: an assertion that fired
+        // before the gate is released would leave the cut thread parked forever
+        // and `thread::scope` would hang the suite instead of failing it.
+        let (mid_transmit, job_id) = thread::scope(|scope| {
             let cut_thread = scope.spawn(|| mgr.cut(one_pass_job()).unwrap());
             ready_rx.recv().unwrap(); // worker is blocked mid-write on chunk 2
+            let mid_transmit = mgr.status();
             mgr.cancel();
             proceed_tx.send(()).unwrap();
-            let job_id = cut_thread.join().unwrap();
-
-            // Cancelled is now the resting state: wait for it directly, and
-            // confirm a live snapshot() actually observes it (not just the
-            // event trail) per the review fix.
-            wait_for_state(&mgr, |s| matches!(s, DeviceState::Cancelled { .. }));
-            assert!(matches!(
-                mgr.snapshot(),
-                DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
-            ));
-            let evs = drain(&events);
-            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
-            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
-            let cancelled = evs.iter().find_map(|e| match &e.kind {
-                DeviceEventKind::StateChanged(DeviceState::Cancelled { completion_known, .. }) if e.job_id == job_id => Some(*completion_known),
-                _ => None,
-            });
-            assert_eq!(cancelled, Some(expect_completion_known));
+            (mid_transmit, cut_thread.join().unwrap())
         });
 
-        let written = mirror.lock().unwrap();
-        // Chunk 1 carries the 2-byte session_begin header plus payload, so the
-        // exact 0xAA count after 2 full chunks land is 2 * WRITE_CHUNK - 2.
-        assert_eq!(written.iter().filter(|&&b| b == 0xAA).count(), 2 * WRITE_CHUNK - 2);
-        assert_eq!(count_subseq(&written, b"PU;"), 1, "abort bytes written exactly once");
+        // Cancelled is the resting state, and it reports as a terminal phase — so
+        // waiting on the published status is enough to know the cancel landed.
+        let at_cancel = wait_for_phase(&mgr, Phase::Done);
+        let evs = drain(&events);
+
+        let mid = mid_transmit.sent.expect("a transmitting cut reports bytes");
+        let stopped = at_cancel.sent.expect("a cancelled cut reports how far it got");
+        assert_eq!(mid_transmit.phase, Phase::Sending, "the gate caught the worker mid-transmit");
+        assert!(mid.sent > 0 && mid.sent < mid.total, "partial progress: {mid:?}");
+        // The gate held chunk 2, so releasing it lands exactly that one chunk before
+        // the cancel flag is next checked. Equal-sized chunks is the cadence under
+        // test; what size they are is the manager's business.
+        assert_eq!(stopped.sent, 2 * mid.sent, "one further chunk landed, then writes stopped");
+        assert!(stopped.sent < mid.total, "the pass did not finish transmitting");
+
+        let (payload_written, aborts) = {
+            let written = mirror.lock().unwrap();
+            (written.iter().filter(|&&b| b == 0xAA).count(), count_subseq(&written, b"PU;"))
+        };
+        // Chunk 1 carries the prologue plus payload, so the payload bytes on the
+        // wire are the reported total less that prologue. A reported byte count
+        // that no transport actually accepted would be worse than no count.
+        assert_eq!(
+            payload_written,
+            stopped.sent - FAKE_SESSION_BEGIN.len(),
+            "reported progress must match the payload bytes that landed"
+        );
+        assert_eq!(aborts, 1, "abort bytes written exactly once");
+
+        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
+        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
+        // `completion_known` has no place in `CutStatus` — nothing a caller can do
+        // differs on it — so the event trail is where it stays observable.
+        let cancelled = evs.iter().find_map(|e| match &e.kind {
+            DeviceEventKind::StateChanged(DeviceState::Cancelled { completion_known, .. }) if e.job_id == job_id => Some(*completion_known),
+            _ => None,
+        });
+        assert_eq!(cancelled, Some(expect_completion_known));
         mgr.shutdown();
     }
 
@@ -1206,14 +1311,18 @@ mod tests {
     #[test]
     fn transport_write_error_mid_job_fails_loudly() {
         let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
-        let write_results = VecDeque::from(vec![Ok(WRITE_CHUNK), Ok(WRITE_CHUNK), Err(TransportError::Io("cable pulled".into()))]);
+        // MockTransport clamps a scripted count to the buffer it is handed, so
+        // usize::MAX is "accept whatever you are offered" — two writes through,
+        // then the cable goes, whatever size the manager writes in.
+        let write_results =
+            VecDeque::from(vec![Ok(usize::MAX), Ok(usize::MAX), Err(TransportError::Io("cable pulled".into()))]);
         let inner = MockTransport { write_results, ..Default::default() };
         let factory = ScriptedFactory {
             info: cameo_info(),
             profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
             caps: cameo_caps,
             abort: None,
-            payload_len: WRITE_CHUNK * 3,
+            payload_len: MULTI_CHUNK_PAYLOAD,
             park_bytes: Vec::new(),
             transports: Mutex::new(VecDeque::from(vec![Box::new(inner) as Box<dyn Transport>])),
         };
@@ -1223,7 +1332,9 @@ mod tests {
 
         let err = mgr.cut(one_pass_job()).unwrap_err();
         assert_eq!(err, DeviceError::Io("cable pulled".into()));
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(DeviceError::Io(_))));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.error, Some(DeviceError::Io("cable pulled".into())));
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
@@ -1283,7 +1394,9 @@ mod tests {
 
         let err = drive(&mgr).unwrap_err();
         assert_eq!(err, expect);
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.error, Some(expect), "status names the same failure the call returned");
         mgr.shutdown();
     }
 
@@ -1376,7 +1489,7 @@ mod tests {
             profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
             caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false },
             abort: None,
-            payload_len: WRITE_CHUNK * 3,
+            payload_len: MULTI_CHUNK_PAYLOAD,
             park_bytes: Vec::new(),
             transports: Mutex::new(VecDeque::from(vec![Box::new(gate) as Box<dyn Transport>])),
         };
@@ -1400,7 +1513,8 @@ mod tests {
         assert_eq!(s.pass, Some(PassPosition { index: 0, total: 1 }), "pass count comes from the submitted Vec");
         // Chunk 1 landed before the gate caught chunk 2, so its per-chunk publish must
         // already be in the cell — proving the in-loop publish, not just its event.
-        assert_eq!(s.sent.unwrap().sent, WRITE_CHUNK);
+        let progress = s.sent.expect("a sending cut reports bytes");
+        assert!(progress.sent > 0 && progress.sent < progress.total, "partial progress: {progress:?}");
 
         assert_eq!(mgr.status().phase, Phase::Idle, "a finished job leaves no pass count behind");
         assert_eq!(mgr.status().pass, None);
@@ -1439,7 +1553,7 @@ mod tests {
         let (mgr, events) = DeviceManager::spawn(factory);
         mgr.connect(cameo_info()).unwrap();
         let job_id = mgr.cut(two_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        wait_for_phase(&mgr, Phase::AwaitingColorSwap);
         drain(&events);
 
         let start = std::time::Instant::now();

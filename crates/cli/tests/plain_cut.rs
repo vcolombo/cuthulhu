@@ -2,6 +2,7 @@
 //! The cut loop driven against a fake device: the bytes a real machine would
 //! receive on the plain (`cuthulhu cut`, no `--by-color`) path, the refusals that
 //! stop bytes being produced at all, and how the loop reports the way a job ended.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -26,9 +27,19 @@ const TWO_COLORS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20
 /// a test only needs a pass that outgrows one.
 const PAD: usize = 64 * 1024;
 
+/// How long a stalled `encode_pass` holds the worker. Only
+/// `a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel` uses it, and
+/// only to keep the worker inside `Command::Cancel` for longer than the cut loop
+/// takes to read one status and send one command. Overshooting costs that test
+/// this much wall clock; undershooting only makes it a weaker test, never a
+/// failing one, since every interleaving reports the same cancelled outcome.
+const CANCEL_STALL: std::time::Duration = std::time::Duration::from_millis(250);
+
 struct FakeDriver {
     profile: MachineProfile,
     pad: usize,
+    /// Set once a cancel has been requested; see `CANCEL_STALL`.
+    stall_encode: Option<Arc<AtomicBool>>,
 }
 impl Driver for FakeDriver {
     fn profile(&self) -> &MachineProfile { &self.profile }
@@ -38,6 +49,14 @@ impl Driver for FakeDriver {
     }
     fn session_begin(&self) -> Vec<u8> { b"BEGIN".to_vec() }
     fn encode_pass(&self, pass: &Job) -> Result<Vec<u8>, DriverError> {
+        // Cancelling a pass parked for confirmation re-encodes it here to report how
+        // many bytes went out, and does so before publishing anything. Stalling here
+        // therefore holds the worker with the *pre-cancel* status still published,
+        // which is the only window in which the cut loop can read a parked phase
+        // that a queued cancel is about to invalidate.
+        if self.stall_encode.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+            std::thread::sleep(CANCEL_STALL);
+        }
         let mut bytes = format!("PASS{}", pass.polylines.len()).into_bytes();
         bytes.resize(bytes.len() + self.pad, b'X');
         Ok(bytes)
@@ -58,7 +77,7 @@ struct TestFactory {
 impl DeviceBackendFactory for TestFactory {
     fn list_devices(&self) -> Vec<DeviceInfo> { vec![info()] }
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        Some(Box::new(FakeDriver { profile: fake_profile(machine_id), pad: 0 }))
+        Some(Box::new(FakeDriver { profile: fake_profile(machine_id), pad: 0, stall_encode: None }))
     }
     fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
         Ok(Box::new(RecordingTransport { inner: MockTransport::default(), sink: self.written.clone() }))
@@ -74,12 +93,41 @@ struct GateFactory {
 impl DeviceBackendFactory for GateFactory {
     fn list_devices(&self) -> Vec<DeviceInfo> { vec![info()] }
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        Some(Box::new(FakeDriver { profile: fake_profile(machine_id), pad: PAD }))
+        Some(Box::new(FakeDriver { profile: fake_profile(machine_id), pad: PAD, stall_encode: None }))
     }
     fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
         Ok(Box::new(GateTransport {
             inner: MockTransport::default(),
             seen_park: false,
+            sync: self.gate.lock().unwrap().take(),
+        }))
+    }
+}
+
+/// Hands out an unpadded pass — one chunk, so its first write is also its last —
+/// gated on that write, plus a driver that stalls the cancel the test lands there.
+/// Together they park a pass for confirmation with a cancel already queued behind
+/// it, which is what a Ctrl-C during a scripted cut does.
+struct ParkedCancelFactory {
+    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl DeviceBackendFactory for ParkedCancelFactory {
+    fn list_devices(&self) -> Vec<DeviceInfo> { vec![info()] }
+    fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+        Some(Box::new(FakeDriver {
+            profile: fake_profile(machine_id),
+            pad: 0,
+            stall_encode: Some(self.cancelled.clone()),
+        }))
+    }
+    fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+        Ok(Box::new(GateTransport {
+            inner: MockTransport::default(),
+            // Already "past a park", so the gate arms on the very first write: the
+            // one chunk of pass 1. A cancel landing inside it is too late for
+            // `transmit_bytes`'s per-chunk flag check to see.
+            seen_park: true,
             sync: self.gate.lock().unwrap().take(),
         }))
     }
@@ -179,6 +227,44 @@ fn a_cancel_part_way_through_is_not_reported_as_a_finished_cut() {
     let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
     assert_eq!(pass, 1, "cancelled during the second pass");
     assert!(sent > 0 && sent < PAD, "stopped part way through that pass, at {sent} bytes");
+    assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
+}
+
+/// The ending a scripted cut got wrong: `Operator::Unattended` never waits, so it
+/// answers a pass parked for confirmation the instant it sees one — and a Ctrl-C
+/// that landed a moment earlier has already taken the job, leaving the worker to
+/// refuse that answer as `Busy`. The state moving under the loop is not a device
+/// fault, and reporting it as one exits 1 on the case
+/// `apps/desktop/MANUAL-CHECKLIST.md` asks a human to test: a scripted cut against
+/// a Puma, cancelled. The interactive path never had this, because
+/// `wait_for_enter_or_cancel` stops waiting once the job reports it was cancelled.
+#[test]
+fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
+    let plan = plan_cut_from_svg(TWO_COLORS, Device::Cameo5, &Settings::default(), &[], None, false).expect("plan");
+    assert_eq!(plan.passes.len(), 2, "a pass parked for confirmation needs a pass after it");
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (proceed_tx, proceed_rx) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(ParkedCancelFactory {
+        gate: Mutex::new(Some((ready_tx, proceed_rx))),
+        cancelled: cancelled.clone(),
+    });
+
+    let outcome = run(&plan, info(), factory, Operator::Unattended, |mgr| {
+        std::thread::spawn(move || {
+            ready_rx.recv().expect("the first pass reached the wire");
+            mgr.cancel();
+            cancelled.store(true, Ordering::SeqCst); // stall the recompute the cancel is about to do
+            proceed_tx.send(()).expect("release the gated write");
+        });
+        Ok(())
+    })
+    .expect("a cancel while parked is an ending, not a fault");
+
+    let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
+    assert_eq!(pass, 0, "cancelled on the first pass, so the second was never asked for");
+    assert!(sent > 0, "that pass had already gone out in full when the cancel landed");
     assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
 }
 

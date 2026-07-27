@@ -6,7 +6,7 @@
 //! the same code runs against hardware and against `MockTransport`.
 use std::sync::Arc;
 
-use driver_core::manager::DeviceManager;
+use driver_core::manager::{DeviceError, DeviceManager};
 use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Ended, Phase};
 
 /// Who answers the machine's pauses.
@@ -77,6 +77,19 @@ pub fn ended_message(outcome: &Outcome) -> String {
     }
 }
 
+/// Answering the pause the loop last read. A cancel can land between reading the
+/// status and answering it — Ctrl-C during a scripted cut, which never waits — and
+/// the worker then refuses the answer with `Busy` because the job is already gone.
+/// That is the state having moved, not a fault: the next turn of the loop re-reads
+/// the status and reports the real ending. Every other `DeviceError` is a device
+/// that stopped working, and stays an error.
+fn answer_pause(what: &str, result: Result<(), DeviceError>) -> Result<(), String> {
+    match result {
+        Ok(()) | Err(DeviceError::Busy) => Ok(()),
+        Err(e) => Err(format!("{what}: {e:?}")),
+    }
+}
+
 /// Connect, cut, and drive the job to its end, reporting how it ended. A cancelled
 /// cut is an `Outcome`, not an error; a device fault is an `Err`.
 ///
@@ -112,7 +125,7 @@ pub fn run(
                     pass_color(plan, &status),
                 );
                 if operator.wait_ack(&prompt, &mgr) {
-                    mgr.resume().map_err(|e| format!("resume: {e:?}"))?;
+                    answer_pause("resume", mgr.resume())?;
                 }
             }
             Phase::AwaitingConfirmation => {
@@ -123,7 +136,7 @@ pub fn run(
                     pass_color(plan, &status),
                 );
                 if operator.wait_ack(&prompt, &mgr) {
-                    mgr.confirm_pass_done().map_err(|e| format!("confirm: {e:?}"))?;
+                    answer_pause("confirm", mgr.confirm_pass_done())?;
                 }
             }
             // Nothing is happening, so the job is over and the operator has nothing

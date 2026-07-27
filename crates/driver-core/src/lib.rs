@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 pub mod manager;
+pub mod status;
+pub use status::{Actions, ByteProgress, CutStatus, PassPosition, Phase};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job { pub polylines: Vec<Polyline>, pub settings: Settings }

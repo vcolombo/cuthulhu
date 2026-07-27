@@ -158,8 +158,15 @@ mod tests {
         assert_eq!(s.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
     }
 
-    /// A cut that ended is `Done` whether it finished or was cancelled; only a fault
-    /// is `Failed`, and it carries the reason.
+    /// The three endings are distinct: a job that ran to the end rests on `Idle`,
+    /// `Done` is reached by nothing but a cancel (and carries where it stopped), and
+    /// only a fault is `Failed`, which carries the reason. A caller reporting the
+    /// ending must not collapse `Idle` and `Done` — that tells an operator who
+    /// cancelled that the whole job was cut.
+    ///
+    /// A future `ended: Completed | Cancelled` would let a completed job report a
+    /// terminal phase of its own instead of resting on `Idle`; that is a design
+    /// change, not a fix.
     #[test]
     fn terminal_phases_are_distinguishable() {
         assert_eq!(status_of(&DeviceState::Idle, 0).phase, Phase::Idle);

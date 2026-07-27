@@ -28,7 +28,7 @@ npm --prefix $P run dev                  # vite dev server on :5173
 npm --prefix $P run build                # tsc + vite build -> dist/ (must be committed)
 npm --prefix $P test                     # vitest run
 npm --prefix $P test -- viewmodel        # one file
-npm --prefix $P exec playwright install chromium   # once per checkout; e2e cannot launch without it
+npm --prefix $P exec -- playwright install --with-deps chromium   # once per checkout; see below
 npm --prefix $P run e2e                  # playwright; boots `npm run dev` itself
 
 (cd apps/desktop && cargo tauri dev)     # cargo-tauri installed globally
@@ -41,6 +41,12 @@ Every command above runs from the repository root, and the `cd`s that need to ha
 subshells for a reason: `cargo tauri` finds its config by searching **subfolders**, never parents,
 so running it from `apps/desktop/ui` fails with "Couldn't recognize the current folder as a Tauri
 project" rather than walking up to `apps/desktop`.
+
+Two details in that block that look like noise and are not. `--with-deps` matches what CI installs:
+without it Playwright downloads the browser but not the system libraries it needs, so `npm run e2e`
+fails at launch on a fresh Linux box (a no-op on macOS, so keep it either way). And `exec --` is
+required because `npm exec` otherwise eats `--with-deps` as its own config flag and silently drops
+it — you get `Unknown cli config "--with-deps"` and a browser installed without dependencies.
 
 `tauri.conf.json`'s `beforeDevCommand`/`beforeBuildCommand` are a bare `npm run build`, and that
 is correct: Tauri runs them from the **frontend** directory (`apps/desktop/ui`), not from the

@@ -23,19 +23,24 @@ cargo test --workspace --locked          # what CI runs; --locked is mandatory (
 cargo test -p cutplan preflight          # one crate, filtered by test-name substring
 cargo run -p cli -- cut file.svg --dry-run
 
-cd apps/desktop/ui
-npm run dev                              # vite dev server on :5173
-npm run build                            # tsc + vite build -> dist/ (must be committed)
-npm test                                 # vitest run
-npm test -- viewmodel                    # one file
-npx playwright install chromium          # once per checkout; e2e cannot launch without it
-npm run e2e                              # playwright; boots `npm run dev` itself
+P=apps/desktop/ui                        # every line below runs from the repo root
+npm --prefix $P run dev                  # vite dev server on :5173
+npm --prefix $P run build                # tsc + vite build -> dist/ (must be committed)
+npm --prefix $P test                     # vitest run
+npm --prefix $P test -- viewmodel        # one file
+npm --prefix $P exec playwright install chromium   # once per checkout; e2e cannot launch without it
+npm --prefix $P run e2e                  # playwright; boots `npm run dev` itself
 
-cargo tauri dev                          # from apps/desktop (cargo-tauri installed globally)
-cargo tauri build                        # produces target/release/bundle/{macos,dmg}
+(cd apps/desktop && cargo tauri dev)     # cargo-tauri installed globally
+(cd apps/desktop && cargo tauri build)   # -> target/release/bundle/{macos,dmg}
 
-cd tools && python3 -m pytest            # spike tool tests
+(cd tools && python3 -m pytest)          # spike tool tests
 ```
+
+Every command above runs from the repository root, and the `cd`s that need to happen are inside
+subshells for a reason: `cargo tauri` finds its config by searching **subfolders**, never parents,
+so running it from `apps/desktop/ui` fails with "Couldn't recognize the current folder as a Tauri
+project" rather than walking up to `apps/desktop`.
 
 `tauri.conf.json`'s `beforeDevCommand`/`beforeBuildCommand` are a bare `npm run build`, and that
 is correct: Tauri runs them from the **frontend** directory (`apps/desktop/ui`), not from the

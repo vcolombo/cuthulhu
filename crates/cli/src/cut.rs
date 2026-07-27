@@ -129,13 +129,17 @@ pub fn run(
             // Nothing is happening, so the job is over and the operator has nothing
             // left to answer. `ended` is what says which ending it was.
             Phase::Idle => {
-                return Ok(match status.ended {
-                    Some(Ended::Cancelled) => Outcome::Cancelled {
+                return match status.ended {
+                    Some(Ended::Cancelled) => Ok(Outcome::Cancelled {
                         pass: status.pass.map(|p| p.index).unwrap_or(0),
                         sent: status.sent.map(|b| b.sent).unwrap_or(0),
-                    },
-                    _ => Outcome::Completed { passes: total },
-                })
+                    }),
+                    Some(Ended::Completed) => Ok(Outcome::Completed { passes: total }),
+                    // Reading a bare `Idle` as success is the inference this task deleted
+                    // from the dialog, so it is not reintroduced here: a job that reaches
+                    // a rest state without saying how it ended is a `driver-core` bug.
+                    None => Err("cut ended without reporting how".into()),
+                }
             }
             Phase::Failed => return Err(format!("device error: {:?}", status.error)),
             // Sending / Cancelling / connection phases: nothing for the operator to do.

@@ -648,6 +648,30 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
+// A completed banner belongs to the connection that cut it: a reconnect is a fresh
+// device that has cut nothing, so the ending must go with the old connection. This is
+// the reconnect half of what the dialog's latch used to get for free by remounting —
+// the status has to clear it, and driver-core's lifecycle emit is what does.
+test("a reconnect clears the completed banner from the previous connection", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByText("Job complete")).toBeVisible();
+
+  // No Disconnect control exists in the UI, so drive the command the way the device
+  // dropping out would: straight through the IPC surface.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expect(page.getByText("Job complete")).toHaveCount(0);
+});
+
 // Losing the device mid-pause abandons the job. The reconnect reports Idle — the same
 // phase a finished cut rests on — so a dialog that remembers "a cut was running" across
 // the disconnect declares a job that never finished complete.

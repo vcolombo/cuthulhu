@@ -93,6 +93,10 @@ impl CutStatus {
 pub(crate) fn status_of(state: &DeviceState, total_passes: usize, ended: Option<Ended>) -> CutStatus {
     let ended = match state {
         DeviceState::Cancelled { .. } => Some(Ended::Cancelled),
+        // A fault is not an ending, and callers render `ended` and `Failed`
+        // independently — a remembered ending surviving into `Error` would have a
+        // failed cut report itself complete at the same time.
+        DeviceState::Error(_) => None,
         _ => ended,
     };
     let pass = |index: usize| Some(PassPosition { index, total: total_passes });
@@ -206,7 +210,9 @@ mod tests {
     /// so a failed job would otherwise report itself complete as well.
     #[test]
     fn a_fault_is_not_an_ending() {
-        let failed = status_of(&DeviceState::Error(DeviceError::Timeout), 1, None);
+        // Handed a remembered completion on purpose: the fault has to clear it, not
+        // merely fail to add one.
+        let failed = status_of(&DeviceState::Error(DeviceError::Timeout), 1, Some(Ended::Completed));
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.ended, None);
         assert_eq!(failed.error, Some(DeviceError::Timeout));

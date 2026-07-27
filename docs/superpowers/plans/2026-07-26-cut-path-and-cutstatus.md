@@ -1510,9 +1510,18 @@ Expected: PASS.
 - [ ] **Step 3: Close the old surface**
 
 In `crates/driver-core/src/manager.rs`, change `pub enum DeviceState` to
-`pub(crate) enum DeviceState` and delete `DeviceManager::snapshot`. Nothing outside
-`driver-core` should reference either any more — if the build fails here, a caller was
-missed in Tasks 11-13 and that is exactly what this step is for.
+`pub(crate) enum DeviceState`, and narrow `DeviceManager::snapshot` to `pub(crate)` rather
+than deleting it. Nothing outside `driver-core` should reference either any more — if the
+build fails here, a caller was missed in Tasks 11-13 and that is exactly what this step is
+for.
+
+**Why narrow rather than delete.** `assert_cancel_mid_transmit` reads `completion_known`
+through `snapshot()`, and that field has no `CutStatus` equivalent — Task 12 removed the
+event trail that used to carry it, so this is now its only observation point. Tests inside
+`manager.rs` are in-crate, so a `pub(crate)` `snapshot()` keeps that assertion working while
+the public surface closes exactly as intended. Deleting it would force either a widened
+`CutStatus` or the loss of the assertion, and neither is worth it. If you find `snapshot()`
+has no remaining in-crate caller, then delete it.
 
 - [ ] **Step 4: Prove the state machine is not reachable outside driver-core**
 

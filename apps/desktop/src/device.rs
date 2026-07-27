@@ -71,15 +71,15 @@ impl DeviceManagerHandle {
         self.factory.list_devices()
     }
 
-    /// Capability is the Driver's answer, not ours — asking the factory keeps the
-    /// thing that encodes the bytes the thing that says what they can carry.
+    /// Capability is the Driver's answer, not ours — the Driver that encodes the
+    /// bytes is also what declares what they can carry.
     /// `Result`, not `Option`: an id the registry cannot build means the caller
     /// is out of sync with it, which is worth surfacing rather than defaulting.
     pub fn caps_for(&self, machine_id: &str) -> Result<MachineCaps, IpcError> {
         self.factory
             .driver_for(machine_id)
             .map(|d| d.caps())
-            .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for '{machine_id}'")))
+            .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{machine_id}`")))
     }
 
     pub fn connect(&self, info: DeviceInfo) -> Result<(), IpcError> {

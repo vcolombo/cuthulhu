@@ -2,7 +2,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
-use driver_core::{CutStatus, DeviceInfo};
+use driver_core::{CutStatus, DeviceInfo, MachineCaps};
 use geometry::{Affine, BoolOp};
 use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PlanCutResponse};
 use crate::state::AppState;
@@ -154,6 +154,11 @@ pub fn confirm_pass_done(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
 #[tauri::command]
 pub fn list_presets(machine_id: String) -> Result<Vec<MaterialPreset>, IpcError> {
     crate::device::list_presets(&machine_id)
+}
+
+#[tauri::command]
+pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) -> Result<MachineCaps, IpcError> {
+    dev.caps_for(&machine_id)
 }
 
 #[tauri::command]

@@ -8,7 +8,7 @@ use cutplan::presets::{
 };
 use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
-use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo};
+use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, MachineCaps};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -69,6 +69,17 @@ impl DeviceManagerHandle {
 
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         self.factory.list_devices()
+    }
+
+    /// Capability is the Driver's answer, not ours — the Driver that encodes the
+    /// bytes is also what declares what they can carry.
+    /// `Result`, not `Option`: an id the registry cannot build means the caller
+    /// is out of sync with it, which is worth surfacing rather than defaulting.
+    pub fn caps_for(&self, machine_id: &str) -> Result<MachineCaps, IpcError> {
+        self.factory
+            .driver_for(machine_id)
+            .map(|d| d.caps())
+            .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{machine_id}`")))
     }
 
     pub fn connect(&self, info: DeviceInfo) -> Result<(), IpcError> {
@@ -305,7 +316,12 @@ mod tests {
     struct TestFactory;
     impl DeviceBackendFactory for TestFactory {
         fn list_devices(&self) -> Vec<DeviceInfo> { vec![test_instance()] }
-        fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+        fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            // Mirrors the real registry: an id nobody claims resolves to nothing,
+            // rather than silently handing back some other machine's encoder.
+            if machine_id != "cameo5" {
+                return None;
+            }
             Some(Box::new(TestDriver {
                 profile: MachineProfile { id: "cameo5".into(), name: "Test Cameo".into(), width_mm: 500.0, height_mm: 500.0 },
                 // A machine that cannot be polled parks the cut at `AwaitingConfirmation`
@@ -407,5 +423,38 @@ mod tests {
         let (dev, _events) = DeviceManagerHandle::new(Arc::new(TestFactory));
         dev.shutdown();
         assert_eq!(dev.status().phase, Phase::Disconnected);
+    }
+
+    #[test]
+    fn caps_for_returns_the_drivers_own_answer() {
+        let (dev, _events) = DeviceManagerHandle::new(Arc::new(TestFactory));
+        let caps = dev.caps_for("cameo5").expect("known machine id");
+        assert_eq!(
+            caps,
+            MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: true }
+        );
+    }
+
+    #[test]
+    fn caps_for_unknown_machine_is_an_error_not_a_default() {
+        let (dev, _events) = DeviceManagerHandle::new(Arc::new(TestFactory));
+        let err = dev.caps_for("nope").expect_err("no driver claims this id");
+        assert_eq!(err.code, "unknown_machine");
+    }
+
+    /// The UI reads `caps.supportsSpeed`. Drop the serde rename and it reads
+    /// `undefined`, `!undefined` is `true`, and every field greys out on every
+    /// machine — silent, and wrong in the direction that looks plausible.
+    #[test]
+    fn machine_caps_serializes_in_the_casing_the_ui_reads() {
+        let json = serde_json::to_value(MachineCaps {
+            supports_speed: true,
+            supports_force: false,
+            needs_operator_pass_confirm: true,
+        })
+        .unwrap();
+        assert_eq!(json["supportsSpeed"], serde_json::json!(true));
+        assert_eq!(json["supportsForce"], serde_json::json!(false));
+        assert_eq!(json["needsOperatorPassConfirm"], serde_json::json!(true));
     }
 }

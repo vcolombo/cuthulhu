@@ -416,6 +416,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     list_presets: () => [],
+    // Deliberately one constant, not a per-machine table: that mapping is pinned in
+    // Rust by each Driver's own caps test, and restating it here would recreate the
+    // copy this change removed — in a file nobody thinks of as production code.
+    machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
     save_preset: () => null,
     delete_preset: () => null,
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.

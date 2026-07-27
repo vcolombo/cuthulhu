@@ -59,6 +59,13 @@ pub struct CutStatus {
 }
 
 impl CutStatus {
+    /// What to report when there is no manager to ask — the desktop holds its
+    /// `DeviceManager` in an `Option` it empties at shutdown, and a status is
+    /// still owed after that.
+    pub fn disconnected() -> CutStatus {
+        status_of(&DeviceState::Disconnected, 0)
+    }
+
     /// True while a cut is mid-flight — what the window-close guard asks.
     pub fn is_active(&self) -> bool {
         matches!(

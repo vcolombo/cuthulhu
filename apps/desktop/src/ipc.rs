@@ -2,8 +2,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
-use driver_core::DeviceInfo;
-use driver_core::manager::DeviceState;
+use driver_core::{CutStatus, DeviceInfo};
 use geometry::{Affine, BoolOp};
 use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PlanCutResponse};
 use crate::state::AppState;
@@ -104,11 +103,11 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
-// Non-blocking, event-driven cache — safe to call even while a cut is
-// mid-transmit (never touches the worker thread; see DeviceManagerHandle::cached_state).
+// Non-blocking — safe to call even while a cut is mid-transmit, since the status is
+// published rather than asked of the worker (see DeviceManagerHandle::status).
 #[tauri::command]
-pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<DeviceState, IpcError> {
-    Ok(dev.cached_state())
+pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {
+    Ok(dev.status())
 }
 
 // Non-blocking cache read, same shape as get_device_state — lets the UI recover which

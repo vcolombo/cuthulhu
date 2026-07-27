@@ -46,12 +46,17 @@ impl From<TransportError> for DeviceError {
     }
 }
 
+/// An event and the status that held when it was sent, so a listener renders from
+/// what it just received rather than polling for a value that may already have
+/// moved on.
 #[derive(Debug, Clone, Serialize)]
-pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind }
+pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind, pub status: CutStatus }
 
 #[derive(Debug, Clone, Serialize)]
 pub enum DeviceEventKind {
-    StateChanged(DeviceState),
+    /// Carries no payload: the event's `status` is what changed. A state the
+    /// caller cannot act on differently is not a distinction worth publishing.
+    StateChanged,
     Progress { pass_index: usize, submitted_bytes: usize, total_bytes: usize },
     PassComplete(usize),
     JobComplete,
@@ -94,7 +99,7 @@ impl DeviceManager {
         let (event_tx, event_rx) = mpsc::channel::<DeviceEvent>();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let worker_flag = cancel_flag.clone();
-        let status = Arc::new(Mutex::new(status_of(&DeviceState::Disconnected, 0)));
+        let status = Arc::new(Mutex::new(CutStatus::disconnected()));
         let reporter = Reporter { events: event_tx, status: status.clone() };
         let handle = thread::spawn(move || worker_loop(cmd_rx, reporter, factory, worker_flag));
         (DeviceManager { cmd_tx, handle, cancel_flag, status }, event_rx)
@@ -210,12 +215,13 @@ impl Reporter {
     /// rely on: one woken by an event and calling `status()` cannot then see a
     /// value older than the event that woke it.
     fn emit(&self, state: &DeviceState, total_passes: usize, job_id: u64, kind: DeviceEventKind) {
+        let status = status_of(state, total_passes);
         // The guard dies at the end of this statement, so the lock is not held
         // across the send below — nor, anywhere in this worker, across a
         // transport write or read.
-        *self.status.lock().unwrap() = status_of(state, total_passes);
+        *self.status.lock().unwrap() = status.clone();
         // Dropped receiver must not panic the worker.
-        let _ = self.events.send(DeviceEvent { job_id, kind });
+        let _ = self.events.send(DeviceEvent { job_id, kind, status });
     }
 }
 
@@ -229,8 +235,8 @@ fn emit(state: &mut DeviceState, new: DeviceState, rep: &Reporter) {
 /// Like `emit`, but tags the `StateChanged` event with the job it belongs to
 /// instead of `NO_JOB`, so listeners can filter a job's own state transitions.
 fn emit_for(job_id: u64, state: &mut DeviceState, new: DeviceState, total_passes: usize, rep: &Reporter) {
-    *state = new.clone();
-    rep.emit(state, total_passes, job_id, DeviceEventKind::StateChanged(new));
+    *state = new;
+    rep.emit(state, total_passes, job_id, DeviceEventKind::StateChanged);
 }
 
 /// A job parked mid-flight (waiting on a color swap or an operator's pass
@@ -270,9 +276,9 @@ const WRITE_CHUNK: usize = 4096;
 
 /// Write `bytes` in `WRITE_CHUNK`-sized pieces, updating `Transmitting` state
 /// and emitting a `Progress` event after each chunk actually lands. Emits a
-/// single `StateChanged(Transmitting)` event up front (not one per chunk) so
-/// listeners — the GUI, in particular — see the device enter `Transmitting`
-/// and can offer a cancel control for the whole pass. Checks `cancel_flag`
+/// single `StateChanged` event up front (not one per chunk) so listeners — the
+/// GUI, in particular — see the device enter `Phase::Sending` and can offer a
+/// cancel control for the whole pass. Checks `cancel_flag`
 /// before each chunk so a cancel mid-transmit stops promptly.
 fn transmit_bytes(
     transport: &mut dyn Transport,
@@ -829,9 +835,12 @@ mod tests {
         assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.connect(cameo_info()).unwrap();
         assert_eq!(mgr.status().phase, Phase::Idle);
-        let kinds: Vec<_> = events.try_iter().collect();
-        assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Connecting))));
-        assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Idle))));
+        let evs: Vec<_> = events.try_iter().collect();
+        let changed_to = |phase| {
+            evs.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged) && e.status.phase == phase)
+        };
+        assert!(changed_to(Phase::Connecting));
+        assert!(changed_to(Phase::Idle));
         mgr.shutdown();
     }
 
@@ -1287,15 +1296,20 @@ mod tests {
         );
         assert_eq!(aborts, 1, "abort bytes written exactly once");
 
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
+        // The stop is announced through the event stream before the terminal phase
+        // lands. `CancelRequested` and `Stopping` both report as `Cancelling` — a
+        // caller can do nothing different in one than the other, which is why the
+        // status collapses them.
+        assert!(evs.iter().any(|e| e.job_id == job_id
+            && matches!(e.kind, DeviceEventKind::StateChanged)
+            && e.status.phase == Phase::Cancelling));
+
         // `completion_known` has no place in `CutStatus` — nothing a caller can do
-        // differs on it — so the event trail is where it stays observable.
-        let cancelled = evs.iter().find_map(|e| match &e.kind {
-            DeviceEventKind::StateChanged(DeviceState::Cancelled { completion_known, .. }) if e.job_id == job_id => Some(*completion_known),
-            _ => None,
-        });
-        assert_eq!(cancelled, Some(expect_completion_known));
+        // differs on it — so the resting state is where it stays observable.
+        assert!(matches!(
+            mgr.snapshot(),
+            DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
+        ));
         mgr.shutdown();
     }
 
@@ -1561,9 +1575,14 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "shutdown should cancel and join promptly");
 
         let evs = drain(&events);
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
+        let changed_to = |phase| {
+            evs.iter().any(|e| {
+                e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged) && e.status.phase == phase
+            })
+        };
+        assert!(changed_to(Phase::Cancelling));
         // Cancelled is the resting state post-shutdown (no further Cut arrives
-        // to lazily flip it back to Idle), so that's the terminal state here.
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Cancelled { .. }))));
+        // to lazily flip it back to Idle), and it reports as `Done`.
+        assert!(changed_to(Phase::Done));
     }
 }

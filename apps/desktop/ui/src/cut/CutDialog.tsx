@@ -8,9 +8,6 @@ import {
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
-  dialogPhase,
-  canStartCut,
-  dialogButtons,
   type PassVm,
   type Caps,
   type Preset,
@@ -32,10 +29,7 @@ type Props = {
   scene: Scene;
   artboard: { x: number; y: number; w: number; h: number };
   docMachineId: string | null;
-  deviceState: ipc.DeviceState;
-  cutOutcome: "complete" | "failed" | null;
-  clearCutOutcome: () => void;
-  setJobId: (id: number | null) => void;
+  status: ipc.CutStatus;
   refreshDeviceState: () => void;
   onConvertMachine: (machineId: string) => void;
   onError: (msg: string) => void;
@@ -77,10 +71,7 @@ export function CutDialog({
   scene,
   artboard,
   docMachineId,
-  deviceState,
-  cutOutcome,
-  clearCutOutcome,
-  setJobId,
+  status,
   refreshDeviceState,
   onConvertMachine,
   onError,
@@ -110,11 +101,6 @@ export function CutDialog({
         return ipc.listPresets(info.machine_id).then((p) => setPresets(p as Preset[]));
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
-    // A stale jobId or latched outcome from a previous dialog session must not
-    // leak into this one: reopening the dialog starts fresh, so a prior cut's
-    // "Job complete"/"Cut failed" banner doesn't reappear.
-    setJobId(null);
-    clearCutOutcome();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -161,36 +147,15 @@ export function CutDialog({
 
   const caps = connected ? CAPS[connected.machine_id] ?? DEFAULT_CAPS : DEFAULT_CAPS;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
-  const phase = dialogPhase(deviceState);
-  const buttons = dialogButtons(phase);
-  // The banner keys off cutOutcome, which App.tsx latches from the job's own
-  // terminal event — decoupled from jobId, which is the *event-filter* id and is
-  // released the moment the job ends (so NO_JOB=0 lifecycle events keep flowing).
-  // Deriving the banner from jobId + an Idle state was wrong twice over: it either
-  // flashed for one render (jobId cleared on completion) or showed "Job complete"
-  // for a *failed* job whose lagging state cache read Idle (jobId retained).
-  // Cleared on mount (above) and on every new cut (startCut below).
-  const justCompleted = cutOutcome === "complete";
-  const failed = cutOutcome === "failed";
 
   const startCut = () => {
     if (!connected || planRevision === null) return;
-    // Resets on every new cut() call: without this, a second cut in the same
-    // dialog session keeps the finished first job's id around, so acceptEvent
-    // (App.tsx) rejects every event the new job emits until it happens to reuse
-    // the old id (it never does — ids are strictly increasing). The previous
-    // outcome banner also clears — a new cut supersedes it.
-    setJobId(null);
-    clearCutOutcome();
     const request = toCutRequest(connected.instance_id, planRevision, rows);
-    ipc
-      .cut(request)
-      .then((id) => setJobId(id))
-      .catch((e) => {
-        const code = ipc.ipcErrorCode(e);
-        if (code === "stale_plan") setStalePlan(true);
-        onError(ipc.ipcErrorMessage(e));
-      });
+    ipc.cut(request).catch((e) => {
+      const code = ipc.ipcErrorCode(e);
+      if (code === "stale_plan") setStalePlan(true);
+      onError(ipc.ipcErrorMessage(e));
+    });
   };
 
   const resume = () => {
@@ -351,46 +316,47 @@ export function CutDialog({
         <CutPreview scene={scene} artboard={artboard} passes={rows} travel={travel} />
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {phase.kind === "waitingSwap" ? <span>Waiting for color swap</span> : null}
-          {phase.kind === "transmitting" ? (
+          {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
+          {status.phase === "Sending" && status.sent ? (
             <span>
-              sending {phase.submittedBytes} / {phase.totalBytes} bytes
+              sending {status.sent.sent} / {status.sent.total} bytes
             </span>
           ) : null}
-          {phase.kind === "cancelRequested" ? <span>cancel requested</span> : null}
-          {phase.kind === "stopping" ? <span>stopping</span> : null}
-          {phase.kind === "awaitingCompletion" ? <span>Awaiting completion</span> : null}
-          {phase.kind === "cancelled" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
-          {justCompleted ? <span>Job complete</span> : null}
-          {failed ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
+          {status.phase === "Cancelling" ? <span>cancelling</span> : null}
+          {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
+          {/* How the last job ended comes from the backend, so the dialog remembers
+              nothing: no latch, no reading `actions.cancel` as a liveness bit. */}
+          {status.ended === "Cancelled" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
+          {status.ended === "Completed" ? <span>Job complete</span> : null}
+          {status.phase === "Failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
 
           <div style={{ flex: 1 }} />
 
-          {buttons.resume ? (
+          {status.actions.resume ? (
             <button aria-label="Resume" style={btn} onClick={resume}>
               Resume
             </button>
           ) : null}
-          {buttons.confirmPassDone ? (
+          {status.actions.confirm ? (
             <button aria-label="Confirm pass done" style={btn} onClick={confirmPassDone}>
               Confirm pass done
             </button>
           ) : null}
-          {buttons.cancel ? (
+          {status.actions.cancel ? (
             <button aria-label="Cancel" style={btn} onClick={cancel}>
               Cancel
             </button>
           ) : null}
-          {buttons.start ? (
-            <button
-              aria-label="Start Cut"
-              style={btn}
-              disabled={!connected || !canStartCut(phase) || machineMismatch || rows.length === 0}
-              onClick={startCut}
-            >
-              Start Cut
-            </button>
-          ) : null}
+          {/* The only enablement checks left are the ones the backend cannot know:
+              whether this dialog has a device, a matching machine and rows to cut. */}
+          <button
+            aria-label="Start Cut"
+            style={btn}
+            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0}
+            onClick={startCut}
+          >
+            Start Cut
+          </button>
         </div>
       </div>
     </div>

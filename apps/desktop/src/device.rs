@@ -7,8 +7,8 @@ use cutplan::presets::{
     SettingsOverride,
 };
 use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
-use driver_core::manager::{CutPass, DeviceEvent, DeviceEventKind, DeviceManager, DeviceState};
-use driver_core::{DeviceBackendFactory, DeviceInfo};
+use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
+use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -49,14 +49,6 @@ pub struct DeviceManagerHandle {
     // several live handles to the same manager (not the case here — one per app).
     manager: Mutex<Option<Arc<DeviceManager>>>,
     pub connected: Mutex<Option<DeviceInfo>>,
-    // ponytail: event-driven cache, kept current by the bridge thread calling
-    // `record_state` for every event it forwards. Never blocks on the worker
-    // thread (unlike `DeviceManager::snapshot()`), so it's safe to read from
-    // the close handler or a polling command even mid-transmit; may lag the
-    // true state by one event. Upgrade to a blocking read only if a caller
-    // ever needs the exact instantaneous state (tests use `DeviceManager::
-    // snapshot()` directly for that).
-    state_cache: Mutex<DeviceState>,
 }
 
 impl DeviceManagerHandle {
@@ -66,7 +58,6 @@ impl DeviceManagerHandle {
             factory,
             manager: Mutex::new(Some(Arc::new(mgr))),
             connected: Mutex::new(None),
-            state_cache: Mutex::new(DeviceState::Disconnected),
         };
         (handle, events)
     }
@@ -92,30 +83,14 @@ impl DeviceManagerHandle {
         Ok(())
     }
 
-    /// Called by the event bridge thread for every event it forwards; updates
-    /// the cache on `StateChanged`. Also synthesizes `Transmitting` from
-    /// `Progress` — the worker sets `Transmitting` directly and only emits
-    /// `Progress` ticks while it holds, so without this arm the cache never
-    /// observes an in-flight transmit and `is_active` stays stuck. Every
-    /// other event kind is ignored.
-    pub fn record_state(&self, event: &DeviceEvent) {
-        match &event.kind {
-            DeviceEventKind::StateChanged(s) => *self.state_cache.lock().unwrap() = s.clone(),
-            DeviceEventKind::Progress { pass_index, submitted_bytes, total_bytes } => {
-                *self.state_cache.lock().unwrap() = DeviceState::Transmitting {
-                    job_id: event.job_id,
-                    pass_index: *pass_index,
-                    submitted_bytes: *submitted_bytes,
-                    total_bytes: *total_bytes,
-                };
-            }
-            _ => {}
+    /// Where the cut has got to. Reads `driver-core`'s published status, which
+    /// never blocks on the worker — so the window-close handler and the IPC
+    /// command can both call it freely, even mid-transmit.
+    pub fn status(&self) -> CutStatus {
+        match self.manager.lock().unwrap().as_ref() {
+            Some(mgr) => mgr.status(),
+            None => CutStatus::disconnected(),
         }
-    }
-
-    /// Non-blocking, event-driven snapshot — see `state_cache`'s doc comment.
-    pub fn cached_state(&self) -> DeviceState {
-        self.state_cache.lock().unwrap().clone()
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
@@ -218,13 +193,6 @@ impl DeviceManagerHandle {
     }
 }
 
-/// True while a cut job is mid-flight — used by the window close handler to
-/// decide whether to block the close and ask the UI to confirm.
-pub fn is_active(state: &DeviceState) -> bool {
-    use DeviceState::*;
-    matches!(state, Transmitting { .. } | AwaitingCompletion { .. } | WaitingForColorSwap { .. } | CancelRequested { .. } | Stopping { .. })
-}
-
 /// Every way `plan_cut` can refuse, as an IPC code the UI can branch on.
 /// `stale_plan` is the one the frontend actually keys off (CutDialog.tsx).
 fn map_cut_error(e: CutError) -> IpcError {
@@ -321,7 +289,7 @@ pub fn delete_preset(id: &str) -> Result<(), IpcError> {
 mod tests {
     use super::*;
     use cutplan::DocumentPasses;
-    use driver_core::{Driver, Job, MachineCaps, MachineProfile, Transport, TransportError, TransportKind};
+    use driver_core::{Driver, Job, MachineCaps, MachineProfile, Phase, Transport, TransportError, TransportKind};
 
     struct TestDriver { profile: MachineProfile, caps: MachineCaps }
     impl Driver for TestDriver {
@@ -340,7 +308,12 @@ mod tests {
         fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
             Some(Box::new(TestDriver {
                 profile: MachineProfile { id: "cameo5".into(), name: "Test Cameo".into(), width_mm: 500.0, height_mm: 500.0 },
-                caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false },
+                // A machine that cannot be polled parks the cut at `AwaitingConfirmation`
+                // instead of driving it to completion, so a cut submitted here stops at a
+                // stable mid-flight phase. `MockTransport` answers no status query, so a
+                // pollable machine would instead sit out the manager's 60s completion
+                // budget and then fail.
+                caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: true },
             }))
         }
         fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
@@ -410,15 +383,29 @@ mod tests {
         assert_eq!(err.code, "unknown_pass_color");
     }
 
+    /// The bridge used to synthesize `Transmitting` from `Progress` because the
+    /// worker never re-emitted a state mid-transmit. `CutStatus` carries the
+    /// progress in the phase itself, so the synthesis has nothing left to do —
+    /// note that nothing here consumes the event channel at all.
     #[test]
-    fn progress_event_marks_cache_transmitting() {
+    fn status_reports_a_mid_flight_cut_without_the_bridge_synthesizing_it() {
+        let mut app = AppState::new();
         let dev = test_device_setup();
-        assert!(!is_active(&dev.cached_state()));
-        let event = DeviceEvent {
-            job_id: 1,
-            kind: DeviceEventKind::Progress { pass_index: 0, submitted_bytes: 10, total_bytes: 100 },
-        };
-        dev.record_state(&event);
-        assert!(is_active(&dev.cached_state()));
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        let s = dev.status();
+        // The exact phase, not merely a mid-flight one: a fixture that let the cut
+        // run to completion would leave nothing in flight for the status to report,
+        // and this test would then pass without ever exercising the question.
+        assert_eq!(s.phase, Phase::AwaitingConfirmation, "the cut should be parked mid-flight");
+        assert!(s.is_active(), "a parked cut is what makes the close guard block a quit");
+    }
+
+    #[test]
+    fn status_without_a_manager_reads_disconnected() {
+        let (dev, _events) = DeviceManagerHandle::new(Arc::new(TestFactory));
+        dev.shutdown();
+        assert_eq!(dev.status().phase, Phase::Disconnected);
     }
 }

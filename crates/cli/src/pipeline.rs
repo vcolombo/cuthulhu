@@ -24,20 +24,6 @@ impl Device {
     }
 }
 
-pub fn build_bytes(svg: &[u8], device: Device, settings: &Settings) -> Result<Vec<u8>, String> {
-    let imp = fileio::svg_to_paths(svg).map_err(|e| format!("SVG parse: {e:?}"))?;
-    let polylines = imp.paths.iter()
-        .flat_map(|(path, _)| path.flatten(0.1))
-        .collect::<Vec<_>>();
-    if polylines.is_empty() { return Err("no cuttable paths in SVG".into()); }
-    let job = Job { polylines, settings: settings.clone() };
-    let d = device.driver();
-    let mut bytes = d.session_begin();
-    bytes.extend(d.encode_pass(&job).map_err(|e| format!("encode: {e:?}"))?);
-    bytes.extend(d.session_end());
-    Ok(bytes)
-}
-
 /// Bytes for pass `i` of `total`, framed exactly as `DeviceManager` transmits
 /// them: `session_begin` before the first pass, `pass_park` between passes,
 /// `session_end` after the last. Keeps `cut --by-color --dry-run` output
@@ -59,6 +45,31 @@ pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     let mut doc = document::Document::new();
     let (delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
         .map_err(|e| format!("SVG parse: {e:?}"))?;
+    doc.apply(delta);
+    Ok(doc)
+}
+
+/// The stroke a plain cut gives every imported path. Opaque black, matching
+/// `document::Style::default()`.
+pub const CUT_STROKE: u32 = 0x000000FF;
+
+/// Import `svg` for a plain (non-`--by-color`) cut: every path gets the same
+/// stroke, so `plan_passes` finds all of it and groups it into exactly one
+/// `ColorPass`.
+///
+/// This is what the plain path has always meant — cut everything in the file,
+/// in one pass — stated explicitly so the cut can go through `plan_cut` and be
+/// preflighted. It deliberately does not touch `plan_passes`' stroke rule; see
+/// issue #68 for whether that rule should change at all.
+pub fn doc_from_svg_all_cuttable(svg: &[u8]) -> Result<document::Document, String> {
+    let mut doc = document::Document::new();
+    let (mut delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
+        .map_err(|e| format!("SVG parse: {e:?}"))?;
+    for op in delta.0.iter_mut() {
+        if let document::NodeOp::Add { node, .. } = op {
+            node.style.stroke = Some(CUT_STROKE);
+        }
+    }
     doc.apply(delta);
     Ok(doc)
 }
@@ -121,6 +132,28 @@ pub fn plan_cut_from_svg(
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
 
+/// Plan a plain cut: all geometry, one pass, validated through `plan_cut` — the
+/// same entry point the desktop and `--by-color` use.
+pub fn plan_plain_cut(
+    svg: &[u8],
+    device: Device,
+    settings: &Settings,
+    allow_out_of_bounds: bool,
+) -> Result<cutplan::CutPlan, String> {
+    let doc = doc_from_svg_all_cuttable(svg)?;
+    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
+    // Checked here rather than left to `plan_cut`: with no passes at all, asking for
+    // CUT_STROKE is an unmatched colour, and "no pass matches color" describes the
+    // request instead of the file.
+    if planned.passes.is_empty() {
+        return Err("no cuttable paths in SVG".into());
+    }
+    let passes = vec![cutplan::PassSelection { color: Some(CUT_STROKE), settings: settings.clone() }];
+    let driver = device.driver();
+    let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
+    cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
+}
+
 /// `CutError` as something to print at a terminal. Out-of-bounds names the
 /// escape hatch, since that is the one refusal an operator may reasonably
 /// want to overrule.
@@ -149,12 +182,22 @@ pub fn parse_hex_color(s: &str) -> Result<u32, String> {
     u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
 }
 
-/// `--allow-out-of-bounds` relaxes a preflight rule, and only `--by-color`
-/// cuts are preflighted. Accepting it on the plain path would say a check was
-/// overruled when no check ran.
-pub fn check_out_of_bounds_scope(allow_out_of_bounds: bool, by_color: bool) -> Result<(), String> {
-    if allow_out_of_bounds && !by_color {
-        return Err("--allow-out-of-bounds applies to --by-color cuts; the plain cut path runs no preflight".into());
+/// `--skip-color` and `--order` select and sequence colours, which only a
+/// `--by-color` cut has. A plain cut puts every colour in one pass, so these
+/// flags cannot do anything there and are refused rather than ignored.
+pub fn check_color_flag_scope(
+    skip_colors: &[String],
+    order: &Option<String>,
+    by_color: bool,
+) -> Result<(), String> {
+    if by_color {
+        return Ok(());
+    }
+    if !skip_colors.is_empty() {
+        return Err("--skip-color applies to --by-color cuts; a plain cut is one pass over every colour".into());
+    }
+    if order.is_some() {
+        return Err("--order applies to --by-color cuts; a plain cut is one pass over every colour".into());
     }
     Ok(())
 }
@@ -166,14 +209,6 @@ pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> 
         return Err("--by-color requires an interactive terminal".into());
     }
     Ok(())
-}
-
-/// `#RRGGBB` for the operator prompt — drop the alpha byte.
-pub fn format_pass_color(color: Option<u32>) -> String {
-    match color {
-        Some(c) => format!("#{:06x}", c >> 8),
-        None => "none".into(),
-    }
 }
 
 #[cfg(test)]
@@ -233,15 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn allow_out_of_bounds_without_by_color_is_an_error() {
-        // Silently accepting it would imply preflight ran and was relaxed, when
-        // the plain cut path runs no preflight at all.
-        assert!(check_out_of_bounds_scope(true, false).is_err());
-        assert!(check_out_of_bounds_scope(true, true).is_ok());
-        assert!(check_out_of_bounds_scope(false, false).is_ok());
-    }
-
-    #[test]
     fn noninteractive_multicolor_is_error() {
         assert_eq!(
             check_interactive(false, 2),
@@ -256,6 +282,65 @@ mod tests {
         assert_eq!(parse_hex_color("ff0000ff"), Ok(0xFF0000FF));
         assert!(parse_hex_color("ff0000").is_err(), "6-digit RRGGBB must be rejected, not zero-padded");
         assert!(parse_hex_color("nothex12").is_err());
+    }
+
+    /// A fill-only SVG is what Illustrator, Inkscape and most clipart emit. The plain
+    /// cut path has always cut it, so routing that path through `plan_passes` — which
+    /// skips strokeless shapes — must not change what it cuts.
+    #[test]
+    fn fill_only_svg_plans_exactly_one_pass() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
+        let doc = doc_from_svg_all_cuttable(svg).expect("import");
+        let planned = cutplan::plan_passes(&doc).expect("plan");
+        assert_eq!(planned.passes.len(), 1, "all geometry belongs to one pass");
+        assert_eq!(planned.passes[0].color, Some(CUT_STROKE));
+    }
+
+    #[test]
+    fn plain_cut_plans_one_pass() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="#ff0000"/></svg>"##;
+        let plan = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect("plan");
+        assert_eq!(plan.passes.len(), 1);
+    }
+
+    /// The whole point of the change: the plain path is preflighted. A shape past the
+    /// bed's edge was silently sent to the machine before.
+    #[test]
+    fn plain_cut_refuses_out_of_bounds_geometry() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
+            <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
+        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false)
+            .expect_err("out of bounds must be refused");
+        assert!(err.contains("outside"), "unexpected message: {err}");
+        // ...and the escape hatch works, now that there is a check to overrule.
+        assert!(plan_plain_cut(svg, Device::Cameo5, &Settings::default(), true).is_ok());
+    }
+
+    /// With no paths at all, `plan_passes` yields no passes, so the requested colour
+    /// matches nothing. Without the empty check that surfaces as `UnknownPassColor`,
+    /// which reads as an internal error rather than "there is nothing here".
+    #[test]
+    fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
+        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect_err("empty");
+        assert_eq!(err, "no cuttable paths in SVG");
+    }
+
+    /// `--skip-color` and `--order` name colours, and a plain cut deliberately
+    /// collapses every colour into one pass. Accepting them silently — which is what
+    /// happened before — reports success for a flag that did nothing.
+    #[test]
+    fn colour_flags_are_refused_without_by_color() {
+        let red = vec!["FF0000FF".to_string()];
+        let err = check_color_flag_scope(&red, &None, false).expect_err("must refuse");
+        assert!(err.contains("--skip-color"), "unexpected message: {err}");
+        let err = check_color_flag_scope(&[], &Some("FF0000FF".into()), false).expect_err("must refuse");
+        assert!(err.contains("--order"), "unexpected message: {err}");
+        // Both are fine with --by-color, and absence is fine either way.
+        assert!(check_color_flag_scope(&red, &Some("FF0000FF".into()), true).is_ok());
+        assert!(check_color_flag_scope(&[], &None, false).is_ok());
     }
 
     #[test]

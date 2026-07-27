@@ -8,16 +8,20 @@
 //! chunks and ENQ polls (for a busy worker), plus a queued `Command::Cancel`
 //! for a worker parked at `recv()` — see `DeviceManager::cancel`.
 
+use crate::status::{status_of, CutStatus, Ended};
 use crate::{write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
 use serde::Serialize;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub enum DeviceState {
+/// The machine, in full detail. Deliberately crate-private: callers read
+/// `CutStatus`, so there is only ever one derivation of phase and legal actions.
+pub(crate) enum DeviceState {
     Disconnected,
     Connecting,
     Idle,
@@ -45,12 +49,17 @@ impl From<TransportError> for DeviceError {
     }
 }
 
+/// An event and the status that held when it was sent, so a listener renders from
+/// what it just received rather than polling for a value that may already have
+/// moved on.
 #[derive(Debug, Clone, Serialize)]
-pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind }
+pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind, pub status: CutStatus }
 
 #[derive(Debug, Clone, Serialize)]
 pub enum DeviceEventKind {
-    StateChanged(DeviceState),
+    /// Carries no payload: the event's `status` is what changed. A state the
+    /// caller cannot act on differently is not a distinction worth publishing.
+    StateChanged,
     Progress { pass_index: usize, submitted_bytes: usize, total_bytes: usize },
     PassComplete(usize),
     JobComplete,
@@ -68,6 +77,7 @@ const NO_JOB: u64 = 0;
 enum Command {
     Connect { info: DeviceInfo, reply: mpsc::Sender<Result<(), DeviceError>> },
     Disconnect { reply: mpsc::Sender<Result<(), DeviceError>> },
+    #[cfg(test)]
     Snapshot { reply: mpsc::Sender<DeviceState> },
     Cut { passes: Vec<CutPass>, reply: mpsc::Sender<Result<u64, DeviceError>> },
     Cancel,
@@ -80,6 +90,11 @@ pub struct DeviceManager {
     cmd_tx: mpsc::SyncSender<Command>,
     handle: thread::JoinHandle<()>,
     cancel_flag: Arc<AtomicBool>,
+    /// Published by the worker on every state change and progress tick. Read
+    /// without touching the command channel, so a caller is never blocked by a
+    /// busy worker. It may lag the worker by one event — that is the single
+    /// documented lag rule, and every caller shares it.
+    status: Arc<Mutex<CutStatus>>,
 }
 
 impl DeviceManager {
@@ -88,8 +103,25 @@ impl DeviceManager {
         let (event_tx, event_rx) = mpsc::channel::<DeviceEvent>();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let worker_flag = cancel_flag.clone();
-        let handle = thread::spawn(move || worker_loop(cmd_rx, event_tx, factory, worker_flag));
-        (DeviceManager { cmd_tx, handle, cancel_flag }, event_rx)
+        let status = Arc::new(Mutex::new(CutStatus::disconnected()));
+        let reporter = Reporter { events: event_tx, status: status.clone(), ended: Cell::new(None) };
+        let handle = thread::spawn(move || worker_loop(cmd_rx, reporter, factory, worker_flag));
+        (DeviceManager { cmd_tx, handle, cancel_flag, status }, event_rx)
+    }
+
+    /// Where the cut has got to, and what may be done next. Never blocks: unlike
+    /// `snapshot()`, which round-trips through the worker's command channel and so
+    /// waits out whatever transport write the worker is inside, this reads the cell
+    /// the worker publishes.
+    pub fn status(&self) -> CutStatus {
+        // A dead worker publishes nothing ever again, so the cell would freeze on
+        // whatever it last held — a UI left offering a cancel button for a cut that
+        // no longer has a thread behind it. `snapshot()` gets this for free from its
+        // channel error; this read path has to ask.
+        if self.handle.is_finished() {
+            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0, None);
+        }
+        self.status.lock().unwrap().clone()
     }
 
     /// Send a command built from a fresh reply channel and wait for the reply.
@@ -108,7 +140,11 @@ impl DeviceManager {
         self.call(|reply| Command::Disconnect { reply })?
     }
 
-    pub fn snapshot(&self) -> DeviceState {
+    /// The only observation point for detail `CutStatus` deliberately does not
+    /// carry (`completion_known`). Nothing shipping needs it, so it exists for
+    /// the tests in this file and nowhere else.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> DeviceState {
         self.call(|reply| Command::Snapshot { reply }).unwrap_or(DeviceState::Disconnected)
     }
 
@@ -173,16 +209,55 @@ impl DeviceManager {
     }
 }
 
-fn emit(state: &mut DeviceState, new: DeviceState, events: &mpsc::Sender<DeviceEvent>) {
-    emit_for(NO_JOB, state, new, events);
+/// The worker's two ways of reporting: the event stream, and the status cell
+/// `DeviceManager::status()` reads. One type owns both so no site can send an
+/// event without publishing — a site that forgot would leave the published
+/// status silently frozen while events kept flowing.
+struct Reporter {
+    events: mpsc::Sender<DeviceEvent>,
+    status: Arc<Mutex<CutStatus>>,
+    /// How the last job finished. Kept here rather than threaded through every
+    /// emit because this is the only thing that reads it, and because a job that
+    /// ran to the end rests on `DeviceState::Idle` — the outcome has nowhere else
+    /// to live. Touched only by the worker thread, hence `Cell`.
+    ended: Cell<Option<Ended>>,
+}
+
+impl Reporter {
+    /// A new job, or a lifecycle transition, has nothing to do with how the last
+    /// job ended: pass `None` so a fresh cut cannot report the previous outcome.
+    fn set_ended(&self, ended: Option<Ended>) {
+        self.ended.set(ended);
+    }
+
+    /// Publishes the status, then sends the event. That order is what callers
+    /// rely on: one woken by an event and calling `status()` cannot then see a
+    /// value older than the event that woke it.
+    fn emit(&self, state: &DeviceState, total_passes: usize, job_id: u64, kind: DeviceEventKind) {
+        let status = status_of(state, total_passes, self.ended.get());
+        // The guard dies at the end of this statement, so the lock is not held
+        // across the send below — nor, anywhere in this worker, across a
+        // transport write or read.
+        *self.status.lock().unwrap() = status.clone();
+        // Dropped receiver must not panic the worker.
+        let _ = self.events.send(DeviceEvent { job_id, kind, status });
+    }
+}
+
+/// A lifecycle transition (connect/disconnect, or clearing a cancelled rest
+/// state) belongs to no job, so it reports no pass count and no outcome — every
+/// state reachable this way has no pass position of its own, and a freshly
+/// connected device has cut nothing.
+fn emit(state: &mut DeviceState, new: DeviceState, rep: &Reporter) {
+    rep.set_ended(None);
+    emit_for(NO_JOB, state, new, 0, rep);
 }
 
 /// Like `emit`, but tags the `StateChanged` event with the job it belongs to
 /// instead of `NO_JOB`, so listeners can filter a job's own state transitions.
-fn emit_for(job_id: u64, state: &mut DeviceState, new: DeviceState, events: &mpsc::Sender<DeviceEvent>) {
-    *state = new.clone();
-    // Dropped receiver must not panic the worker.
-    let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::StateChanged(new) });
+fn emit_for(job_id: u64, state: &mut DeviceState, new: DeviceState, total_passes: usize, rep: &Reporter) {
+    *state = new;
+    rep.emit(state, total_passes, job_id, DeviceEventKind::StateChanged);
 }
 
 /// A job parked mid-flight (waiting on a color swap or an operator's pass
@@ -222,22 +297,24 @@ const WRITE_CHUNK: usize = 4096;
 
 /// Write `bytes` in `WRITE_CHUNK`-sized pieces, updating `Transmitting` state
 /// and emitting a `Progress` event after each chunk actually lands. Emits a
-/// single `StateChanged(Transmitting)` event up front (not one per chunk) so
-/// listeners — the GUI, in particular — see the device enter `Transmitting`
-/// and can offer a cancel control for the whole pass. Checks `cancel_flag`
+/// single `StateChanged` event up front (not one per chunk) so listeners — the
+/// GUI, in particular — see the device enter `Phase::Sending` and can offer a
+/// cancel control for the whole pass. Checks `cancel_flag`
 /// before each chunk so a cancel mid-transmit stops promptly.
 fn transmit_bytes(
     transport: &mut dyn Transport,
     bytes: &[u8],
     job_id: u64,
     pass_index: usize,
+    total_passes: usize,
     state: &mut DeviceState,
-    events: &mpsc::Sender<DeviceEvent>,
+    rep: &Reporter,
     cancel_flag: &AtomicBool,
 ) -> Result<TransmitOutcome, DeviceError> {
     let total_bytes = bytes.len();
     let mut submitted_bytes = 0usize;
-    emit_for(job_id, state, DeviceState::Transmitting { job_id, pass_index, submitted_bytes, total_bytes }, events);
+    let sending = DeviceState::Transmitting { job_id, pass_index, submitted_bytes, total_bytes };
+    emit_for(job_id, state, sending, total_passes, rep);
     for chunk in bytes.chunks(WRITE_CHUNK) {
         if cancel_flag.load(Ordering::SeqCst) {
             return Ok(TransmitOutcome::Cancelled { submitted_bytes });
@@ -245,10 +322,12 @@ fn transmit_bytes(
         write_all(transport, chunk).map_err(DeviceError::from)?;
         submitted_bytes += chunk.len();
         *state = DeviceState::Transmitting { job_id, pass_index, submitted_bytes, total_bytes };
-        let _ = events.send(DeviceEvent {
+        rep.emit(
+            state,
+            total_passes,
             job_id,
-            kind: DeviceEventKind::Progress { pass_index, submitted_bytes, total_bytes },
-        });
+            DeviceEventKind::Progress { pass_index, submitted_bytes, total_bytes },
+        );
     }
     Ok(TransmitOutcome::Completed)
 }
@@ -341,18 +420,24 @@ fn finish_pass(
     driver: &(dyn Driver + Send),
     transport: &mut dyn Transport,
     state: &mut DeviceState,
-    events: &mpsc::Sender<DeviceEvent>,
+    rep: &Reporter,
 ) -> Result<PassRunOutcome, DeviceError> {
-    let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::PassComplete(pass_index) });
+    rep.emit(state, total_passes, job_id, DeviceEventKind::PassComplete(pass_index));
     if pass_index + 1 < total_passes {
         write_all(transport, &driver.pass_park()).map_err(DeviceError::from)?;
         let next_pass_index = pass_index + 1;
-        emit_for(job_id, state, DeviceState::WaitingForColorSwap { job_id, next_pass_index }, events);
+        emit_for(job_id, state, DeviceState::WaitingForColorSwap { job_id, next_pass_index }, total_passes, rep);
         Ok(PassRunOutcome::Paused { next_pass_index })
     } else {
         write_all(transport, &driver.session_end()).map_err(DeviceError::from)?;
-        let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::JobComplete });
-        emit_for(job_id, state, DeviceState::Idle, events);
+        rep.emit(state, total_passes, job_id, DeviceEventKind::JobComplete);
+        // Set after `JobComplete` goes out, not before: that event still carries the
+        // mid-flight status, and a caller renders it — a "completed" outcome attached
+        // to a `Sending` phase would read as a cut both finishing and still running.
+        rep.set_ended(Some(Ended::Completed));
+        // The job is over, so `Idle` reports no pass count. `total_passes` is a
+        // parameter, not worker state, so nothing stale can outlive this call.
+        emit_for(job_id, state, DeviceState::Idle, 0, rep);
         Ok(PassRunOutcome::Done)
     }
 }
@@ -366,15 +451,16 @@ fn run_from_pass(
     driver: &(dyn Driver + Send),
     transport: &mut dyn Transport,
     state: &mut DeviceState,
-    events: &mpsc::Sender<DeviceEvent>,
+    rep: &Reporter,
     cancel_flag: &AtomicBool,
 ) -> Result<PassRunOutcome, DeviceError> {
+    let total_passes = passes.len();
     let mut bytes = if pass_index == 0 { driver.session_begin() } else { Vec::new() };
     let pass_bytes = driver
         .encode_pass(&passes[pass_index].job)
         .map_err(|e| DeviceError::Io(format!("{e:?}")))?;
     bytes.extend(pass_bytes);
-    match transmit_bytes(transport, &bytes, job_id, pass_index, state, events, cancel_flag)? {
+    match transmit_bytes(transport, &bytes, job_id, pass_index, total_passes, state, rep, cancel_flag)? {
         TransmitOutcome::Cancelled { submitted_bytes } => {
             return Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes });
         }
@@ -383,10 +469,11 @@ fn run_from_pass(
     match resolve_pass_completion(driver, transport, cancel_flag)? {
         PassCompletion::Cancelled => Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes: bytes.len() }),
         PassCompletion::NeedsConfirm => {
-            emit_for(job_id, state, DeviceState::AwaitingCompletion { job_id, pass_index }, events);
+            let awaiting = DeviceState::AwaitingCompletion { job_id, pass_index };
+            emit_for(job_id, state, awaiting, total_passes, rep);
             Ok(PassRunOutcome::AwaitingConfirm { pass_index })
         }
-        PassCompletion::Ready => finish_pass(job_id, pass_index, passes.len(), driver, transport, state, events),
+        PassCompletion::Ready => finish_pass(job_id, pass_index, total_passes, driver, transport, state, rep),
     }
 }
 
@@ -409,23 +496,27 @@ fn pass_byte_len(driver: &(dyn Driver + Send), passes: &[CutPass], pass_index: u
 /// the device's readiness is actually known, then emit `Cancelled` and leave
 /// it as the resting state — `Cancelled` is what `snapshot()`/the next
 /// `Command::Cut` sees until a fresh job starts and transitions to `Idle`.
+/// Resting on a state of its own is why a cancel needs no remembered outcome:
+/// `status_of` reads the ending straight off `Cancelled`.
 fn perform_cancel(
     job_id: u64,
     pass_index: usize,
     submitted_bytes: usize,
+    total_passes: usize,
     driver: &(dyn Driver + Send),
     transport: &mut dyn Transport,
     state: &mut DeviceState,
-    events: &mpsc::Sender<DeviceEvent>,
+    rep: &Reporter,
     cancel_flag: &AtomicBool,
 ) {
-    emit_for(job_id, state, DeviceState::CancelRequested { job_id }, events);
-    emit_for(job_id, state, DeviceState::Stopping { job_id }, events);
+    emit_for(job_id, state, DeviceState::CancelRequested { job_id }, total_passes, rep);
+    emit_for(job_id, state, DeviceState::Stopping { job_id }, total_passes, rep);
     if let Some(abort) = driver.abort_bytes() {
         let _ = write_all(transport, &abort); // best-effort: failure here doesn't block cancellation
     }
     let completion_known = cancel_completion_known(driver, transport);
-    emit_for(job_id, state, DeviceState::Cancelled { job_id, pass_index, submitted_bytes, completion_known }, events);
+    let cancelled = DeviceState::Cancelled { job_id, pass_index, submitted_bytes, completion_known };
+    emit_for(job_id, state, cancelled, total_passes, rep);
     // Cancelled stays the resting state (no auto-Idle) so a snapshot/event
     // drain can actually observe it; Command::Cut clears it back to Idle.
     cancel_flag.store(false, Ordering::SeqCst); // consumed: don't poison the next job
@@ -461,18 +552,27 @@ fn cancel_completion_known(driver: &(dyn Driver + Send), transport: &mut dyn Tra
 
 /// A pass/job failed: report `Failed` + transition to `Error`, returning the
 /// same error so the caller can send it back as the command's reply.
-fn fail(job_id: u64, e: DeviceError, state: &mut DeviceState, events: &mpsc::Sender<DeviceEvent>) -> DeviceError {
-    let _ = events.send(DeviceEvent { job_id, kind: DeviceEventKind::Failed(e.clone()) });
-    emit_for(job_id, state, DeviceState::Error(e.clone()), events);
+fn fail(
+    job_id: u64,
+    e: DeviceError,
+    total_passes: usize,
+    state: &mut DeviceState,
+    rep: &Reporter,
+) -> DeviceError {
+    // `Failed` still reports the state the job died in, so it needs the real pass
+    // count; `Error` itself has no pass position.
+    rep.emit(state, total_passes, job_id, DeviceEventKind::Failed(e.clone()));
+    emit_for(job_id, state, DeviceState::Error(e.clone()), 0, rep);
     e
 }
 
 fn worker_loop(
     cmd_rx: mpsc::Receiver<Command>,
-    events: mpsc::Sender<DeviceEvent>,
+    rep: Reporter,
     factory: Arc<dyn DeviceBackendFactory>,
     cancel_flag: Arc<AtomicBool>,
 ) {
+    let rep = &rep;
     let mut state = DeviceState::Disconnected;
     let mut transport: Option<Box<dyn Transport>> = None;
     let mut driver: Option<Box<dyn Driver + Send>> = None;
@@ -482,6 +582,7 @@ fn worker_loop(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             Command::Shutdown => break,
+            #[cfg(test)]
             Command::Snapshot { reply } => {
                 let _ = reply.send(state.clone());
             }
@@ -490,7 +591,7 @@ fn worker_loop(
                     let _ = reply.send(Err(DeviceError::Busy));
                     continue;
                 }
-                emit(&mut state, DeviceState::Connecting, &events);
+                emit(&mut state, DeviceState::Connecting, rep);
                 let outcome = factory
                     .open_transport(&info)
                     .map_err(DeviceError::from)
@@ -510,21 +611,21 @@ fn worker_loop(
                     Ok((t, d)) => {
                         transport = Some(t);
                         driver = Some(d);
-                        emit(&mut state, DeviceState::Idle, &events);
+                        emit(&mut state, DeviceState::Idle, rep);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
-                        emit(&mut state, DeviceState::Error(e.clone()), &events);
+                        emit(&mut state, DeviceState::Error(e.clone()), rep);
                         let _ = reply.send(Err(e));
                     }
                 }
             }
             Command::Disconnect { reply } => {
-                emit(&mut state, DeviceState::Disconnecting, &events);
+                emit(&mut state, DeviceState::Disconnecting, rep);
                 transport = None;
                 driver = None;
                 active_job = None; // invariant: active_job.is_some() <=> a job is parked
-                emit(&mut state, DeviceState::Disconnected, &events);
+                emit(&mut state, DeviceState::Disconnected, rep);
                 let _ = reply.send(Ok(()));
             }
             Command::Cut { passes, reply } => {
@@ -540,15 +641,19 @@ fn worker_loop(
                     continue;
                 }
                 if matches!(state, DeviceState::Cancelled { .. }) {
-                    emit(&mut state, DeviceState::Idle, &events); // leave the cancelled rest state behind
+                    emit(&mut state, DeviceState::Idle, rep); // leave the cancelled rest state behind
                 }
                 let job_id = next_job_id;
                 next_job_id += 1;
+                // The reported pass count is this Vec's length, for this job only —
+                // read from the job in hand at every emit, never cached on the worker.
+                let total_passes = passes.len();
                 cancel_flag.store(false, Ordering::SeqCst); // fresh job: clear any stale cancel from a prior one
+                rep.set_ended(None); // and the prior job's ending, or this one reports it as its own
                 // Idle/Cancelled both imply a successful prior connect, so both are Some.
                 let drv = driver.as_deref().expect("driver present while Idle");
                 let tr = transport.as_deref_mut().expect("transport present while Idle");
-                match run_from_pass(job_id, 0, &passes, drv, tr, &mut state, &events, &cancel_flag) {
+                match run_from_pass(job_id, 0, &passes, drv, tr, &mut state, rep, &cancel_flag) {
                     Ok(PassRunOutcome::Paused { next_pass_index }) => {
                         active_job = Some(JobProgress { job_id, passes, pass_index: next_pass_index });
                         let _ = reply.send(Ok(job_id));
@@ -561,11 +666,11 @@ fn worker_loop(
                         let _ = reply.send(Ok(job_id));
                     }
                     Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes }) => {
-                        perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
+                        perform_cancel(job_id, pass_index, submitted_bytes, total_passes, drv, tr, &mut state, rep, &cancel_flag);
                         let _ = reply.send(Ok(job_id));
                     }
                     Err(e) => {
-                        let e = fail(job_id, e, &mut state, &events);
+                        let e = fail(job_id, e, total_passes, &mut state, rep);
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -586,16 +691,17 @@ fn worker_loop(
                     } else {
                         0
                     };
-                    perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
+                    perform_cancel(job_id, pass_index, submitted_bytes, passes.len(), drv, tr, &mut state, rep, &cancel_flag);
                 }
                 // else: nothing active, safe no-op.
             }
             Command::Resume { reply } => match (&state, active_job.take()) {
                 (DeviceState::WaitingForColorSwap { .. }, Some(job)) => {
                     let JobProgress { job_id, passes, pass_index } = job;
+                    let total_passes = passes.len();
                     let drv = driver.as_deref().expect("driver present while job active");
                     let tr = transport.as_deref_mut().expect("transport present while job active");
-                    match run_from_pass(job_id, pass_index, &passes, drv, tr, &mut state, &events, &cancel_flag) {
+                    match run_from_pass(job_id, pass_index, &passes, drv, tr, &mut state, rep, &cancel_flag) {
                         Ok(PassRunOutcome::Paused { next_pass_index }) => {
                             active_job = Some(JobProgress { job_id, passes, pass_index: next_pass_index });
                             let _ = reply.send(Ok(()));
@@ -608,7 +714,7 @@ fn worker_loop(
                             let _ = reply.send(Ok(()));
                         }
                         Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes }) => {
-                            perform_cancel(job_id, pass_index, submitted_bytes, drv, tr, &mut state, &events, &cancel_flag);
+                            perform_cancel(job_id, pass_index, submitted_bytes, total_passes, drv, tr, &mut state, rep, &cancel_flag);
                             let _ = reply.send(Ok(()));
                         }
                         Err(e) => {
@@ -617,7 +723,7 @@ fn worker_loop(
                             // deliberately skip the best-effort abort_bytes write
                             // (that belongs to perform_cancel's cancel path) — a
                             // write that just failed is unlikely to accept an abort.
-                            let e = fail(job_id, e, &mut state, &events);
+                            let e = fail(job_id, e, total_passes, &mut state, rep);
                             let _ = reply.send(Err(e));
                         }
                     }
@@ -633,7 +739,7 @@ fn worker_loop(
                     let total_passes = passes.len();
                     let drv = driver.as_deref().expect("driver present while job active");
                     let tr = transport.as_deref_mut().expect("transport present while job active");
-                    match finish_pass(job_id, pass_index, total_passes, drv, tr, &mut state, &events) {
+                    match finish_pass(job_id, pass_index, total_passes, drv, tr, &mut state, rep) {
                         Ok(PassRunOutcome::Paused { next_pass_index }) => {
                             active_job = Some(JobProgress { job_id, passes, pass_index: next_pass_index });
                             let _ = reply.send(Ok(()));
@@ -644,7 +750,7 @@ fn worker_loop(
                         Ok(PassRunOutcome::AwaitingConfirm { .. }) => unreachable!("finish_pass never re-parks for confirmation"),
                         Ok(PassRunOutcome::Cancelled { .. }) => unreachable!("finish_pass never cancels"),
                         Err(e) => {
-                            let e = fail(job_id, e, &mut state, &events);
+                            let e = fail(job_id, e, total_passes, &mut state, rep);
                             let _ = reply.send(Err(e));
                         }
                     }
@@ -661,9 +767,20 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DriverError, MachineCaps, MachineProfile, MockTransport, Settings, TransportKind};
+    use crate::{
+        DriverError, Ended, MachineCaps, MachineProfile, MockTransport, PassPosition, Phase, Settings, TransportKind,
+    };
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    /// `FakeDriver`'s prologue. Named because two tests count it on the wire, and
+    /// one of them subtracts its length from a reported byte total.
+    const FAKE_SESSION_BEGIN: [u8; 2] = [0x1b, 0x04];
+
+    /// A payload big enough to need several chunk writes, so a gate on the second
+    /// write catches the worker mid-pass. How large a chunk the manager writes is
+    /// its own business; a test only needs a job that outgrows it.
+    const MULTI_CHUNK_PAYLOAD: usize = 64 * 1024;
 
     struct FakeDriver {
         profile: MachineProfile,
@@ -675,7 +792,7 @@ mod tests {
     impl Driver for FakeDriver {
         fn profile(&self) -> &MachineProfile { &self.profile }
         fn caps(&self) -> MachineCaps { self.caps }
-        fn session_begin(&self) -> Vec<u8> { vec![0x1b, 0x04] }
+        fn session_begin(&self) -> Vec<u8> { FAKE_SESSION_BEGIN.to_vec() }
         fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> { Ok(vec![0xAA; self.payload_len]) }
         fn pass_park(&self) -> Vec<u8> { self.park_bytes.clone() }
         fn session_end(&self) -> Vec<u8> { b"SO0".to_vec() }
@@ -744,12 +861,15 @@ mod tests {
     #[test]
     fn connect_transitions_disconnected_to_idle_and_events_fire() {
         let (mgr, events) = DeviceManager::spawn(Arc::new(test_factory()));
-        assert!(matches!(mgr.snapshot(), DeviceState::Disconnected));
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.connect(cameo_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
-        let kinds: Vec<_> = events.try_iter().collect();
-        assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Connecting))));
-        assert!(kinds.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Idle))));
+        assert_eq!(mgr.status().phase, Phase::Idle);
+        let evs: Vec<_> = events.try_iter().collect();
+        let changed_to = |phase| {
+            evs.iter().any(|e| matches!(e.kind, DeviceEventKind::StateChanged) && e.status.phase == phase)
+        };
+        assert!(changed_to(Phase::Connecting));
+        assert!(changed_to(Phase::Idle));
         mgr.shutdown();
     }
 
@@ -757,9 +877,9 @@ mod tests {
     fn connect_failure_yields_error_state_and_reconnect_recovers() {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(FlakyOpenFactory::new()));
         assert!(mgr.connect(cameo_info()).is_err());
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
-        mgr.connect(cameo_info()).unwrap(); // recovery: a later successful connect clears Error
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Failed);
+        mgr.connect(cameo_info()).unwrap(); // recovery: a later successful connect clears the failure
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -776,7 +896,7 @@ mod tests {
         let (mgr, events) = DeviceManager::spawn(Arc::new(test_factory()));
         drop(events);
         mgr.connect(cameo_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -796,7 +916,7 @@ mod tests {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(test_factory()));
         mgr.connect(cameo_info()).unwrap();
         mgr.disconnect().unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Disconnected));
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.shutdown();
     }
 
@@ -869,14 +989,32 @@ mod tests {
     fn one_pass_job() -> Vec<CutPass> { vec![CutPass { job: empty_job() }] }
     fn two_pass_job() -> Vec<CutPass> { vec![CutPass { job: empty_job() }, CutPass { job: empty_job() }] }
 
-    fn wait_for_state(mgr: &DeviceManager, pred: impl Fn(&DeviceState) -> bool) {
-        for _ in 0..200 {
-            if pred(&mgr.snapshot()) {
-                return;
+    /// Polls `status()` — which never blocks, so this cannot itself be held up by
+    /// the worker it is waiting on — until the phase arrives.
+    fn wait_for_phase(mgr: &DeviceManager, want: Phase) -> CutStatus {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = mgr.status();
+            if s.phase == want {
+                return s;
             }
+            assert!(Instant::now() < deadline, "never reached {want:?}, last was {:?}", s.phase);
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("timed out waiting for expected state; last snapshot: {:?}", mgr.snapshot());
+    }
+
+    /// Like `wait_for_phase`, but for an ending. Every ending rests on `Phase::Idle`,
+    /// so the phase alone cannot say that a cancel has landed.
+    fn wait_for_ended(mgr: &DeviceManager, want: Ended) -> CutStatus {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let s = mgr.status();
+            if s.ended == Some(want) {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "never ended {want:?}, last was {:?}/{:?}", s.phase, s.ended);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn drain(events: &mpsc::Receiver<DeviceEvent>) -> Vec<DeviceEvent> { events.try_iter().collect() }
@@ -896,9 +1034,10 @@ mod tests {
         drain(&events); // discard connect-time (NO_JOB) events; only the job's own events matter below
 
         let job_id = mgr.cut(two_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        let parked = wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        assert_eq!(parked.pass, Some(PassPosition { index: 1, total: 2 }), "parked before pass 2 of 2");
         mgr.resume().unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         let evs = drain(&events);
         assert!(!evs.is_empty());
@@ -907,7 +1046,7 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e.kind, DeviceEventKind::JobComplete)));
 
         let written = written.lock().unwrap();
-        assert_eq!(count_subseq(&written, &[0x1b, 0x04]), 1, "one prologue for the whole job");
+        assert_eq!(count_subseq(&written, &FAKE_SESSION_BEGIN), 1, "one prologue for the whole job");
         assert_eq!(count_subseq(&written, b"SO0"), 1, "one epilogue for the whole job");
         mgr.shutdown();
     }
@@ -922,8 +1061,8 @@ mod tests {
         let (factory2, _written2) = factory_with_ready_reads(1);
         let (mgr2, _events2) = DeviceManager::spawn(factory2);
         mgr2.connect(cameo_info()).unwrap();
-        mgr2.cut(two_pass_job()).unwrap(); // pauses in WaitingForColorSwap after pass 1
-        wait_for_state(&mgr2, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        mgr2.cut(two_pass_job()).unwrap(); // pauses for the color swap after pass 1
+        wait_for_phase(&mgr2, Phase::AwaitingColorSwap);
         assert_eq!(mgr2.cut(one_pass_job()).unwrap_err(), DeviceError::Busy); // job still active
 
         mgr.shutdown();
@@ -935,9 +1074,10 @@ mod tests {
         let (mgr, events) = DeviceManager::spawn(Arc::new(PumaFactory));
         mgr.connect(puma_info()).unwrap();
         let job_id = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::AwaitingCompletion { .. }));
+        let awaiting = wait_for_phase(&mgr, Phase::AwaitingConfirmation);
+        assert!(awaiting.actions.confirm, "the operator is the only way this pass completes");
         mgr.confirm_pass_done().unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::JobComplete)));
@@ -964,7 +1104,7 @@ mod tests {
     fn candidate_device_answering_status_connects() {
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), vec![Ok(b"0\r".to_vec())]));
         mgr.connect(puma_info()).unwrap();
-        assert!(matches!(mgr.snapshot(), DeviceState::Idle));
+        assert_eq!(mgr.status().phase, Phase::Idle);
         mgr.shutdown();
     }
 
@@ -975,7 +1115,9 @@ mod tests {
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), Vec::new()));
         let err = mgr.connect(puma_info()).unwrap_err();
         assert!(matches!(err, DeviceError::Io(_)), "refusal must carry a reason, got {err:?}");
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert!(matches!(s.error, Some(DeviceError::Io(_))), "and status must repeat the reason");
         mgr.shutdown();
     }
 
@@ -1002,14 +1144,112 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
 
         let job1 = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
         let job2 = mgr.cut(one_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::Idle));
+        wait_for_phase(&mgr, Phase::Idle);
 
         assert_ne!(job1, job2);
         let evs = drain(&events);
         assert!(evs.iter().any(|e| e.job_id == job1 && matches!(e.kind, DeviceEventKind::JobComplete)));
         assert!(evs.iter().any(|e| e.job_id == job2 && matches!(e.kind, DeviceEventKind::JobComplete)));
+        // Distinct ids alone would still let a listener see job 1's tail after job 2
+        // had started, which is why the desktop UI used to filter on job id at all.
+        // One worker sending every event in order down one channel is what let that
+        // filtering go, so it is asserted here rather than left to a comment.
+        let first2 = evs.iter().position(|e| e.job_id == job2).expect("job2 reported");
+        assert!(evs[first2..].iter().all(|e| e.job_id != job1), "no job-1 event may follow job 2's first");
+        mgr.shutdown();
+    }
+
+    // --- what a caller used to have to work out for itself ----------------
+    // The three tests below were `acceptEvent` and `terminalTransition` in
+    // apps/desktop/ui/src/cut/viewmodel.ts: rules a caller re-derived because the
+    // manager did not state them. They belong here, against the manager, or the
+    // next caller re-derives them too.
+
+    /// Was `acceptEvent`. A caller should not have to track job ids to know an
+    /// event belongs to the job it is watching.
+    #[test]
+    fn events_from_a_finished_job_do_not_reopen_it() {
+        let (factory, _written) = factory_with_ready_reads(1);
+        let (mgr, events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        let job = mgr.cut(one_pass_job()).expect("cut");
+        let seen: Vec<DeviceEvent> = events.try_iter().collect();
+        assert!(
+            seen.iter().all(|e| e.job_id == job || e.job_id == NO_JOB),
+            "no event may carry a foreign job id: {:?}",
+            seen.iter().map(|e| e.job_id).collect::<Vec<_>>()
+        );
+        assert!(seen.iter().any(|e| e.job_id == job), "the job did report events of its own");
+        assert_eq!(mgr.status().phase, Phase::Idle, "the job is over");
+        mgr.shutdown();
+    }
+
+    /// The worker's half of the ending. A job that ran to the end rests on `Idle`,
+    /// which says nothing by itself, so the worker remembers `Completed` — and has to
+    /// forget it in the two places it would otherwise be read as this job's own: a
+    /// reconnect (a fresh device has cut nothing) and the next `cut`.
+    #[test]
+    fn a_completed_job_reports_completion_until_something_supersedes_it() {
+        let (factory, _written) = factory_with_ready_reads(2);
+        let (mgr, _events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+        assert_eq!(mgr.status().ended, None, "nothing has run yet");
+
+        mgr.cut(one_pass_job()).expect("cut");
+        let done = wait_for_ended(&mgr, Ended::Completed);
+        assert_eq!(done.phase, Phase::Idle, "phase says what is happening now: nothing");
+        assert_eq!(done.pass, None, "and a finished job leaves no pass position behind");
+
+        mgr.disconnect().expect("disconnect");
+        mgr.connect(cameo_info()).expect("reconnect");
+        assert_eq!(mgr.status().ended, None, "a fresh connection has cut nothing");
+
+        mgr.cut(two_pass_job()).expect("cut"); // parks for the swap, so it is still in flight
+        let parked = wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        assert_eq!(parked.ended, None, "a job in flight has not ended");
+        mgr.shutdown();
+    }
+
+    /// Was `terminalTransition`'s Cancelled case. A cancel ends the job, but it
+    /// arrives as a resting state rather than a terminal event kind — a caller
+    /// watching only for `JobComplete`/`Failed` waits forever. `ended`/`actions`
+    /// say it outright.
+    #[test]
+    fn a_cancelled_job_reports_cancelled_and_allows_another_cut() {
+        // Reads: pass 1's completion poll, the post-cancel readiness check, then
+        // the replacement job's own poll.
+        let (factory, _written) = factory_with_ready_reads(3);
+        let (mgr, _events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        mgr.cut(two_pass_job()).expect("cut"); // parks for the color swap, so there is a job to cancel
+        wait_for_phase(&mgr, Phase::AwaitingColorSwap);
+        mgr.cancel();
+
+        let s = wait_for_ended(&mgr, Ended::Cancelled);
+        assert!(s.actions.cut, "another cut is legal after a cancel");
+        mgr.cut(one_pass_job()).expect("and the manager honours what actions promised");
+        mgr.shutdown();
+    }
+
+    /// Was the `NO_JOB` release case: the viewmodel's job filter outlived the job
+    /// and swallowed lifecycle events, so a disconnect went unnoticed.
+    #[test]
+    fn lifecycle_events_survive_a_finished_job() {
+        let (factory, _written) = factory_with_ready_reads(1);
+        let (mgr, events) = DeviceManager::spawn(factory);
+        mgr.connect(cameo_info()).unwrap();
+
+        mgr.cut(one_pass_job()).expect("cut");
+        drain(&events); // the job's own events are not what this is about
+
+        mgr.disconnect().expect("disconnect");
+        let after = drain(&events);
+        assert!(after.iter().any(|e| e.job_id == NO_JOB), "disconnect must be reported");
+        assert_eq!(mgr.status().phase, Phase::Disconnected);
         mgr.shutdown();
     }
 
@@ -1067,8 +1307,10 @@ mod tests {
 
     /// Cuts a large single-pass job on a `GateTransport` gated at the second
     /// chunk write, releases it after calling `cancel()` mid-transmit, then
-    /// asserts: no further payload bytes land, exactly one `abort_bytes` write
-    /// went out, and the final `Cancelled` event carries `expect_completion_known`.
+    /// asserts: transmission advanced by exactly one more chunk and then stopped,
+    /// the reported byte total matches what actually landed on the wire, exactly
+    /// one `abort_bytes` write went out, and the final `Cancelled` event carries
+    /// `expect_completion_known`.
     fn assert_cancel_mid_transmit(caps: MachineCaps, ready_reads: Vec<Result<Vec<u8>, TransportError>>, expect_completion_known: bool) {
         let mirror = Arc::new(Mutex::new(Vec::new()));
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -1080,7 +1322,7 @@ mod tests {
             profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
             caps,
             abort: Some(b"PU;".to_vec()),
-            payload_len: WRITE_CHUNK * 3,
+            payload_len: MULTI_CHUNK_PAYLOAD,
             park_bytes: Vec::new(),
             transports: Mutex::new(VecDeque::from(vec![Box::new(gate) as Box<dyn Transport>])),
         };
@@ -1088,36 +1330,64 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
         drain(&events);
 
-        thread::scope(|scope| {
+        // Read inside the gate but assert outside it: an assertion that fired
+        // before the gate is released would leave the cut thread parked forever
+        // and `thread::scope` would hang the suite instead of failing it.
+        let (mid_transmit, job_id) = thread::scope(|scope| {
             let cut_thread = scope.spawn(|| mgr.cut(one_pass_job()).unwrap());
-            ready_rx.recv().unwrap(); // worker is blocked mid-write on chunk 2
+            // Timed out, not blocking: the sender lives in a transport the still-running
+            // worker owns, so a gate the worker never reaches (a changed chunk size, a
+            // smaller payload) must fail this test rather than hang the suite.
+            ready_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("worker reached the gated write");
+            let mid_transmit = mgr.status();
             mgr.cancel();
             proceed_tx.send(()).unwrap();
-            let job_id = cut_thread.join().unwrap();
-
-            // Cancelled is now the resting state: wait for it directly, and
-            // confirm a live snapshot() actually observes it (not just the
-            // event trail) per the review fix.
-            wait_for_state(&mgr, |s| matches!(s, DeviceState::Cancelled { .. }));
-            assert!(matches!(
-                mgr.snapshot(),
-                DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
-            ));
-            let evs = drain(&events);
-            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
-            assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Stopping { .. }))));
-            let cancelled = evs.iter().find_map(|e| match &e.kind {
-                DeviceEventKind::StateChanged(DeviceState::Cancelled { completion_known, .. }) if e.job_id == job_id => Some(*completion_known),
-                _ => None,
-            });
-            assert_eq!(cancelled, Some(expect_completion_known));
+            (mid_transmit, cut_thread.join().unwrap())
         });
 
-        let written = mirror.lock().unwrap();
-        // Chunk 1 carries the 2-byte session_begin header plus payload, so the
-        // exact 0xAA count after 2 full chunks land is 2 * WRITE_CHUNK - 2.
-        assert_eq!(written.iter().filter(|&&b| b == 0xAA).count(), 2 * WRITE_CHUNK - 2);
-        assert_eq!(count_subseq(&written, b"PU;"), 1, "abort bytes written exactly once");
+        // Cancelled is the resting state, and it reports its ending — so waiting on
+        // the published status is enough to know the cancel landed.
+        let at_cancel = wait_for_ended(&mgr, Ended::Cancelled);
+        let evs = drain(&events);
+
+        let mid = mid_transmit.sent.expect("a transmitting cut reports bytes");
+        let stopped = at_cancel.sent.expect("a cancelled cut reports how far it got");
+        assert_eq!(mid_transmit.phase, Phase::Sending, "the gate caught the worker mid-transmit");
+        assert!(mid.sent > 0 && mid.sent < mid.total, "partial progress: {mid:?}");
+        // The gate held chunk 2, so releasing it lands exactly that one chunk before
+        // the cancel flag is next checked. Equal-sized chunks is the cadence under
+        // test; what size they are is the manager's business.
+        assert_eq!(stopped.sent, 2 * mid.sent, "one further chunk landed, then writes stopped");
+        assert!(stopped.sent < mid.total, "the pass did not finish transmitting");
+
+        let (payload_written, aborts) = {
+            let written = mirror.lock().unwrap();
+            (written.iter().filter(|&&b| b == 0xAA).count(), count_subseq(&written, b"PU;"))
+        };
+        // Chunk 1 carries the prologue plus payload, so the payload bytes on the
+        // wire are the reported total less that prologue. A reported byte count
+        // that no transport actually accepted would be worse than no count.
+        assert_eq!(
+            payload_written,
+            stopped.sent - FAKE_SESSION_BEGIN.len(),
+            "reported progress must match the payload bytes that landed"
+        );
+        assert_eq!(aborts, 1, "abort bytes written exactly once");
+
+        // The stop is announced through the event stream before the terminal phase
+        // lands. `CancelRequested` and `Stopping` both report as `Cancelling` — a
+        // caller can do nothing different in one than the other, which is why the
+        // status collapses them.
+        assert!(evs.iter().any(|e| e.job_id == job_id
+            && matches!(e.kind, DeviceEventKind::StateChanged)
+            && e.status.phase == Phase::Cancelling));
+
+        // `completion_known` has no place in `CutStatus` — nothing a caller can do
+        // differs on it — so the resting state is where it stays observable.
+        assert!(matches!(
+            mgr.snapshot(),
+            DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
+        ));
         mgr.shutdown();
     }
 
@@ -1133,14 +1403,18 @@ mod tests {
     #[test]
     fn transport_write_error_mid_job_fails_loudly() {
         let cameo_caps = MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false };
-        let write_results = VecDeque::from(vec![Ok(WRITE_CHUNK), Ok(WRITE_CHUNK), Err(TransportError::Io("cable pulled".into()))]);
+        // MockTransport clamps a scripted count to the buffer it is handed, so
+        // usize::MAX is "accept whatever you are offered" — two writes through,
+        // then the cable goes, whatever size the manager writes in.
+        let write_results =
+            VecDeque::from(vec![Ok(usize::MAX), Ok(usize::MAX), Err(TransportError::Io("cable pulled".into()))]);
         let inner = MockTransport { write_results, ..Default::default() };
         let factory = ScriptedFactory {
             info: cameo_info(),
             profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
             caps: cameo_caps,
             abort: None,
-            payload_len: WRITE_CHUNK * 3,
+            payload_len: MULTI_CHUNK_PAYLOAD,
             park_bytes: Vec::new(),
             transports: Mutex::new(VecDeque::from(vec![Box::new(inner) as Box<dyn Transport>])),
         };
@@ -1150,7 +1424,9 @@ mod tests {
 
         let err = mgr.cut(one_pass_job()).unwrap_err();
         assert_eq!(err, DeviceError::Io("cable pulled".into()));
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(DeviceError::Io(_))));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.error, Some(DeviceError::Io("cable pulled".into())));
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
@@ -1210,7 +1486,9 @@ mod tests {
 
         let err = drive(&mgr).unwrap_err();
         assert_eq!(err, expect);
-        assert!(matches!(mgr.snapshot(), DeviceState::Error(_)));
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.error, Some(expect), "status names the same failure the call returned");
         mgr.shutdown();
     }
 
@@ -1279,13 +1557,97 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    /// The desktop cannot use `snapshot()`: it round-trips through the worker's
+    /// command channel, so it blocks for as long as the worker is inside a
+    /// transport write — which is why `apps/desktop/src/device.rs` grew a second
+    /// state cache of its own. `status()` reads published memory instead, so it
+    /// answers while the worker is busy. The gate parks the worker inside the
+    /// second chunk write, so this needs no polling: reaching that point means
+    /// `Transmitting` was already published.
+    #[test]
+    fn status_answers_while_the_worker_is_transmitting() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let inner = MockTransport { reads: VecDeque::from(vec![Ok(b"0\x03".to_vec())]), ..Default::default() };
+        let gate = GateTransport {
+            inner,
+            mirror: Arc::new(Mutex::new(Vec::new())),
+            call_index: 0,
+            block_on: 2,
+            sync: Some((ready_tx, proceed_rx)),
+        };
+        let factory = ScriptedFactory {
+            info: cameo_info(),
+            profile: MachineProfile { id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0 },
+            caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false },
+            abort: None,
+            payload_len: MULTI_CHUNK_PAYLOAD,
+            park_bytes: Vec::new(),
+            transports: Mutex::new(VecDeque::from(vec![Box::new(gate) as Box<dyn Transport>])),
+        };
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(factory));
+        mgr.connect(cameo_info()).unwrap();
+
+        // Read the status inside the gate, but assert outside it: an assertion that
+        // fired before releasing the gate would leave the cut thread parked forever
+        // and `thread::scope` would hang instead of failing.
+        let s = thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = mgr.cut(one_pass_job());
+            });
+            // Timed out for the same reason as `assert_cancel_mid_transmit`'s gate: an
+            // unreached gate must fail this test rather than hang the suite.
+            ready_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("worker reached the gated write");
+            let s = mgr.status();
+            proceed_tx.send(()).unwrap();
+            s
+        });
+        assert_eq!(s.phase, Phase::Sending, "status() must answer from published memory, not the worker");
+        assert!(s.actions.cancel, "a sending cut can be cancelled");
+        assert_eq!(s.pass, Some(PassPosition { index: 0, total: 1 }), "pass count comes from the submitted Vec");
+        // Chunk 1 landed before the gate caught chunk 2, so its per-chunk publish must
+        // already be in the cell — proving the in-loop publish, not just its event.
+        let progress = s.sent.expect("a sending cut reports bytes");
+        assert!(progress.sent > 0 && progress.sent < progress.total, "partial progress: {progress:?}");
+
+        assert_eq!(mgr.status().phase, Phase::Idle, "a finished job leaves no pass count behind");
+        assert_eq!(mgr.status().pass, None);
+        mgr.shutdown();
+    }
+
+    /// A published cell only moves while something is publishing. Once the worker
+    /// is gone the last value would stand forever — `Idle` here, or worse a
+    /// `Sending` with a live cancel button — so `status()` must report the dead
+    /// worker instead. `snapshot()` gets this from its channel error; this is the
+    /// same promise for the read path that replaces it.
+    #[test]
+    fn status_reports_a_dead_worker_instead_of_the_frozen_cell() {
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(test_factory()));
+        mgr.connect(cameo_info()).unwrap();
+        assert_eq!(mgr.status().phase, Phase::Idle, "the cell holds a healthy state to be overridden");
+
+        // Kill the worker without consuming the manager, which `shutdown()` would.
+        mgr.cmd_tx.try_send(Command::Shutdown).unwrap();
+        for _ in 0..200 {
+            if mgr.status().phase == Phase::Failed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let s = mgr.status();
+        assert_eq!(s.phase, Phase::Failed, "a finished worker must not leave the cell reading Idle");
+        assert_eq!(s.error, Some(DeviceError::Disconnected), "and it must say why");
+        assert!(!s.actions.cut && !s.actions.cancel, "nothing can be done to a device with no worker");
+        mgr.shutdown();
+    }
+
     #[test]
     fn shutdown_mid_job_cancels_and_joins() {
         let (factory, _written) = factory_with_ready_reads(1);
         let (mgr, events) = DeviceManager::spawn(factory);
         mgr.connect(cameo_info()).unwrap();
         let job_id = mgr.cut(two_pass_job()).unwrap();
-        wait_for_state(&mgr, |s| matches!(s, DeviceState::WaitingForColorSwap { .. }));
+        wait_for_phase(&mgr, Phase::AwaitingColorSwap);
         drain(&events);
 
         let start = std::time::Instant::now();
@@ -1293,9 +1655,10 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2), "shutdown should cancel and join promptly");
 
         let evs = drain(&events);
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::CancelRequested { .. }))));
-        // Cancelled is the resting state post-shutdown (no further Cut arrives
-        // to lazily flip it back to Idle), so that's the terminal state here.
-        assert!(evs.iter().any(|e| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged(DeviceState::Cancelled { .. }))));
+        let own = |e: &DeviceEvent| e.job_id == job_id && matches!(e.kind, DeviceEventKind::StateChanged);
+        assert!(evs.iter().any(|e| own(e) && e.status.phase == Phase::Cancelling));
+        // Cancelled is the resting state post-shutdown (no further Cut arrives to
+        // lazily flip it back to Idle), and it reports how the job ended.
+        assert!(evs.iter().any(|e| own(e) && e.status.ended == Some(Ended::Cancelled)));
     }
 }

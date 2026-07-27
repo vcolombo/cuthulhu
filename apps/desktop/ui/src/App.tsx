@@ -6,7 +6,6 @@ import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { applyOptimistic, dragMatrix, type Matrix, type Pt } from "./interaction/transform";
-import { acceptEvent, terminalTransition } from "./cut/viewmodel";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
@@ -152,17 +151,7 @@ export function App() {
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
-  const [deviceState, setDeviceState] = useState<ipc.DeviceState>("Disconnected");
-  // Latched terminal outcome of the most recent cut, kept separate from jobId: the
-  // completion/failure banner must outlive the event-filter id, which is released
-  // the moment the job ends (terminalTransition in the listener below) so NO_JOB=0
-  // lifecycle events — e.g. a reconnect after a failed resume — keep flowing.
-  const [cutOutcome, setCutOutcome] = useState<"complete" | "failed" | null>(null);
-  const [jobId, setJobId] = useState<number | null>(null);
-  const jobIdRef = useRef<number | null>(null);
-  useEffect(() => {
-    jobIdRef.current = jobId;
-  }, [jobId]);
+  const [status, setStatus] = useState<ipc.CutStatus>(ipc.DISCONNECTED_STATUS);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
 
@@ -196,7 +185,7 @@ export function App() {
   const refreshDeviceState = useCallback(() => {
     ipc
       .getDeviceState()
-      .then(setDeviceState)
+      .then(setStatus)
       .catch((e) => setError(ipc.ipcErrorMessage(e)));
   }, []);
 
@@ -208,19 +197,12 @@ export function App() {
       .catch((e) => setError(ipc.ipcErrorMessage(e)));
   }, [refresh]);
 
-  // Mount-once device-event listener: filters by job id (viewmodel's acceptEvent — accepts
-  // everything until a job is actually running, then only that job's own events) and keeps
-  // deviceState in sync with StateChanged payloads without a separate poll.
+  // Mount-once device-event listener. Every event carries the status that held when it
+  // was sent, so keeping the latest is the whole job — no event-kind interpreting, no
+  // job-id filtering (one worker sends them in order over one channel), no poll.
   useEffect(() => {
     const unlisten = listen<ipc.DeviceEvent>("device-event", (e) => {
-      const ev = e.payload;
-      if (!acceptEvent(jobIdRef.current, ev)) return;
-      if (typeof ev.kind === "object" && "StateChanged" in ev.kind) {
-        setDeviceState(ev.kind.StateChanged);
-      }
-      const t = terminalTransition(jobIdRef.current, ev);
-      if (t.outcome) setCutOutcome(t.outcome);
-      if (t.releaseJob) setJobId(null);
+      setStatus(e.payload.status);
     });
     return () => {
       unlisten.then((f) => f());
@@ -478,17 +460,14 @@ export function App() {
         />
       </div>
       <div style={{ gridColumn: "1 / -1" }}>
-        <StatusBar machine={doc?.machine ?? null} artboard={doc?.artboard ?? null} error={error} deviceState={deviceState} />
+        <StatusBar machine={doc?.machine ?? null} artboard={doc?.artboard ?? null} error={error} status={status} />
       </div>
       {cutOpen && doc ? (
         <CutDialog
           scene={scene}
           artboard={doc.artboard}
           docMachineId={doc.machine?.id ?? null}
-          deviceState={deviceState}
-          cutOutcome={cutOutcome}
-          clearCutOutcome={() => setCutOutcome(null)}
-          setJobId={setJobId}
+          status={status}
           refreshDeviceState={refreshDeviceState}
           onConvertMachine={(machineId) => run(() => ipc.setMachine({ machineId }))}
           onError={setError}

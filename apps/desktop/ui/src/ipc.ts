@@ -86,27 +86,49 @@ export type DeviceError =
   | "WriteZero"
   | { Io: string };
 
-export type DeviceState =
+export type Phase =
   | "Disconnected"
   | "Connecting"
-  | "Idle"
-  | { Transmitting: { job_id: number; pass_index: number; submitted_bytes: number; total_bytes: number } }
-  | { AwaitingCompletion: { job_id: number; pass_index: number } }
-  | { WaitingForColorSwap: { job_id: number; next_pass_index: number } }
-  | { CancelRequested: { job_id: number } }
-  | { Stopping: { job_id: number } }
-  | { Cancelled: { job_id: number; pass_index: number; submitted_bytes: number; completion_known: boolean } }
   | "Disconnecting"
-  | { Error: DeviceError };
+  | "Idle"
+  | "Sending"
+  | "AwaitingConfirmation"
+  | "AwaitingColorSwap"
+  | "Cancelling"
+  | "Failed";
 
+/** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
+ *  says how the last job finished, which no phase can — a finished cut and a
+ *  cancelled one both rest on "Idle". Actions say which buttons are legal.
+ *  Nothing here needs interpreting, and nothing needs remembering. */
+export type CutStatus = {
+  phase: Phase;
+  ended: "Completed" | "Cancelled" | null;
+  actions: { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
+  pass: { index: number; total: number } | null;
+  sent: { sent: number; total: number } | null;
+  error: DeviceError | null;
+};
+
+/** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
+export const DISCONNECTED_STATUS: CutStatus = {
+  phase: "Disconnected",
+  ended: null,
+  actions: { cut: false, cancel: false, resume: false, confirm: false },
+  pass: null,
+  sent: null,
+  error: null,
+};
+
+// `StateChanged` carries no payload: the event's own `status` is what changed.
 export type DeviceEventKind =
-  | { StateChanged: DeviceState }
+  | "StateChanged"
   | { Progress: { pass_index: number; submitted_bytes: number; total_bytes: number } }
   | { PassComplete: number }
   | "JobComplete"
   | { Failed: DeviceError };
 
-export type DeviceEvent = { job_id: number; kind: DeviceEventKind };
+export type DeviceEvent = { job_id: number; kind: DeviceEventKind; status: CutStatus };
 
 export type PlanCutPassSummary = { color: number | null; shape_count: number; node_ids: number[] };
 
@@ -144,7 +166,7 @@ export async function disconnectDevice(): Promise<void> {
   return invoke("disconnect_device", {});
 }
 
-export async function getDeviceState(): Promise<DeviceState> {
+export async function getDeviceState(): Promise<CutStatus> {
   return invoke("get_device_state", {});
 }
 

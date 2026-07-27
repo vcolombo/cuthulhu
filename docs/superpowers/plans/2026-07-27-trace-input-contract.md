@@ -614,28 +614,64 @@ use trace::{trace, TraceControls, TraceMode};
 
 - [ ] **Step 7: Write the CLI's failing test for the flip**
 
-Add to `crates/cli/tests/trace.rs`:
+`fixture_png` is a hard-edged square: vtracer traces its corners with `L` commands at every
+`--detail` value, so counting `L` commands cannot observe the control at all — the assertion
+`commands("10") >= commands("3.5")` is `0 >= 0` on that fixture and passes even with the inversion
+deleted, reversed, or replaced by a constant. Use a filled circle instead, which has no corners and
+is traced entirely with curve (`C`) commands, and assert **strictly** (`>`, not `>=`): `>=` is what
+let the dead control through in the first place.
+
+Add to `crates/cli/tests/trace.rs`, alongside `fixture_png`:
 
 ```rust
-/// `--detail` is stated in the same units as the dialog's Detail slider: higher means more detail.
-/// It used to carry vtracer's threshold, which runs the other way, so the two interfaces gave
-/// opposite advice for the same failure. The bottom of the range must trace more coarsely than the
-/// top — fewer path commands for the same image.
+/// A filled circle, unlike `fixture_png`'s square, has no corners — it is traced entirely with
+/// curve (`C`) commands at every detail level, so the curve count is what actually moves when
+/// `--detail` moves. A polygon's corners are corners regardless of threshold and cannot observe
+/// the control at all.
+fn fixture_circle_png(dir: &std::path::Path) -> std::path::PathBuf {
+    let (cx, cy, r) = (100.0_f64, 100.0_f64, 70.0_f64);
+    let img = image::RgbaImage::from_fn(200, 200, |x, y| {
+        let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+        if dx * dx + dy * dy <= r * r {
+            image::Rgba([0, 0, 0, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    });
+    let p = dir.join("circle.png");
+    img.save(&p).unwrap();
+    p
+}
+
+/// `--detail` is stated in the same units as the desktop's Detail slider: higher means more
+/// detail. It used to carry vtracer's `length_threshold`, which runs the other way, so the two
+/// interfaces printed opposite advice for the same failure. This asserts strictly (`>`, not `>=`)
+/// on purpose: `>=` also passes when the control does nothing at all, which is the failure this
+/// test exists to catch — a hard-edged square fixture traces with zero curve commands at every
+/// detail level, so `>=` on that fixture cannot distinguish "detail works" from "detail is dead".
 #[test]
 fn detail_reads_high_for_more_detail() {
     let dir = tempfile::tempdir().unwrap();
-    let input = fixture_png(dir.path());
-    let commands = |detail: &str| {
+    let input = fixture_circle_png(dir.path());
+    let curve_commands = |detail: &str| {
         let out = dir.path().join(format!("out-{detail}.svg"));
         let status = bin().args([
             "trace", input.to_str().unwrap(), "-o", out.to_str().unwrap(), "--detail", detail,
         ]).status().unwrap();
         assert!(status.success(), "--detail {detail} failed");
-        std::fs::read_to_string(&out).unwrap().matches('L').count()
+        std::fs::read_to_string(&out).unwrap().matches('C').count()
     };
-    assert!(commands("10") >= commands("3.5"), "higher --detail must not trace more coarsely");
+    assert!(
+        curve_commands("10") > curve_commands("3.5"),
+        "higher --detail must trace strictly more curve commands"
+    );
 }
 ```
+
+Expected on this fixture: `--detail 3.5` → 7 curve commands (504 bytes of SVG); `--detail 10` → 12
+curve commands (696 bytes). The pixel-center offset (`x as f64 + 0.5 - cx`) matters: an
+integer-coordinate circle mask traces to the same curve count at both detail values on this image
+size, so it would silently reintroduce the same non-discriminating test it replaces.
 
 - [ ] **Step 8: Update the CLI**
 

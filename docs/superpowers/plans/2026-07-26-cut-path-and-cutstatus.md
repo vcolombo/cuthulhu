@@ -1579,6 +1579,96 @@ git commit -m "Name the value a cut reports, and list what a human still has to 
 
 ---
 
+---
+
+### Task 16: Say how a cut ended, instead of making callers infer it
+
+**Files:**
+- Modify: `crates/driver-core/src/status.rs` (add `Ended`, add `CutStatus::ended`, delete `Phase::Done`, update `status_of` and its tests)
+- Modify: `crates/driver-core/src/manager.rs` (the worker must remember how the last job ended)
+- Modify: `crates/cli/src/cut.rs` (terminal messages come from `ended`)
+- Modify: `apps/desktop/ui/src/ipc.ts` (type), `apps/desktop/ui/src/cut/CutDialog.tsx` (delete the latch), `apps/desktop/ui/e2e/smoke.spec.ts` (mock), `apps/desktop/ui/dist` (rebuild)
+- Test: `crates/driver-core/src/status.rs`, `crates/driver-core/src/manager.rs`, `crates/cli/tests/plain_cut.rs`, `apps/desktop/ui/e2e/smoke.spec.ts`
+
+**Interfaces:**
+- Consumes: everything Tasks 9-14 built.
+- Produces:
+  ```rust
+  pub enum Ended { Completed, Cancelled }
+  // CutStatus gains: pub ended: Option<Ended>
+  // Phase loses: Done
+  ```
+
+**Why.** `Phase::Done` was reachable only from a cancelled job, because a job that finishes normally rests on `Idle`. So `Idle` meant three things — no cut yet, cut finished, freshly connected — and both callers had to invent memory to tell them apart: the dialog latched a bit off `actions.cancel`, and the CLI could not name a cancellation at all until it read `pass`/`sent` back out. That inference is the exact thing `CutStatus` exists to prevent, so the fix belongs in the status, not in each caller.
+
+After this task `phase` means only "what is happening now", and `ended` means "how the last job finished". `Idle` with `ended: None` is a fresh connection; `Idle` with `ended: Some(Completed)` is a finished cut; `Idle` with `ended: Some(Cancelled)` is a cancelled one. No caller needs to remember anything.
+
+- [ ] **Step 1: Write the failing tests in `status.rs`**
+
+```rust
+    /// The wart this task removes: a cut that finished and a cut that was cancelled both
+    /// rested on `Idle`, so no caller could tell them apart without keeping its own
+    /// memory of what it had seen.
+    #[test]
+    fn a_finished_cut_and_a_cancelled_one_are_distinguishable() {
+        let fresh = status_of(&DeviceState::Idle, 0, None);
+        assert_eq!(fresh.phase, Phase::Idle);
+        assert_eq!(fresh.ended, None, "nothing has run yet");
+
+        let finished = status_of(&DeviceState::Idle, 3, Some(Ended::Completed));
+        assert_eq!(finished.phase, Phase::Idle, "phase says what is happening now");
+        assert_eq!(finished.ended, Some(Ended::Completed));
+
+        let cancelled = status_of(
+            &DeviceState::Cancelled { job_id: 1, pass_index: 1, submitted_bytes: 40, completion_known: false }, 3);
+        assert_eq!(cancelled.phase, Phase::Idle, "a cancelled job is no longer in flight");
+        assert_eq!(cancelled.ended, Some(Ended::Cancelled));
+        assert_eq!(cancelled.pass, Some(PassPosition { index: 1, total: 3 }));
+        assert!(cancelled.actions.cut, "another cut is legal after a cancel");
+    }
+```
+
+Adapt the signature to however you thread the remembered outcome — the point is that `status_of` can report it, not the exact parameter list. Every existing test in `status.rs` that names `Phase::Done` must be updated in this task.
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `cargo test -p driver-core status`
+Expected: FAIL — `Ended` does not exist, `CutStatus` has no `ended`.
+
+- [ ] **Step 3: Implement in `driver-core`**
+
+Add `Ended` and `CutStatus::ended`; delete `Phase::Done` and map `DeviceState::Cancelled` to `Phase::Idle` with `ended: Some(Ended::Cancelled)`. The worker remembers how the last job ended: set `Completed` where it currently transitions to `Idle` after a job, set `Cancelled` on the cancel path, and clear it to `None` when a new `Cut` command is accepted so a fresh cut does not report the previous outcome.
+
+- [ ] **Step 4: Simplify both callers**
+
+CLI (`crates/cli/src/cut.rs`): the terminal arm becomes one `Phase::Idle` arm that reads `ended` — `Some(Cancelled)` prints the cancelled wording with pass and bytes, anything else prints the completed wording. Delete the `Phase::Done` arm.
+
+Dialog (`apps/desktop/ui/src/cut/CutDialog.tsx`): **delete the latch entirely.** The banner reads `status.ended` for a finished or cancelled outcome and `status.phase === "Failed"` for a failure. No `useState`, no `useEffect` reconstructing an outcome, no reading `actions.cancel` as a liveness bit. This deletion is the point of the task — if the latch survives in any form, the task is not done.
+
+- [ ] **Step 5: Update the mock and the types**
+
+`ipc.ts`: drop `"Done"` from the `Phase` union, add `ended: "Completed" | "Cancelled" | null`. `smoke.spec.ts`: emit `ended` where the mock rests after a job, and add a case asserting a normally-completed cut reports completion — the mock previously could not express one.
+
+- [ ] **Step 6: Verify everything**
+
+```bash
+cargo test --workspace --locked
+npm --prefix apps/desktop/ui run build
+npm --prefix apps/desktop/ui test
+npm --prefix apps/desktop/ui run e2e
+grep -rn "Phase::Done\|\"Done\"" crates apps/desktop/src apps/desktop/ui/src   # expect nothing
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/driver-core/src/status.rs crates/driver-core/src/manager.rs crates/cli/src/cut.rs \
+        crates/cli/tests/plain_cut.rs apps/desktop/ui/src apps/desktop/ui/e2e apps/desktop/ui/dist
+git commit -m "Report how a cut ended, so no caller has to remember"
+```
+
+---
+
 ## Self-review
 
 **Coverage against the agreed decisions.** Plain path promotes unstroked paths at import (Task 1) and stays exactly one pass (Tasks 1-2); it goes through `plan_cut` so preflight runs (Task 2); it transmits via `DeviceManager` with the registry's `open_transport` and a TTY guard (Tasks 4, 7); `check_out_of_bounds_scope` is deleted and the colour flags error (Task 3); the cut function takes a factory parameter and is tested over `MockTransport` (Tasks 4-5); `build_bytes` and its test are deleted (Task 6). `CutStatus` carries phase, actions, pass position and bytes, and is both queried and carried on events (Tasks 9-10); `DeviceState` goes private (Task 11); the worker publishes so reads never block, deleting the desktop cache and the `Transmitting` synthesis (Tasks 10, 12); all three callers convert (Tasks 12-14); 10 Hz coalescing stays in the bridge (Task 12); manager tests assert `CutStatus`, the `WRITE_CHUNK` reach-past dies, and the three TypeScript scenarios become Rust tests (Task 11); the five TypeScript blocks are deleted while `reorderPass` and `toCutRequest` survive (Task 13). `plan_passes` is untouched throughout and #68 stays open.

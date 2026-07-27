@@ -202,6 +202,10 @@ export async function listPresets(machineId: string) {
   return invoke("list_presets", { machineId });
 }
 
+export async function machineCaps(machineId: string) {
+  return invoke("machine_caps", { machineId });
+}
+
 export async function savePreset(p: Args) {
   return invoke("save_preset", { p });
 }

@@ -13,15 +13,10 @@ import {
   type Preset,
 } from "./viewmodel";
 
-// ponytail: no IPC exposes machine capabilities yet (follow-up: expose MachineCaps via
-// IPC). Hardcoded from spec §5 — the Puma's speed/force are set on its own panel, so
-// those fields stay disabled with a hint; the Cameo exposes both over the wire. Replace
-// with a real capability query if more machines or knob variety show up.
-const CAPS: Record<string, Caps> = {
-  cameo5: { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false },
-  puma: { supportsSpeed: false, supportsForce: false, needsOperatorPassConfirm: true },
-};
-const DEFAULT_CAPS: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
+// What the fields allow before any machine has been asked. Not a machine's claim —
+// a placeholder that keeps passes editable offline. Preflight ignores speed/force a
+// machine does not support, so an optimistic default here cannot mis-send anything.
+const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
 type PassRow = PassVm & { nodeIds: number[] };
 
@@ -79,6 +74,10 @@ export function CutDialog({
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
   const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
+  // The machine id rides along with the caps: `connected` can change before an
+  // in-flight fetch resolves, and showing one machine's capability against another
+  // is the exact defect this fetch was added to remove.
+  const [capsFor, setCapsFor] = useState<{ machineId: string; caps: Caps } | null>(null);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [rows, setRows] = useState<PassRow[]>([]);
   const [travel, setTravel] = useState<[number, number, number, number][]>([]);
@@ -98,6 +97,12 @@ export function CutDialog({
       .then((info) => {
         setConnected(info);
         if (!info) return;
+        // Separate chains on purpose: a corrupt presets file must not leave caps
+        // unfetched, and an unknown machine must not blank the preset dropdown.
+        ipc
+          .machineCaps(info.machine_id)
+          .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
+          .catch((e) => onError(ipc.ipcErrorMessage(e)));
         return ipc.listPresets(info.machine_id).then((p) => setPresets(p as Preset[]));
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
@@ -139,13 +144,17 @@ export function CutDialog({
       .then(() => {
         setConnected(info);
         refreshDeviceState();
+        ipc
+          .machineCaps(info.machine_id)
+          .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
+          .catch((e) => onError(ipc.ipcErrorMessage(e)));
         return ipc.listPresets(info.machine_id);
       })
       .then((p) => setPresets(p as Preset[]))
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
-  const caps = connected ? CAPS[connected.machine_id] ?? DEFAULT_CAPS : DEFAULT_CAPS;
+  const caps = connected && capsFor?.machineId === connected.machine_id ? capsFor.caps : ALL_ENABLED;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
 
   const startCut = () => {

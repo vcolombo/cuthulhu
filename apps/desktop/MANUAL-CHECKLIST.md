@@ -24,6 +24,8 @@
 ### Hardware: Puma IV (non-blocking)
 - [ ] Multi-color cut via operator-confirmed pass completion (manual "pass done" button).
 - [ ] Host-queue drain ≠ cutter completion — explicitly verified that operator must confirm motion stopped before proceeding.
+- [ ] Speed and force grey out when the Puma connects and stay editable for the Cameo.
+      (Caps now come from the Driver over `machine_caps` rather than a table in `CutDialog.tsx`. Everything either side of the link is pinned — wire casing by a Rust test, per-machine values by each Driver's own caps test, the disable rule by four vitest cases — but nothing automated asserts that the fetched value reaches the field, because the e2e fake deliberately answers with one constant rather than restating the per-machine mapping it exists to remove.)
 
 ### GUI verification — verified 2026-07-24 in the real app (imported 2-color SVG, Cameo 5 connected)
 - [x] Open Cut dialog on a 2-color document — displays 2 passes with correct color swatches.

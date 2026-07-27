@@ -79,7 +79,7 @@ reliable way to move a slider is AX `set focused to true` on it, then arrow-key 
 
 - [ ] Cut dialog buttons match what the machine allows at each stage — nothing enabled that errors when pressed.
 - [ ] Progress advances during a pass; pass n of m is correct across a colour swap.
-- [ ] Cancel mid-cut lands on Done and a second cut can be started straight after.
+- [ ] Cancel mid-cut reports the cancelled ending, the dialog shows "Cancelled", and a second cut can be started straight after.
 - [ ] Unplug mid-cut shows the failure with its reason, and the dialog offers no dead buttons.
 - [ ] Closing the window mid-cut still prompts.
 - [ ] `cuthulhu cut --by-color` on the Puma still prompts per pass and completes.

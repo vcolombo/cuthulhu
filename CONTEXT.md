@@ -111,9 +111,10 @@ _Avoid_: run, cycle, layer
 
 **CutStatus**:
 Where a cut has got to and what the operator may do next — the phase it is in, how the last one
-ended, which of cancel/resume/confirm are legal, which Pass of how many, and how many bytes of it
-have been sent. The only thing a Driver's caller is told about a cut; the states behind it are not
-anybody else's business, and a caller that keeps its own memory of them has gone wrong.
+ended, which of cut/cancel/resume/confirm are legal, which Pass of how many, how many bytes of it
+have been sent, and the reason if it failed. The only thing a Driver's caller is told about a cut;
+the states behind it are not anybody else's business, and a caller that keeps its own memory of
+them has gone wrong.
 _Avoid_: device state, state machine, progress
 
 **Phase**:
@@ -122,7 +123,8 @@ Says nothing about how a previous cut turned out; that is what an Ended is for.
 _Avoid_: status, state
 
 **Ended**:
-How the last cut finished — completed or cancelled — or nothing at all if none has run since the
-machine was connected. Separate from Phase because a finished machine and an untouched one are both
-idle, and every caller that had to tell them apart invented its own memory to do it.
+How the last cut finished — completed or cancelled — or nothing at all if no cut has been
+attempted since the machine was connected. Separate from Phase because a finished machine and an
+untouched one are both idle, and every caller that had to tell them apart invented its own memory
+to do it.
 _Avoid_: result, outcome, done

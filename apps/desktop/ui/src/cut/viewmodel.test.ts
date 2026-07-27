@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import type { DeviceState } from "../ipc";
 import {
   reorderPass,
   effectiveSettings,
   fieldDisabled,
-  acceptEvent,
-  terminalTransition,
   toCutRequest,
-  dialogPhase,
-  canStartCut,
-  dialogButtons,
   type PassVm,
   type Caps,
   type Preset,
@@ -229,82 +223,6 @@ describe("fieldDisabled", () => {
   });
 });
 
-describe("acceptEvent", () => {
-  it("accepts event when currentJobId is null", () => {
-    expect(acceptEvent(null, { job_id: 1 })).toBe(true);
-  });
-
-  it("accepts event when currentJobId matches job_id", () => {
-    expect(acceptEvent(5, { job_id: 5 })).toBe(true);
-  });
-
-  it("rejects stale event when currentJobId does not match", () => {
-    expect(acceptEvent(2, { job_id: 1 })).toBe(false);
-  });
-
-  it("rejects stale event with different numbers", () => {
-    expect(acceptEvent(10, { job_id: 9 })).toBe(false);
-  });
-});
-
-describe("terminalTransition", () => {
-  it("latches complete and releases the job on the job's own JobComplete", () => {
-    expect(terminalTransition(5, { job_id: 5, kind: "JobComplete" })).toEqual({
-      outcome: "complete",
-      releaseJob: true,
-    });
-  });
-
-  it("latches failed and releases the job on the job's own Failed", () => {
-    expect(terminalTransition(5, { job_id: 5, kind: { Failed: "Timeout" } })).toEqual({
-      outcome: "failed",
-      releaseJob: true,
-    });
-  });
-
-  it("releases the job without an outcome when the state rests on Cancelled", () => {
-    const kind = { StateChanged: { Cancelled: { job_id: 5, pass_index: 0, submitted_bytes: 10, completion_known: true } } };
-    expect(terminalTransition(5, { job_id: 5, kind })).toEqual({
-      outcome: null,
-      releaseJob: true,
-    });
-  });
-
-  it("ignores terminal events from another job", () => {
-    expect(terminalTransition(5, { job_id: 4, kind: "JobComplete" })).toEqual({
-      outcome: null,
-      releaseJob: false,
-    });
-  });
-
-  it("ignores everything when no job is active", () => {
-    expect(terminalTransition(null, { job_id: 0, kind: "JobComplete" })).toEqual({
-      outcome: null,
-      releaseJob: false,
-    });
-  });
-
-  it("does not release on non-terminal events for the current job", () => {
-    expect(terminalTransition(5, { job_id: 5, kind: { Progress: { pass_index: 0, submitted_bytes: 1, total_bytes: 2 } } })).toEqual({
-      outcome: null,
-      releaseJob: false,
-    });
-    expect(terminalTransition(5, { job_id: 5, kind: { StateChanged: "Idle" } })).toEqual({
-      outcome: null,
-      releaseJob: false,
-    });
-  });
-
-  it("releasing the job makes later NO_JOB lifecycle events acceptable again", () => {
-    // The regression this guards: a failed job's id stayed pinned as the event
-    // filter, so a reconnect's NO_JOB=0 lifecycle events were dropped forever.
-    const t = terminalTransition(5, { job_id: 5, kind: { Failed: "Timeout" } });
-    expect(t.releaseJob).toBe(true);
-    const releasedJobId = t.releaseJob ? null : 5;
-    expect(acceptEvent(releasedJobId, { job_id: 0 })).toBe(true);
-  });
-});
-
 describe("toCutRequest", () => {
   it("serializes PassVm to CutRequest with ConfiguredPassDto fields", () => {
     const passes: PassVm[] = [
@@ -386,95 +304,5 @@ describe("toCutRequest", () => {
     expect(result.passes).toHaveLength(2);
     expect(result.passes[0].preset_id).toBe("preset1");
     expect(result.passes[1].preset_id).toBe("preset2");
-  });
-});
-
-// One state per DeviceState variant (the union has 11 members) so every branch of
-// dialogPhase/canStartCut/dialogButtons is exercised at least once.
-const STATES: Record<string, DeviceState> = {
-  Disconnected: "Disconnected",
-  Connecting: "Connecting",
-  Idle: "Idle",
-  Transmitting: { Transmitting: { job_id: 1, pass_index: 0, submitted_bytes: 10, total_bytes: 100 } },
-  AwaitingCompletion: { AwaitingCompletion: { job_id: 1, pass_index: 0 } },
-  WaitingForColorSwap: { WaitingForColorSwap: { job_id: 1, next_pass_index: 1 } },
-  CancelRequested: { CancelRequested: { job_id: 1 } },
-  Stopping: { Stopping: { job_id: 1 } },
-  Cancelled: { Cancelled: { job_id: 1, pass_index: 0, submitted_bytes: 10, completion_known: true } },
-  Disconnecting: "Disconnecting",
-  Error: { Error: "Timeout" },
-};
-
-describe("dialogPhase", () => {
-  it("maps Disconnected", () => expect(dialogPhase(STATES.Disconnected)).toEqual({ kind: "disconnected" }));
-  it("maps Connecting", () => expect(dialogPhase(STATES.Connecting)).toEqual({ kind: "connecting" }));
-  it("maps Idle", () => expect(dialogPhase(STATES.Idle)).toEqual({ kind: "idle" }));
-  it("maps Transmitting", () => {
-    expect(dialogPhase(STATES.Transmitting)).toEqual({ kind: "transmitting", passIndex: 0, submittedBytes: 10, totalBytes: 100 });
-  });
-  it("maps AwaitingCompletion", () => {
-    expect(dialogPhase(STATES.AwaitingCompletion)).toEqual({ kind: "awaitingCompletion", passIndex: 0 });
-  });
-  it("maps WaitingForColorSwap", () => {
-    expect(dialogPhase(STATES.WaitingForColorSwap)).toEqual({ kind: "waitingSwap", nextPassIndex: 1 });
-  });
-  it("maps CancelRequested", () => expect(dialogPhase(STATES.CancelRequested)).toEqual({ kind: "cancelRequested" }));
-  it("maps Stopping", () => expect(dialogPhase(STATES.Stopping)).toEqual({ kind: "stopping" }));
-  it("maps Cancelled", () => {
-    expect(dialogPhase(STATES.Cancelled)).toEqual({ kind: "cancelled", passIndex: 0, submittedBytes: 10, completionKnown: true });
-  });
-  it("maps Disconnecting", () => expect(dialogPhase(STATES.Disconnecting)).toEqual({ kind: "disconnecting" }));
-  it("maps Error", () => expect(dialogPhase(STATES.Error)).toEqual({ kind: "error" }));
-});
-
-describe("canStartCut", () => {
-  it("is true for idle and cancelled (mirrors driver-core's Idle | Cancelled precondition)", () => {
-    expect(canStartCut(dialogPhase(STATES.Idle))).toBe(true);
-    expect(canStartCut(dialogPhase(STATES.Cancelled))).toBe(true);
-  });
-
-  it("is false for every other variant", () => {
-    for (const key of Object.keys(STATES)) {
-      if (key === "Idle" || key === "Cancelled") continue;
-      expect(canStartCut(dialogPhase(STATES[key])), key).toBe(false);
-    }
-  });
-});
-
-describe("dialogButtons", () => {
-  it("offers only Start (disabled-eligible) for disconnected/connecting/idle/disconnecting/error/cancelled", () => {
-    for (const key of ["Disconnected", "Connecting", "Idle", "Disconnecting", "Error", "Cancelled"]) {
-      const buttons = dialogButtons(dialogPhase(STATES[key]));
-      expect(buttons, key).toEqual({ start: true, resume: false, confirmPassDone: false, cancel: false });
-    }
-  });
-
-  it("offers Resume + Cancel for WaitingForColorSwap", () => {
-    expect(dialogButtons(dialogPhase(STATES.WaitingForColorSwap))).toEqual({
-      start: false,
-      resume: true,
-      confirmPassDone: false,
-      cancel: true,
-    });
-  });
-
-  it("offers Confirm pass done + Cancel for AwaitingCompletion", () => {
-    expect(dialogButtons(dialogPhase(STATES.AwaitingCompletion))).toEqual({
-      start: false,
-      resume: false,
-      confirmPassDone: true,
-      cancel: true,
-    });
-  });
-
-  it("offers only Cancel for Transmitting, CancelRequested, and Stopping", () => {
-    for (const key of ["Transmitting", "CancelRequested", "Stopping"]) {
-      expect(dialogButtons(dialogPhase(STATES[key])), key).toEqual({
-        start: false,
-        resume: false,
-        confirmPassDone: false,
-        cancel: true,
-      });
-    }
   });
 });

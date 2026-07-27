@@ -151,12 +151,35 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   };
 
   // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
-  // order and driver-core::manager's DeviceState/DeviceEvent shapes closely enough to
-  // drive the cut dialog through a real state machine. ---
+  // order and driver-core::manager's DeviceEvent shape closely enough to drive the cut
+  // dialog through a real state machine. The statuses below are transcribed from
+  // driver-core/src/status.rs's status_of table — phase and the four action booleans
+  // per internal state — so a frontend that re-derives permissions has nothing to
+  // re-derive them from. ---
 
   type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean };
-  type DeviceState = unknown;
-  type DeviceEvent = { job_id: number; kind: unknown };
+  type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
+  type CutStatus = {
+    phase: string;
+    actions: Actions;
+    pass: { index: number; total: number } | null;
+    sent: { sent: number; total: number } | null;
+    error: unknown;
+  };
+  type DeviceEvent = { job_id: number; kind: unknown; status: CutStatus };
+
+  const NO_ACTIONS: Actions = { cut: false, cancel: false, resume: false, confirm: false };
+  const statusOf = (phase: string, actions: Partial<Actions> = {}, rest: Partial<CutStatus> = {}): CutStatus => ({
+    phase,
+    actions: { ...NO_ACTIONS, ...actions },
+    pass: null,
+    sent: null,
+    error: null,
+    ...rest,
+  });
+  const DISCONNECTED = statusOf("Disconnected");
+  const CONNECTING = statusOf("Connecting");
+  const IDLE = statusOf("Idle", { cut: true });
 
   const devices: DeviceInfo[] = [
     { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false },
@@ -164,7 +187,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   ];
 
   let connected: DeviceInfo | null = null;
-  let deviceState: DeviceState = "Disconnected";
+  let status: CutStatus = DISCONNECTED;
   let nextJobId = 1;
   let jobId: number | null = null;
   let planPasses: { color: number | null; enabled: boolean }[] = [];
@@ -209,8 +232,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const eventNameToIds = new Map<string, number[]>();
   let nextCallbackId = 1;
 
+  // Mirrors Reporter::emit: the event carries the status that held when it was sent, so
+  // a listener renders from what it received rather than polling for a newer value.
   function emit(kind: unknown) {
-    const ev: DeviceEvent = { job_id: jobId ?? 0, kind };
+    const ev: DeviceEvent = { job_id: jobId ?? 0, kind, status };
     for (const id of eventNameToIds.get("device-event") ?? []) {
       callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
     }
@@ -232,28 +257,38 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // superseded within the same synchronous burst.
   function runPass(passIndex: number, enabledIndices: number[]) {
     const total = 100;
-    deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: 0, total_bytes: total } };
-    emit({ StateChanged: deviceState });
+    const sending = (sent: number) =>
+      statusOf("Sending", { cancel: true }, { pass: { index: passIndex, total: enabledIndices.length }, sent: { sent, total } });
+    status = sending(0);
+    emit("StateChanged");
     setTimeout(() => {
-      deviceState = { Transmitting: { job_id: jobId, pass_index: passIndex, submitted_bytes: total, total_bytes: total } };
+      status = sending(total);
       emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
       emit({ PassComplete: passIndex });
 
       const pos = enabledIndices.indexOf(passIndex);
       const isLast = pos === enabledIndices.length - 1;
       if (isLast) {
-        deviceState = "Idle";
+        // finish_pass emits JobComplete *before* the state becomes Idle, so this event's
+        // status still reads Sending. A frontend that treats the JobComplete kind as
+        // "finished" would show a completed job as still cutting; only the Idle status
+        // below says the job is over.
         emit("JobComplete");
-        emit({ StateChanged: "Idle" });
+        status = IDLE;
+        emit("StateChanged");
         // Production releases the job id once the job is over: all later lifecycle
         // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
         // mock keeps stamping finished-job ids on lifecycle events production
-        // would never stamp — hiding event-filter bugs from these tests.
+        // would never stamp.
         jobId = null;
       } else {
         const next = enabledIndices[pos + 1];
-        deviceState = { WaitingForColorSwap: { job_id: jobId, next_pass_index: next } };
-        emit({ StateChanged: deviceState });
+        status = statusOf(
+          "AwaitingColorSwap",
+          { cancel: true, resume: true },
+          { pass: { index: next, total: enabledIndices.length } },
+        );
+        emit("StateChanged");
       }
     }, 50);
   }
@@ -264,21 +299,21 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const info = a.info as DeviceInfo;
       connected = info;
       // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
-      // emitting them here (instead of silently mutating deviceState) is what lets
+      // emitting them here (instead of silently mutating the status) is what lets
       // these tests catch a frontend that filters lifecycle events out.
-      deviceState = "Connecting";
-      emit({ StateChanged: "Connecting" });
-      deviceState = "Idle";
-      emit({ StateChanged: "Idle" });
+      status = CONNECTING;
+      emit("StateChanged");
+      status = IDLE;
+      emit("StateChanged");
       return null;
     },
     disconnect_device: () => {
       connected = null;
-      deviceState = "Disconnected";
-      emit({ StateChanged: "Disconnected" });
+      status = DISCONNECTED;
+      emit("StateChanged");
       return null;
     },
-    get_device_state: () => deviceState,
+    get_device_state: () => status,
     get_connected_device: () => connected,
     plan_cut: () => planFromDoc(),
     cut: (a) => {
@@ -303,19 +338,17 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     cancel_cut: () => {
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
-      // Cancelled resting state (no auto-Idle) — not a jump straight to Idle.
-      const s = deviceState as { Transmitting?: { pass_index: number; submitted_bytes: number }; WaitingForColorSwap?: { next_pass_index: number } };
-      const passIndex = s.Transmitting?.pass_index ?? s.WaitingForColorSwap?.next_pass_index ?? 0;
-      const submittedBytes = s.Transmitting?.submitted_bytes ?? 0;
-      deviceState = { Cancelled: { job_id: jobId, pass_index: passIndex, submitted_bytes: submittedBytes, completion_known: true } };
-      emit({ StateChanged: deviceState });
+      // Cancelled resting state — phase Done, with Cut legal again (status.rs's
+      // Cancelled arm), not a jump straight to Idle.
+      const sent = status.sent?.sent ?? 0;
+      status = statusOf("Done", { cut: true }, { pass: status.pass, sent: { sent, total: sent } });
+      emit("StateChanged");
       jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
       return null;
     },
     resume_cut: () => {
-      const s = deviceState as { WaitingForColorSwap?: { next_pass_index: number } };
-      const nextIndex = s.WaitingForColorSwap?.next_pass_index;
-      if (nextIndex === undefined) throw ipcError("device_error", "not waiting for color swap");
+      if (status.phase !== "AwaitingColorSwap") throw ipcError("device_error", "not waiting for color swap");
+      const nextIndex = status.pass?.index ?? 0;
       if (failNextResume) {
         // Async failure, as in production: resume_cut returns Ok and the failure
         // arrives via the event stream (Failed carries the job's id, then the
@@ -324,8 +357,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         failNextResume = false;
         setTimeout(() => {
           emit({ Failed: "Timeout" });
-          deviceState = { Error: "Timeout" };
-          emit({ StateChanged: deviceState });
+          status = statusOf("Failed", {}, { error: "Timeout" });
+          emit("StateChanged");
           jobId = null;
         }, 50);
         return null;
@@ -341,8 +374,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     confirm_pass_done: () => {
-      deviceState = "Idle";
-      emit({ StateChanged: "Idle" });
+      status = IDLE;
+      emit("StateChanged");
       return null;
     },
     list_presets: () => [],
@@ -472,9 +505,8 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText(/complete/i)).toBeVisible();
 
-  // Second cut in the same session: without resetting jobId at the top of
-  // startCut, this job's own events would still carry the first job's stale
-  // id and get filtered out by acceptEvent, so this would hang forever.
+  // Second cut in the same session: the dialog must take the new job's statuses as
+  // they arrive, with no per-job bookkeeping left over from the finished first cut.
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
@@ -524,19 +556,17 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
-  // Arm a one-shot async resume failure, then resume: the Failed event must show
-  // "Cut failed" — never "Job complete", which the old jobId+Idle-derived banner
-  // produced once a lagging state cache read Idle for the failed job.
+  // Arm a one-shot async resume failure, then resume: the Failed phase must show
+  // "Cut failed" — never "Job complete", which a banner derived from "a job ended
+  // and the device is Idle" produced for a failed job whose state cache lagged.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText("Cut failed")).toBeVisible();
   await expect(page.getByText("Job complete")).toHaveCount(0);
 
-  // Recover by reconnecting (the other listed device). The connect lifecycle
-  // events carry NO_JOB=0 and must not be filtered by the failed job's id. Note
-  // this mock's get_device_state poll isn't lagging like production's cache, so
-  // it can also rescue this assertion — the filter-release behavior itself is
-  // pinned by the terminalTransition unit tests in viewmodel.test.ts.
+  // Recover by reconnecting (the other listed device). The connect lifecycle events
+  // carry NO_JOB=0 and must still reach the dialog after a failed job — Start Cut
+  // comes back only because the reconnect's Idle status was accepted.
   await page.getByRole("button", { name: "Connect", exact: false }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });

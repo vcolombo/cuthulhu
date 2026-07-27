@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import type { MachineProfile } from "../App";
-import type { DeviceState } from "../ipc";
+import type { CutStatus, Phase } from "../ipc";
 
 type Props = {
   machine: MachineProfile | null;
   artboard: { w: number; h: number } | null;
   error: string | null;
-  deviceState: DeviceState;
+  status: CutStatus;
 };
 
-// Idle/Disconnected read as "nothing wrong" (green), a device error is red, and every
-// other state (connecting, actively cutting, cancelling…) is "busy" (accent).
-function dotColor(state: DeviceState): string {
-  if (state === "Idle" || state === "Disconnected") return "var(--ready)";
-  if (typeof state === "object" && "Error" in state) return "var(--cut)";
+// Idle/Disconnected read as "nothing wrong" (green), a failed device is red, and every
+// other phase (connecting, actively cutting, cancelling…) is "busy" (accent).
+function dotColor(phase: Phase): string {
+  if (phase === "Idle" || phase === "Disconnected") return "var(--ready)";
+  if (phase === "Failed") return "var(--cut)";
   return "var(--accent)";
 }
 
-export function StatusBar({ machine, artboard, error, deviceState }: Props) {
+export function StatusBar({ machine, artboard, error, status }: Props) {
   return (
     <div
       style={{
@@ -31,7 +31,7 @@ export function StatusBar({ machine, artboard, error, deviceState }: Props) {
         borderTop: "1px solid var(--border)",
       }}
     >
-      <span style={{ width: 8, height: 8, borderRadius: "50%", background: dotColor(deviceState), display: "inline-block" }} />
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: dotColor(status.phase), display: "inline-block" }} />
       <span>{machine ? machine.name : "No machine selected"}</span>
       {artboard ? (
         <span>

@@ -74,3 +74,12 @@ reliable way to move a slider is AX `set focused to true` on it, then arrow-key 
 - [ ] `cuthulhu cut a.svg --skip-color FF0000FF` — refused, naming `--by-color`.
 - [ ] On hardware: a plain cut on the Cameo 5 completes, and Ctrl-C mid-cut stops it.
 - [ ] Scripted (stdin redirected from /dev/null): `cuthulhu cut a.svg --device puma --port …` completes without blocking, and prints the completion-not-verified note.
+
+## CutStatus (architecture review candidate 1)
+
+- [ ] Cut dialog buttons match what the machine allows at each stage — nothing enabled that errors when pressed.
+- [ ] Progress advances during a pass; pass n of m is correct across a colour swap.
+- [ ] Cancel mid-cut lands on Done and a second cut can be started straight after.
+- [ ] Unplug mid-cut shows the failure with its reason, and the dialog offers no dead buttons.
+- [ ] Closing the window mid-cut still prompts.
+- [ ] `cuthulhu cut --by-color` on the Puma still prompts per pass and completes.

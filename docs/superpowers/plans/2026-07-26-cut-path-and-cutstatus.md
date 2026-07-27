@@ -1550,12 +1550,28 @@ git commit -m "Drive the CLI cut from the reported status, and shut the state ma
 
 ```markdown
 **CutStatus**:
-Where a cut has got to and what the operator may do next — the phase it is in, which of
-cancel/resume/confirm are legal, which Pass of how many, and how many bytes of it have been sent.
-The only thing a Driver's caller is told about a cut in flight; the states behind it are not
-anybody else's business.
+Where a cut has got to and what the operator may do next — the phase it is in, how the last one
+ended, which of cancel/resume/confirm are legal, which Pass of how many, and how many bytes of it
+have been sent. The only thing a Driver's caller is told about a cut; the states behind it are not
+anybody else's business, and a caller that keeps its own memory of them has gone wrong.
 _Avoid_: device state, state machine, progress
+
+**Phase**:
+What a machine is doing right now — idle, sending, cancelling, awaiting an operator, or failed.
+Says nothing about how a previous cut turned out; that is what an Ended is for.
+_Avoid_: status, state
+
+**Ended**:
+How the last cut finished — completed or cancelled — or nothing at all if none has run since the
+machine was connected. Separate from Phase because a finished machine and an untouched one are both
+idle, and every caller that had to tell them apart invented its own memory to do it.
+_Avoid_: result, outcome, done
 ```
+
+Use the shape the code actually landed on: `CutStatus { phase, ended, actions, pass, sent, error }`,
+`Phase` without a `Done` variant, `Ended { Completed, Cancelled }`. Read
+`crates/driver-core/src/status.rs` and match it — a glossary that disagrees with the type is worse
+than none.
 
 - [ ] **Step 2: Add the checklist items**
 

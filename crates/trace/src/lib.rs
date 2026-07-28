@@ -9,39 +9,196 @@ pub const MAX_DIM: u32 = 2048;
 /// RGBA frame is ~96 MiB) while refusing the pathological cases.
 const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 
+/// Ceiling on the source *file*, as opposed to `MAX_DECODE_ALLOC`'s ceiling on what decoding it may
+/// allocate. The decoder's limit only applies once the bytes are already resident, so without this
+/// a huge file exhausts memory before it can be rejected for not being a usable image.
+pub const MAX_INPUT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn too_large() -> TraceError {
+    TraceError::Input(format!(
+        "file is too large to open: over {} MiB",
+        MAX_INPUT_FILE_BYTES / (1024 * 1024)
+    ))
+}
+
+/// Read a whole stream, refusing input longer than `cap` bytes.
+///
+/// `cap` is a parameter rather than the constant so the bound can be exercised with a handful of
+/// bytes instead of a quarter gigabyte.
+fn read_capped<R: std::io::Read>(reader: R, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    // One byte past the ceiling, so landing exactly on it is distinguishable from exceeding it,
+    // and so an oversized input costs one extra byte rather than its whole length.
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Read an image file, refusing anything past the ceiling.
+///
+/// Everything happens through one open handle, rather than `std::fs::metadata` followed by a
+/// separate `std::fs::read`. Two *pathname* resolutions describe two moments: the size that passed
+/// the check belonged to whatever the path pointed at then, and a file that grew in between was
+/// read in full anyway.
+///
+/// The size check itself is not the problem and is kept — `File::metadata` is `fstat` on the
+/// handle, so it cannot describe a different file than the one about to be read. It earns its
+/// place by refusing an oversized file for the cost of a syscall, instead of allocating the whole
+/// ceiling first only to throw it away.
+///
+/// Takes the path the caller means to open, and opens exactly that. The desktop authorizes first
+/// and passes the already-canonical path it got back, so its check and this open are one
+/// resolution; handing an unresolved path here instead would reopen the window
+/// `apps/desktop/src/ipc.rs`'s `authorized_path` exists to close.
+pub fn read_image(path: &std::path::Path) -> Result<Vec<u8>, TraceError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| TraceError::Input(format!("cannot read {}: {e}", path.display())))?;
+    // A failed fstat is not fatal: this is a fast path, and `read_capped` below is the real bound.
+    if file.metadata().is_ok_and(|m| m.len() > MAX_INPUT_FILE_BYTES) {
+        return Err(too_large());
+    }
+    match read_capped(file, MAX_INPUT_FILE_BYTES)
+        .map_err(|e| TraceError::Input(format!("cannot read {}: {e}", path.display())))?
+    {
+        Some(bytes) => Ok(bytes),
+        None => Err(too_large()),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TraceMode { Binary, Color }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One user-facing trace control: what it is called, what it accepts, and where it starts.
+///
+/// The single statement of these numbers. `validate` builds its refusals from them, the CLI takes
+/// its clap defaults and help from them, and the desktop ships the table to the dialog, which
+/// renders its sliders from it — so a range moves in one place instead of four.
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TraceOptions {
-    pub mode: TraceMode,
-    pub filter_speckle: u8,   // 0–16 px
-    pub corner_threshold: u8, // 0–180 degrees
-    pub length_threshold: f64, // 3.5–10.0
-    pub color_precision: u8,  // 1–8 bits
+pub struct ControlSpec {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub default: f64,
+    /// Inert in binary mode. Which controls those are is the tracer's knowledge, not the widget's.
+    pub color_only: bool,
 }
-impl Default for TraceOptions {
+
+pub const SPECKLE: ControlSpec = ControlSpec {
+    name: "speckle", label: "Ignore speckles",
+    help: "Ignore speckles up to this size in px (0–16)",
+    min: 0.0, max: 16.0, step: 1.0, default: 4.0, color_only: false,
+};
+pub const SMOOTHING: ControlSpec = ControlSpec {
+    name: "smoothing", label: "Smoothing",
+    help: "Corner threshold in degrees (0–180); higher = smoother",
+    min: 0.0, max: 180.0, step: 1.0, default: 60.0, color_only: false,
+};
+pub const DETAIL: ControlSpec = ControlSpec {
+    name: "detail", label: "Detail",
+    help: "Level of detail (3.5–10); higher = more detail",
+    min: 3.5, max: 10.0, step: 0.5, default: 9.5, color_only: false,
+};
+pub const COLORS: ControlSpec = ControlSpec {
+    name: "colors", label: "Colors",
+    help: "Color precision in bits (1–8, color mode only)",
+    min: 1.0, max: 8.0, step: 1.0, default: 6.0, color_only: true,
+};
+
+/// In display order.
+pub const CONTROLS: [ControlSpec; 4] = [SPECKLE, SMOOTHING, DETAIL, COLORS];
+
+/// What a caller asks for, in the units a person setting it thinks in.
+///
+/// vtracer's own parameter names and directions do not appear here, or anywhere outside this
+/// module: they are an implementation of tracing, not a description of it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceControls {
+    pub mode: TraceMode,
+    pub speckle: u8,
+    pub smoothing: u8,
+    /// Higher means more detail, the direction a person expects from a control with this name.
+    pub detail: f64,
+    pub colors: u8,
+}
+
+impl Default for TraceControls {
     fn default() -> Self {
-        TraceOptions { mode: TraceMode::Binary, filter_speckle: 4, corner_threshold: 60,
-                       length_threshold: 4.0, color_precision: 6 }
+        TraceControls {
+            mode: TraceMode::Binary,
+            speckle: SPECKLE.default as u8,
+            smoothing: SMOOTHING.default as u8,
+            detail: DETAIL.default,
+            colors: COLORS.default as u8,
+        }
     }
 }
 
+/// The table plus the two facts that are not controls: what mode a fresh dialog starts in, and the
+/// size a large image is reduced to. `MAX_DIM` travels with them because the dialog states it to
+/// the user, and used to state it as a hardcoded 2048.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceControlSpecs {
+    pub controls: [ControlSpec; 4],
+    pub default_mode: TraceMode,
+    pub max_dim: u32,
+}
+
+pub fn control_specs() -> TraceControlSpecs {
+    TraceControlSpecs {
+        controls: CONTROLS,
+        default_mode: TraceControls::default().mode,
+        max_dim: MAX_DIM,
+    }
+}
+
+/// vtracer's `length_threshold` runs opposite to detail: a lower threshold keeps shorter segments,
+/// so it yields *more* detail. Reflect the user's value through its own range rather than
+/// subtracting a constant, so moving either bound cannot silently break the mapping.
+fn length_threshold(detail: f64) -> f64 {
+    DETAIL.min + DETAIL.max - detail
+}
+
 #[derive(Debug, PartialEq)]
-pub enum TraceError { InvalidOption(String), Decode(String), Trace(String), EmptyResult }
+pub enum TraceError { Input(String), InvalidOption(String), Decode(String), Trace(String), EmptyResult }
 impl std::fmt::Display for TraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Input's messages are already whole sentences naming the file, so a prefix would read twice.
+            TraceError::Input(m) => write!(f, "{m}"),
             TraceError::InvalidOption(m) => write!(f, "invalid option: {m}"),
             TraceError::Decode(m) => write!(f, "could not read image: {m}"),
             TraceError::Trace(m) => write!(f, "trace failed: {m}"),
-            TraceError::EmptyResult => write!(f, "empty"),
+            TraceError::EmptyResult =>
+                write!(f, "nothing traced — lower the speckle filter or raise detail"),
         }
     }
 }
 impl std::error::Error for TraceError {}
+
+impl TraceError {
+    /// Stable identifier for a caller that must branch on the *kind* of failure rather than show
+    /// its text — the desktop sends it as `IpcError::code`, and the dialog renders its empty state
+    /// from `"empty"` instead of matching a `Display` string across a language boundary.
+    pub fn code(&self) -> &'static str {
+        match self {
+            TraceError::Input(_) => "input",
+            TraceError::InvalidOption(_) => "invalid_option",
+            TraceError::Decode(_) => "decode",
+            TraceError::Trace(_) => "trace",
+            TraceError::EmptyResult => "empty",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,18 +210,21 @@ pub struct TraceResult {
     pub downscaled: bool,
 }
 
-pub(crate) fn validate(opts: &TraceOptions) -> Result<(), TraceError> {
-    if opts.filter_speckle > 16 {
-        return Err(TraceError::InvalidOption("filter_speckle must be 0–16".into()));
-    }
-    if opts.corner_threshold > 180 {
-        return Err(TraceError::InvalidOption("corner_threshold must be 0–180".into()));
-    }
-    if !(3.5..=10.0).contains(&opts.length_threshold) {
-        return Err(TraceError::InvalidOption("length_threshold must be 3.5–10.0".into()));
-    }
-    if !(1..=8).contains(&opts.color_precision) {
-        return Err(TraceError::InvalidOption("color_precision must be 1–8".into()));
+/// Refuse a control that falls outside the range its own spec states.
+pub(crate) fn validate(c: &TraceControls) -> Result<(), TraceError> {
+    for (spec, value) in [
+        (SPECKLE, c.speckle as f64),
+        (SMOOTHING, c.smoothing as f64),
+        (DETAIL, c.detail),
+        (COLORS, c.colors as f64),
+    ] {
+        // A NaN fails `contains` too, which is the answer we want and the reason this is not
+        // written as a pair of comparisons.
+        if !(spec.min..=spec.max).contains(&value) {
+            return Err(TraceError::InvalidOption(format!(
+                "{} must be {}–{}", spec.name, spec.min, spec.max
+            )));
+        }
     }
     Ok(())
 }
@@ -224,8 +384,8 @@ fn pad_with_transparent_row(img: &image::RgbaImage) -> image::RgbaImage {
     padded
 }
 
-pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, TraceError> {
-    validate(opts)?;
+pub fn trace(image_bytes: &[u8], controls: &TraceControls) -> Result<TraceResult, TraceError> {
+    validate(controls)?;
     let (mut rgba, downscaled) = decode_and_downscale(image_bytes)?;
     // Nothing visible means nothing to cut. This has to be decided before flattening, which
     // erases the distinction by making every transparent pixel opaque white — and in colour mode
@@ -239,7 +399,7 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     // that colour, so the background produces no cluster. Flattening first would hide the alpha
     // it looks for, and the manufactured white would come back as a stroked path the cut planner
     // reports as a pass. Binary mode has no such handling and needs the composite.
-    if opts.mode == TraceMode::Binary {
+    if controls.mode == TraceMode::Binary {
         flatten_onto_white(&mut rgba);
     }
     let (width, height) = (rgba.width(), rgba.height());
@@ -247,7 +407,7 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     // Colour mode leans on vtracer's keying, which is threshold-gated, so force it whenever the
     // image has any transparency at all rather than only when enough of it lands on the sampled
     // scanlines. Binary mode has already had its transparency composited away.
-    let padded = opts.mode == TraceMode::Color && rgba.pixels().any(|p| p[3] == 0);
+    let padded = controls.mode == TraceMode::Color && rgba.pixels().any(|p| p[3] == 0);
     let fed = if padded { pad_with_transparent_row(&rgba) } else { rgba };
     let (fed_width, fed_height) = (fed.width(), fed.height());
 
@@ -257,15 +417,15 @@ pub fn trace(image_bytes: &[u8], opts: &TraceOptions) -> Result<TraceResult, Tra
     img.height = fed_height as usize;
 
     let config = vtracer::Config {
-        color_mode: match opts.mode {
+        color_mode: match controls.mode {
             TraceMode::Binary => vtracer::ColorMode::Binary,
             TraceMode::Color => vtracer::ColorMode::Color,
         },
         hierarchical: vtracer::Hierarchical::Stacked,
-        filter_speckle: opts.filter_speckle as usize,
-        color_precision: opts.color_precision as i32,
-        corner_threshold: opts.corner_threshold as i32,
-        length_threshold: opts.length_threshold,
+        filter_speckle: controls.speckle as usize,
+        color_precision: controls.colors as i32,
+        corner_threshold: controls.smoothing as i32,
+        length_threshold: length_threshold(controls.detail),
         ..vtracer::Config::default()
     };
 
@@ -329,15 +489,93 @@ mod tests {
         })
     }
 
+    /// The ranges are data now, not prose in four places. Each control is rejected one step
+    /// outside the bounds its own spec states, so a range can only be changed in the table.
     #[test]
-    fn validate_rejects_out_of_range() {
-        let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
-        assert!(matches!(validate(&bad), Err(TraceError::InvalidOption(m)) if m.contains("filter_speckle")));
-        let bad = TraceOptions { color_precision: 0, ..TraceOptions::default() };
-        assert!(matches!(validate(&bad), Err(TraceError::InvalidOption(m)) if m.contains("color_precision")));
-        let bad = TraceOptions { length_threshold: 11.0, ..TraceOptions::default() };
-        assert!(matches!(validate(&bad), Err(TraceError::InvalidOption(m)) if m.contains("length_threshold")));
-        assert!(validate(&TraceOptions::default()).is_ok());
+    fn validate_rejects_each_control_outside_its_own_spec() {
+        let over = |c: &TraceControls| validate(c).unwrap_err();
+        let d = TraceControls::default();
+
+        let bad = TraceControls { speckle: SPECKLE.max as u8 + 1, ..d.clone() };
+        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("speckle")));
+        let bad = TraceControls { smoothing: SMOOTHING.max as u8 + 1, ..d.clone() };
+        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("smoothing")));
+        let bad = TraceControls { detail: DETAIL.max + DETAIL.step, ..d.clone() };
+        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        let bad = TraceControls { detail: DETAIL.min - DETAIL.step, ..d.clone() };
+        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        let bad = TraceControls { colors: COLORS.min as u8 - 1, ..d.clone() };
+        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("colors")));
+
+        assert!(validate(&d).is_ok());
+
+        // The defaults above sit in the interior of every range, so they cannot catch a
+        // `validate` that is tighter than the table — one that refused a slider sitting at its
+        // own min or max. The dialog hands out exactly those two values, so a bound this test
+        // never exercises is a bound the UI can still trip on.
+        let at_min = TraceControls {
+            speckle: SPECKLE.min as u8,
+            smoothing: SMOOTHING.min as u8,
+            detail: DETAIL.min,
+            colors: COLORS.min as u8,
+            ..d.clone()
+        };
+        assert!(validate(&at_min).is_ok());
+        let at_max = TraceControls {
+            speckle: SPECKLE.max as u8,
+            smoothing: SMOOTHING.max as u8,
+            detail: DETAIL.max,
+            colors: COLORS.max as u8,
+            ..d
+        };
+        assert!(validate(&at_max).is_ok());
+    }
+
+    /// clap's derive needs a literal for `help`, so each spec states its range in prose beside the
+    /// numbers. That is the one restatement this design accepts, and only because this test makes
+    /// it impossible to change one bound without the other: checked as one joined token, not two
+    /// separate `contains`, since `format!("{}", 3.0)` is `"3"`, a substring of `"3.5"` — separate
+    /// checks would pass against a `min` that had quietly drifted.
+    #[test]
+    fn control_help_states_its_own_range() {
+        for spec in CONTROLS {
+            let range = format!("{}–{}", spec.min, spec.max);
+            assert!(
+                spec.help.contains(&range),
+                "{}: help {:?} does not state its range {range}",
+                spec.name, spec.help,
+            );
+        }
+    }
+
+    /// Detail is reflected through its own range rather than subtracted from a constant. The
+    /// constant that used to live in the UI (`13.5`) was only correct because 3.5 + 10 happens to
+    /// equal it; moving either bound would have broken the mapping silently.
+    #[test]
+    fn detail_reflects_through_its_own_range() {
+        assert_eq!(length_threshold(DETAIL.max), DETAIL.min);
+        assert_eq!(length_threshold(DETAIL.min), DETAIL.max);
+        // The default trace is unchanged by the flip: 9.5 user-facing is vtracer's old 4.0 default.
+        assert_eq!(length_threshold(DETAIL.default), 4.0);
+    }
+
+    /// A caller that must branch on the kind of failure gets a code, not a `Display` string. The
+    /// dialog's empty state used to be selected by matching the literal "empty".
+    #[test]
+    fn every_error_carries_a_code() {
+        assert_eq!(TraceError::Input(String::new()).code(), "input");
+        assert_eq!(TraceError::InvalidOption(String::new()).code(), "invalid_option");
+        assert_eq!(TraceError::Decode(String::new()).code(), "decode");
+        assert_eq!(TraceError::Trace(String::new()).code(), "trace");
+        assert_eq!(TraceError::EmptyResult.code(), "empty");
+    }
+
+    /// One sentence, printed verbatim by both entry points. Before this, the CLI said "lower
+    /// --detail" and the dialog said "raise detail" for the same failure, and both were right.
+    #[test]
+    fn empty_result_names_both_ways_out() {
+        let m = TraceError::EmptyResult.to_string();
+        assert!(m.contains("speckle") && m.contains("detail"), "{m}");
     }
 
     #[test]
@@ -363,11 +601,6 @@ mod tests {
         assert!((680..=684).contains(&img.height()));
     }
 
-    #[test]
-    fn empty_result_displays_empty_sentinel() {
-        assert_eq!(TraceError::EmptyResult.to_string(), "empty");
-    }
-
     /// 100×100 image split into 4 solid 50×50 quadrants: red, green, blue, white.
     fn quadrants() -> RgbaImage {
         RgbaImage::from_fn(100, 100, |x, y| match (x < 50, y < 50) {
@@ -381,7 +614,7 @@ mod tests {
     #[test]
     fn binary_trace_of_black_square_yields_paths() {
         let bytes = png_bytes(&black_square(128, 128, 64));
-        let r = trace(&bytes, &TraceOptions::default()).unwrap();
+        let r = trace(&bytes, &TraceControls::default()).unwrap();
         assert!(r.path_count >= 1);
         assert!(r.svg.contains("<path"));
         assert_eq!((r.width_px, r.height_px), (128, 128));
@@ -390,7 +623,7 @@ mod tests {
 
     #[test]
     fn color_trace_yields_multiple_fills() {
-        let opts = TraceOptions { mode: TraceMode::Color, filter_speckle: 0, ..TraceOptions::default() };
+        let opts = TraceControls { mode: TraceMode::Color, speckle: 0, ..TraceControls::default() };
         let r = trace(&png_bytes(&quadrants()), &opts).unwrap();
         assert!(r.path_count >= 2);
         // At least two distinct fill colors among the emitted paths.
@@ -403,8 +636,8 @@ mod tests {
     #[test]
     fn trace_is_deterministic() {
         let bytes = png_bytes(&black_square(128, 128, 64));
-        let a = trace(&bytes, &TraceOptions::default()).unwrap();
-        let b = trace(&bytes, &TraceOptions::default()).unwrap();
+        let a = trace(&bytes, &TraceControls::default()).unwrap();
+        let b = trace(&bytes, &TraceControls::default()).unwrap();
         assert_eq!(a.svg, b.svg);
     }
 
@@ -412,13 +645,13 @@ mod tests {
     fn speckle_filter_can_empty_the_result() {
         // Whole image is smaller than a 16px speckle after the square shrinks to 4px.
         let bytes = png_bytes(&black_square(64, 64, 4));
-        let opts = TraceOptions { filter_speckle: 16, ..TraceOptions::default() };
+        let opts = TraceControls { speckle: 16, ..TraceControls::default() };
         assert!(matches!(trace(&bytes, &opts), Err(TraceError::EmptyResult)));
     }
 
     #[test]
     fn trace_rejects_invalid_options_before_decoding() {
-        let bad = TraceOptions { filter_speckle: 17, ..TraceOptions::default() };
+        let bad = TraceControls { speckle: 17, ..TraceControls::default() };
         assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
     }
 
@@ -430,7 +663,7 @@ mod tests {
         let img = RgbaImage::from_fn(256, 256, |x, y| {
             if (x + y) % 2 == 0 { image::Rgba([0, 0, 0, 255]) } else { image::Rgba([255, 255, 255, 255]) }
         });
-        let opts = TraceOptions { mode: TraceMode::Binary, filter_speckle: 0, ..TraceOptions::default() };
+        let opts = TraceControls { mode: TraceMode::Binary, speckle: 0, ..TraceControls::default() };
         match trace(&png_bytes(&img), &opts) {
             Err(TraceError::EmptyResult) => {}
             Ok(r) => {
@@ -455,7 +688,7 @@ mod tests {
         }
 
         for mode in [TraceMode::Binary, TraceMode::Color] {
-            let opts = TraceOptions { mode, filter_speckle: 0, ..TraceOptions::default() };
+            let opts = TraceControls { mode, speckle: 0, ..TraceControls::default() };
             let r = trace(&png_bytes(&quadrants()), &opts).unwrap();
             let paths: Vec<&str> =
                 r.svg.lines().filter(|l| l.trim_start().starts_with("<path")).collect();
@@ -479,7 +712,7 @@ mod tests {
     fn a_fully_transparent_image_traces_to_nothing() {
         let img = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
         for mode in [TraceMode::Binary, TraceMode::Color] {
-            let opts = TraceOptions { mode, ..TraceOptions::default() };
+            let opts = TraceControls { mode, ..TraceControls::default() };
             assert!(
                 matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
                 "{mode:?}: a transparent image must trace to nothing, not to a cuttable rectangle",
@@ -501,7 +734,7 @@ mod tests {
                 image::Rgba([0, 0, 0, 0])
             }
         });
-        let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+        let opts = TraceControls { mode: TraceMode::Color, ..TraceControls::default() };
         let r = trace(&png_bytes(&img), &opts).expect("the opaque square should trace");
         assert_eq!(r.path_count, 1, "expected only the square, got {} paths:\n{}", r.path_count, r.svg);
         assert!(
@@ -525,7 +758,7 @@ mod tests {
                 image::Rgba([255, 255, 255, 255])
             }
         });
-        let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+        let opts = TraceControls { mode: TraceMode::Color, ..TraceControls::default() };
         let r = trace(&png_bytes(&img), &opts).expect("the opaque background should trace");
         assert_eq!(r.path_count, 1, "the invisible island became geometry:\n{}", r.svg);
         assert!(!r.svg.contains("#000000"), "the island was traced as black:\n{}", r.svg);
@@ -543,7 +776,7 @@ mod tests {
     fn transparency_is_empty_regardless_of_its_hidden_color() {
         for hidden in [[0, 0, 0, 0], [255, 255, 255, 0], [17, 200, 90, 0]] {
             let img = RgbaImage::from_pixel(32, 32, image::Rgba(hidden));
-            let opts = TraceOptions { mode: TraceMode::Color, ..TraceOptions::default() };
+            let opts = TraceControls { mode: TraceMode::Color, ..TraceControls::default() };
             assert!(
                 matches!(trace(&png_bytes(&img), &opts), Err(TraceError::EmptyResult)),
                 "hidden colour {hidden:?} must still count as empty",
@@ -566,7 +799,7 @@ mod tests {
                 }
             })
         };
-        let opts = TraceOptions { mode: TraceMode::Binary, ..TraceOptions::default() };
+        let opts = TraceControls { mode: TraceMode::Binary, ..TraceControls::default() };
         let transparent = trace(&png_bytes(&shape(image::Rgba([0, 0, 0, 0]))), &opts).unwrap();
         let white = trace(&png_bytes(&shape(image::Rgba([255, 255, 255, 255]))), &opts).unwrap();
         assert_eq!(
@@ -606,10 +839,63 @@ mod tests {
     #[test]
     fn trace_contains_tracer_panic_on_high_frequency_image() {
         let bytes = include_bytes!("../tests/fixtures/checker-512.png");
-        let opts = TraceOptions { filter_speckle: 0, ..TraceOptions::default() };
+        let opts = TraceControls { speckle: 0, ..TraceControls::default() };
         match trace(bytes, &opts) {
             Err(TraceError::Trace(_)) | Err(TraceError::EmptyResult) => {}
             other => panic!("expected a typed error, got {other:?}"),
         }
+    }
+
+    /// The ceiling has to come from the read itself. A separate size check describes whatever the
+    /// pathname pointed at when it ran, so a file that grows between the check and the read is
+    /// read in full despite having just passed the limit — the cap is advisory rather than a
+    /// bound. Deliberately exercised through a plain reader, with no file and no metadata call,
+    /// because that is the property under test.
+    #[test]
+    fn read_capped_refuses_a_stream_longer_than_the_cap() {
+        use std::io::Read as _;
+        let over = std::io::repeat(b'x').take(9);
+        assert!(read_capped(over, 8).unwrap().is_none(), "9 bytes must be refused against a cap of 8");
+    }
+
+    /// Covers the glue the helper tests cannot: opening the path, threading the real ceiling
+    /// through, and handing back the bytes. Both trace entry points read through here, so a
+    /// mistake in this wiring breaks every trace.
+    #[test]
+    fn read_image_returns_the_contents_of_a_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
+        std::fs::write(&path, b"not an image, but bytes are bytes").unwrap();
+        assert_eq!(read_image(&path).unwrap(), b"not an image, but bytes are bytes");
+    }
+
+    /// Exercises the real `MAX_INPUT_FILE_BYTES`, which the `read_capped` tests deliberately do
+    /// not. The file is extended rather than written, so no quarter gigabyte ever moves through
+    /// this process. What it costs on disk is the filesystem's business — usually nothing, since
+    /// the range can be left unallocated, but `set_len` promises the size and never the storage.
+    #[test]
+    fn read_image_refuses_a_file_past_the_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        std::fs::File::create(&path).unwrap().set_len(MAX_INPUT_FILE_BYTES + 1).unwrap();
+        assert!(matches!(read_image(&path), Err(TraceError::Input(m)) if m.contains("too large")));
+    }
+
+    #[test]
+    fn read_capped_accepts_a_stream_exactly_at_the_cap() {
+        use std::io::Read as _;
+        let exact = std::io::repeat(b'x').take(8);
+        assert_eq!(read_capped(exact, 8).unwrap().map(|b| b.len()), Some(8));
+    }
+
+    /// A path that does not exist is an input failure, not a decode failure: nothing was ever
+    /// handed to the decoder. The distinction is what `code()` will make visible to the desktop,
+    /// and the message must carry the filename since that is the only thing distinguishing this
+    /// failure from any other missing file.
+    #[test]
+    fn read_image_reports_a_missing_path_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.bin");
+        assert!(matches!(read_image(&path), Err(TraceError::Input(m)) if m.contains("absent.bin")));
     }
 }

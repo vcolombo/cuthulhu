@@ -227,17 +227,36 @@ export async function pickOpenPath(): Promise<string | null> {
 
 // --- trace wire types ---
 
-export type TraceOptionsDto = {
+export type TraceControlsDto = {
   mode: "binary" | "color";
-  filterSpeckle: number;
-  cornerThreshold: number;
-  lengthThreshold: number;
-  colorPrecision: number;
+  speckle: number;
+  smoothing: number;
+  detail: number;
+  colors: number;
+};
+// Mirrors trace::ControlSpec. No range, default, or step is written on this side — the whole point
+// of the command below is that these numbers have one home.
+export type ControlSpec = {
+  name: "speckle" | "smoothing" | "detail" | "colors";
+  label: string;
+  help: string;
+  min: number;
+  max: number;
+  step: number;
+  default: number;
+  colorOnly: boolean;
+};
+export type TraceControlSpecsDto = {
+  controls: ControlSpec[];
+  defaultMode: "binary" | "color";
+  maxDim: number;
 };
 export type TraceResultDto = { svg: string; pathCount: number; widthPx: number; heightPx: number; downscaled: boolean };
 
-
-export async function traceImage(args: { path: string; opts: TraceOptionsDto }): Promise<TraceResultDto> {
+export async function traceControls(): Promise<TraceControlSpecsDto> {
+  return invoke("trace_controls", {});
+}
+export async function traceImage(args: { path: string; controls: TraceControlsDto }): Promise<TraceResultDto> {
   return invoke("trace_image", args);
 }
 export async function loadImagePreview(args: { path: string }): Promise<string> {

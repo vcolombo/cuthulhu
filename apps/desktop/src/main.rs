@@ -60,6 +60,7 @@ fn main() {
             ipc::save_preset,
             ipc::delete_preset,
             ipc::trace_image,
+            ipc::trace_controls,
             ipc::load_image_preview,
             ipc::pick_image,
             force_quit,

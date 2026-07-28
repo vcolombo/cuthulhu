@@ -27,6 +27,14 @@ Converting a bitmap image into outlines that can be cut. A traced result enters 
 ordinary Nodes.
 _Avoid_: vectorize, autotrace, raster conversion
 
+**TraceControls**:
+What a caller asks a Trace for, in the units a person setting them thinks in — mode, speckle,
+smoothing, detail, colors. Ranges and defaults are stated once, in `trace::CONTROLS`. A higher
+`detail` value yields more detail, the opposite direction from vtracer's `length_threshold`, which
+never leaves the `trace` crate.
+_Avoid_: options, params, settings (Settings is the machine's, not the tracer's), vtracer parameter
+names
+
 ### Planning a cut
 
 **ColorPass**:

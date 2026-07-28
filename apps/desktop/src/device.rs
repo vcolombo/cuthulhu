@@ -17,7 +17,7 @@ use crate::state::AppState;
 pub struct IpcError { pub code: String, pub message: String }
 
 impl IpcError {
-    fn new(code: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
         IpcError { code: code.into(), message: message.into() }
     }
 }

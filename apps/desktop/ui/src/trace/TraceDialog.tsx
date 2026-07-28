@@ -2,8 +2,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
 import {
-  acceptError, acceptResult, defaultControls, makeDebouncer, svgDataUrl,
-  toOptionsDto, type PreviewState, type TraceControls,
+  acceptError, acceptResult, controlsFromSpecs, makeDebouncer, svgDataUrl, type PreviewState,
 } from "./viewmodel";
 
 const panelStyle: CSSProperties = {
@@ -54,7 +53,8 @@ export function TraceDialog({ path, onInsert, onClose }: {
   onInsert: (svg: string) => void;
   onClose: () => void;
 }) {
-  const [controls, setControls] = useState<TraceControls>(defaultControls);
+  const [specs, setSpecs] = useState<ipc.TraceControlSpecsDto | null>(null);
+  const [controls, setControls] = useState<ipc.TraceControlsDto | null>(null);
   const [preview, setPreview] = useState<PreviewState>({ kind: "idle" });
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [sourceError, setSourceError] = useState<string | null>(null);
@@ -76,6 +76,19 @@ export function TraceDialog({ path, onInsert, onClose }: {
   }, [path]);
 
   useEffect(() => {
+    let ignore = false;
+    // `.then(...).catch(...)`, not `.then(onFulfilled, onRejected)`: `controlsFromSpecs` throws
+    // when the table omits a control, and a rejection handler passed to the *same* `then` does
+    // not see a throw from its own fulfillment handler. The dialog would sit idle with no
+    // sliders and no error — the failure that throwing was supposed to make visible.
+    ipc.traceControls()
+      .then((s) => { if (!ignore) { setSpecs(s); setControls(controlsFromSpecs(s)); } })
+      .catch((e) => { if (!ignore) setPreview({ kind: "error", message: ipc.ipcErrorMessage(e) }); });
+    return () => { ignore = true; };
+  }, []);
+
+  useEffect(() => {
+    if (controls === null) return;
     // Both statements must run here, not inside the debounced callback:
     //   - bumping the id retires any in-flight request, so a late response is rejected;
     //   - clearing to `tracing` retires the *displayed* result.
@@ -85,22 +98,14 @@ export function TraceDialog({ path, onInsert, onClose }: {
     const id = ++latestId.current;
     setPreview({ kind: "tracing" });
     debouncer.schedule(() => {
-      ipc.traceImage({ path, opts: toOptionsDto(controls) }).then(
+      ipc.traceImage({ path, controls }).then(
         (r) => setPreview((prev) => acceptResult(id, latestId.current, r, prev)),
-        (e) => setPreview((prev) => acceptError(id, latestId.current, ipc.ipcErrorMessage(e), prev)),
+        (e) => setPreview((prev) =>
+          acceptError(id, latestId.current, ipc.ipcErrorCode(e), ipc.ipcErrorMessage(e), prev)),
       );
     });
     return () => debouncer.cancel();
   }, [path, controls, debouncer]);
-
-  const slider = (label: string, value: number, min: number, max: number, step: number, set: (v: number) => void, disabled = false) => (
-    <label style={{ display: "flex", alignItems: "center", gap: 8, opacity: disabled ? 0.4 : 1 }}>
-      <span style={{ width: 110 }}>{label}</span>
-      <input type="range" min={min} max={max} step={step} value={value} disabled={disabled}
-        onChange={(e) => set(Number(e.target.value))} />
-      <span style={{ width: 32, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{value}</span>
-    </label>
-  );
 
   return (
     <div style={panelStyle}>
@@ -121,7 +126,7 @@ export function TraceDialog({ path, onInsert, onClose }: {
           <div style={previewPane}>
             {preview.kind === "ready" && <img src={svgDataUrl(preview.svg)} alt="Traced preview" style={{ maxWidth: "100%", maxHeight: 200 }} />}
             {preview.kind === "tracing" && <span>Tracing…</span>}
-            {preview.kind === "empty" && <span>Nothing traced — lower speckle filter or raise detail</span>}
+            {preview.kind === "empty" && <span>{preview.message}</span>}
             {preview.kind === "error" && <span style={{ color: "var(--cut)" }}>{preview.message}</span>}
           </div>
         </div>
@@ -129,24 +134,36 @@ export function TraceDialog({ path, onInsert, onClose }: {
         {preview.kind === "ready" ? (
           <div style={{ fontSize: 12, color: "var(--muted)" }}>
             {preview.pathCount} {preview.pathCount === 1 ? "path" : "paths"}
-            {preview.downscaled ? " — large image reduced to 2048 px for tracing" : ""}
+            {preview.downscaled ? ` — large image reduced to ${specs?.maxDim} px for tracing` : ""}
           </div>
         ) : null}
 
         <div style={{ display: "flex", gap: 16, fontSize: 12 }}>
           <label>
-            <input type="radio" checked={controls.mode === "binary"} onChange={() => setControls({ ...controls, mode: "binary" })} /> Binary
+            <input type="radio" checked={controls?.mode === "binary"}
+              onChange={() => setControls((c) => c && { ...c, mode: "binary" })} /> Binary
           </label>
           <label>
-            <input type="radio" checked={controls.mode === "color"} onChange={() => setControls({ ...controls, mode: "color" })} /> Color
+            <input type="radio" checked={controls?.mode === "color"}
+              onChange={() => setControls((c) => c && { ...c, mode: "color" })} /> Color
           </label>
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
-          {slider("Ignore speckles", controls.speckle, 0, 16, 1, (v) => setControls({ ...controls, speckle: v }))}
-          {slider("Smoothing", controls.smoothing, 0, 180, 1, (v) => setControls({ ...controls, smoothing: v }))}
-          {slider("Detail", controls.detail, 3.5, 10, 0.5, (v) => setControls({ ...controls, detail: v }))}
-          {slider("Colors", controls.colors, 1, 8, 1, (v) => setControls({ ...controls, colors: v }), controls.mode !== "color")}
+          {specs?.controls.map((s) => {
+            const disabled = s.colorOnly && controls?.mode !== "color";
+            return (
+              <label key={s.name} style={{ display: "flex", alignItems: "center", gap: 8, opacity: disabled ? 0.4 : 1 }}>
+                <span style={{ width: 110 }}>{s.label}</span>
+                <input type="range" min={s.min} max={s.max} step={s.step} disabled={disabled}
+                  value={controls?.[s.name] ?? s.default}
+                  onChange={(e) => setControls((c) => c && { ...c, [s.name]: Number(e.target.value) })} />
+                <span style={{ width: 32, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+                  {controls?.[s.name] ?? s.default}
+                </span>
+              </label>
+            );
+          })}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>

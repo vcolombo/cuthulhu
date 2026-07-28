@@ -9,7 +9,7 @@
 //! for a worker parked at `recv()` — see `DeviceManager::cancel`.
 
 use crate::status::{status_of, CutStatus, Ended};
-use crate::{write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
+use crate::{close_pass, open_pass, write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
 use serde::Serialize;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -423,13 +423,12 @@ fn finish_pass(
     rep: &Reporter,
 ) -> Result<PassRunOutcome, DeviceError> {
     rep.emit(state, total_passes, job_id, DeviceEventKind::PassComplete(pass_index));
+    write_all(transport, &close_pass(driver, pass_index, total_passes)).map_err(DeviceError::from)?;
     if pass_index + 1 < total_passes {
-        write_all(transport, &driver.pass_park()).map_err(DeviceError::from)?;
         let next_pass_index = pass_index + 1;
         emit_for(job_id, state, DeviceState::WaitingForColorSwap { job_id, next_pass_index }, total_passes, rep);
         Ok(PassRunOutcome::Paused { next_pass_index })
     } else {
-        write_all(transport, &driver.session_end()).map_err(DeviceError::from)?;
         rep.emit(state, total_passes, job_id, DeviceEventKind::JobComplete);
         // Set after `JobComplete` goes out, not before: that event still carries the
         // mid-flight status, and a caller renders it — a "completed" outcome attached
@@ -455,11 +454,8 @@ fn run_from_pass(
     cancel_flag: &AtomicBool,
 ) -> Result<PassRunOutcome, DeviceError> {
     let total_passes = passes.len();
-    let mut bytes = if pass_index == 0 { driver.session_begin() } else { Vec::new() };
-    let pass_bytes = driver
-        .encode_pass(&passes[pass_index].job)
+    let bytes = open_pass(driver, &passes[pass_index].job, pass_index)
         .map_err(|e| DeviceError::Io(format!("{e:?}")))?;
-    bytes.extend(pass_bytes);
     match transmit_bytes(transport, &bytes, job_id, pass_index, total_passes, state, rep, cancel_flag)? {
         TransmitOutcome::Cancelled { submitted_bytes } => {
             return Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes });
@@ -477,16 +473,13 @@ fn run_from_pass(
     }
 }
 
-/// Recompute the byte length of an already-fully-transmitted pass, mirroring
-/// `run_from_pass`'s own encode step — used by `Command::Cancel` to report
+/// The byte length of an already-fully-transmitted Pass, from the same function
+/// that produced those bytes — used by `Command::Cancel` to report
 /// `submitted_bytes` for a job parked in `AwaitingCompletion`. Errors fall
-/// back to 0: encoding already succeeded once to get here.
+/// back to 0: encoding already succeeded once to get here, and a cancel must not fail
+/// because a byte count could not be recomputed.
 fn pass_byte_len(driver: &(dyn Driver + Send), passes: &[CutPass], pass_index: usize) -> usize {
-    let mut bytes = if pass_index == 0 { driver.session_begin() } else { Vec::new() };
-    if let Ok(pass_bytes) = driver.encode_pass(&passes[pass_index].job) {
-        bytes.extend(pass_bytes);
-    }
-    bytes.len()
+    open_pass(driver, &passes[pass_index].job, pass_index).map_or(0, |b| b.len())
 }
 
 /// Run once cancellation has been observed (either the worker noticed the

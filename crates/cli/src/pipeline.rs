@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use driver_core::{DeviceBackendFactory, Driver, Job, Settings};
+use driver_core::{close_pass, open_pass, DeviceBackendFactory, Driver, Job, Settings};
 use driver_registry::HardwareBackendFactory;
 
 #[derive(Clone, Copy)]
@@ -24,18 +24,13 @@ impl Device {
     }
 }
 
-/// Bytes for pass `i` of `total`, framed exactly as `DeviceManager` transmits
-/// them: `session_begin` before the first pass, `pass_park` between passes,
-/// `session_end` after the last. Keeps `cut --by-color --dry-run` output
-/// faithful to what a real multi-pass cut sends.
-pub fn pass_stream_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> Result<Vec<u8>, String> {
-    let mut bytes = if i == 0 { d.session_begin() } else { Vec::new() };
-    bytes.extend(d.encode_pass(job).map_err(|e| format!("encode: {e:?}"))?);
-    if i + 1 == total {
-        bytes.extend(d.session_end());
-    } else {
-        bytes.extend(d.pass_park());
-    }
+/// The whole of Pass `i` of `total` on the wire, for `--dry-run`: what
+/// `DeviceManager` writes before it waits for the machine, then what it writes
+/// after. Both halves come from `driver-core`, so this cannot say something a cut
+/// would not.
+pub fn dry_run_pass_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = open_pass(d, job, i).map_err(|e| format!("encode: {e:?}"))?;
+    bytes.extend(close_pass(d, i, total));
     Ok(bytes)
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
 use cli::cut::{self, format_pass_color};
-use cli::pipeline::{check_color_flag_scope, check_interactive, pass_stream_bytes, plan_cut_from_svg, plan_plain_cut, Device};
+use cli::pipeline::{check_color_flag_scope, check_interactive, dry_run_pass_bytes, plan_cut_from_svg, plan_plain_cut, Device};
 use driver_registry::HardwareBackendFactory;
 use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, TransportKind};
 use std::io::IsTerminal;
@@ -117,7 +117,7 @@ fn run() -> Result<(), String> {
                 let plan = plan_plain_cut(&svg, device, &settings, allow_out_of_bounds)?;
                 if dry_run {
                     let driver = device.driver();
-                    let bytes = pass_stream_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
+                    let bytes = dry_run_pass_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
                     print_hex_ascii(&bytes);
                     return Ok(());
                 }
@@ -174,7 +174,7 @@ fn cut_by_color(
         let d = device.driver();
         for (i, pass) in passes.iter().enumerate() {
             println!("-- pass {}/{} (color {}) --", i + 1, passes.len(), format_pass_color(pass.color));
-            let bytes = pass_stream_bytes(d.as_ref(), &pass.job, i, passes.len())?;
+            let bytes = dry_run_pass_bytes(d.as_ref(), &pass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }
         return Ok(());

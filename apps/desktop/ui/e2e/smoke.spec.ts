@@ -144,6 +144,18 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
       pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
     }),
+    // A fixture, not a claim: the real table lives in trace::CONTROLS and is what ships. This
+    // exists only so the dialog has sliders to render.
+    trace_controls: () => ({
+      controls: [
+        { name: "speckle", label: "Ignore speckles", help: "", min: 0, max: 16, step: 1, default: 4, colorOnly: false },
+        { name: "smoothing", label: "Smoothing", help: "", min: 0, max: 180, step: 1, default: 60, colorOnly: false },
+        { name: "detail", label: "Detail", help: "", min: 3.5, max: 10, step: 0.5, default: 9.5, colorOnly: false },
+        { name: "colors", label: "Colors", help: "", min: 1, max: 8, step: 1, default: 6, colorOnly: true },
+      ],
+      defaultMode: "binary",
+      maxDim: 2048,
+    }),
     load_image_preview: () => {
       if (opts?.failImagePreview) throw new Error("could not read image: broken thumbnail");
       return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";

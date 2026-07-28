@@ -80,10 +80,10 @@ pub fn write_all(t: &mut dyn Transport, mut bytes: &[u8]) -> Result<(), Transpor
 /// The bytes that open Pass `index`: the session prologue on the first Pass, then
 /// the encoded Pass itself.
 ///
-/// `DeviceManager` writes these, waits for the machine, then writes `close_pass`.
-/// The two together are one Pass on the wire, so a caller that wants the whole Pass
-/// at once — `cuthulhu cut --dry-run` — concatenates them rather than restating when
-/// a prologue is owed.
+/// `DeviceManager` writes these, waits for the machine (polling `status_query` in
+/// between), then writes `close_pass`. The two together are this Pass's own bytes, so a
+/// caller that wants the whole Pass at once — `cuthulhu cut --dry-run` — concatenates
+/// them rather than restating when a prologue is owed.
 pub fn open_pass(d: &dyn Driver, job: &Job, index: usize) -> Result<Vec<u8>, DriverError> {
     let mut bytes = if index == 0 { d.session_begin() } else { Vec::new() };
     bytes.extend(d.encode_pass(job)?);

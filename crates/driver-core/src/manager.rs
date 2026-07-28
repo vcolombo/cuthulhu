@@ -441,8 +441,7 @@ fn finish_pass(
     }
 }
 
-/// Run `passes[pass_index]` (prefixing `session_begin` when it's the first
-/// pass) through transmit + completion policy, then either park or finish.
+/// Run `passes[pass_index]` through transmit + completion policy, then either park or finish.
 fn run_from_pass(
     job_id: u64,
     pass_index: usize,

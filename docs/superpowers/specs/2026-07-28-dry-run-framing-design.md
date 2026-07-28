@@ -50,7 +50,8 @@ about the same functions the dry run calls. Drift is closed either way.
 ## Scope
 
 In scope: two new functions in `driver-core`, three callers changed to use them, one duplicated
-encode in the worker deleted.
+assembly of the prologue-plus-Pass sequence deleted from the worker (the encode itself stays;
+`pass_byte_len` still calls `encode_pass` via `open_pass`).
 
 Out of scope, decided deliberately:
 
@@ -180,8 +181,11 @@ both be wrong.
   / `PARK` / `END` on the recorded bytes, so it covers the worker's use of the new functions
   end to end without knowing they exist.
 - `manager.rs::cancel_mid_transmit_stops_writes_sends_abort_and_confirms_stop` — asserts a reported
-  byte total against payload bytes that actually landed, so it is the guard on `pass_byte_len`
-  changing shape.
+  byte total against payload bytes that actually landed, but that count comes from
+  `transmit_bytes`'s own counter; it never reaches `pass_byte_len`, which only runs from
+  `Command::Cancel` on a Pass parked in `AwaitingCompletion`. `plain_cut.rs`'s
+  `a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel` is the one test that reaches it,
+  and pins the exact byte count `pass_byte_len` recomputes.
 
 No `MANUAL-CHECKLIST.md` entry: the bytes on the wire are unchanged by construction, and the tests
 above are what say so.

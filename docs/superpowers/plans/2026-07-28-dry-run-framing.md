@@ -132,9 +132,12 @@ git commit -m "Give the framing of a Pass one home, since a comment was all that
 
 No new test. This task is behaviour-preserving, and the tests that prove it already exist —
 `two_pass_job_frames_session_once_and_pauses_for_swap` counts one prologue and one epilogue on bytes a
-`TeeTransport` actually received, and `cancel_mid_transmit_stops_writes_sends_abort_and_confirms_stop`
-checks a reported byte total against the payload bytes that landed, which is the guard on
-`pass_byte_len`. Writing a new failing test here would mean inventing behaviour that must not change.
+`TeeTransport` actually received, and `plain_cut.rs`'s
+`a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel` pins the exact byte total
+`pass_byte_len` recomputes for a Pass parked in `AwaitingCompletion`
+(`cancel_mid_transmit_stops_writes_sends_abort_and_confirms_stop` covers a different path — its count
+comes from `transmit_bytes`'s counter, not `pass_byte_len`). Writing a new failing test here would
+mean inventing behaviour that must not change.
 
 - [ ] **Step 1: Record the green baseline**
 

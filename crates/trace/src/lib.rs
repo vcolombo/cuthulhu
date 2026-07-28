@@ -508,19 +508,42 @@ mod tests {
         assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("colors")));
 
         assert!(validate(&d).is_ok());
+
+        // The defaults above sit in the interior of every range, so they cannot catch a
+        // `validate` that is tighter than the table — one that refused a slider sitting at its
+        // own min or max. The dialog hands out exactly those two values, so a bound this test
+        // never exercises is a bound the UI can still trip on.
+        let at_min = TraceControls {
+            speckle: SPECKLE.min as u8,
+            smoothing: SMOOTHING.min as u8,
+            detail: DETAIL.min,
+            colors: COLORS.min as u8,
+            ..d.clone()
+        };
+        assert!(validate(&at_min).is_ok());
+        let at_max = TraceControls {
+            speckle: SPECKLE.max as u8,
+            smoothing: SMOOTHING.max as u8,
+            detail: DETAIL.max,
+            colors: COLORS.max as u8,
+            ..d
+        };
+        assert!(validate(&at_max).is_ok());
     }
 
     /// clap's derive needs a literal for `help`, so each spec states its range in prose beside the
     /// numbers. That is the one restatement this design accepts, and only because this test makes
-    /// it impossible to change one without the other.
+    /// it impossible to change one bound without the other: checked as one joined token, not two
+    /// separate `contains`, since `format!("{}", 3.0)` is `"3"`, a substring of `"3.5"` — separate
+    /// checks would pass against a `min` that had quietly drifted.
     #[test]
     fn control_help_states_its_own_range() {
-        fn rendered(v: f64) -> String { format!("{v}") }
         for spec in CONTROLS {
+            let range = format!("{}–{}", spec.min, spec.max);
             assert!(
-                spec.help.contains(&rendered(spec.min)) && spec.help.contains(&rendered(spec.max)),
-                "{}: help {:?} does not state its range {}–{}",
-                spec.name, spec.help, spec.min, spec.max,
+                spec.help.contains(&range),
+                "{}: help {:?} does not state its range {range}",
+                spec.name, spec.help,
             );
         }
     }
@@ -858,14 +881,6 @@ mod tests {
         assert!(matches!(read_image(&path), Err(TraceError::Input(m)) if m.contains("too large")));
     }
 
-    /// A path that does not exist is an input failure, not a decode failure: nothing was ever
-    /// handed to the decoder. The distinction is what `code()` will make visible to the desktop.
-    #[test]
-    fn read_image_reports_a_missing_file_as_input() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(read_image(&dir.path().join("nope.png")), Err(TraceError::Input(_))));
-    }
-
     #[test]
     fn read_capped_accepts_a_stream_exactly_at_the_cap() {
         use std::io::Read as _;
@@ -873,6 +888,10 @@ mod tests {
         assert_eq!(read_capped(exact, 8).unwrap().map(|b| b.len()), Some(8));
     }
 
+    /// A path that does not exist is an input failure, not a decode failure: nothing was ever
+    /// handed to the decoder. The distinction is what `code()` will make visible to the desktop,
+    /// and the message must carry the filename since that is the only thing distinguishing this
+    /// failure from any other missing file.
     #[test]
     fn read_image_reports_a_missing_path_with_its_name() {
         let dir = tempfile::tempdir().unwrap();

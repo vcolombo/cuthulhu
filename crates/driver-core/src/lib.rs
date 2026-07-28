@@ -77,6 +77,25 @@ pub fn write_all(t: &mut dyn Transport, mut bytes: &[u8]) -> Result<(), Transpor
     Ok(())
 }
 
+/// The bytes that open Pass `index`: the session prologue on the first Pass, then
+/// the encoded Pass itself.
+///
+/// `DeviceManager` writes these, waits for the machine, then writes `close_pass`.
+/// The two together are one Pass on the wire, so a caller that wants the whole Pass
+/// at once — `cuthulhu cut --dry-run` — concatenates them rather than restating when
+/// a prologue is owed.
+pub fn open_pass(d: &dyn Driver, job: &Job, index: usize) -> Result<Vec<u8>, DriverError> {
+    let mut bytes = if index == 0 { d.session_begin() } else { Vec::new() };
+    bytes.extend(d.encode_pass(job)?);
+    Ok(bytes)
+}
+
+/// The bytes that close Pass `index` of `total`: park between Passes, end the
+/// session after the last one.
+pub fn close_pass(d: &dyn Driver, index: usize, total: usize) -> Vec<u8> {
+    if index + 1 < total { d.pass_park() } else { d.session_end() }
+}
+
 #[derive(Default)]
 pub struct MockTransport {
     pub written: Vec<u8>,
@@ -188,5 +207,37 @@ mod tests {
         let serial: Vec<_> = f.list_devices().into_iter()
             .filter(|d| matches!(d.transport, TransportKind::Serial { .. })).collect();
         assert!(serial.iter().all(|d| d.candidate), "serial ports can't be assumed to be Pumas");
+    }
+
+    /// Distinguishable constants for the three framing methods, so a test can say
+    /// which one landed and in what order. `profile`/`caps` diverge: framing reads
+    /// neither, and a test that starts needing them is testing something else.
+    struct FramingDriver;
+    impl Driver for FramingDriver {
+        fn profile(&self) -> &MachineProfile { unreachable!("framing does not read the profile") }
+        fn caps(&self) -> MachineCaps { unreachable!("framing does not read the caps") }
+        fn session_begin(&self) -> Vec<u8> { b"BEGIN".to_vec() }
+        fn encode_pass(&self, pass: &Job) -> Result<Vec<u8>, DriverError> {
+            Ok(format!("PASS{}", pass.polylines.len()).into_bytes())
+        }
+        fn pass_park(&self) -> Vec<u8> { b"PARK".to_vec() }
+        fn session_end(&self) -> Vec<u8> { b"END".to_vec() }
+        fn abort_bytes(&self) -> Option<Vec<u8>> { None }
+    }
+
+    #[test]
+    fn only_the_first_pass_carries_the_session_prologue() {
+        let job = Job { polylines: Vec::new(), settings: Settings::default() };
+        assert_eq!(open_pass(&FramingDriver, &job, 0).unwrap(), b"BEGINPASS0".to_vec());
+        assert_eq!(open_pass(&FramingDriver, &job, 1).unwrap(), b"PASS0".to_vec());
+    }
+
+    #[test]
+    fn a_pass_parks_unless_it_is_the_last_one() {
+        assert_eq!(close_pass(&FramingDriver, 0, 2), b"PARK".to_vec(), "another Pass follows, so park");
+        assert_eq!(close_pass(&FramingDriver, 1, 2), b"END".to_vec(), "the last Pass closes the session");
+        // The boundary a caller gets wrong: a one-Pass job's only Pass is also its last,
+        // so it must close rather than park.
+        assert_eq!(close_pass(&FramingDriver, 0, 1), b"END".to_vec());
     }
 }

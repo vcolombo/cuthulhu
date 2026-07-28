@@ -77,10 +77,13 @@ export function TraceDialog({ path, onInsert, onClose }: {
 
   useEffect(() => {
     let ignore = false;
-    ipc.traceControls().then(
-      (s) => { if (!ignore) { setSpecs(s); setControls(controlsFromSpecs(s)); } },
-      (e) => { if (!ignore) setPreview({ kind: "error", message: ipc.ipcErrorMessage(e) }); },
-    );
+    // `.then(...).catch(...)`, not `.then(onFulfilled, onRejected)`: `controlsFromSpecs` throws
+    // when the table omits a control, and a rejection handler passed to the *same* `then` does
+    // not see a throw from its own fulfillment handler. The dialog would sit idle with no
+    // sliders and no error — the failure that throwing was supposed to make visible.
+    ipc.traceControls()
+      .then((s) => { if (!ignore) { setSpecs(s); setControls(controlsFromSpecs(s)); } })
+      .catch((e) => { if (!ignore) setPreview({ kind: "error", message: ipc.ipcErrorMessage(e) }); });
     return () => { ignore = true; };
   }, []);
 

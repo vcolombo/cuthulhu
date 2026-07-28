@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -152,7 +152,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         { name: "smoothing", label: "Smoothing", help: "", min: 0, max: 180, step: 1, default: 60, colorOnly: false },
         { name: "detail", label: "Detail", help: "", min: 3.5, max: 10, step: 0.5, default: 9.5, colorOnly: false },
         { name: "colors", label: "Colors", help: "", min: 1, max: 8, step: 1, default: 6, colorOnly: true },
-      ],
+      ].filter((c) => c.name !== opts?.dropTraceControl),
       defaultMode: "binary",
       maxDim: 2048,
     }),
@@ -723,6 +723,22 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
   // import_svg mock was invoked — it adds a node to doc, so the layer list reflects the
   // insert, same observable-effect assertion the "new doc → add rect" test above uses.
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
+});
+
+// `controlsFromSpecs` throws when the table omits a control, so that a dialog and a tracer
+// disagreeing about what a trace takes is visible rather than papered over with an invented
+// default. That only holds if the throw reaches the error state: it happens inside a `then`
+// fulfillment handler, and a rejection handler passed to the *same* `then` does not catch it —
+// the dialog would sit idle with no sliders, no error, and an unhandled rejection in the console.
+test("trace dialog: a control table missing a control reports it instead of hanging", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { dropTraceControl: "detail" });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Trace" }).click();
+  const dialog = page.getByRole("dialog", { name: "Trace image" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText(/detail/)).toBeVisible();
+  // Nothing traceable was ever configured, so Insert must not offer geometry.
+  await expect(page.getByRole("button", { name: "Insert" })).toBeDisabled();
 });
 
 // The traced pane covers the common case where a file fails to decode, because both commands

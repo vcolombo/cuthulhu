@@ -73,14 +73,20 @@ pub fn machine_ids() -> Vec<&'static str> {
     MACHINES.iter().map(|m| m.id).collect()
 }
 
-/// The device an operator names with `--port`, or `None` if `machine_id` is
-/// unknown or does not connect over a serial port at all. Enumeration cannot
-/// answer this: a serial port announces nothing about what is on the other end,
-/// so the operator's word is all there is — and it is only worth taking for a
-/// machine that speaks serial.
+/// Whether naming a port for `machine_id` means anything — false for an unknown
+/// machine and for one that does not connect over serial. Worth asking before
+/// the fact is needed, so that a message about a missing device can offer
+/// `--port` to the machines it can actually help.
+pub fn takes_a_named_port(machine_id: &str) -> bool {
+    MACHINES.iter().any(|m| m.id == machine_id && m.serial)
+}
+
+/// The device an operator names with `--port`, or `None` if that machine cannot
+/// be named that way. Enumeration cannot answer this: a serial port announces
+/// nothing about what is on the other end, so the operator's word is all there
+/// is — and it is only worth taking for a machine that speaks serial.
 pub fn device_at_port(machine_id: &str, path: &str, baud: u32) -> Option<DeviceInfo> {
-    let machine = MACHINES.iter().find(|m| m.id == machine_id)?;
-    machine.serial.then(|| DeviceInfo {
+    takes_a_named_port(machine_id).then(|| DeviceInfo {
         instance_id: format!("serial:{path}"),
         machine_id: machine_id.to_string(),
         transport: TransportKind::Serial { path: path.to_string(), baud },

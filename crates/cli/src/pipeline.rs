@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use driver_core::{close_pass, open_pass, DeviceBackendFactory, DeviceInfo, Driver, Job, Settings};
-use driver_registry::{device_at_port, machine_ids, HardwareBackendFactory};
+use driver_registry::{device_at_port, machine_ids, takes_a_named_port, HardwareBackendFactory};
 
 /// The driver for `--device`, or the message to print when there is none. The
 /// registry is the only list of machines this build knows, so the CLI resolves
@@ -35,8 +35,15 @@ pub fn resolve_device_info(
     if let Some(info) = found {
         return Ok(info.clone());
     }
-    let path = port
-        .ok_or_else(|| format!("no {machine_id} device found — plug it in, or name its serial port with --port"))?;
+    // `--port` is only offered to the machines it can help. Suggesting it for a
+    // USB machine spends the operator's next attempt on a second refusal.
+    let Some(path) = port else {
+        return Err(if takes_a_named_port(machine_id) {
+            format!("no {machine_id} device found — plug it in, or name its serial port with --port")
+        } else {
+            format!("no {machine_id} device found — plug it in")
+        });
+    };
     device_at_port(machine_id, path, baud)
         .ok_or_else(|| format!("no {machine_id} device found, and --port cannot name one: {machine_id} does not connect over a serial port"))
 }
@@ -405,6 +412,11 @@ mod tests {
         let err = resolve_device_info("cameo5", &[], Some("/dev/ttyUSB0"), 9600)
             .expect_err("a Cameo does not speak serial");
         assert!(err.contains("does not connect over a serial port"), "unexpected message: {err}");
+
+        // ...and the missing-device message does not send the operator to a flag
+        // whose only effect on this machine is the refusal above.
+        let err = resolve_device_info("cameo5", &[], None, 9600).expect_err("nothing attached");
+        assert!(!err.contains("--port"), "a USB machine must not be offered --port: {err}");
     }
 
     /// An enumerated device is the one meant, and `--port` does not override it:

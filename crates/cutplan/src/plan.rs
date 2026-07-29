@@ -153,7 +153,6 @@ pub fn plan_cut(
 mod tests {
     use super::*;
     use crate::passes::plan_passes;
-    use crate::preflight::PreflightError;
     use document::history::Editor;
     use document::{Delta, Node, NodeOp, ShapeKind, Style};
     use geometry::Affine;

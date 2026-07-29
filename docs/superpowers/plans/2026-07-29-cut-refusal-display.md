@@ -473,4 +473,4 @@ After Task 4, confirm the change did what it claims rather than assuming it:
 - [ ] `cargo test --workspace --locked` passes.
 - [ ] `git diff --stat main...HEAD` shows four files and a net line reduction in the two callers.
 - [ ] `grep -rn "{e:?}" crates/cli/src/pipeline.rs` returns nothing for `CutError` (the `plan: {e:?}` on `PlanError` at `:138` and `:164` is a different type and out of scope).
-- [ ] `grep -rn "nothing_to_cut\|machine_mismatch\|out_of_bounds" apps/desktop/src/device.rs` returns nothing — the codes now come from `cutplan`, and the ones the frontend uses are pinned by Task 1's table test.
+- [ ] `sed -n '210,212p' apps/desktop/src/device.rs | grep -n "nothing_to_cut\|machine_mismatch\|out_of_bounds"` returns nothing — `map_cut_error`'s body has no hand-written code string, only `e.code()`; the codes it forwards now come from `cutplan` and are pinned by Task 1's table test.

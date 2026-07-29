@@ -43,9 +43,10 @@ impl std::fmt::Display for PreflightError {
                 write!(f, "this document is set up for `{document}`, but the connected machine is `{device}`"),
             // Megabytes, not the byte count the variant carries: the estimate weights 16
             // bytes per point by repeat_count, so printing it exactly claims a precision
-            // it does not have. Divisor matches the rule's own `64 * 1024 * 1024`.
+            // it does not have. Divisor matches the rule's own `64 * 1024 * 1024`. Rounds
+            // up so a value just over the limit cannot print as if it were at or under it.
             PreflightError::OutputTooLarge(bytes) =>
-                write!(f, "the encoded cut is about {} MB, over the 64 MB limit", bytes / (1024 * 1024)),
+                write!(f, "the encoded cut is about {} MB, over the 64 MB limit", bytes.div_ceil(1024 * 1024)),
         }
     }
 }
@@ -545,7 +546,9 @@ mod tests {
 
     /// Both the whole table at once: a new variant fails to compile the match in
     /// `Display`/`code`, and a reworded one fails here. These strings are what an
-    /// operator reads, so they are worth pinning.
+    /// operator reads, so they are worth pinning — four of them used to reach a
+    /// CLI user as `preflight: MachineMismatch { .. }`, which is why this type
+    /// gained `Display` at all.
     #[test]
     fn every_refusal_has_a_sentence_and_a_code() {
         let cases: Vec<(PreflightError, &str, &str)> = vec![
@@ -582,32 +585,12 @@ mod tests {
             (
                 PreflightError::OutputTooLarge(80_000_000),
                 "output_too_large",
-                "the encoded cut is about 76 MB, over the 64 MB limit",
+                "the encoded cut is about 77 MB, over the 64 MB limit",
             ),
         ];
         for (error, code, message) in cases {
             assert_eq!(error.code(), code, "code for {error:?}");
             assert_eq!(error.to_string(), message, "message for {error:?}");
-        }
-    }
-
-    /// No refusal may print `Debug` at an operator. The four the CLI used to leak
-    /// (`preflight: MachineMismatch { .. }`) are the reason this type gained `Display`.
-    #[test]
-    fn no_refusal_leaks_debug_formatting() {
-        let errors = [
-            PreflightError::NothingToCut,
-            PreflightError::NonFiniteGeometry(NodeId(1)),
-            PreflightError::DegeneratePolyline(NodeId(1)),
-            PreflightError::OutOfBounds { node: NodeId(1), bounds: (0.0, 0.0, 100.0, 100.0) },
-            PreflightError::SettingsOutOfRange("force must be 1..=33"),
-            PreflightError::MachineMismatch { document: "puma".into(), device: "cameo5".into() },
-            PreflightError::OutputTooLarge(80_000_000),
-        ];
-        for error in errors {
-            let message = error.to_string();
-            assert!(!message.contains('{'), "{message}");
-            assert!(!message.contains("NodeId("), "{message}");
         }
     }
 }

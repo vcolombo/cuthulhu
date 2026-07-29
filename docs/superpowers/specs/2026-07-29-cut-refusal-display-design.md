@@ -12,7 +12,7 @@ chokepoint every cut goes through, and it refuses in ten distinct ways — three
 one of which wraps seven `PreflightError` variants. Neither type implements `Display`, so each of
 the two callers writes its own English for all ten:
 
-- `apps/desktop/src/device.rs:198-231` — `map_cut_error` plus `map_preflight_error`, ten arms,
+- `apps/desktop/src/device.rs:207-231` — `map_cut_error` plus `map_preflight_error`, ten arms,
   each producing an IPC code and a message.
 - `crates/cli/src/pipeline.rs:177-190` — `describe_cut_error`, five arms and a catch-all
   `format!("preflight: {e:?}")`.

@@ -101,9 +101,11 @@ pub fn shape_outline(node: &Node) -> Result<Option<Path>, String> {
     match &node.kind {
         NodeKind::Shape(ShapeKind::Rect { w, h }) => Ok(Some(rect_path(0.0, 0.0, *w, *h))),
         NodeKind::Shape(ShapeKind::Ellipse { rx, ry }) => Ok(Some(ellipse_path(*rx, *ry, *rx, *ry))),
-        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).map(Some).map_err(|e| format!("{e:?}")),
+        // `to_string`, not `{e:?}`: this string is carried verbatim into `PlanError::BadShape`
+        // and `CmdError::Geometry`, and both of those reach an operator (#91).
+        NodeKind::Shape(ShapeKind::Path { d }) => Path::from_svg(d).map(Some).map_err(|e| e.to_string()),
         NodeKind::Shape(ShapeKind::Text { family, size_mm, text }) =>
-            text_to_path(family, *size_mm, text).map(Some).map_err(|e| format!("{e:?}")),
+            text_to_path(family, *size_mm, text).map(Some).map_err(|e| e.to_string()),
         _ => Ok(None),
     }
 }
@@ -374,7 +376,7 @@ mod tests {
             },
             // headless CI with zero system fonts: assert the real Geometry(NoFont) path instead.
             None => assert_eq!(ed.add_text(parent, "Whatever", 10.0, "Hi"),
-                Err(CmdError::Geometry(format!("{:?}", geometry::GeomError::NoFont)))),
+                Err(CmdError::Geometry(geometry::GeomError::NoFont.to_string()))),
         }
     }
 

@@ -34,6 +34,22 @@ pub struct DocumentPasses {
 
 #[derive(Debug, PartialEq)]
 pub enum PlanError { BadShape(NodeId, String), MissingNode(NodeId), CycleDetected }
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // `shape #3`, not a name: `plan_passes` walks ids, and a lookup from id to
+            // whatever the UI calls the shape is not something it has (same limit as
+            // `PreflightError`). The payload is `shape_outline`'s sentence about the
+            // shape itself, so it reads on from the id.
+            PlanError::BadShape(node, message) => write!(f, "shape #{}: {message}", node.0),
+            PlanError::MissingNode(node) =>
+                write!(f, "shape #{} is referenced by the document but missing from it", node.0),
+            PlanError::CycleDetected =>
+                write!(f, "the document's shapes contain each other in a loop"),
+        }
+    }
+}
+impl std::error::Error for PlanError {}
 
 /// Hash of the document's JSON snapshot — cheap staleness check for a previously
 /// computed `DocumentPasses` (recompute if this no longer matches `doc_revision(doc)`).
@@ -120,6 +136,31 @@ mod tests {
     use document::history::Editor;
     use document::{Delta, Node, NodeKind, NodeOp, ShapeKind, Style};
 
+    /// The whole table at once: a new variant fails to compile the match in `Display`,
+    /// and a reworded one fails here. These strings are what an operator reads — all
+    /// three used to arrive as `plan: MissingNode(NodeId(3))`, which is why this type
+    /// gained `Display` at all (#91).
+    #[test]
+    fn every_plan_refusal_has_a_sentence() {
+        let cases: Vec<(PlanError, &str)> = vec![
+            (
+                PlanError::BadShape(NodeId(3), geometry::GeomError::NoFont.to_string()),
+                "shape #3: no font on this system matches the requested family",
+            ),
+            (
+                PlanError::MissingNode(NodeId(4)),
+                "shape #4 is referenced by the document but missing from it",
+            ),
+            (
+                PlanError::CycleDetected,
+                "the document's shapes contain each other in a loop",
+            ),
+        ];
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence, "{error:?}");
+        }
+    }
+
     fn with_stroke(mut node: Node, stroke: Option<u32>) -> Node {
         node.style = Style { stroke, fill: None };
         node
@@ -198,7 +239,7 @@ mod tests {
         let mut bad_doc = ed.doc.clone();
         bad_doc.apply(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
         assert_eq!(plan_passes(&bad_doc),
-            Err(PlanError::BadShape(bad_id, format!("{:?}", geometry::GeomError::NoFont))));
+            Err(PlanError::BadShape(bad_id, geometry::GeomError::NoFont.to_string())));
     }
 
     #[test]

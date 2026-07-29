@@ -60,14 +60,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     doc.nodes[doc.root].children.push(redId, greenId);
   }
 
-  // Bumped on every doc mutation; string-compared against CutRequest.doc_revision
-  // to emulate the real stale_plan check (device.rs's prepare_cut).
-  let revision = 0;
-
   const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
     new_doc: () => {
       doc = freshDoc();
-      revision++;
       return JSON.stringify(doc);
     },
     snapshot: () => JSON.stringify(doc),
@@ -76,14 +71,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const style = a.stroke !== undefined ? { stroke: a.stroke as number | null, fill: null } : DEFAULT_STYLE;
       doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [] };
       doc.nodes[a.parent as number].children.push(id);
-      revision++;
       return {};
     },
     add_text: (a) => {
       const id = nextId++;
       doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
       doc.nodes[a.parent as number].children.push(id);
-      revision++;
       return {};
     },
     commit_transform: (a) => {
@@ -102,24 +95,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         delete doc.nodes[id];
         for (const n of Object.values(doc.nodes)) n.children = n.children.filter((c) => c !== id);
       }
-      revision++;
       return {};
     },
-    reorder: () => {
-      revision++;
-      return {};
-    },
+    reorder: () => ({}),
     undo: () => null,
     redo: () => null,
-    boolean_op: () => {
-      revision++;
-      return {};
-    },
+    boolean_op: () => ({}),
     import_svg: (a) => {
       const id = nextId++;
       doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
       doc.nodes[a.parent as number].children.push(id);
-      revision++;
       return [{}, []];
     },
     save_project: () => {
@@ -128,7 +113,6 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     load_project: () => {
       if (saved) doc = JSON.parse(JSON.stringify(saved));
-      revision++;
       return JSON.stringify(doc);
     },
     set_machine: (a) => {
@@ -136,7 +120,6 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       if (!m) throw new Error("unknown machine");
       doc.machine = m;
       doc.artboard = { x: 0, y: 0, w: m.width_mm, h: m.height_mm };
-      revision++;
       return null;
     },
     list_machines: () => machines,
@@ -238,7 +221,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     };
     walk(doc.root);
     const passes = [...byColor.values()].map((p) => ({ color: p.color, shape_count: p.node_ids.length, node_ids: p.node_ids }));
-    return { passes, skipped_no_stroke: skipped, doc_revision: String(revision), travel: [] as [number, number, number, number][] };
+    // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
+    // snapshot_json: a doc edited back to a previous state is not stale. A counter
+    // bumped per command diverges on that, and silently goes stale-blind for any
+    // command that mutates `doc` and forgets to bump (commit_transform did).
+    return { passes, skipped_no_stroke: skipped, doc_revision: JSON.stringify(doc), travel: [] as [number, number, number, number][] };
   }
 
   // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
@@ -517,6 +504,34 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
 
   await page.getByRole("button", { name: "Close" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+// The plan is made from the document, so an edit after planning must refuse the cut —
+// cutplan::plan_cut's stale-plan rule. `commit_transform` is the discriminating edit:
+// it changes geometry without adding or removing a node, so a revision that tracks
+// commands rather than the document itself cuts stale geometry and still passes.
+test("a doc edited after planning refuses the cut until replan", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  // Reaches past the UI on purpose: the canvas drag that issues this command is behind
+  // the open dialog, and the backend contract under test is the same either way.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Replan" }).click();
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
 });
 
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {

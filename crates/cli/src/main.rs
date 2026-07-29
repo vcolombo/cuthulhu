@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
 use cli::cut::{self, format_pass_color};
-use cli::pipeline::{check_color_flag_scope, check_interactive, dry_run_pass_bytes, plan_cut_from_svg, plan_plain_cut, Device};
-use driver_registry::HardwareBackendFactory;
-use driver_core::{DeviceBackendFactory, DeviceInfo, Settings, TransportKind};
+use cli::pipeline::{
+    check_color_flag_scope, check_interactive, driver_for, dry_run_pass_bytes, plan_cut_from_svg, plan_plain_cut,
+    resolve_device_info,
+};
+use driver_registry::{machine_ids, HardwareBackendFactory};
+use driver_core::{DeviceBackendFactory, Driver, Settings};
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -85,8 +88,8 @@ fn operator() -> cut::Operator {
 /// Ctrl-C is installed here rather than inside `cut::run`: a process-wide signal
 /// handler belongs to the binary, and `set_handler` errors on a second call, so a
 /// library function that installs one can only ever be called once per process.
-fn drive_cut(plan: &cutplan::CutPlan, device: Device, port: Option<&str>, baud: u32) -> Result<(), String> {
-    let info = resolve_device_info(device, port, baud)?;
+fn drive_cut(plan: &cutplan::CutPlan, machine_id: &str, port: Option<&str>, baud: u32) -> Result<(), String> {
+    let info = resolve_device_info(machine_id, &HardwareBackendFactory.list_devices(), port, baud)?;
     let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
     let outcome = cut::run(plan, info, factory, operator(), |mgr| {
         // ponytail: the handler holds a permanent Arc clone for the life of the
@@ -108,27 +111,26 @@ fn main() {
 fn run() -> Result<(), String> {
     match Cli::parse().command {
         Command::Cut { file, device, dry_run, speed, force, port, baud, by_color, skip_color, order, allow_out_of_bounds } => {
-            let device = Device::from_id(&device)?;
+            let driver = driver_for(&device)?;
             check_color_flag_scope(&skip_color, &order, by_color)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
             let settings = Settings { speed, force, repeat_count: 1 };
 
             if !by_color {
-                let plan = plan_plain_cut(&svg, device, &settings, allow_out_of_bounds)?;
+                let plan = plan_plain_cut(&svg, driver.as_ref(), &settings, allow_out_of_bounds)?;
                 if dry_run {
-                    let driver = device.driver();
                     let bytes = dry_run_pass_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
                     print_hex_ascii(&bytes);
                     return Ok(());
                 }
-                return drive_cut(&plan, device, port.as_deref(), baud);
+                return drive_cut(&plan, &device, port.as_deref(), baud);
             }
 
-            cut_by_color(&svg, device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
+            cut_by_color(&svg, driver.as_ref(), &device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
         }
         Command::ListDevices => {
-            for d in [Device::Cameo5, Device::Puma] {
-                let p = d.driver().profile().clone();
+            for id in machine_ids() {
+                let p = driver_for(id)?.profile().clone();
                 println!("{}\t{}\t{} x {} mm", p.id, p.name, p.width_mm, p.height_mm);
             }
             Ok(())
@@ -156,7 +158,8 @@ fn run() -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn cut_by_color(
     svg: &[u8],
-    device: Device,
+    driver: &dyn Driver,
+    machine_id: &str,
     settings: &Settings,
     skip_color: &[String],
     order: Option<String>,
@@ -167,14 +170,13 @@ fn cut_by_color(
 ) -> Result<(), String> {
     // Preflight runs here, before the dry-run branch, so a dry run and a real
     // cut always agree on whether the job is acceptable at all.
-    let plan = plan_cut_from_svg(svg, device, settings, skip_color, order, allow_out_of_bounds)?;
+    let plan = plan_cut_from_svg(svg, driver, settings, skip_color, order, allow_out_of_bounds)?;
     let passes = &plan.passes;
 
     if dry_run {
-        let d = device.driver();
         for (i, pass) in passes.iter().enumerate() {
             println!("-- pass {}/{} (color {}) --", i + 1, passes.len(), format_pass_color(pass.color));
-            let bytes = dry_run_pass_bytes(d.as_ref(), &pass.job, i, passes.len())?;
+            let bytes = dry_run_pass_bytes(driver, &pass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }
         return Ok(());
@@ -185,26 +187,7 @@ fn cut_by_color(
         std::process::exit(2);
     }
 
-    drive_cut(&plan, device, port.as_deref(), baud)
-}
-
-fn resolve_device_info(device: Device, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
-    match device {
-        Device::Cameo5 => HardwareBackendFactory
-            .list_devices()
-            .into_iter()
-            .find(|d| d.machine_id == "cameo5")
-            .ok_or_else(|| "no cameo5 device found".to_string()),
-        Device::Puma => {
-            let path = port.ok_or("--port required for serial devices")?.to_string();
-            Ok(DeviceInfo {
-                instance_id: format!("serial:{path}"),
-                machine_id: "puma".into(),
-                transport: TransportKind::Serial { path, baud },
-                candidate: true,
-            })
-        }
-    }
+    drive_cut(&plan, machine_id, port.as_deref(), baud)
 }
 
 fn print_hex_ascii(bytes: &[u8]) {

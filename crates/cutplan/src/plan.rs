@@ -62,6 +62,40 @@ pub enum CutError {
     Preflight(PreflightError),
 }
 
+/// Every refusal in the words an operator reads. `Preflight` forwards rather than
+/// prefixing: its variants are already whole sentences, and the CLI's old
+/// `format!("preflight: {e:?}")` is exactly the thing this replaces.
+impl std::fmt::Display for CutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The revision numbers are for a bug report, not for an operator; `Debug` keeps them.
+            CutError::StalePlan { .. } =>
+                write!(f, "the document changed since this cut was planned"),
+            CutError::UnknownPassColor(Some(color)) =>
+                write!(f, "no planned pass has color #{color:08X}"),
+            // `plan_passes` only ever builds `Some(color)` passes, so this is a caller
+            // asking for a pass that cannot exist rather than one that went missing.
+            CutError::UnknownPassColor(None) =>
+                write!(f, "no planned pass without a color"),
+            CutError::Preflight(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for CutError {}
+
+impl CutError {
+    /// Stable identifier for a caller that must branch on the *kind* of refusal — see
+    /// `PreflightError::code`, whose codes this passes through unchanged so the desktop
+    /// keeps emitting one flat set across both types.
+    pub fn code(&self) -> &'static str {
+        match self {
+            CutError::StalePlan { .. } => "stale_plan",
+            CutError::UnknownPassColor(_) => "unknown_pass_color",
+            CutError::Preflight(e) => e.code(),
+        }
+    }
+}
+
 /// Select, validate and flatten `planned` into passes for `profile`.
 ///
 /// Takes what `plan_passes` produced rather than the `Document` it came from:
@@ -119,6 +153,7 @@ pub fn plan_cut(
 mod tests {
     use super::*;
     use crate::passes::plan_passes;
+    use crate::preflight::PreflightError;
     use document::history::Editor;
     use document::{Delta, Node, NodeOp, ShapeKind, Style};
     use geometry::Affine;
@@ -247,5 +282,27 @@ mod tests {
         assert_eq!(job.settings, settings);
         assert_eq!(job.polylines.len(), 2, "both red rects flatten into the one job");
         assert_eq!(plan.cut_passes().len(), 1);
+    }
+
+    /// The three top-level refusals. Preflight's own table is pinned in preflight.rs;
+    /// what matters here is that the wrapped variant adds no prefix of its own — a
+    /// caller printing "preflight: ..." in front of a finished sentence reads twice.
+    #[test]
+    fn every_refusal_has_a_sentence_and_a_code() {
+        let stale = CutError::StalePlan { expected: 7, actual: 9 };
+        assert_eq!(stale.code(), "stale_plan");
+        assert_eq!(stale.to_string(), "the document changed since this cut was planned");
+
+        let unknown = CutError::UnknownPassColor(Some(0xFF0000FF));
+        assert_eq!(unknown.code(), "unknown_pass_color");
+        assert_eq!(unknown.to_string(), "no planned pass has color #FF0000FF");
+
+        let colorless = CutError::UnknownPassColor(None);
+        assert_eq!(colorless.code(), "unknown_pass_color");
+        assert_eq!(colorless.to_string(), "no planned pass without a color");
+
+        let wrapped = CutError::Preflight(PreflightError::NothingToCut);
+        assert_eq!(wrapped.code(), "nothing_to_cut");
+        assert_eq!(wrapped.to_string(), "no pass selected for this cut has any geometry");
     }
 }

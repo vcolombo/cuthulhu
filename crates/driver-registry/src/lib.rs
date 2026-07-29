@@ -9,15 +9,18 @@ use driver_core::{DeviceBackendFactory, DeviceInfo, Driver, Transport, Transport
 use driver_hpgl::HpglDriver;
 use driver_silhouette::SilhouetteDriver;
 
-// Enumeration and resolution have to agree on these, and only the resolution
-// half is reachable from a test — `list_devices` talks to real hardware. One
-// binding each keeps the two halves from drifting where nothing would catch it.
+// The id each driver's own `MachineProfile` spells, bound once here so the
+// table below and the enumerators agree with it.
 const CAMEO5: &str = "cameo5";
 const PUMA: &str = "puma";
 
 struct Machine {
     id: &'static str,
     driver: fn() -> Box<dyn Driver + Send>,
+    /// The attached hardware of this machine, if any. Per machine rather than
+    /// one shared scan because the transports have nothing in common: USB is
+    /// matched on VID/PID, serial is a list of ports that might be anything.
+    enumerate: fn() -> Vec<DeviceInfo>,
     /// Whether an operator can name this machine's port with `--port`. A USB
     /// machine is discriminated by VID/PID and enumerates itself; a serial port
     /// identifies nothing, so it takes the operator's word. Naming a port for a
@@ -26,14 +29,44 @@ struct Machine {
 }
 
 /// Every machine this build can drive. One row is the whole of adding a
-/// machine: `driver_for` searches this table and `machine_ids` reads it, so a
-/// machine cannot be drivable and yet missing from `cuthulhu list-devices` or
-/// from `--device`'s suggestions — which a separate id list beside a `match`
-/// left possible.
+/// machine: `list_devices` scans it, `driver_for` searches it, `machine_ids`
+/// reads it, and `device_at_port` asks it what a port can name. A machine
+/// therefore cannot be half-added — drivable but never enumerated, or
+/// enumerated but missing from `cuthulhu list-devices` — which is what an id
+/// list and a `match` and a hand-written scan left possible between them.
 const MACHINES: [Machine; 2] = [
-    Machine { id: CAMEO5, driver: || Box::new(SilhouetteDriver::new()), serial: false },
-    Machine { id: PUMA, driver: || Box::new(HpglDriver::new()), serial: true },
+    Machine {
+        id: CAMEO5,
+        driver: || Box::new(SilhouetteDriver::new()),
+        enumerate: cameo5_devices,
+        serial: false,
+    },
+    Machine { id: PUMA, driver: || Box::new(HpglDriver::new()), enumerate: puma_devices, serial: true },
 ];
+
+fn cameo5_devices() -> Vec<DeviceInfo> {
+    driver_silhouette::list_locators()
+        .into_iter()
+        .map(|locator| DeviceInfo {
+            instance_id: format!("usb:{locator}"),
+            machine_id: CAMEO5.into(),
+            transport: TransportKind::Usb { locator },
+            candidate: false, // USB is discriminated by VID/PID — not a guess
+        })
+        .collect()
+}
+
+fn puma_devices() -> Vec<DeviceInfo> {
+    driver_hpgl::list_ports()
+        .into_iter()
+        .map(|path| DeviceInfo {
+            instance_id: format!("serial:{path}"),
+            machine_id: PUMA.into(),
+            transport: TransportKind::Serial { path, baud: 9600 },
+            candidate: true, // any serial port could be a Puma — needs operator confirmation
+        })
+        .collect()
+}
 
 /// The machines a caller can offer as a choice, in a stable order.
 pub fn machine_ids() -> Vec<&'static str> {
@@ -60,22 +93,7 @@ pub struct HardwareBackendFactory;
 
 impl DeviceBackendFactory for HardwareBackendFactory {
     fn list_devices(&self) -> Vec<DeviceInfo> {
-        let mut devices: Vec<DeviceInfo> = driver_silhouette::list_locators()
-            .into_iter()
-            .map(|locator| DeviceInfo {
-                instance_id: format!("usb:{locator}"),
-                machine_id: CAMEO5.into(),
-                transport: TransportKind::Usb { locator },
-                candidate: false, // USB is discriminated by VID/PID — not a guess
-            })
-            .collect();
-        devices.extend(driver_hpgl::list_ports().into_iter().map(|path| DeviceInfo {
-            instance_id: format!("serial:{path}"),
-            machine_id: PUMA.into(),
-            transport: TransportKind::Serial { path, baud: 9600 },
-            candidate: true, // any serial port could be a Puma — needs operator confirmation
-        }));
-        devices
+        MACHINES.iter().flat_map(|m| (m.enumerate)()).collect()
     }
 
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
@@ -107,6 +125,19 @@ mod tests {
             assert_eq!(driver.profile().id, id);
         }
         assert!(HardwareBackendFactory.driver_for("unknown").is_none());
+    }
+
+    /// A row's enumerator must label its devices with that row's id, or a
+    /// connect would look the driver up under a name the row does not answer
+    /// to. Vacuous with nothing plugged in — which is the only state CI has —
+    /// but it is the assertion that would catch a copy-pasted row.
+    #[test]
+    fn each_machine_enumerates_devices_under_its_own_id() {
+        for m in MACHINES.iter() {
+            for device in (m.enumerate)() {
+                assert_eq!(device.machine_id, m.id);
+            }
+        }
     }
 
     /// `--port` is the operator saying "it is here". That is worth taking for a

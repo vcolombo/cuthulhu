@@ -89,7 +89,7 @@ fn operator() -> cut::Operator {
 /// handler belongs to the binary, and `set_handler` errors on a second call, so a
 /// library function that installs one can only ever be called once per process.
 fn drive_cut(plan: &cutplan::CutPlan, machine_id: &str, port: Option<&str>, baud: u32) -> Result<(), String> {
-    let info = resolve_device_info(machine_id, port, baud)?;
+    let info = resolve_device_info(machine_id, &HardwareBackendFactory.list_devices(), port, baud)?;
     let factory: Arc<dyn DeviceBackendFactory> = Arc::new(HardwareBackendFactory);
     let outcome = cut::run(plan, info, factory, operator(), |mgr| {
         // ponytail: the handler holds a permanent Arc clone for the life of the

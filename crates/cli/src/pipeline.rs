@@ -12,7 +12,7 @@ pub fn driver_for(machine_id: &str) -> Result<Box<dyn Driver>, String> {
         .ok_or_else(|| format!("unknown device '{machine_id}' (try: {})", machine_ids().join(", ")))
 }
 
-/// Which attached device a `--device` cut goes to.
+/// Which of the `attached` devices a `--device` cut goes to.
 ///
 /// Enumeration wins when it finds one: a USB device is discriminated by
 /// VID/PID, so the one that enumerated is the one meant. A serial port could be
@@ -21,13 +21,19 @@ pub fn driver_for(machine_id: &str) -> Result<Box<dyn Driver>, String> {
 /// Whether a machine *can* be named that way is the registry's answer, not this
 /// function's: pointing `--port` at a USB machine would pair its dialect with a
 /// wire nothing on it can read.
-pub fn resolve_device_info(machine_id: &str, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
-    let found = HardwareBackendFactory
-        .list_devices()
-        .into_iter()
-        .find(|d| d.machine_id == machine_id && !d.candidate);
+///
+/// `attached` is passed in rather than enumerated here so that the choice is a
+/// function of its inputs — otherwise every case below the first is reachable
+/// only on a machine with the right hardware absent.
+pub fn resolve_device_info(
+    machine_id: &str,
+    attached: &[DeviceInfo],
+    port: Option<&str>,
+    baud: u32,
+) -> Result<DeviceInfo, String> {
+    let found = attached.iter().find(|d| d.machine_id == machine_id && !d.candidate);
     if let Some(info) = found {
-        return Ok(info);
+        return Ok(info.clone());
     }
     let path = port
         .ok_or_else(|| format!("no {machine_id} device found — plug it in, or name its serial port with --port"))?;
@@ -366,15 +372,22 @@ mod tests {
         }
     }
 
-    /// A serial machine is only ever the one the operator names: the registry
-    /// marks enumerated serial ports `candidate`, and resolution never picks a
-    /// candidate, so a `--port`-less serial cut asks instead of guessing.
+    /// A serial port that enumerated is a `candidate` — something is on it, but
+    /// nothing says what. Resolution never picks one, so a `--port`-less serial
+    /// cut asks instead of guessing.
     #[test]
     fn a_serial_device_needs_port_and_is_taken_at_the_operators_word() {
-        let err = resolve_device_info("puma", None, 9600).expect_err("must not guess a serial port");
+        let enumerated_port = DeviceInfo {
+            instance_id: "serial:/dev/ttyS9".into(),
+            machine_id: "puma".into(),
+            transport: driver_core::TransportKind::Serial { path: "/dev/ttyS9".into(), baud: 9600 },
+            candidate: true,
+        };
+        let err = resolve_device_info("puma", std::slice::from_ref(&enumerated_port), None, 9600)
+            .expect_err("must not guess which serial port is the Puma");
         assert!(err.contains("--port"), "unexpected message: {err}");
 
-        let info = resolve_device_info("puma", Some("/dev/ttyUSB0"), 19200).expect("named port");
+        let info = resolve_device_info("puma", &[enumerated_port], Some("/dev/ttyUSB0"), 19200).expect("named port");
         assert_eq!(info.machine_id, "puma");
         assert_eq!(
             info.transport,
@@ -389,15 +402,22 @@ mod tests {
     /// says which machines a port can name, and this refuses the rest.
     #[test]
     fn a_usb_machine_cannot_be_pointed_at_a_serial_port() {
-        // Only the fallback is under test. An attached Cameo is resolved by
-        // enumeration before `--port` is ever consulted, so on a machine with
-        // one plugged in there is nothing here to check. (`device_at_port`
-        // itself is pinned in `driver-registry`, where no hardware can hide it.)
-        if HardwareBackendFactory.list_devices().iter().any(|d| d.machine_id == "cameo5") {
-            return;
-        }
-        let err = resolve_device_info("cameo5", Some("/dev/ttyUSB0"), 9600)
+        let err = resolve_device_info("cameo5", &[], Some("/dev/ttyUSB0"), 9600)
             .expect_err("a Cameo does not speak serial");
         assert!(err.contains("does not connect over a serial port"), "unexpected message: {err}");
+    }
+
+    /// An enumerated device is the one meant, and `--port` does not override it:
+    /// the Cameo announced itself over USB, so a port is not what it is on.
+    #[test]
+    fn an_enumerated_device_wins_over_a_named_port() {
+        let attached = [DeviceInfo {
+            instance_id: "usb:1:4".into(),
+            machine_id: "cameo5".into(),
+            transport: driver_core::TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+        }];
+        let info = resolve_device_info("cameo5", &attached, Some("/dev/ttyUSB0"), 9600).expect("attached Cameo");
+        assert_eq!(info.transport, driver_core::TransportKind::Usb { locator: "1:4".into() });
     }
 }

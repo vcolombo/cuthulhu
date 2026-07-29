@@ -171,21 +171,18 @@ pub fn plan_plain_cut(
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
 
-/// `CutError` as something to print at a terminal. Out-of-bounds names the
-/// escape hatch, since that is the one refusal an operator may reasonably
-/// want to overrule.
+/// `CutError` as something to print at a terminal. Two arms outlive the shared
+/// `Display`: `NothingToCut`, because only this caller knows an SVG was imported
+/// and that none of its paths were stroked; and out-of-bounds, because naming
+/// `--allow-out-of-bounds` is the CLI's to do — the desktop hardcodes
+/// `allow_out_of_bounds: false` and offers the operator no such control.
 fn describe_cut_error(e: cutplan::CutError) -> String {
     use cutplan::preflight::PreflightError as P;
     match e {
-        cutplan::CutError::StalePlan { .. } => "document changed while planning".into(),
-        cutplan::CutError::UnknownPassColor(c) => format!("no pass matches color {c:?}"),
         cutplan::CutError::Preflight(P::NothingToCut) => "no cuttable paths in SVG".into(),
-        cutplan::CutError::Preflight(P::OutOfBounds { node, bounds }) => format!(
-            "shape {node:?} lies outside the {} x {} mm cutting area — pass --allow-out-of-bounds to send it anyway",
-            bounds.2, bounds.3,
-        ),
-        cutplan::CutError::Preflight(P::SettingsOutOfRange(m)) => m.into(),
-        cutplan::CutError::Preflight(e) => format!("preflight: {e:?}"),
+        cutplan::CutError::Preflight(P::OutOfBounds { .. }) =>
+            format!("{e} — pass --allow-out-of-bounds to send it anyway"),
+        e => e.to_string(),
     }
 }
 
@@ -431,5 +428,38 @@ mod tests {
         }];
         let info = resolve_device_info("cameo5", &attached, Some("/dev/ttyUSB0"), 9600).expect("attached Cameo");
         assert_eq!(info.transport, driver_core::TransportKind::Usb { locator: "1:4".into() });
+    }
+
+    /// The leak this change exists to close: four preflight refusals used to fall
+    /// through to `format!("preflight: {e:?}")`, so a document built for a Puma sent
+    /// to a Cameo printed a struct literal. Tested against `describe_cut_error`
+    /// directly because an SVG import never sets a machine id, so `plan_cut_from_svg`
+    /// cannot reach `MachineMismatch`.
+    #[test]
+    fn a_machine_mismatch_reads_as_a_sentence() {
+        let err = describe_cut_error(cutplan::CutError::Preflight(
+            cutplan::preflight::PreflightError::MachineMismatch {
+                document: "puma".into(),
+                device: "cameo5".into(),
+            },
+        ));
+        assert_eq!(err, "this document is set up for `puma`, but the connected machine is `cameo5`");
+    }
+
+    /// Out-of-bounds is the one refusal an operator may reasonably want to overrule,
+    /// and only the CLI has a flag for it — the desktop hardcodes `allow_out_of_bounds:
+    /// false`. So the shared sentence states the fact and this caller adds the escape.
+    #[test]
+    fn out_of_bounds_names_the_flag_that_overrules_it() {
+        let err = describe_cut_error(cutplan::CutError::Preflight(
+            cutplan::preflight::PreflightError::OutOfBounds {
+                node: document::NodeId(3),
+                bounds: (0.0, 0.0, 304.8, 304.8),
+            },
+        ));
+        assert_eq!(
+            err,
+            "shape #3 lies outside the 304.8 x 304.8 mm cutting area — pass --allow-out-of-bounds to send it anyway",
+        );
     }
 }

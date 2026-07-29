@@ -180,7 +180,7 @@ impl DeviceManagerHandle {
         // Planned here, at cut time, against the live document — `expect_revision`
         // is what refuses the cut if that is no longer the document the UI planned.
         let planned = plan_passes(&app.editor.doc)
-            .map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
+            .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
         let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
         Ok(plan.cut_passes())
     }
@@ -229,7 +229,7 @@ pub struct PlanCutPassSummary {
 /// Summarizes `plan_passes` output for the UI — not the raw `DocumentPasses`
 /// (which carries full flattened polylines the cut dialog doesn't need).
 pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, IpcError> {
-    let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", format!("{e:?}")))?;
+    let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", e.to_string()))?;
     let refs: Vec<&ColorPass> = planned.passes.iter().collect();
     let travel = cutplan::travel_moves(&refs);
     Ok(PlanCutResponse {

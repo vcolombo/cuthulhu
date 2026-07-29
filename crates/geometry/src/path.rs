@@ -4,6 +4,19 @@ use crate::affine::{Point, Polyline, Rect, Affine};
 
 #[derive(Debug, PartialEq)]
 pub enum GeomError { Parse(String), Degenerate, NoFont }
+impl std::fmt::Display for GeomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The payload is the parser's own note about where it stopped ("cmd Q",
+            // "cmd M: expected 2 numbers, got 1"), so it needs the clause in front of
+            // it to mean anything to whoever is holding the file.
+            GeomError::Parse(m) => write!(f, "the path data could not be read ({m})"),
+            GeomError::Degenerate => write!(f, "the operation left no geometry behind"),
+            GeomError::NoFont => write!(f, "no font on this system matches the requested family"),
+        }
+    }
+}
+impl std::error::Error for GeomError {}
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Seg { Move(Point), Line(Point), Cubic(Point, Point, Point), Close }

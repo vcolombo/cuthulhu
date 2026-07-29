@@ -135,7 +135,7 @@ pub fn plan_cut_from_svg(
     // Planned once: --order and --skip-color name colours, so the colours have
     // to be known before a selection can be built, and plan_cut cuts the very
     // passes handed to it here.
-    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
+    let planned = cutplan::plan_passes(&doc).map_err(|e| e.to_string())?;
     let colors = pass_order(&planned.passes, skip_colors, order)?;
 
     // One `--speed`/`--force` pair applies to every pass; the CLI has no
@@ -159,7 +159,7 @@ pub fn plan_plain_cut(
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg_all_cuttable(svg)?;
-    let planned = cutplan::plan_passes(&doc).map_err(|e| format!("plan: {e:?}"))?;
+    let planned = cutplan::plan_passes(&doc).map_err(|e| e.to_string())?;
     // Checked here rather than left to `plan_cut`: with no passes at all, asking for
     // CUT_STROKE is an unmatched colour, and "no pass matches color" describes the
     // request instead of the file.

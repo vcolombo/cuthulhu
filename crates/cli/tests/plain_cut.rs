@@ -251,7 +251,11 @@ fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
 
     let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
     assert_eq!(pass, 1, "cancelled on the only pass, named as the prompts name it");
-    assert!(sent > 0, "that pass had already gone out in full when the cancel landed");
+    // That pass had already gone out in full when the cancel landed: `pass_byte_len`
+    // recomputes it from FakeDriver's own encoding, `session_begin` (b"BEGIN", 5 bytes)
+    // plus `encode_pass` (`format!("PASS{}", polylines.len())` with `pad: 0`). SQUARE is
+    // one rect, which flattens to one closed polyline, so that's "PASS1" (5 bytes): 10.
+    assert_eq!(sent, 10, "the whole pass — prologue plus its one \"PASS1\" — went out before the cancel landed");
     assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
 }
 

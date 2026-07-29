@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use cli::pipeline::{pass_stream_bytes, plan_cut_from_svg, Device};
+use cli::pipeline::{dry_run_pass_bytes, plan_cut_from_svg, Device};
 use driver_core::Settings;
 
 /// A dry run must refuse what a real cut would refuse. Through `build_bytes` it did
@@ -40,7 +40,7 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
         .iter()
         .enumerate()
         .map(|(i, pass)| {
-            String::from_utf8(pass_stream_bytes(d.as_ref(), &pass.job, i, passes.len()).unwrap()).unwrap()
+            String::from_utf8(dry_run_pass_bytes(d.as_ref(), &pass.job, i, passes.len()).unwrap()).unwrap()
         })
         .collect();
 
@@ -54,8 +54,8 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
     // catch a stream that wrongly closes the session between passes.
     let cameo = Device::Cameo5.driver();
     let contains = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
-    let c0 = pass_stream_bytes(cameo.as_ref(), &passes[0].job, 0, passes.len()).unwrap();
-    let c1 = pass_stream_bytes(cameo.as_ref(), &passes[1].job, 1, passes.len()).unwrap();
+    let c0 = dry_run_pass_bytes(cameo.as_ref(), &passes[0].job, 0, passes.len()).unwrap();
+    let c1 = dry_run_pass_bytes(cameo.as_ref(), &passes[1].job, 1, passes.len()).unwrap();
     assert!(!contains(&c0, b"FN0"), "pass 0 must not close the session");
     assert!(contains(&c1, b"FN0"), "last pass must close the session");
 }

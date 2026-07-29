@@ -60,6 +60,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     doc.nodes[doc.root].children.push(redId, greenId);
   }
 
+  const unimplemented = (cmd: string): never => {
+    throw new Error(`${cmd}: mocked command the e2e fake does not perform; implement it here to test it`);
+  };
+
   const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
     new_doc: () => {
       doc = freshDoc();
@@ -97,10 +101,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }
       return {};
     },
-    reorder: () => ({}),
-    undo: () => null,
-    redo: () => null,
-    boolean_op: () => ({}),
+    // Four commands the fake has never performed. They used to answer "ok" while leaving
+    // `doc` untouched, which is the false green this file exists to avoid: each one edits
+    // the document in the real backend, so a plan made before it goes stale and `plan_cut`
+    // refuses the cut. Refuse here too, loudly, rather than silently permitting one.
+    reorder: () => unimplemented("reorder"),
+    undo: () => unimplemented("undo"),
+    redo: () => unimplemented("redo"),
+    boolean_op: () => unimplemented("boolean_op"),
     import_svg: (a) => {
       const id = nextId++;
       doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };

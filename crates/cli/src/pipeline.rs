@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use driver_core::{close_pass, open_pass, DeviceBackendFactory, DeviceInfo, Driver, Job, Settings, TransportKind};
-use driver_registry::{HardwareBackendFactory, MACHINE_IDS};
+use driver_core::{close_pass, open_pass, DeviceBackendFactory, DeviceInfo, Driver, Job, Settings};
+use driver_registry::{device_at_port, machine_ids, HardwareBackendFactory};
 
 /// The driver for `--device`, or the message to print when there is none. The
 /// registry is the only list of machines this build knows, so the CLI resolves
@@ -9,7 +9,7 @@ pub fn driver_for(machine_id: &str) -> Result<Box<dyn Driver>, String> {
     HardwareBackendFactory
         .driver_for(machine_id)
         .map(|d| d as Box<dyn Driver>)
-        .ok_or_else(|| format!("unknown device '{machine_id}' (try: {})", MACHINE_IDS.join(", ")))
+        .ok_or_else(|| format!("unknown device '{machine_id}' (try: {})", machine_ids().join(", ")))
 }
 
 /// Which attached device a `--device` cut goes to.
@@ -18,6 +18,9 @@ pub fn driver_for(machine_id: &str) -> Result<Box<dyn Driver>, String> {
 /// VID/PID, so the one that enumerated is the one meant. A serial port could be
 /// any machine — the registry marks those `candidate` and this never picks one
 /// for the operator, so `--port` is how a serial machine gets named at all.
+/// Whether a machine *can* be named that way is the registry's answer, not this
+/// function's: pointing `--port` at a USB machine would pair its dialect with a
+/// wire nothing on it can read.
 pub fn resolve_device_info(machine_id: &str, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
     let found = HardwareBackendFactory
         .list_devices()
@@ -27,14 +30,9 @@ pub fn resolve_device_info(machine_id: &str, port: Option<&str>, baud: u32) -> R
         return Ok(info);
     }
     let path = port
-        .ok_or_else(|| format!("no {machine_id} device found — plug it in, or name its serial port with --port"))?
-        .to_string();
-    Ok(DeviceInfo {
-        instance_id: format!("serial:{path}"),
-        machine_id: machine_id.into(),
-        transport: TransportKind::Serial { path, baud },
-        candidate: true,
-    })
+        .ok_or_else(|| format!("no {machine_id} device found — plug it in, or name its serial port with --port"))?;
+    device_at_port(machine_id, path, baud)
+        .ok_or_else(|| format!("no {machine_id} device found, and --port cannot name one: {machine_id} does not connect over a serial port"))
 }
 
 /// The whole of Pass `i` of `total` on the wire, for `--dry-run`: what
@@ -358,12 +356,12 @@ mod tests {
     /// is refused with that same list rather than a hardcoded suggestion.
     #[test]
     fn device_ids_come_from_the_registry() {
-        for id in MACHINE_IDS {
+        for id in machine_ids() {
             assert_eq!(driver_for(id).expect("registry id").profile().id, id);
         }
         // `.err()` rather than `expect_err`: `Box<dyn Driver>` has no `Debug`.
         let err = driver_for("cameo6").err().expect("unknown device must be refused");
-        for id in MACHINE_IDS {
+        for id in machine_ids() {
             assert!(err.contains(id), "{err} should name {id} as a choice");
         }
     }
@@ -378,7 +376,28 @@ mod tests {
 
         let info = resolve_device_info("puma", Some("/dev/ttyUSB0"), 19200).expect("named port");
         assert_eq!(info.machine_id, "puma");
-        assert_eq!(info.transport, TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 19200 });
+        assert_eq!(
+            info.transport,
+            driver_core::TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 19200 }
+        );
         assert!(info.candidate, "an operator-named port is still unverified hardware");
+    }
+
+    /// `--port` used to be ignored for a USB machine, which at least sent it
+    /// nowhere. Honouring it for every machine would be worse: with no Cameo
+    /// attached it would write GPGL to whatever sits on that port. The registry
+    /// says which machines a port can name, and this refuses the rest.
+    #[test]
+    fn a_usb_machine_cannot_be_pointed_at_a_serial_port() {
+        // Only the fallback is under test. An attached Cameo is resolved by
+        // enumeration before `--port` is ever consulted, so on a machine with
+        // one plugged in there is nothing here to check. (`device_at_port`
+        // itself is pinned in `driver-registry`, where no hardware can hide it.)
+        if HardwareBackendFactory.list_devices().iter().any(|d| d.machine_id == "cameo5") {
+            return;
+        }
+        let err = resolve_device_info("cameo5", Some("/dev/ttyUSB0"), 9600)
+            .expect_err("a Cameo does not speak serial");
+        assert!(err.contains("does not connect over a serial port"), "unexpected message: {err}");
     }
 }

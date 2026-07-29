@@ -5,7 +5,7 @@ use cli::pipeline::{
     check_color_flag_scope, check_interactive, driver_for, dry_run_pass_bytes, plan_cut_from_svg, plan_plain_cut,
     resolve_device_info,
 };
-use driver_registry::{HardwareBackendFactory, MACHINE_IDS};
+use driver_registry::{machine_ids, HardwareBackendFactory};
 use driver_core::{DeviceBackendFactory, Driver, Settings};
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -129,7 +129,7 @@ fn run() -> Result<(), String> {
             cut_by_color(&svg, driver.as_ref(), &device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
         }
         Command::ListDevices => {
-            for id in MACHINE_IDS {
+            for id in machine_ids() {
                 let p = driver_for(id)?.profile().clone();
                 println!("{}\t{}\t{} x {} mm", p.id, p.name, p.width_mm, p.height_mm);
             }

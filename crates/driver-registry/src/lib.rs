@@ -15,10 +15,45 @@ use driver_silhouette::SilhouetteDriver;
 const CAMEO5: &str = "cameo5";
 const PUMA: &str = "puma";
 
-/// Every machine this build can drive. `driver_for` answers for exactly this
-/// set, so a caller that needs to offer a choice — `cuthulhu list-devices`,
-/// `--device`'s error message — asks here instead of keeping its own list.
-pub const MACHINE_IDS: [&str; 2] = [CAMEO5, PUMA];
+struct Machine {
+    id: &'static str,
+    driver: fn() -> Box<dyn Driver + Send>,
+    /// Whether an operator can name this machine's port with `--port`. A USB
+    /// machine is discriminated by VID/PID and enumerates itself; a serial port
+    /// identifies nothing, so it takes the operator's word. Naming a port for a
+    /// USB machine would put its dialect on a wire nothing on it can read.
+    serial: bool,
+}
+
+/// Every machine this build can drive. One row is the whole of adding a
+/// machine: `driver_for` searches this table and `machine_ids` reads it, so a
+/// machine cannot be drivable and yet missing from `cuthulhu list-devices` or
+/// from `--device`'s suggestions — which a separate id list beside a `match`
+/// left possible.
+const MACHINES: [Machine; 2] = [
+    Machine { id: CAMEO5, driver: || Box::new(SilhouetteDriver::new()), serial: false },
+    Machine { id: PUMA, driver: || Box::new(HpglDriver::new()), serial: true },
+];
+
+/// The machines a caller can offer as a choice, in a stable order.
+pub fn machine_ids() -> Vec<&'static str> {
+    MACHINES.iter().map(|m| m.id).collect()
+}
+
+/// The device an operator names with `--port`, or `None` if `machine_id` is
+/// unknown or does not connect over a serial port at all. Enumeration cannot
+/// answer this: a serial port announces nothing about what is on the other end,
+/// so the operator's word is all there is — and it is only worth taking for a
+/// machine that speaks serial.
+pub fn device_at_port(machine_id: &str, path: &str, baud: u32) -> Option<DeviceInfo> {
+    let machine = MACHINES.iter().find(|m| m.id == machine_id)?;
+    machine.serial.then(|| DeviceInfo {
+        instance_id: format!("serial:{path}"),
+        machine_id: machine_id.to_string(),
+        transport: TransportKind::Serial { path: path.to_string(), baud },
+        candidate: true,
+    })
+}
 
 /// Enumerates attached USB/serial hardware and builds the driver for it.
 pub struct HardwareBackendFactory;
@@ -44,11 +79,7 @@ impl DeviceBackendFactory for HardwareBackendFactory {
     }
 
     fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
-        match machine_id {
-            CAMEO5 => Some(Box::new(SilhouetteDriver::new())),
-            PUMA => Some(Box::new(HpglDriver::new())),
-            _ => None,
-        }
+        MACHINES.iter().find(|m| m.id == machine_id).map(|m| (m.driver)())
     }
 
     fn open_transport(&self, info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
@@ -63,19 +94,33 @@ impl DeviceBackendFactory for HardwareBackendFactory {
 mod tests {
     use super::*;
 
-    /// `MACHINE_IDS` ties enumeration, resolution and every caller's list of
+    /// `MACHINES` ties enumeration, resolution and every caller's list of
     /// choices together, but each driver still spells its own id independently
     /// in its `MachineProfile`. This pins that copy to the rest: an enumerated
     /// device must resolve to a driver that answers to the same id, or a
     /// connect would hand the wrong encoder to a machine. Unknown ids must stay
-    /// unresolvable rather than defaulting — which also proves the `match` arms
-    /// above are const patterns and not catch-all bindings.
+    /// unresolvable rather than defaulting.
     #[test]
     fn enumerated_machine_ids_resolve_to_drivers_that_claim_them() {
-        for id in MACHINE_IDS {
+        for id in machine_ids() {
             let driver = HardwareBackendFactory.driver_for(id).expect("known machine id");
             assert_eq!(driver.profile().id, id);
         }
         assert!(HardwareBackendFactory.driver_for("unknown").is_none());
+    }
+
+    /// `--port` is the operator saying "it is here". That is worth taking for a
+    /// machine that speaks serial and meaningless for one that does not: a USB
+    /// machine reached this way would get its dialect written to whatever
+    /// happens to be on that port.
+    #[test]
+    fn only_a_serial_machine_can_be_named_at_a_port() {
+        let puma = device_at_port(PUMA, "/dev/ttyUSB0", 19200).expect("the Puma is a serial machine");
+        assert_eq!(puma.machine_id, PUMA);
+        assert_eq!(puma.transport, TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 19200 });
+        assert!(puma.candidate, "an operator-named port is still unverified hardware");
+
+        assert!(device_at_port(CAMEO5, "/dev/ttyUSB0", 9600).is_none(), "the Cameo is USB-only");
+        assert!(device_at_port("unknown", "/dev/ttyUSB0", 9600).is_none());
     }
 }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::sync::{Arc, Mutex};
 
-use cutplan::preflight::PreflightError;
 use cutplan::presets::{
     default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
     SettingsOverride,
@@ -206,28 +205,10 @@ impl DeviceManagerHandle {
 
 /// Every way `plan_cut` can refuse, as an IPC code the UI can branch on.
 /// `stale_plan` is the one the frontend actually keys off (CutDialog.tsx).
+/// The message is `cutplan`'s — this used to restate all ten here, and the CLI
+/// restated them again, differently.
 fn map_cut_error(e: CutError) -> IpcError {
-    match e {
-        CutError::StalePlan { .. } => {
-            IpcError::new("stale_plan", "document changed since the cut was planned")
-        }
-        CutError::UnknownPassColor(color) => {
-            IpcError::new("unknown_pass_color", format!("no planned pass matches color {color:?}"))
-        }
-        CutError::Preflight(e) => map_preflight_error(e),
-    }
-}
-
-fn map_preflight_error(e: PreflightError) -> IpcError {
-    match e {
-        PreflightError::NothingToCut => IpcError::new("nothing_to_cut", "no enabled pass has any geometry"),
-        PreflightError::NonFiniteGeometry(id) => IpcError::new("non_finite_geometry", format!("node {id:?} has non-finite coordinates")),
-        PreflightError::DegeneratePolyline(id) => IpcError::new("degenerate_polyline", format!("node {id:?} has a polyline with < 2 points")),
-        PreflightError::OutOfBounds { node, bounds } => IpcError::new("out_of_bounds", format!("node {node:?} outside {bounds:?}")),
-        PreflightError::SettingsOutOfRange(msg) => IpcError::new("settings_out_of_range", msg),
-        PreflightError::MachineMismatch { document, device } => IpcError::new("machine_mismatch", format!("document targets `{document}`, connected device is `{device}`")),
-        PreflightError::OutputTooLarge(size) => IpcError::new("output_too_large", format!("estimated encoded size {size} bytes exceeds 64MB")),
-    }
+    IpcError::new(e.code(), e.to_string())
 }
 
 #[derive(Debug, Serialize)]

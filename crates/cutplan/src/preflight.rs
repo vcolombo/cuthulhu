@@ -20,6 +20,55 @@ pub enum PreflightError {
     OutputTooLarge(usize),
 }
 
+/// What each rule refused, in the words an operator reads. It lives next to the rules
+/// rather than in each caller because the desktop and the CLI used to write it twice,
+/// and the CLI's copy fell through to `Debug` for four of these.
+impl std::fmt::Display for PreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Not "no enabled pass": a colour nobody selected is simply not cut, so
+            // there is no flag for an operator to go looking for (CONTEXT.md).
+            PreflightError::NothingToCut =>
+                write!(f, "no pass selected for this cut has any geometry"),
+            PreflightError::NonFiniteGeometry(node) =>
+                write!(f, "shape #{} has a coordinate that is not a finite number", node.0),
+            PreflightError::DegeneratePolyline(node) =>
+                write!(f, "shape #{} has a path with fewer than two points", node.0),
+            // bounds is (0, 0, width_mm, height_mm) — the machine's area, not the shape's.
+            PreflightError::OutOfBounds { node, bounds } =>
+                write!(f, "shape #{} lies outside the {} x {} mm cutting area", node.0, bounds.2, bounds.3),
+            // Already a whole clause naming the setting and its range, so a prefix would read twice.
+            PreflightError::SettingsOutOfRange(message) => write!(f, "{message}"),
+            PreflightError::MachineMismatch { document, device } =>
+                write!(f, "this document is set up for `{document}`, but the connected machine is `{device}`"),
+            // Megabytes, not the byte count the variant carries: the estimate weights 16
+            // bytes per point by repeat_count, so printing it exactly claims a precision
+            // it does not have. Divisor matches the rule's own `64 * 1024 * 1024`. Rounds
+            // up so a value just over the limit cannot print as if it were at or under it.
+            PreflightError::OutputTooLarge(bytes) =>
+                write!(f, "the encoded cut is about {} MB, over the 64 MB limit", bytes.div_ceil(1024 * 1024)),
+        }
+    }
+}
+impl std::error::Error for PreflightError {}
+
+impl PreflightError {
+    /// Stable identifier for a caller that must branch on the *kind* of refusal rather
+    /// than show its text — the desktop sends it as `IpcError::code`, and `CutDialog.tsx`
+    /// keys off `stale_plan` instead of matching a sentence across a language boundary.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PreflightError::NothingToCut => "nothing_to_cut",
+            PreflightError::NonFiniteGeometry(_) => "non_finite_geometry",
+            PreflightError::DegeneratePolyline(_) => "degenerate_polyline",
+            PreflightError::OutOfBounds { .. } => "out_of_bounds",
+            PreflightError::SettingsOutOfRange(_) => "settings_out_of_range",
+            PreflightError::MachineMismatch { .. } => "machine_mismatch",
+            PreflightError::OutputTooLarge(_) => "output_too_large",
+        }
+    }
+}
+
 /// Validate a cut job before encoding. Rules checked in order (first violation wins):
 /// 1. All enabled passes empty → NothingToCut
 /// 2. Any NaN/inf coordinate → NonFiniteGeometry
@@ -493,5 +542,55 @@ mod tests {
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);
         assert_eq!(result, Ok(()));
+    }
+
+    /// Both the whole table at once: a new variant fails to compile the match in
+    /// `Display`/`code`, and a reworded one fails here. These strings are what an
+    /// operator reads, so they are worth pinning — four of them used to reach a
+    /// CLI user as `preflight: MachineMismatch { .. }`, which is why this type
+    /// gained `Display` at all.
+    #[test]
+    fn every_refusal_has_a_sentence_and_a_code() {
+        let cases: Vec<(PreflightError, &str, &str)> = vec![
+            (
+                PreflightError::NothingToCut,
+                "nothing_to_cut",
+                "no pass selected for this cut has any geometry",
+            ),
+            (
+                PreflightError::NonFiniteGeometry(NodeId(3)),
+                "non_finite_geometry",
+                "shape #3 has a coordinate that is not a finite number",
+            ),
+            (
+                PreflightError::DegeneratePolyline(NodeId(4)),
+                "degenerate_polyline",
+                "shape #4 has a path with fewer than two points",
+            ),
+            (
+                PreflightError::OutOfBounds { node: NodeId(5), bounds: (0.0, 0.0, 304.8, 304.8) },
+                "out_of_bounds",
+                "shape #5 lies outside the 304.8 x 304.8 mm cutting area",
+            ),
+            (
+                PreflightError::SettingsOutOfRange("speed must be 1..=30"),
+                "settings_out_of_range",
+                "speed must be 1..=30",
+            ),
+            (
+                PreflightError::MachineMismatch { document: "puma".into(), device: "cameo5".into() },
+                "machine_mismatch",
+                "this document is set up for `puma`, but the connected machine is `cameo5`",
+            ),
+            (
+                PreflightError::OutputTooLarge(80_000_000),
+                "output_too_large",
+                "the encoded cut is about 77 MB, over the 64 MB limit",
+            ),
+        ];
+        for (error, code, message) in cases {
+            assert_eq!(error.code(), code, "code for {error:?}");
+            assert_eq!(error.to_string(), message, "message for {error:?}");
+        }
     }
 }

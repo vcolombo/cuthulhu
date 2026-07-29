@@ -163,9 +163,10 @@ variant's `code()` — so adding a variant without a sentence fails to compile t
 one with the wrong sentence fails the assertion.
 
 In `pipeline.rs`, the existing `an_svg_with_nothing_stroked_is_refused_by_name` keeps `NothingToCut`
-honest. Add one asserting a `MachineMismatch` no longer prints `Debug` — the specific leak this
-candidate fixes — by planning a document whose `machine_id` is `puma` against a Cameo profile and
-asserting the message contains neither `{` nor `MachineMismatch`.
+honest. Add two against `describe_cut_error` directly — a `MachineMismatch` reading as a sentence
+rather than a struct literal, which is the specific leak this candidate fixes, and an out-of-bounds
+naming the flag that overrules it. Called directly rather than driven through `plan_cut_from_svg`,
+because an SVG import never sets a machine id, so no CLI path can reach `MachineMismatch` at all.
 
 In `device.rs`, the existing `prepare_cut` tests assert codes and keep doing so; no new test, since
 `map_cut_error` no longer holds a decision.

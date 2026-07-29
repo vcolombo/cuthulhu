@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use cli::pipeline::{dry_run_pass_bytes, plan_cut_from_svg, Device};
+use cli::pipeline::{driver_for, dry_run_pass_bytes, plan_cut_from_svg};
 use driver_core::Settings;
 
 /// A dry run must refuse what a real cut would refuse. Through `build_bytes` it did
@@ -31,16 +31,16 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
         <path d="M0 10 L20 10" stroke="#00ff00"/>
     </svg>"##;
     // Planned through the same entry point `cut --by-color` uses, preflight included.
-    let plan = plan_cut_from_svg(svg, Device::Puma, &Settings::default(), &[], None, false).unwrap();
+    let puma = driver_for("puma").expect("registry id");
+    let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), &[], None, false).unwrap();
     let passes = &plan.passes;
     assert_eq!(passes.len(), 2);
 
-    let d = Device::Puma.driver();
     let streams: Vec<String> = passes
         .iter()
         .enumerate()
         .map(|(i, pass)| {
-            String::from_utf8(dry_run_pass_bytes(d.as_ref(), &pass.job, i, passes.len()).unwrap()).unwrap()
+            String::from_utf8(dry_run_pass_bytes(puma.as_ref(), &pass.job, i, passes.len()).unwrap()).unwrap()
         })
         .collect();
 
@@ -52,7 +52,7 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
 
     // Silhouette distinguishes park (empty) from session_end (SO0/FN0), so it can
     // catch a stream that wrongly closes the session between passes.
-    let cameo = Device::Cameo5.driver();
+    let cameo = driver_for("cameo5").expect("registry id");
     let contains = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
     let c0 = dry_run_pass_bytes(cameo.as_ref(), &passes[0].job, 0, passes.len()).unwrap();
     let c1 = dry_run_pass_bytes(cameo.as_ref(), &passes[1].job, 1, passes.len()).unwrap();

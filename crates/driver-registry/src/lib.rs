@@ -15,6 +15,11 @@ use driver_silhouette::SilhouetteDriver;
 const CAMEO5: &str = "cameo5";
 const PUMA: &str = "puma";
 
+/// Every machine this build can drive. `driver_for` answers for exactly this
+/// set, so a caller that needs to offer a choice — `cuthulhu list-devices`,
+/// `--device`'s error message — asks here instead of keeping its own list.
+pub const MACHINE_IDS: [&str; 2] = [CAMEO5, PUMA];
+
 /// Enumerates attached USB/serial hardware and builds the driver for it.
 pub struct HardwareBackendFactory;
 
@@ -58,16 +63,16 @@ impl DeviceBackendFactory for HardwareBackendFactory {
 mod tests {
     use super::*;
 
-    /// `CAMEO5`/`PUMA` tie enumeration to resolution, but each driver still
-    /// spells its own id independently in its `MachineProfile`. This pins that
-    /// third copy to the other two: an enumerated device must resolve to a
-    /// driver that answers to the same id, or a connect would hand the wrong
-    /// encoder to a machine. Unknown ids must stay unresolvable rather than
-    /// defaulting — which also proves the `match` arms above are const
-    /// patterns and not catch-all bindings.
+    /// `MACHINE_IDS` ties enumeration, resolution and every caller's list of
+    /// choices together, but each driver still spells its own id independently
+    /// in its `MachineProfile`. This pins that copy to the rest: an enumerated
+    /// device must resolve to a driver that answers to the same id, or a
+    /// connect would hand the wrong encoder to a machine. Unknown ids must stay
+    /// unresolvable rather than defaulting — which also proves the `match` arms
+    /// above are const patterns and not catch-all bindings.
     #[test]
     fn enumerated_machine_ids_resolve_to_drivers_that_claim_them() {
-        for id in [CAMEO5, PUMA] {
+        for id in MACHINE_IDS {
             let driver = HardwareBackendFactory.driver_for(id).expect("known machine id");
             assert_eq!(driver.profile().id, id);
         }

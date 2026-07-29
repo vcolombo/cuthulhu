@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use cli::cut::{ended_message, run, Operator, Outcome};
-use cli::pipeline::{plan_cut_from_svg, plan_plain_cut, Device};
+use cli::pipeline::{driver_for, plan_cut_from_svg, plan_plain_cut};
 use driver_core::{
     DeviceBackendFactory, DeviceInfo, Driver, DriverError, Job, MachineCaps, MachineProfile,
     MockTransport, Settings, Transport, TransportError, TransportKind,
@@ -148,6 +148,12 @@ impl Transport for RecordingTransport {
     }
 }
 
+/// The real Cameo driver, for the profile and caps a plan is checked against.
+/// The cut itself runs on `FakeDriver` — the factory decides that, not the plan.
+fn cameo5() -> Box<dyn Driver> {
+    driver_for("cameo5").expect("the registry knows the Cameo")
+}
+
 fn info() -> DeviceInfo {
     DeviceInfo {
         instance_id: "test:0".into(),
@@ -159,7 +165,7 @@ fn info() -> DeviceInfo {
 
 #[test]
 fn a_plain_cut_sends_one_framed_pass() {
-    let plan = plan_plain_cut(SQUARE, Device::Cameo5, &Settings::default(), false).expect("plan");
+    let plan = plan_plain_cut(SQUARE, cameo5().as_ref(), &Settings::default(), false).expect("plan");
     assert_eq!(plan.passes.len(), 1, "a plain cut is one pass");
 
     let written = Arc::new(Mutex::new(Vec::new()));
@@ -184,7 +190,7 @@ fn a_plain_cut_sends_one_framed_pass() {
 /// installed a process-wide Ctrl-C handler that no test binary can install twice.
 #[test]
 fn a_cancel_part_way_through_is_not_reported_as_a_finished_cut() {
-    let plan = plan_plain_cut(SQUARE, Device::Cameo5, &Settings::default(), false).expect("plan");
+    let plan = plan_plain_cut(SQUARE, cameo5().as_ref(), &Settings::default(), false).expect("plan");
     assert_eq!(plan.passes.len(), 1, "one pass: an unattended cut may not have more");
 
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -226,7 +232,7 @@ fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
     // One pass is enough to park: `resolve_pass_completion` returns `NeedsConfirm` on
     // caps alone, with no regard for what follows. Only the *colour swap* park needs a
     // pass after it, and an unattended cut may not have one.
-    let plan = plan_plain_cut(SQUARE, Device::Cameo5, &Settings::default(), false).expect("plan");
+    let plan = plan_plain_cut(SQUARE, cameo5().as_ref(), &Settings::default(), false).expect("plan");
     assert_eq!(plan.passes.len(), 1, "one pass: an unattended cut may not have more");
 
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -282,7 +288,7 @@ impl DeviceBackendFactory for NoDeviceFactory {
 /// bytes can reach a blade.
 #[test]
 fn an_unattended_cut_refuses_more_than_one_pass() {
-    let plan = plan_cut_from_svg(TWO_COLORS, Device::Cameo5, &Settings::default(), &[], None, false).expect("plan");
+    let plan = plan_cut_from_svg(TWO_COLORS, cameo5().as_ref(), &Settings::default(), &[], None, false).expect("plan");
     assert_eq!(plan.passes.len(), 2, "two stroke colours, two passes");
 
     let err = run(&plan, info(), Arc::new(NoDeviceFactory), Operator::Unattended, |_| Ok(()))
@@ -296,5 +302,5 @@ fn an_unattended_cut_refuses_more_than_one_pass() {
 fn geometry_off_the_bed_never_reaches_a_transport() {
     let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
         <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
-    assert!(plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).is_err());
+    assert!(plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false).is_err());
 }

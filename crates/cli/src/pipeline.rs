@@ -1,27 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use driver_core::{close_pass, open_pass, DeviceBackendFactory, Driver, Job, Settings};
-use driver_registry::HardwareBackendFactory;
+use driver_core::{close_pass, open_pass, DeviceBackendFactory, DeviceInfo, Driver, Job, Settings, TransportKind};
+use driver_registry::{HardwareBackendFactory, MACHINE_IDS};
 
-#[derive(Clone, Copy)]
-pub enum Device { Cameo5, Puma }
-impl Device {
-    pub fn from_id(s: &str) -> Result<Device, String> {
-        match s {
-            "cameo5" => Ok(Device::Cameo5),
-            "puma" => Ok(Device::Puma),
-            _ => Err(format!("unknown device '{s}' (try: cameo5, puma)")),
-        }
+/// The driver for `--device`, or the message to print when there is none. The
+/// registry is the only list of machines this build knows, so the CLI resolves
+/// against it rather than keeping a second list that can disagree.
+pub fn driver_for(machine_id: &str) -> Result<Box<dyn Driver>, String> {
+    HardwareBackendFactory
+        .driver_for(machine_id)
+        .map(|d| d as Box<dyn Driver>)
+        .ok_or_else(|| format!("unknown device '{machine_id}' (try: {})", MACHINE_IDS.join(", ")))
+}
+
+/// Which attached device a `--device` cut goes to.
+///
+/// Enumeration wins when it finds one: a USB device is discriminated by
+/// VID/PID, so the one that enumerated is the one meant. A serial port could be
+/// any machine — the registry marks those `candidate` and this never picks one
+/// for the operator, so `--port` is how a serial machine gets named at all.
+pub fn resolve_device_info(machine_id: &str, port: Option<&str>, baud: u32) -> Result<DeviceInfo, String> {
+    let found = HardwareBackendFactory
+        .list_devices()
+        .into_iter()
+        .find(|d| d.machine_id == machine_id && !d.candidate);
+    if let Some(info) = found {
+        return Ok(info);
     }
-    fn machine_id(&self) -> &'static str {
-        match self {
-            Device::Cameo5 => "cameo5",
-            Device::Puma => "puma",
-        }
-    }
-    pub fn driver(&self) -> Box<dyn Driver> {
-        HardwareBackendFactory.driver_for(self.machine_id())
-            .expect("Device variant always maps to a known machine_id")
-    }
+    let path = port
+        .ok_or_else(|| format!("no {machine_id} device found — plug it in, or name its serial port with --port"))?
+        .to_string();
+    Ok(DeviceInfo {
+        instance_id: format!("serial:{path}"),
+        machine_id: machine_id.into(),
+        transport: TransportKind::Serial { path, baud },
+        candidate: true,
+    })
 }
 
 /// The whole of Pass `i` of `total` on the wire, for `--dry-run`: what
@@ -101,7 +114,7 @@ pub fn pass_order(
 /// CLI gets preflight rather than sending unchecked geometry at the machine.
 pub fn plan_cut_from_svg(
     svg: &[u8],
-    device: Device,
+    driver: &dyn Driver,
     settings: &Settings,
     skip_colors: &[String],
     order: Option<String>,
@@ -121,7 +134,6 @@ pub fn plan_cut_from_svg(
         .map(|color| cutplan::PassSelection { color, settings: settings.clone() })
         .collect();
 
-    let driver = device.driver();
     // No revision to be stale against: the document was imported a few lines ago.
     let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
@@ -131,7 +143,7 @@ pub fn plan_cut_from_svg(
 /// same entry point the desktop and `--by-color` use.
 pub fn plan_plain_cut(
     svg: &[u8],
-    device: Device,
+    driver: &dyn Driver,
     settings: &Settings,
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
@@ -144,7 +156,6 @@ pub fn plan_plain_cut(
         return Err("no cuttable paths in SVG".into());
     }
     let passes = vec![cutplan::PassSelection { color: Some(CUT_STROKE), settings: settings.clone() }];
-    let driver = device.driver();
     let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
@@ -221,6 +232,10 @@ mod tests {
         Settings { speed: None, force: None, repeat_count: 1 }
     }
 
+    fn cameo5() -> Box<dyn Driver> {
+        driver_for("cameo5").expect("the registry knows the Cameo")
+    }
+
     #[test]
     fn by_color_plans_from_svg_respects_skip_and_order() {
         let doc = doc_from_svg(two_color_svg()).unwrap();
@@ -237,11 +252,11 @@ mod tests {
             <rect width="1512" height="10" stroke="#ff0000" fill="none"/>
         </svg>"##;
 
-        let err = plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, false).unwrap_err();
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap_err();
         assert!(err.contains("outside"), "expected an out-of-bounds refusal, got: {err}");
 
         assert!(
-            plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, true).is_ok(),
+            plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, true).is_ok(),
             "--allow-out-of-bounds must let it through",
         );
     }
@@ -249,7 +264,7 @@ mod tests {
     #[test]
     fn settings_out_of_range_are_refused_before_reaching_the_machine() {
         let bad = Settings { speed: Some(99), force: None, repeat_count: 1 };
-        let err = plan_cut_from_svg(two_color_svg(), Device::Cameo5, &bad, &[], None, false).unwrap_err();
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &bad, &[], None, false).unwrap_err();
         assert!(err.contains("speed"), "expected a settings-range refusal, got: {err}");
     }
 
@@ -258,7 +273,7 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
             <rect width="5" height="5" fill="#ff0000"/>
         </svg>"##;
-        let err = plan_cut_from_svg(svg, Device::Cameo5, &cut_settings(), &[], None, false).unwrap_err();
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap_err();
         assert_eq!(err, "no cuttable paths in SVG");
     }
 
@@ -296,7 +311,7 @@ mod tests {
     fn plain_cut_plans_one_pass() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#ff0000"/></svg>"##;
-        let plan = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect("plan");
+        let plan = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false).expect("plan");
         assert_eq!(plan.passes.len(), 1);
     }
 
@@ -306,11 +321,11 @@ mod tests {
     fn plain_cut_refuses_out_of_bounds_geometry() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
             <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
-        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false)
+        let err = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false)
             .expect_err("out of bounds must be refused");
         assert!(err.contains("outside"), "unexpected message: {err}");
         // ...and the escape hatch works, now that there is a check to overrule.
-        assert!(plan_plain_cut(svg, Device::Cameo5, &Settings::default(), true).is_ok());
+        assert!(plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), true).is_ok());
     }
 
     /// With no paths at all, `plan_passes` yields no passes, so the requested colour
@@ -319,7 +334,7 @@ mod tests {
     #[test]
     fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
-        let err = plan_plain_cut(svg, Device::Cameo5, &Settings::default(), false).expect_err("empty");
+        let err = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false).expect_err("empty");
         assert_eq!(err, "no cuttable paths in SVG");
     }
 
@@ -338,12 +353,32 @@ mod tests {
         assert!(check_color_flag_scope(&[], &None, false).is_ok());
     }
 
+    /// `--device` resolves through the registry rather than a list the CLI
+    /// keeps: every machine the registry knows is accepted, and an unknown one
+    /// is refused with that same list rather than a hardcoded suggestion.
     #[test]
-    fn device_driver_routes_through_the_factory() {
-        // Regression guard: Device::driver() must keep resolving via the shared
-        // registry, not a hardcoded match, so the cut path and the enumeration
-        // path agree. (Which ids the registry knows is its own test.)
-        assert_eq!(Device::Cameo5.driver().profile().id, "cameo5");
-        assert_eq!(Device::Puma.driver().profile().id, "puma");
+    fn device_ids_come_from_the_registry() {
+        for id in MACHINE_IDS {
+            assert_eq!(driver_for(id).expect("registry id").profile().id, id);
+        }
+        // `.err()` rather than `expect_err`: `Box<dyn Driver>` has no `Debug`.
+        let err = driver_for("cameo6").err().expect("unknown device must be refused");
+        for id in MACHINE_IDS {
+            assert!(err.contains(id), "{err} should name {id} as a choice");
+        }
+    }
+
+    /// A serial machine is only ever the one the operator names: the registry
+    /// marks enumerated serial ports `candidate`, and resolution never picks a
+    /// candidate, so a `--port`-less serial cut asks instead of guessing.
+    #[test]
+    fn a_serial_device_needs_port_and_is_taken_at_the_operators_word() {
+        let err = resolve_device_info("puma", None, 9600).expect_err("must not guess a serial port");
+        assert!(err.contains("--port"), "unexpected message: {err}");
+
+        let info = resolve_device_info("puma", Some("/dev/ttyUSB0"), 19200).expect("named port");
+        assert_eq!(info.machine_id, "puma");
+        assert_eq!(info.transport, TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 19200 });
+        assert!(info.candidate, "an operator-named port is still unverified hardware");
     }
 }

@@ -49,11 +49,51 @@ pub fn format_pass_color(color: Option<u32>) -> String {
     }
 }
 
-/// Which pass to name to the operator, counting from 1. A paused or cancelled job
-/// always reports a position; `1` is only a fallback so a missing one cannot panic
-/// a live cut.
-fn pass_at(status: &CutStatus) -> usize {
-    status.pass.map(|p| p.index + 1).unwrap_or(1)
+/// What the machine is waiting for the operator to do, or `None` if it is waiting
+/// for nothing. Read from `status.actions`, never from `status.phase`: `driver-core`
+/// owns which calls are legal (`status.rs`), and a caller that maps phases back to
+/// permissions has to be re-audited every time a phase is added — which is the audit
+/// `actions` exists to delete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pause {
+    /// `resume()` is legal: parked between colours for a tool change.
+    Swap,
+    /// `confirm_pass_done()` is legal: the machine cannot be polled, so a human says
+    /// when the pass finished.
+    Confirm,
+}
+
+/// The two are never both legal — one parks before a pass, the other after — so the
+/// order here decides nothing.
+fn pause_of(status: &CutStatus) -> Option<Pause> {
+    if status.actions.resume {
+        Some(Pause::Swap)
+    } else if status.actions.confirm {
+        Some(Pause::Confirm)
+    } else {
+        None
+    }
+}
+
+/// Which pass to name to the operator and how many there are, counting from 1. A
+/// paused or cancelled job always reports both; `1/1` is only a fallback so a missing
+/// position cannot panic a live cut.
+fn pass_position(status: &CutStatus) -> (usize, usize) {
+    status.pass.map(|p| (p.index + 1, p.total)).unwrap_or((1, 1))
+}
+
+/// What to ask the operator for. Returned rather than printed so the wording is
+/// assertable, and taking the whole position from the status so the index and its
+/// denominator cannot come from two different accounts of the job.
+fn pause_prompt(pause: Pause, plan: &cutplan::CutPlan, status: &CutStatus) -> String {
+    let (pass, total) = pass_position(status);
+    let color = pass_color(plan, status);
+    match pause {
+        Pause::Swap => format!("Pass {pass}/{total} (color {color}): swap tool, press Enter to resume"),
+        Pause::Confirm => {
+            format!("Pass {pass}/{total} (color {color}) cutting; press Enter once the machine finishes")
+        }
+    }
 }
 
 /// The colour of the pass the job is paused on — the reason the operator is being
@@ -112,6 +152,10 @@ pub fn run(
     operator: Operator,
     with_cancel: impl FnOnce(Arc<DeviceManager>) -> Result<(), String>,
 ) -> Result<Outcome, String> {
+    // The plan's own count, needed before a device exists (the guard below) and after
+    // the job has stopped reporting a position — a finished cut rests on `Idle`, which
+    // carries none. The prompts deliberately do not use it: while a job is running the
+    // status reports both halves of the position itself.
     let total = plan.passes.len();
     // The invariant `Unattended` depends on, enforced where the dependency lives
     // rather than only in `check_interactive` upstream. On a machine that parks for
@@ -135,35 +179,25 @@ pub fn run(
 
     loop {
         let status = mgr.status();
+        // What the operator may answer comes from `actions`; `phase` is only asked
+        // what is happening once there is nothing to answer.
+        if let Some(pause) = pause_of(&status) {
+            if operator.wait_ack(&pause_prompt(pause, plan, &status), &mgr) {
+                let (what, answered) = match pause {
+                    Pause::Swap => ("resume", mgr.resume()),
+                    Pause::Confirm => ("confirm", mgr.confirm_pass_done()),
+                };
+                answer_pause(what, answered)?;
+            }
+            continue;
+        }
         match status.phase {
-            Phase::AwaitingColorSwap => {
-                let prompt = format!(
-                    "Pass {}/{} (color {}): swap tool, press Enter to resume",
-                    pass_at(&status),
-                    total,
-                    pass_color(plan, &status),
-                );
-                if operator.wait_ack(&prompt, &mgr) {
-                    answer_pause("resume", mgr.resume())?;
-                }
-            }
-            Phase::AwaitingConfirmation => {
-                let prompt = format!(
-                    "Pass {}/{} (color {}) cutting; press Enter once the machine finishes",
-                    pass_at(&status),
-                    total,
-                    pass_color(plan, &status),
-                );
-                if operator.wait_ack(&prompt, &mgr) {
-                    answer_pause("confirm", mgr.confirm_pass_done())?;
-                }
-            }
             // Nothing is happening, so the job is over and the operator has nothing
             // left to answer. `ended` is what says which ending it was.
             Phase::Idle => {
                 return match status.ended {
                     Some(Ended::Cancelled) => Ok(Outcome::Cancelled {
-                        pass: pass_at(&status),
+                        pass: pass_position(&status).0,
                         sent: status.sent.map(|b| b.sent).unwrap_or(0),
                     }),
                     Some(Ended::Completed) => Ok(Outcome::Completed { passes: total }),
@@ -200,5 +234,66 @@ fn wait_for_enter_or_cancel(mgr: &DeviceManager) -> bool {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use driver_core::{Actions, Job, PassPosition, Settings};
+
+    fn status(actions: Actions, phase: Phase, pass: Option<PassPosition>) -> CutStatus {
+        CutStatus { phase, ended: None, actions, pass, sent: None, error: None }
+    }
+
+    fn plan(colors: &[Option<u32>]) -> cutplan::CutPlan {
+        cutplan::CutPlan {
+            passes: colors
+                .iter()
+                .map(|&color| cutplan::PlannedPass {
+                    color,
+                    job: Job { polylines: vec![], settings: Settings::default() },
+                })
+                .collect(),
+        }
+    }
+
+    /// The phases are deliberately wrong here: `driver-core` owns which calls are
+    /// legal, and a loop that re-derives that from the phase has to be re-audited
+    /// every time a phase is added. Reading `actions` is what deletes that audit, so
+    /// a status that permits an answer must be answered whatever it calls itself.
+    #[test]
+    fn the_pause_is_read_from_actions_not_from_the_phase() {
+        let resume = Actions { cancel: true, resume: true, ..Actions::default() };
+        assert_eq!(pause_of(&status(resume, Phase::Sending, None)), Some(Pause::Swap));
+
+        let confirm = Actions { cancel: true, confirm: true, ..Actions::default() };
+        assert_eq!(pause_of(&status(confirm, Phase::Sending, None)), Some(Pause::Confirm));
+
+        // Mid-flight: cancellable, but there is nothing for the operator to answer.
+        let sending = Actions { cancel: true, ..Actions::default() };
+        assert_eq!(pause_of(&status(sending, Phase::AwaitingConfirmation, None)), None);
+        assert_eq!(pause_of(&status(Actions::default(), Phase::Failed, None)), None);
+    }
+
+    /// Both halves of "2/3" come from the status, so the number being counted and the
+    /// number it counts towards cannot come from two different accounts of the job.
+    #[test]
+    fn a_prompt_takes_both_halves_of_the_position_from_the_status() {
+        let plan = plan(&[Some(0xff0000ff), Some(0x0000ffff), None]);
+        let at_second = status(
+            Actions { cancel: true, resume: true, ..Actions::default() },
+            Phase::AwaitingColorSwap,
+            Some(PassPosition { index: 1, total: 3 }),
+        );
+
+        let swap = pause_prompt(Pause::Swap, &plan, &at_second);
+        assert!(swap.contains("Pass 2/3"), "counts from 1, out of the job's own total: {swap}");
+        assert!(swap.contains("#0000ff"), "names the colour being swapped to: {swap}");
+        assert!(swap.contains("swap tool"), "says what to do: {swap}");
+
+        let confirm = pause_prompt(Pause::Confirm, &plan, &at_second);
+        assert!(confirm.contains("Pass 2/3"), "{confirm}");
+        assert!(confirm.contains("once the machine finishes"), "waits on the blade, not the queue: {confirm}");
     }
 }

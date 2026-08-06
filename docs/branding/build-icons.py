@@ -18,10 +18,6 @@ what set this boundary - so a C mark stands in underneath. The `.ico` and
 `.icns` containers are genuinely multi-resolution: each entry holds whichever
 artwork suits its own size, and the OS picks.
 
-Note that macOS insets `.icns` content to 824/1024 of its tile, so the 32px
-tile draws only 26px of artwork and lands on the C mark, while the 64px tile
-draws 52px and gets the mascot.
-
 Requires Pillow and CairoSVG, neither of which the Rust or Node toolchains
 pull in. This is why the script is not wired into CI - the committed icons are
 the build output, and this regenerates them on demand.
@@ -60,7 +56,13 @@ _cache = {}
 
 
 def art(size):
-    """Rounded artwork with transparent corners, rendered natively at `size`."""
+    """The glyph on a transparent background, rendered natively at `size`.
+
+    The sources draw no background tile of their own: macOS 26 composites any
+    legacy `.icns` onto its own white squircle plate, so artwork carrying its
+    own tile renders tile-in-tile. Surfaces that need an opaque background get
+    it from `art_square` instead.
+    """
     if size not in _cache:
         svg = C_SMALL if size <= 20 else C_STD if size <= 30 else MASCOT
         buf = io.BytesIO()
@@ -94,7 +96,7 @@ def _dib(im):
 def write_ico(path, sizes):
     entries, blobs, off = [], [], 6 + 16 * len(sizes)
     for s in sizes:
-        im = art_square(s)
+        im = art(s)
         if s >= 256:                      # PNG payload at 256+, DIB below it
             buf = io.BytesIO()
             im.save(buf, "PNG", optimize=True)
@@ -113,22 +115,9 @@ def write_ico(path, sizes):
 
 
 # ---------------------------------------------------------------- .icns ----
-def mac_tile(size):
-    """Apple's macOS 11+ app-icon grid: content inset to 824/1024, centred.
-
-    The inset is forced to even parity because an odd margin cannot be split
-    evenly either side, which shifts the artwork half a pixel off centre.
-    """
-    inner = round(size * 824 / 1024)
-    if (size - inner) % 2:
-        inner -= 1
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    a = art(inner)
-    o = (size - inner) // 2
-    canvas.paste(a, (o, o), a)
-    return canvas
-
-
+# No 824/1024 inset here. That grid is for tile artwork on macOS 11-15; this is
+# a free glyph, and macOS 26 rescales the whole canvas onto its own squircle
+# plate regardless, so an inset would only shrink the artwork twice.
 def write_icns(path):
     types = [(b"icp4", 16), (b"icp5", 32), (b"icp6", 64), (b"ic07", 128),
              (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024), (b"ic11", 32),
@@ -136,7 +125,7 @@ def write_icns(path):
     chunks = b""
     for tag, s in types:
         buf = io.BytesIO()
-        mac_tile(s).save(buf, "PNG", optimize=True)
+        art(s).save(buf, "PNG", optimize=True)
         d = buf.getvalue()
         # the chunk length counts its own 8-byte header, not just the payload
         chunks += tag + struct.pack(">I", 8 + len(d)) + d
@@ -159,11 +148,34 @@ STORE_TILES = [(30, "Square30x30Logo"), (44, "Square44x44Logo"),
 # throw away the whole point of the C mark, so ship explicit target-size assets
 # and let the tier rule pick the artwork at each one. 32 is included because it
 # is the first size above the boundary, so it is the mascot's weakest showing.
+# These are transparent: Windows plates targetsize assets itself, so an opaque
+# square here would tile-in-tile exactly like the macOS case.
 TARGET_SIZES = [16, 24, 32, 48, 256]
 
 
+def write_preview(path, sizes=(16, 20, 24, 32, 48, 64, 128, 256)):
+    """The size ladder the README says to judge regenerations by.
+
+    Two rows, light and dark, because the glyph is transparent and has to be
+    checked against both plate colours it will actually sit on.
+    """
+    pad = 8
+    w = sum(s + pad for s in sizes) + pad
+    h = max(sizes) + 2 * pad
+    sheet = Image.new("RGBA", (w, 2 * h))
+    for bg, top in (((255, 255, 255, 255), 0), ((30, 30, 30, 255), h)):
+        row = Image.new("RGBA", (w, h), bg)
+        x = pad
+        for s in sizes:
+            a = art(s)
+            row.paste(a, (x, (h - s) // 2), a)
+            x += s + pad
+        sheet.paste(row, (0, top))
+    save(sheet, path)
+
+
 def main():
-    save(art_square(32), os.path.join(ICONS, "32x32.png"))
+    save(art(32), os.path.join(ICONS, "32x32.png"))
     save(art(128), os.path.join(ICONS, "128x128.png"))
     save(art(256), os.path.join(ICONS, "128x128@2x.png"))
     save(art(1024), os.path.join(ICONS, "icon.png"))
@@ -174,8 +186,10 @@ def main():
     for size, name in STORE_TILES:
         save(art_square(size), os.path.join(ICONS, f"{name}.png"))
     for size in TARGET_SIZES:
-        save(art_square(size),
+        save(art(size),
              os.path.join(ICONS, f"Square44x44Logo.targetsize-{size}.png"))
+
+    write_preview(os.path.join(HERE, "preview-sizes.png"))
 
     print("wrote", os.path.relpath(ICONS, ROOT))
 

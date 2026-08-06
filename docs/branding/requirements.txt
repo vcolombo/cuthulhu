@@ -14,9 +14,9 @@
 #
 # The committed assets were produced in this environment:
 #
-#     Ubuntu 26.04 LTS (x86_64)
-#     libcairo    1.18.4-3
-#     Python      3.14.3
+#     macOS 26.6 (arm64)
+#     libcairo    1.18.4 (Homebrew)
+#     Python      3.14.6
 #     cairocffi   1.7.1
 #     CairoSVG    2.9.0
 #     Pillow      12.3.0

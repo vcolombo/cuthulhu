@@ -33,7 +33,9 @@ size of the diff. See "Regeneration is visual, not byte-exact" in README.md.
 """
 import io
 import os
+import shutil
 import struct
+import subprocess
 import sys
 
 try:
@@ -153,6 +155,49 @@ STORE_TILES = [(30, "Square30x30Logo"), (44, "Square44x44Logo"),
 TARGET_SIZES = [16, 24, 32, 48, 256]
 
 
+# ------------------------------------------------- macOS 26 .icon ----
+# Tahoe draws legacy .icns on a system grey plate. The Icon Composer bundle in
+# AppIcon.icon is the sanctioned way to control that backdrop: cream fill, the
+# mascot as a non-glass layer. The layer keeps the old 824/1024 inset because
+# the squircle mask crops the canvas corners — a full-bleed glyph would lose
+# its tentacle curls to the mask, and here the margin lands on our own cream
+# rather than a system plate.
+ICON_BUNDLE = os.path.join(HERE, "AppIcon.icon")
+
+
+def write_icon_layer():
+    canvas = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+    a = art(824)
+    canvas.paste(a, (100, 100), a)
+    save(canvas, os.path.join(ICON_BUNDLE, "Assets", "mascot.png"))
+
+
+def compile_assets_car():
+    """Compile AppIcon.icon into Assets.car beside the other bundle icons.
+
+    actool ships with full Xcode only, so this step is macOS-plus-Xcode; on
+    any other host the committed Assets.car simply stays as it is, same as
+    every other committed output here.
+    """
+    if not shutil.which("actool"):
+        print("actool not found - skipped Assets.car (needs Xcode on macOS)")
+        return
+    plist = os.path.join(ICONS, "_actool_partial.plist")
+    subprocess.run(
+        ["actool", ICON_BUNDLE, "--compile", ICONS,
+         "--output-format", "human-readable-text", "--notices", "--warnings",
+         "--errors", "--output-partial-info-plist", plist,
+         "--app-icon", "AppIcon", "--include-all-app-icons",
+         "--enable-on-demand-resources", "NO", "--development-region", "en",
+         "--target-device", "mac", "--minimum-deployment-target", "26.0",
+         "--platform", "macosx"],
+        check=True)
+    os.remove(plist)
+    # actool also emits its own fallback icns, mascot-only at every size.
+    # Ours is better - per-size artwork tiers - so the fallback stays out.
+    os.remove(os.path.join(ICONS, "AppIcon.icns"))
+
+
 def write_preview(path, sizes=(16, 20, 24, 32, 48, 64, 128, 256)):
     """The size ladder the README says to judge regenerations by.
 
@@ -189,6 +234,8 @@ def main():
         save(art(size),
              os.path.join(ICONS, f"Square44x44Logo.targetsize-{size}.png"))
 
+    write_icon_layer()
+    compile_assets_car()
     write_preview(os.path.join(HERE, "preview-sizes.png"))
 
     print("wrote", os.path.relpath(ICONS, ROOT))

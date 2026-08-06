@@ -23,6 +23,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "macOS": {
+      "files": {
+        "Resources/Assets.car": "icons/Assets.car"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -8,6 +8,7 @@ desktop shell's icon bundle from them.
 cuthulhu-mascot.svg    vector master - kraken gripping a craft knife
 cuthulhu-c.svg         C mark, standard tier (21-30px)
 cuthulhu-c-16.svg      C mark, small tier (16-20px)
+AppIcon.icon/          Icon Composer bundle for macOS 26+ (layer PNG written by the script)
 build-icons.py         renders apps/desktop/icons/ from the three SVGs above
 requirements.txt       pinned rasteriser versions for that script
 preview-sizes.png      the full size ladder on light and dark, written by the script
@@ -56,6 +57,25 @@ reading. Rendered onto the Windows Store tiles it was clear that everything from
 roughly 30 to 50px shows a recognisable creature with a soft grey smear for a
 knife and no legible eyes; eyes only return cleanly around 71px. Thirty was the
 last size the OS actually asks for in that band, so the boundary went above it.
+
+### macOS 26: the .icon bundle
+
+macOS 26 draws legacy `.icns` icons scaled down on a system grey squircle
+plate. The way to control that backdrop is Apple's Icon Composer format:
+`AppIcon.icon/` holds `icon.json` (solid cream fill, the mascot as a single
+non-glass layer) and a script-rendered layer PNG. `build-icons.py` compiles it
+into `apps/desktop/icons/Assets.car` with `actool` when Xcode is present, and
+skips with a note when it is not — the committed `Assets.car` is the build
+output, like everything else here. Tauri carries it into `Contents/Resources`
+via `bundle.macOS.files`, and `apps/desktop/Info.plist` adds
+`CFBundleIconName` so macOS 26+ finds it; older macOS keeps using
+`CFBundleIconFile` and `icon.icns`. actool's auto-generated fallback icns is
+discarded — ours carries the per-size artwork tiers, its version is
+mascot-at-every-size.
+
+The layer PNG keeps an 824/1024 inset: the squircle mask crops the canvas
+corners, so a full-bleed glyph would lose its tentacle curls — and inside the
+`.icon` the margin lands on our own cream rather than a system plate.
 
 The `.icns` entries carry no 824/1024 inset. That grid is for tile artwork on
 macOS 11-15; this is a free glyph, and macOS 26 rescales the whole canvas onto

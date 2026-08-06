@@ -12,8 +12,9 @@ AppIcon.icon/          Icon Composer bundle for macOS 26+ (layer PNG written by 
 build-icons.py         renders apps/desktop/icons/ from the three SVGs above
 requirements.txt       pinned rasteriser versions for that script
 preview-sizes.png      the full size ladder on light and dark, written by the script
-social-preview.png     GitHub social preview card, written by the script; uploaded
-                       manually in repo settings (GitHub has no API for it)
+social-preview.png     GitHub social preview card, hand-designed (not script
+                       output); uploaded manually in repo settings (GitHub has
+                       no API for it)
 ```
 
 ## Palette

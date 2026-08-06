@@ -198,26 +198,6 @@ def compile_assets_car():
     os.remove(os.path.join(ICONS, "AppIcon.icns"))
 
 
-def write_social_card(path):
-    """GitHub social preview (1280x640): mascot left, wordmark right, on cream.
-
-    Uploaded manually in the repository settings - GitHub has no API for it -
-    but generated here so the card regenerates with the artwork. The wordmark
-    uses Pillow's embedded font: pinned with Pillow itself, so the card does
-    not depend on whatever fonts the host happens to have.
-    """
-    from PIL import ImageDraw, ImageFont
-    card = Image.new("RGBA", (1280, 640), CREAM)
-    a = art(520)
-    card.paste(a, (110, 60), a)
-    d = ImageDraw.Draw(card)
-    font = ImageFont.load_default(size=110)
-    x0, y0, x1, y1 = d.textbbox((0, 0), "cuthulhu", font=font)
-    d.text((640 + (600 - (x1 - x0)) // 2 - x0, (640 - (y1 - y0)) // 2 - y0),
-           "cuthulhu", font=font, fill=(20, 52, 58, 255))
-    save(card.convert("RGB"), path)
-
-
 def write_preview(path, sizes=(16, 20, 24, 32, 48, 64, 128, 256)):
     """The size ladder the README says to judge regenerations by.
 
@@ -256,7 +236,6 @@ def main():
 
     write_icon_layer()
     compile_assets_car()
-    write_social_card(os.path.join(HERE, "social-preview.png"))
     write_preview(os.path.join(HERE, "preview-sizes.png"))
 
     print("wrote", os.path.relpath(ICONS, ROOT))

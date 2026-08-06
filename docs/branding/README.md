@@ -103,10 +103,40 @@ the Rust nor the Node toolchain pulls in.
 
 Use the pinned requirements rather than installing loose. Because the icons are
 committed as binary, an unpinned rasteriser bump produces a diff that looks
-exactly like an intentional artwork change. The committed set was produced with
-Pillow 12.3.0 and CairoSVG 2.9.0 against cairocffi 1.7.1. The pin only covers
-the Python layer — CairoSVG draws through the system libcairo, so a different
-libcairo can still shift antialiasing by a pixel.
+exactly like an intentional artwork change.
+
+### Regeneration is visual, not byte-exact
+
+The pins do not make this reproducible, and it is worth being blunt about that
+rather than leaving it as a footnote. Running the script on a host with a
+different system libcairo rewrites most of `apps/desktop/icons/` without any SVG
+edit: byte-different across the set, and pixel-different on the larger mascot
+renders, where there is enough curve detail for antialiasing to disagree.
+
+The cause is structural. CairoSVG is a thin layer over the system libcairo via
+cairocffi, and libcairo does the rasterising. pip can pin CairoSVG; it cannot
+pin the library actually drawing the pixels. What the pins buy is narrower than
+reproducibility: they remove the Python layer as a variable, so when output does
+shift there is exactly one place it can have come from.
+
+The committed assets were produced in this environment:
+
+| | |
+| --- | --- |
+| Platform | Ubuntu 26.04 LTS (x86_64) |
+| libcairo | 1.18.4-3 |
+| Python | 3.14.3 |
+| cairocffi | 1.7.1 |
+| CairoSVG | 2.9.0 |
+| Pillow | 12.3.0 |
+
+So: do not read an empty diff as confirmation, and do not read a large diff as
+breakage. **Review `preview-sizes.png` and the 16px tile, and judge the artwork.**
+If you need regeneration to be byte-reproducible — for a release process that
+asserts the committed icons match their sources — pin libcairo too, by running
+the script in a container built from a fixed base image. That is deliberately
+not done here: it is a lot of machinery for an icon set that changes rarely and
+is verified by eye anyway.
 
 Edit the SVGs, never the PNGs, and re-check the result at 16px magnified before
 committing — small-size artwork cannot be judged at 100%.

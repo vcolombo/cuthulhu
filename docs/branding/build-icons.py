@@ -29,6 +29,11 @@ the build output, and this regenerates them on demand.
 Install from `requirements.txt` rather than loose. The icons are committed as
 binary, so an unpinned rasteriser bump produces a diff indistinguishable from
 an intentional artwork change.
+
+Those pins do not make this byte-reproducible. libcairo does the rasterising and
+pip cannot pin it, so a host with a different libcairo rewrites most of the
+output with no SVG edit. Judge a regeneration by preview-sizes.png, not by the
+size of the diff. See "Regeneration is visual, not byte-exact" in README.md.
 """
 import io
 import os

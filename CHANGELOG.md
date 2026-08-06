@@ -20,5 +20,11 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Added
 
+- The desktop shell has an application icon. macOS and Windows bundles now get a real `.icns` and
+  `.ico`, where `bundle.icon` previously listed only a 32 px placeholder PNG. Both containers are
+  multi-resolution and carry two artworks: the kraken mascot at 27 px and above, and a C mark below
+  it, since the mascot's knife and tentacle curls stop resolving at small sizes. Sources and the
+  regeneration script are in `docs/branding/`.
+
 - `cuthulhu trace` reports when a large image was reduced to 2048 px for tracing. The reduction
   always happened; it was only ever visible in the desktop.

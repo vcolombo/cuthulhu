@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <!-- Cuthulhu small mark: small tier, 16-20px: slit widened 8u->12u to survive rasterisation
+       ring R=39 counter 50x34 cut x=23 slit 12x22 (96u grid) -->
+  <rect width="96" height="96" rx="17" ry="17" fill="#FAECD6"/>
+  <path d="M71.00 16.50 A39 39 0 1 0 71.00 79.50 L71.00 54.66 A25 17 0 1 1 71.00 41.34 Z" fill="#17767A"/>
+  <rect x="42.0" y="37.0" width="12" height="22" rx="6.0" fill="#17767A"/>
+</svg>

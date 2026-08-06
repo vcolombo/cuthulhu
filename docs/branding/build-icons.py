@@ -198,6 +198,18 @@ def compile_assets_car():
     os.remove(os.path.join(ICONS, "AppIcon.icns"))
 
 
+def write_social_card(path):
+    """GitHub social preview (1280x640): the mascot centred on cream.
+
+    Uploaded manually in the repository settings - GitHub has no API for it -
+    but generated here so the card regenerates with the artwork.
+    """
+    card = Image.new("RGBA", (1280, 640), CREAM)
+    a = art(560)
+    card.paste(a, ((1280 - 560) // 2, (640 - 560) // 2), a)
+    save(card.convert("RGB"), path)
+
+
 def write_preview(path, sizes=(16, 20, 24, 32, 48, 64, 128, 256)):
     """The size ladder the README says to judge regenerations by.
 
@@ -236,6 +248,7 @@ def main():
 
     write_icon_layer()
     compile_assets_car()
+    write_social_card(os.path.join(HERE, "social-preview.png"))
     write_preview(os.path.join(HERE, "preview-sizes.png"))
 
     print("wrote", os.path.relpath(ICONS, ROOT))

@@ -9,13 +9,18 @@ Every raster is rendered from SVG at its native pixel size - nothing is ever
 downscaled from a bitmap - and each size draws on the artwork suited to it:
 
     16 - 20 px      C mark, small tier    (widened slit)
-    21 - 26 px      C mark, standard tier
-    27 px and up    full mascot
+    21 - 30 px      C mark, standard tier
+    31 px and up    full mascot
 
-The mascot carries a craft knife and eight tentacle curls that stop resolving
-below about 27px, so a C mark stands in underneath. The `.ico` and `.icns`
-containers are genuinely multi-resolution: each entry holds whichever artwork
-suits its own size, and the OS picks.
+The mascot carries a craft knife and eight tentacle curls. Its eyes and blade
+go soft below roughly 31px - visible on the Windows 30px Start tile, which is
+what set this boundary - so a C mark stands in underneath. The `.ico` and
+`.icns` containers are genuinely multi-resolution: each entry holds whichever
+artwork suits its own size, and the OS picks.
+
+Note that macOS insets `.icns` content to 824/1024 of its tile, so the 32px
+tile draws only 26px of artwork and lands on the C mark, while the 64px tile
+draws 52px and gets the mascot.
 
 Requires Pillow and CairoSVG, neither of which the Rust or Node toolchains
 pull in. This is why the script is not wired into CI - the committed icons are
@@ -52,7 +57,7 @@ _cache = {}
 def art(size):
     """Rounded artwork with transparent corners, rendered natively at `size`."""
     if size not in _cache:
-        svg = C_SMALL if size <= 20 else C_STD if size <= 26 else MASCOT
+        svg = C_SMALL if size <= 20 else C_STD if size <= 30 else MASCOT
         buf = io.BytesIO()
         cairosvg.svg2png(url=svg, write_to=buf, output_width=size, output_height=size)
         _cache[size] = Image.open(io.BytesIO(buf.getvalue())).convert("RGBA")
@@ -147,7 +152,8 @@ STORE_TILES = [(30, "Square30x30Logo"), (44, "Square44x44Logo"),
 # Windows draws the app-list entry from Square44x44Logo, scaling it down as far
 # as 16px for the taskbar. Left to itself it would shrink the 44px mascot and
 # throw away the whole point of the C mark, so ship explicit target-size assets
-# and let the tier rule pick the artwork at each one.
+# and let the tier rule pick the artwork at each one. 32 is included because it
+# is the first size above the boundary, so it is the mascot's weakest showing.
 TARGET_SIZES = [16, 24, 32, 48, 256]
 
 

@@ -22,7 +22,7 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 - The desktop shell has an application icon. macOS and Windows bundles now get a real `.icns` and
   `.ico`, where `bundle.icon` previously listed only a 32 px placeholder PNG. Both containers are
-  multi-resolution and carry two artworks: the kraken mascot at 27 px and above, and a C mark below
+  multi-resolution and carry two artworks: the kraken mascot at 31 px and above, and a C mark below
   it, since the mascot's knife and tentacle curls stop resolving at small sizes. The Windows Store
   tile set ships alongside, including explicit target-size assets so the taskbar entry uses the C
   mark rather than a shrunken mascot. Sources and the regeneration script are in `docs/branding/`.

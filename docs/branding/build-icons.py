@@ -135,6 +135,22 @@ def write_icns(path):
         f.write(b"icns" + struct.pack(">I", 8 + len(chunks)) + chunks)
 
 
+# Tauri's default Store tile set. These are full-bleed rather than transparent:
+# the cream tile is part of the mark, and a transparent tile would composite
+# onto whatever accent colour the user has picked.
+STORE_TILES = [(30, "Square30x30Logo"), (44, "Square44x44Logo"),
+               (71, "Square71x71Logo"), (89, "Square89x89Logo"),
+               (107, "Square107x107Logo"), (142, "Square142x142Logo"),
+               (150, "Square150x150Logo"), (284, "Square284x284Logo"),
+               (310, "Square310x310Logo"), (50, "StoreLogo")]
+
+# Windows draws the app-list entry from Square44x44Logo, scaling it down as far
+# as 16px for the taskbar. Left to itself it would shrink the 44px mascot and
+# throw away the whole point of the C mark, so ship explicit target-size assets
+# and let the tier rule pick the artwork at each one.
+TARGET_SIZES = [16, 24, 32, 48, 256]
+
+
 def main():
     save(art_square(32), os.path.join(ICONS, "32x32.png"))
     save(art(128), os.path.join(ICONS, "128x128.png"))
@@ -143,6 +159,13 @@ def main():
     write_ico(os.path.join(ICONS, "icon.ico"),
               [16, 20, 24, 32, 48, 64, 128, 256])
     write_icns(os.path.join(ICONS, "icon.icns"))
+
+    for size, name in STORE_TILES:
+        save(art_square(size), os.path.join(ICONS, f"{name}.png"))
+    for size in TARGET_SIZES:
+        save(art_square(size),
+             os.path.join(ICONS, f"Square44x44Logo.targetsize-{size}.png"))
+
     print("wrote", os.path.relpath(ICONS, ROOT))
 
 

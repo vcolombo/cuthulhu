@@ -20,6 +20,10 @@ suits its own size, and the OS picks.
 Requires Pillow and CairoSVG, neither of which the Rust or Node toolchains
 pull in. This is why the script is not wired into CI - the committed icons are
 the build output, and this regenerates them on demand.
+
+Install from `requirements.txt` rather than loose. The icons are committed as
+binary, so an unpinned rasteriser bump produces a diff indistinguishable from
+an intentional artwork change.
 """
 import io
 import os
@@ -30,7 +34,8 @@ try:
     import cairosvg
     from PIL import Image
 except ImportError:
-    sys.exit("needs Pillow and CairoSVG: pip install pillow cairosvg")
+    sys.exit("needs Pillow and CairoSVG: "
+             "pip install -r docs/branding/requirements.txt")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Pinned because build-icons.py's output is committed as binary. Unpinned
+# rasteriser versions make a toolchain bump indistinguishable from an
+# intentional artwork change in the diff.
+#
+# Note this pins the Python layer only. CairoSVG draws through the system
+# libcairo via cairocffi, so a different libcairo can still shift antialiasing
+# by a pixel. Check preview-sizes.png if the committed icons change without an
+# SVG edit.
+Pillow==12.3.0
+CairoSVG==2.9.0

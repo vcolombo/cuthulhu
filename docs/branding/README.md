@@ -9,6 +9,7 @@ cuthulhu-mascot.svg    vector master - kraken gripping a craft knife
 cuthulhu-c.svg         C mark, standard tier (21-26px)
 cuthulhu-c-16.svg      C mark, small tier (16-20px)
 build-icons.py         renders apps/desktop/icons/ from the three SVGs above
+requirements.txt       pinned rasteriser versions for that script
 preview-sizes.png      the full size ladder, for eyeballing changes
 ```
 
@@ -85,13 +86,20 @@ to mush.
 ## Regenerating
 
 ```sh
-pip install pillow cairosvg
+pip install -r docs/branding/requirements.txt
 python3 docs/branding/build-icons.py
 ```
 
 This rewrites `apps/desktop/icons/`. The outputs are committed, and the script
 is deliberately not wired into CI: it needs a Python imaging stack that neither
 the Rust nor the Node toolchain pulls in.
+
+Use the pinned requirements rather than installing loose. Because the icons are
+committed as binary, an unpinned rasteriser bump produces a diff that looks
+exactly like an intentional artwork change. The committed set was produced with
+Pillow 12.3.0 and CairoSVG 2.9.0 against cairocffi 1.7.1. The pin only covers
+the Python layer — CairoSVG draws through the system libcairo, so a different
+libcairo can still shift antialiasing by a pixel.
 
 Edit the SVGs, never the PNGs, and re-check the result at 16px magnified before
 committing — small-size artwork cannot be judged at 100%.

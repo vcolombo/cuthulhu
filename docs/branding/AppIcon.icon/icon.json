@@ -1,0 +1,20 @@
+{
+  "fill": {
+    "solid": "srgb:0.98039,0.92549,0.83922,1.00000"
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "glass": false,
+          "image-name": "mascot.png",
+          "name": "mascot"
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "circles": ["watchOS"],
+    "squares": "shared"
+  }
+}

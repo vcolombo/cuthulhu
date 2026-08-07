@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Pinned because build-icons.py's output is committed as binary. Unpinned
+# rasteriser versions make a toolchain bump indistinguishable from an
+# intentional artwork change in the diff.
+#
+# These pins do NOT make regeneration byte-reproducible, and nothing here
+# claims they do. CairoSVG draws through the system libcairo via cairocffi,
+# which pip cannot pin, and libcairo decides the antialiasing. Regenerating on
+# a host with a different libcairo rewrites most of apps/desktop/icons/ with no
+# SVG edit - byte-different, and pixel-different on the larger mascot renders.
+# What the pins buy is that the Python layer stops being a variable, so any
+# remaining drift has exactly one place to come from.
+#
+# The committed assets were produced in this environment:
+#
+#     macOS 26.6 (arm64)
+#     libcairo    1.18.4 (Homebrew)
+#     Python      3.14.6
+#     cairocffi   1.7.1
+#     CairoSVG    2.9.0
+#     Pillow      12.3.0
+#
+# Treat regeneration as visual, not byte-exact: review preview-sizes.png rather
+# than trusting an empty diff. See "Regenerating" in README.md.
+Pillow==12.3.0
+CairoSVG==2.9.0

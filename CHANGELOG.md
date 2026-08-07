@@ -20,5 +20,16 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Added
 
+- The desktop shell has an application icon. macOS and Windows bundles now get a real `.icns` and
+  `.ico`, where `bundle.icon` previously listed only a 32 px placeholder PNG. Both containers are
+  multi-resolution and carry two artworks: the kraken mascot at 31 px and above, and a C mark below
+  it, since the mascot's knife and tentacle curls stop resolving at small sizes. The Windows Store
+  tile set ships alongside, including explicit target-size assets so the taskbar entry uses the C
+  mark rather than a shrunken mascot. The artwork is a glyph on a transparent background — macOS 26
+  and the Windows taskbar composite icons onto their own backplates, so a self-drawn tile renders
+  tile-in-tile. On macOS 26+ the bundle also ships an Icon Composer icon (`Assets.car` +
+  `CFBundleIconName`), which replaces the system's grey legacy plate with the mark's own cream
+  squircle. Sources and the regeneration script are in `docs/branding/`.
+
 - `cuthulhu trace` reports when a large image was reduced to 2048 px for tracing. The reduction
   always happened; it was only ever visible in the desktop.

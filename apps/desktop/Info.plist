@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Merged into the generated Info.plist by Tauri. CFBundleIconName points
+     macOS 26+ at the Icon Composer icon in Resources/Assets.car; older macOS
+     ignores it and keeps using CFBundleIconFile / icon.icns. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+</dict>
+</plist>

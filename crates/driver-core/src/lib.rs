@@ -8,17 +8,17 @@ pub mod manager;
 pub mod status;
 pub use status::{Actions, ByteProgress, CutStatus, Ended, PassPosition, Phase};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Job { pub polylines: Vec<Polyline>, pub settings: Settings }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings { pub speed: Option<u32>, pub force: Option<u32>, pub repeat_count: u32 }
 impl Default for Settings { fn default() -> Self { Settings { speed: None, force: None, repeat_count: 1 } } }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MachineProfile { pub id: String, pub name: String, pub width_mm: f64, pub height_mm: f64 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineCaps { pub supports_speed: bool, pub supports_force: bool, pub needs_operator_pass_confirm: bool }
 

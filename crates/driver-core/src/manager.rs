@@ -10,7 +10,7 @@
 
 use crate::status::{status_of, CutStatus, Ended};
 use crate::{close_pass, open_pass, write_all, DeviceBackendFactory, DeviceInfo, Driver, Job, Transport, TransportError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -35,7 +35,7 @@ pub(crate) enum DeviceState {
     Error(DeviceError),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DeviceError { Disconnected, Busy, Timeout, WriteZero, Io(String) }
 
 impl From<TransportError> for DeviceError {
@@ -52,10 +52,10 @@ impl From<TransportError> for DeviceError {
 /// An event and the status that held when it was sent, so a listener renders from
 /// what it just received rather than polling for a value that may already have
 /// moved on.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEvent { pub job_id: u64, pub kind: DeviceEventKind, pub status: CutStatus }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DeviceEventKind {
     /// Carries no payload: the event's `status` is what changed. A state the
     /// caller cannot act on differently is not a distinction worth publishing.
@@ -67,6 +67,7 @@ pub enum DeviceEventKind {
 }
 
 /// One per color, in configured order (Task 7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CutPass { pub job: Job }
 
 /// Lifecycle events (connect/disconnect) aren't scoped to a job; they're

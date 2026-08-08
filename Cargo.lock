@@ -718,6 +718,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cut-host"
+version = "0.1.0"
+dependencies = [
+ "cutplan",
+ "driver-core",
+ "driver-registry",
+ "geometry",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cutplan"
 version = "0.1.0"
 dependencies = [

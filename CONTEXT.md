@@ -107,6 +107,11 @@ The wire to a physical machine, over USB or a serial port. Carries bytes and kno
 what they mean.
 _Avoid_: connection, channel, port, link
 
+**Cut Host** — a machine that owns Transports to one or more cutters and runs Jobs on them on behalf
+of remote clients. A Cut Host owns the cut: a client may detach mid-Job and the Job continues.
+
+_Avoid_: proxy, server, relay, bridge — all four name something that forwards, which this does not.
+
 **Job**:
 The geometry for one pass, as flat polylines in millimetres, together with the Settings to cut it
 with. What a Driver encodes.

@@ -81,8 +81,11 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use driver_core::manager::{CutPass, DeviceEvent, DeviceEventKind};
-    use driver_core::{CutStatus, DeviceInfo, Job, Settings, TransportKind};
+    use driver_core::manager::{CutPass, DeviceError, DeviceEvent, DeviceEventKind};
+    use driver_core::{
+        Actions, ByteProgress, CutStatus, DeviceInfo, Ended, Job, PassPosition, Phase, Settings,
+        TransportKind,
+    };
     use geometry::Point;
 
     fn a_device() -> DeviceInfo {
@@ -142,14 +145,28 @@ mod tests {
         }
     }
 
+    /// Every field set to something a default would not produce, so a dropped or
+    /// mis-renamed field fails the round trip instead of passing silently.
+    fn a_populated_status() -> CutStatus {
+        CutStatus {
+            phase: Phase::Sending,
+            ended: Some(Ended::Cancelled),
+            actions: Actions { cut: false, cancel: true, resume: false, confirm: true },
+            pass: Some(PassPosition { index: 2, total: 5 }),
+            sent: Some(ByteProgress { sent: 4096, total: 20480 }),
+            error: Some(DeviceError::Timeout),
+        }
+    }
+
     /// `CutStatus` is what a reattaching client renders from, so it is the one type
     /// whose round trip has to carry every field — phase, ending, actions, Pass
-    /// position and byte progress together.
+    /// position and byte progress together. `disconnected()` alone would not catch
+    /// a dropped `Option` field, since every one of those is `None` there.
     #[test]
     fn a_snapshot_carries_the_whole_status() {
         let sent = Response::Snapshots(vec![DeviceSnapshot {
             info: a_device(),
-            status: CutStatus::disconnected(),
+            status: a_populated_status(),
             job_id: Some(7),
         }]);
         let json = serde_json::to_string(&sent).unwrap();
@@ -157,8 +174,37 @@ mod tests {
         match back {
             Response::Snapshots(s) => {
                 assert_eq!(s[0].info, a_device());
-                assert_eq!(s[0].status, CutStatus::disconnected());
+                assert_eq!(s[0].status.phase, Phase::Sending);
+                assert_eq!(s[0].status.ended, Some(Ended::Cancelled));
+                assert_eq!(
+                    s[0].status.actions,
+                    Actions { cut: false, cancel: true, resume: false, confirm: true }
+                );
+                assert_eq!(s[0].status.pass, Some(PassPosition { index: 2, total: 5 }));
+                assert_eq!(s[0].status.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
+                assert_eq!(s[0].status.error, Some(DeviceError::Timeout));
                 assert_eq!(s[0].job_id, Some(7));
+            }
+            other => panic!("round trip changed the variant: {other:?}"),
+        }
+    }
+
+    /// The all-`None`/all-default shape a fresh or disconnected device reports —
+    /// kept alongside the populated case since it exercises a different serde path
+    /// (every `Option` absent rather than present).
+    #[test]
+    fn a_disconnected_snapshot_round_trips() {
+        let sent = Response::Snapshots(vec![DeviceSnapshot {
+            info: a_device(),
+            status: CutStatus::disconnected(),
+            job_id: None,
+        }]);
+        let json = serde_json::to_string(&sent).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::Snapshots(s) => {
+                assert_eq!(s[0].status, CutStatus::disconnected());
+                assert_eq!(s[0].job_id, None);
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }

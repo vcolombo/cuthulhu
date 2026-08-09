@@ -74,14 +74,55 @@ configured host's cutters, so a user who never pairs a Pi sees exactly today's l
 alternative — namespacing `instance_id` strings — would hide the distinction inside a format
 nothing parses.
 
+`HostId` is an opaque string minted at pairing and never derived from the address, the display
+name, or the certificate. All three change in ordinary use: a Pi gets a static DHCP lease, an
+operator renames it, a certificate is regenerated. An id derived from any of them would make a
+saved cutter reference point at nothing the first time one did. `hosts.json` maps the id to the
+address, so moving a host is an edit rather than a re-pairing.
+
+Together with #100's `usb:sn:…` / `serial:sn:…` ids, a saved reference is then stable in both
+halves: which host, and which cutter on it.
+
 This is the field that hits issue #70: the IPC types are mirrored by hand in four places, and the
 e2e fake in `smoke.spec.ts` mirrors them again.
 
-### `enum Cutters { Local { factory, manager }, Remote(HostClient) }`
+### The desktop holds every paired host at once, and routes per call
 
-Behind the existing mutex in `apps/desktop/src/device.rs`, with each method becoming a two-arm
-match. `Local` is what exists today; a user who pairs nothing never executes the other arm. If the
-file outgrows comfort the remote arm splits into its own module, which is where issue #72 points.
+Phase 1's design sketched `enum Cutters { Local { .. }, Remote(HostClient) }` behind the existing
+mutex, as though the desktop were connected to one thing at a time. That is wrong for what this
+phase actually does: `list_devices` has to ask *every* configured host, and the status list shows
+every host's cutters together. An either/or enum cannot express that.
+
+So the desktop holds both, always:
+
+```rust
+struct Cutters {
+    local: LocalCutters,                     // the factory and DeviceManager it has today
+    hosts: HashMap<HostId, HostConnection>,  // one per paired host, lazily connected
+}
+```
+
+and the enum becomes about *routing a single call*, derived from the `DeviceInfo.host` of the
+device being addressed — `None` routes to `local`, `Some(id)` routes to that host. A user who
+pairs nothing has an empty map and never executes the remote path.
+
+`HostConnection` owns the `HostClient` plus its last known reachability, so a host that is down is
+listed with its cutters marked unreachable rather than vanishing (#42).
+
+### Connections are held open, which makes #97 a prerequisite
+
+Polling every host once a second means either holding a TLS connection per host or completing a
+handshake per poll. Handshaking at 1 Hz is waste, so the connections are held.
+
+That has a consequence the phase 1 design's "holds no connection open" line got wrong: **issue #97
+(no read timeout in `read_frame`) must be fixed before this phase, not after.** `HostClient::call`
+holds its stream mutex across a blocking read with no deadline, so a Pi that hangs — or a Wi-Fi
+drop that never sends a RST — freezes the poll, the mutex, and whatever UI thread is behind it.
+That is tolerable when nothing consumes `HostClient`. It is a frozen application once the desktop
+polls on a timer.
+
+Polling still beats a pushed-event connection here, for the reason given above — but not because
+it avoids holding a socket. It avoids a *second* socket and a demultiplexing reader.
 
 ### Pairing lives in the device list, and ends with a Test
 
@@ -108,6 +149,15 @@ alone.
 A headless Pi cannot run OctoPrint's approve-in-the-browser flow, so tokens are minted by the
 person configuring the daemon, not by the app. That is a smaller mechanism, and it is honest about
 what a machine with no screen can do.
+
+`cutd.toml` moves from `token = "…"` to a `[tokens]` table keyed by a name the operator chooses
+(`workshop-laptop`, `office-desktop`). The old scalar is **refused with a message naming the new
+form**, rather than silently accepted as an unnamed token — a daemon that quietly kept working
+would leave the operator believing they had per-client revocation when they had one shared key.
+Nothing is deployed yet, so this costs a line in `docs/cut-host.md` and no migration.
+
+The daemon logs which token name authenticated each connection, so revoking the right one does not
+require guessing.
 
 ### The device list shows every cutter, not only the one you are aimed at
 
@@ -154,9 +204,9 @@ apps/desktop
 | File | Change |
 | --- | --- |
 | `crates/driver-core/src/lib.rs` | `DeviceInfo` gains `host: Option<HostId>` |
-| `crates/cut-host/src/config.rs` | `token` becomes a named table; `token_matches` takes the set |
+| `crates/cut-host/src/config.rs` | `[tokens]` table replaces the scalar; the old form is refused by name |
 | `crates/cut-host/src/client.rs` | `HostClient::test()` — connect, list, disconnect, for pairing |
-| `apps/desktop/src/device.rs` | the `Cutters` enum; `list_devices` merges; snapshot polling |
+| `apps/desktop/src/device.rs` | `Cutters { local, hosts }`; `list_devices` merges; snapshot polling |
 | `apps/desktop/src/hosts.rs` (new) | `hosts.json` load/save, `0600`, atomic write |
 | `apps/desktop/src/ipc.rs` | host add / remove / test / list commands |
 | `apps/desktop/ui/src/` | the pairing dialog, the device list's host rows and phase badges |
@@ -182,7 +232,9 @@ is testable headless against it — no Pi required.
 - `hosts.json` round-trips; a corrupt file does not lose the others; the file is `0600`.
 - Pairing: a wrong token, a wrong fingerprint, and an unreachable host each fail without saving.
 - `list_devices` merges, and a device's `host` distinguishes local from remote.
-- A remote dispatch, cancel, and confirm each reach the host, through `Cutters::Remote`.
+- A remote dispatch, cancel, and confirm each route to the right host by `DeviceInfo.host`.
+- Two paired hosts are listed together, and one being unreachable does not hide the other's cutters.
+- A `cutd.toml` carrying the old scalar `token` is refused with a message naming `[tokens]`.
 - Controls render from `actions`; no test may reach for a phase to decide legality.
 - The UI mirror and `e2e/smoke.spec.ts`'s fake move with `DeviceInfo` (#70).
 
@@ -200,8 +252,20 @@ npm --prefix apps/desktop/ui run e2e
 
 ## Dependencies on open issues
 
-- **#100 (serial identity) should land first.** `hosts.json` persists an `instance_id`, and until a
-  serial cutter's id is stable across a reboot, saving one stores a reference that can silently
-  come to mean a different machine.
-- **#97 (no read timeout)** is why this phase polls rather than holding a connection open.
-- **#70** is unavoidable here: `DeviceInfo` gains a field, and four hand-written mirrors move.
+Two must land before this phase starts. Both are small, and both become expensive to retrofit once
+a desktop is storing references or polling on a timer.
+
+- **#100 — stable device identity. Fixed in PR #101.** `hosts.json` persists a cutter reference,
+  and until a cutter's id survives a reboot, saving one stores a reference that can silently come
+  to mean a different machine. With #101 the id is `usb:sn:…` / `serial:sn:…`, and a device that
+  can only be named by socket says so — which the pairing UI should surface, because a saved
+  reference to an `at:` device is exactly the one that can go wrong.
+- **#97 — no read timeout in `read_frame`. Prerequisite, not a follow-up.** See *Connections are
+  held open* above. Polling on a timer over a held connection turns a hung Pi into a frozen
+  application; today it costs only a stuck test.
+
+And one that is unavoidable rather than blocking:
+
+- **#70** — `DeviceInfo` gains a field, so four hand-written IPC mirrors and the e2e fake move
+  with it. Worth considering whether this phase is the moment to generate them instead, since it
+  is the second time in two phases that this type has changed.

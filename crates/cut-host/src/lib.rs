@@ -8,4 +8,5 @@
 
 pub mod check;
 pub mod frame;
+pub mod host;
 pub mod protocol;

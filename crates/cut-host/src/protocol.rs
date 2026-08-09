@@ -72,7 +72,7 @@ pub enum Refusal {
 
 /// `driver-core`'s own event, plus which cutter it came from. One client
 /// connection carries every cutter on a host, so the id is what separates them.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub device: String,
     pub event: DeviceEvent,

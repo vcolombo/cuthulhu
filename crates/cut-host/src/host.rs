@@ -9,7 +9,7 @@
 //! structural, not implemented.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use driver_core::manager::{CutPass, DeviceManager};
@@ -184,6 +184,36 @@ impl Host {
     /// rather than a second reading of the phases.
     pub fn is_any_cut_active(&self) -> bool {
         self.slots.values().any(|s| s.manager.status().is_active())
+    }
+
+    /// Cancel, resume and confirm take no client identity on purpose. One token is
+    /// one trust level: whoever walks to the cutter to swap material for a Pass a
+    /// machine cannot be polled through is not necessarily sitting at the laptop
+    /// that dispatched the Job.
+    pub fn cancel(&self, device: &str) -> Result<(), Refusal> {
+        self.with_slot(device, |slot| {
+            slot.manager.cancel();
+            Ok(())
+        })
+    }
+
+    pub fn resume(&self, device: &str) -> Result<(), Refusal> {
+        self.with_slot(device, |slot| slot.manager.resume().map_err(Refusal::Device))
+    }
+
+    pub fn confirm_pass_done(&self, device: &str) -> Result<(), Refusal> {
+        self.with_slot(device, |slot| slot.manager.confirm_pass_done().map_err(Refusal::Device))
+    }
+
+    fn with_slot(
+        &self,
+        device: &str,
+        f: impl FnOnce(&DeviceSlot) -> Result<(), Refusal>,
+    ) -> Result<(), Refusal> {
+        match self.slot(device) {
+            Some(slot) => f(slot),
+            None => Err(Refusal::UnknownDevice(device.to_string())),
+        }
     }
 
     pub(crate) fn slot(&self, device: &str) -> Option<&DeviceSlot> {
@@ -509,5 +539,93 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
             other => panic!("pump outlived its Host: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_confirm_advances_the_cutter_that_was_named() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+
+        host.confirm_pass_done(CAMEO).unwrap();
+        let done = wait_for(&host, CAMEO, driver_core::Phase::Idle);
+        assert_eq!(done.ended, Some(driver_core::Ended::Completed));
+    }
+
+    /// A second client confirming a Job it did not start is the case this design
+    /// requires to work: whoever swaps the material walks to whatever is nearest.
+    #[test]
+    fn any_client_may_confirm_a_job_another_dispatched() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("from-the-laptop".into()), PUMA, "puma", vec![square_pass()]).unwrap();
+        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+
+        // No dispatch id, no client identity — the host does not track ownership.
+        host.confirm_pass_done(PUMA).unwrap();
+        assert_eq!(wait_for(&host, PUMA, driver_core::Phase::Idle).ended, Some(driver_core::Ended::Completed));
+    }
+
+    #[test]
+    fn a_cancel_stops_the_cutter_that_was_named() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+
+        host.cancel(CAMEO).unwrap();
+        assert_eq!(wait_for(&host, CAMEO, driver_core::Phase::Idle).ended, Some(driver_core::Ended::Cancelled));
+    }
+
+    #[test]
+    fn every_verb_refuses_an_unknown_cutter() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        assert!(matches!(host.cancel("usb:9:9"), Err(Refusal::UnknownDevice(_))));
+        assert!(matches!(host.resume("usb:9:9"), Err(Refusal::UnknownDevice(_))));
+        assert!(matches!(host.confirm_pass_done("usb:9:9"), Err(Refusal::UnknownDevice(_))));
+    }
+
+    /// A verb the cutter cannot accept right now comes back as the Device error the
+    /// manager gave, not as a Preflight refusal — the client renders `actions` and
+    /// should be told it asked at the wrong moment.
+    #[test]
+    fn a_verb_the_cutter_cannot_accept_returns_the_device_error() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        // Idle: nothing to resume.
+        match host.resume(CAMEO) {
+            Err(Refusal::Device(driver_core::manager::DeviceError::Busy)) => {}
+            other => panic!("expected Device(Busy), got {other:?}"),
+        }
+    }
+
+    /// Every client attached sees every cutter's events over its own subscription.
+    #[test]
+    fn a_subscriber_sees_events_from_both_cutters_labelled_by_device() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let events = host.subscribe();
+        host.dispatch(DispatchId("d-cameo".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        host.dispatch(DispatchId("d-puma".into()), PUMA, "puma", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+
+        let mut seen = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.len() < 2 && std::time::Instant::now() < deadline {
+            if let Ok(event) = events.recv_timeout(std::time::Duration::from_millis(200)) {
+                seen.insert(event.device);
+            }
+        }
+        assert!(seen.contains(CAMEO) && seen.contains(PUMA), "saw only {seen:?}");
+    }
+
+    /// A client going away is the normal case, not a fault: its Job carries on and
+    /// the host keeps serving whoever is left.
+    #[test]
+    fn a_dropped_subscriber_does_not_disturb_the_cut() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let staying = host.subscribe();
+        drop(host.subscribe()); // a client that closed its laptop
+
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        assert!(staying.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
     }
 }

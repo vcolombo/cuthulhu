@@ -2,4 +2,4 @@
 mod encode;
 mod usb;
 pub use encode::SilhouetteDriver;
-pub use usb::{list_locators, UsbTransport};
+pub use usb::{list_locators, Locator, UsbTransport};

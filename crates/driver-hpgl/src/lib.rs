@@ -2,4 +2,4 @@
 mod encode;
 pub use encode::HpglDriver;
 mod serial;
-pub use serial::{list_ports, SerialTransport};
+pub use serial::{list_ports, PortId, SerialTransport};

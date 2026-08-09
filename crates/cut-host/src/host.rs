@@ -23,6 +23,9 @@ pub(crate) struct DeviceSlot {
     pub manager: Arc<DeviceManager>,
     /// The most recent Job this cutter was given, so a reattaching client can tell
     /// whose finished cut it is looking at. `CutStatus` cannot say.
+    ///
+    /// `None` between `dispatch` returning and `cut()` assigning it — a
+    /// snapshot-only client racing that window sees an active cutter with no id.
     pub job_id: Mutex<Option<u64>>,
     /// Dispatch ids already accepted for this cutter. A repeat starts nothing.
     pub dispatches: Mutex<HashSet<DispatchId>>,
@@ -33,7 +36,7 @@ pub struct Host {
     /// `HashMap` has none and clients render a list.
     order: Vec<String>,
     slots: HashMap<String, DeviceSlot>,
-    subscribers: Mutex<Vec<mpsc::Sender<Event>>>,
+    subscribers: Mutex<Vec<mpsc::SyncSender<Event>>>,
     pub(crate) factory: Arc<dyn DeviceBackendFactory>,
 }
 
@@ -114,7 +117,7 @@ impl Host {
     }
 
     pub fn subscribe(&self) -> mpsc::Receiver<Event> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(256);
         self.subscribers.lock().unwrap().push(tx);
         rx
     }
@@ -196,6 +199,9 @@ impl Host {
 
     /// What the daemon's shutdown guard asks, using `driver-core`'s own predicate
     /// rather than a second reading of the phases.
+    ///
+    /// No caller consults this yet — `cuthulhu-cutd` has no signal handling and no
+    /// shutdown path. Wiring one is later work; this is the predicate it will ask.
     pub fn is_any_cut_active(&self) -> bool {
         self.slots.values().any(|s| s.manager.status().is_active())
     }
@@ -236,10 +242,17 @@ impl Host {
 
     /// Drops subscribers whose client has gone. A detached client is the normal
     /// case here, not a fault — the Job it started carries on without it.
+    //
+    // ponytail: a full queue drops the event rather than blocking the pump — a client
+    // this far behind rebuilds from `Snapshot` on its next call anyway. Give events
+    // their own connection if that ever stops being true.
     fn broadcast(&self, event: Event) {
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|tx| {
-            tx.send(Event { device: event.device.clone(), event: event.event.clone() }).is_ok()
+            match tx.try_send(Event { device: event.device.clone(), event: event.event.clone() }) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            }
         });
     }
 }
@@ -522,7 +535,7 @@ mod tests {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
-        assert!(host.is_any_cut_active(), "the daemon must refuse to exit through this");
+        assert!(host.is_any_cut_active(), "a Host with a cut in flight must report itself active");
     }
 
     #[test]

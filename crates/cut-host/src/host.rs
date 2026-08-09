@@ -12,10 +12,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 
-use driver_core::manager::DeviceManager;
+use driver_core::manager::{CutPass, DeviceManager};
 use driver_core::{DeviceBackendFactory, DeviceInfo};
 
-use crate::protocol::{DeviceSnapshot, DispatchId, Event};
+use crate::check::check_passes;
+use crate::protocol::{DeviceSnapshot, DispatchId, Event, Refusal};
 
 pub(crate) struct DeviceSlot {
     pub info: DeviceInfo,
@@ -116,6 +117,67 @@ impl Host {
         let (tx, rx) = mpsc::channel();
         self.subscribers.lock().unwrap().push(tx);
         rx
+    }
+
+    /// Register a Job and start it, returning as soon as it is registered.
+    ///
+    /// The cut runs on a thread of its own because `DeviceManager::cut` does not
+    /// return until the Job reaches its first pause point or finishes
+    /// (`manager.rs:648-668`) — for a machine that can be polled, a single-Pass Job
+    /// has no pause point, so a synchronous dispatch would hold the client's
+    /// connection open for the whole cut. The client learns the `job_id` from the
+    /// event stream, which already carries it.
+    ///
+    /// Refusals happen in this order and none of them touch the machine: unknown
+    /// cutter, machine mismatch, Preflight.
+    pub fn dispatch(
+        self: &Arc<Self>,
+        dispatch_id: DispatchId,
+        device: &str,
+        machine_id: &str,
+        passes: Vec<CutPass>,
+    ) -> Result<(), Refusal> {
+        let slot = self.slot(device).ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
+
+        // Already accepted. Saying so again is the whole guard against a client
+        // that retried after a dropped reply cutting the same material twice.
+        if slot.dispatches.lock().unwrap().contains(&dispatch_id) {
+            return Ok(());
+        }
+
+        if slot.info.machine_id != machine_id {
+            return Err(Refusal::MachineMismatch {
+                dispatched: machine_id.to_string(),
+                attached: slot.info.machine_id.clone(),
+            });
+        }
+        if passes.is_empty() {
+            return Err(Refusal::Preflight("this cut has no passes".into()));
+        }
+
+        // Against the Driver actually attached, which is the only reason to check
+        // again at all: the client planned against a machine it believed was here.
+        let driver = self
+            .factory
+            .driver_for(&slot.info.machine_id)
+            .ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
+        check_passes(&passes, driver.profile(), &driver.caps())
+            .map_err(|fault| Refusal::Preflight(fault.to_string()))?;
+
+        slot.dispatches.lock().unwrap().insert(dispatch_id);
+
+        let host = self.clone();
+        let device = device.to_string();
+        thread::spawn(move || {
+            let Some(slot) = host.slot(&device) else { return };
+            match slot.manager.cut(passes) {
+                Ok(job_id) => *slot.job_id.lock().unwrap() = Some(job_id),
+                // The events already carried the failure and `CutStatus` already
+                // reports it; this thread has nobody to return to.
+                Err(e) => eprintln!("cut host: {device} refused the job: {e:?}"),
+            }
+        });
+        Ok(())
     }
 
     /// What the daemon's shutdown guard asks, using `driver-core`'s own predicate
@@ -225,6 +287,156 @@ mod tests {
     use super::testing::*;
     use super::*;
     use std::sync::Arc;
+
+    use crate::protocol::Refusal;
+    use driver_core::manager::CutPass;
+    use driver_core::{Job, Settings};
+    use geometry::Point;
+
+    fn square_pass() -> CutPass {
+        CutPass {
+            job: Job {
+                polylines: vec![vec![
+                    Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 0.0 },
+                    Point { x: 10.0, y: 10.0 }, Point { x: 0.0, y: 0.0 },
+                ]],
+                settings: Settings::default(),
+            },
+        }
+    }
+
+    /// Waits for `device` to reach a phase the test can assert on. The worker is a
+    /// separate thread, so a bare assertion after `dispatch` would race it.
+    fn wait_for(host: &Host, device: &str, want: driver_core::Phase) -> driver_core::CutStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = host.slot(device).unwrap().manager.status();
+            if status.phase == want {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{device} never reached {want:?}, sat at {:?}", status.phase);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_dispatch_to_an_unknown_cutter_is_refused() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let refusal = host
+            .dispatch(DispatchId("d-1".into()), "usb:9:9", "cameo5", vec![square_pass()])
+            .unwrap_err();
+        assert!(matches!(refusal, Refusal::UnknownDevice(id) if id == "usb:9:9"));
+    }
+
+    /// The refusal the network hop exists to make possible: the client planned for
+    /// one machine and a different one is on that port.
+    #[test]
+    fn a_dispatch_naming_the_wrong_machine_is_refused_before_anything_moves() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let refusal = host
+            .dispatch(DispatchId("d-1".into()), CAMEO, "puma", vec![square_pass()])
+            .unwrap_err();
+        match refusal {
+            Refusal::MachineMismatch { dispatched, attached } => {
+                assert_eq!(dispatched, "puma");
+                assert_eq!(attached, "cameo5");
+            }
+            other => panic!("expected MachineMismatch, got {other:?}"),
+        }
+        assert_eq!(host.slot(CAMEO).unwrap().manager.status().phase, driver_core::Phase::Idle);
+    }
+
+    #[test]
+    fn a_dispatch_that_fails_preflight_is_refused_with_its_sentence() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let off_the_bed = CutPass {
+            job: Job {
+                polylines: vec![vec![Point { x: 0.0, y: 0.0 }, Point { x: 400.0, y: 0.0 }]],
+                settings: Settings::default(),
+            },
+        };
+        let refusal = host
+            .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![off_the_bed])
+            .unwrap_err();
+        match refusal {
+            // The Cameo's test bed is 300x300; the Puma's is 600x600, so this is
+            // refused only because the check ran against the machine actually there.
+            Refusal::Preflight(message) => assert!(message.contains("300 x 300"), "got: {message}"),
+            other => panic!("expected Preflight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_dispatch_is_refused() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        assert!(host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", Vec::new()).is_err());
+    }
+
+    /// `dispatch` must return without waiting for the cut. Asserted by time: the
+    /// test Driver parks at `AwaitingConfirmation` and stays there until something
+    /// confirms, so a `dispatch` that waited for `DeviceManager::cut` would block
+    /// here forever.
+    #[test]
+    fn a_dispatch_returns_before_the_cut_finishes() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let started = std::time::Instant::now();
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "dispatch waited for the cut");
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+    }
+
+    /// The guard against cutting the same material twice after a dropped reply.
+    #[test]
+    fn a_repeated_dispatch_id_starts_nothing_further() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        let job_after_first = *host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+
+        // A retry arrives. The cutter is mid-Job, so a second cut would be refused
+        // Busy anyway — the assertion that matters is that it is accepted as a
+        // no-op rather than surfacing an error to a client that did nothing wrong.
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job_after_first);
+    }
+
+    #[test]
+    fn a_dispatch_records_the_job_a_reattaching_client_would_ask_about() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+
+        let snap = host.snapshots().into_iter().find(|s| s.info.instance_id == CAMEO).unwrap();
+        assert!(snap.job_id.is_some(), "a dispatched cutter reports which Job is on it");
+        assert!(snap.status.actions.confirm, "and what may be done to it");
+    }
+
+    /// #59's isolation criterion. Both cutters are given work; one is cancelled;
+    /// the other must be entirely unaffected.
+    #[test]
+    fn a_failure_on_one_cutter_leaves_the_other_cutting() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-cameo".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        host.dispatch(DispatchId("d-puma".into()), PUMA, "puma", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+
+        host.slot(CAMEO).unwrap().manager.cancel();
+        let cameo = wait_for(&host, CAMEO, driver_core::Phase::Idle);
+        assert_eq!(cameo.ended, Some(driver_core::Ended::Cancelled));
+
+        let puma = host.slot(PUMA).unwrap().manager.status();
+        assert_eq!(puma.phase, driver_core::Phase::AwaitingConfirmation, "the other cutter kept its Job");
+        assert!(puma.actions.confirm);
+    }
+
+    #[test]
+    fn a_host_with_a_cut_in_flight_reports_it_as_active() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        assert!(host.is_any_cut_active(), "the daemon must refuse to exit through this");
+    }
 
     #[test]
     fn a_host_holds_every_cutter_it_enumerates() {

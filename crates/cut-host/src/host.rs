@@ -528,16 +528,27 @@ mod tests {
     /// own — no `shutdown` call, nothing else pinning it — for the teardown chain
     /// (`Host` drops `slots` drops each `DeviceManager` drops its `cmd_tx`, the
     /// worker's `recv()` errors and it returns, dropping the event sender the pump
-    /// is reading) to reach the pump and end it. `recv_timeout` bounds the wait so a
-    /// regression to the old strong-Arc pump fails this test instead of hanging it.
+    /// is reading) to reach the pump and end it. Observed as the subscriber's
+    /// receiver disconnecting.
+    ///
+    /// Drains rather than asserting on the first message: `Host::start` connects
+    /// each cutter before the pumps are spawned, so a connect-time event can still
+    /// be queued and arrive after `subscribe`. Those are legitimate and say nothing
+    /// about teardown — only a disconnect does.
     #[test]
     fn dropping_the_host_lets_its_event_pumps_end() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         let rx = host.subscribe();
         drop(host);
-        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            other => panic!("pump outlived its Host: {other:?}"),
+
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(_) => continue, // a connect-time event that beat the drop
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // what this proves
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("the pumps outlived the Host they were waiting on")
+                }
+            }
         }
     }
 

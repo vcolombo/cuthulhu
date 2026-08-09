@@ -85,12 +85,11 @@ mod tests {
         assert!(matches!(read_frame::<_, String>(&mut cursor, DEFAULT_MAX_FRAME), Err(FrameError::Eof)));
     }
 
-    /// The rule this task exists for: the length is refused *before* the body is
-    /// read, so a hostile header cannot make the host allocate what it claims.
-    /// Asserted by giving a huge length and no body at all — a reader that
-    /// allocated first would block or die instead of returning `TooLarge`.
+    /// The cap is checked before the body is read from the stream. Demonstrated
+    /// by supplying a header with no body — a reader that read the body first
+    /// would return `Io` from the unexpected end of stream rather than `TooLarge`.
     #[test]
-    fn an_oversized_length_is_refused_without_reading_a_body() {
+    fn an_oversized_length_is_refused_before_the_body_is_read() {
         let mut framed: Vec<u8> = Vec::new();
         framed.extend_from_slice(&(9_000_000u32).to_be_bytes());
         // deliberately no body

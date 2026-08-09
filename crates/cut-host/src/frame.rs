@@ -75,6 +75,12 @@ pub fn write_frame<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()
 fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<(), FrameError> {
     let mut filled = 0;
     while filled < buf.len() {
+        // Checked before every read, not just a stalled one: a peer that trickles a byte at a
+        // time, always just under `SOCKET_POLL_INTERVAL`, never sees `WouldBlock` — the deadline
+        // has to bound the whole fill, not only the retries.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(FrameError::Timeout);
+        }
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(if filled == 0 {
@@ -90,31 +96,31 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<
                 if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-                ) =>
-            {
-                if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return Err(FrameError::Timeout);
-                }
-            }
+                ) => {}
             Err(e) => return Err(FrameError::Io(e.to_string())),
         }
     }
     Ok(())
 }
 
-/// Read one frame. Waits indefinitely for it to begin and gives it `body_timeout` to finish.
+/// Read one frame. `header_timeout` bounds the wait for it to begin; `body_timeout` bounds the
+/// wait for it to finish once the header has arrived.
 ///
-/// The two waits differ on purpose. An idle connection is normal — a desktop polling once a
-/// second leaves one idle in between — so a header that has not arrived is not a fault. A body
-/// that has not arrived is: the peer promised it in the header, and a peer that stops mid-frame
-/// would otherwise hold this reader, and whatever lock is above it, forever.
+/// The rule is not "headers are unbounded, bodies are not" — it is that a frame that is *owed*
+/// has a deadline, and a frame that may never come does not. A daemon's request loop reading the
+/// next request from an attached client owes nothing — a desktop polling once a second is idle in
+/// between and must not be dropped for it — so that call site passes `None`. Everywhere else a
+/// frame was promised: a token after a connection was accepted, a greeting after a token was
+/// sent, a reply after a request was sent. A peer that goes silent there would otherwise hold
+/// this reader, and whatever lock is above it, forever.
 pub fn read_frame<R: Read, T: DeserializeOwned>(
     r: &mut R,
     max: usize,
+    header_timeout: Option<Duration>,
     body_timeout: Duration,
 ) -> Result<T, FrameError> {
     let mut header = [0u8; 4];
-    fill(r, &mut header, None)?;
+    fill(r, &mut header, header_timeout.map(|d| Instant::now() + d))?;
 
     let len = u32::from_be_bytes(header) as usize;
     // Before the allocation, not after: the whole point of the cap.
@@ -137,8 +143,12 @@ mod tests {
         write_frame(&mut buf, &42u32).unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
-        let first: String = read_frame(&mut cursor, DEFAULT_MAX_FRAME, DEFAULT_BODY_TIMEOUT).unwrap();
-        let second: u32 = read_frame(&mut cursor, DEFAULT_MAX_FRAME, DEFAULT_BODY_TIMEOUT).unwrap();
+        let first: String =
+            read_frame(&mut cursor, DEFAULT_MAX_FRAME, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT)
+                .unwrap();
+        let second: u32 =
+            read_frame(&mut cursor, DEFAULT_MAX_FRAME, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT)
+                .unwrap();
         assert_eq!(first, "hello");
         assert_eq!(second, 42);
     }
@@ -147,7 +157,12 @@ mod tests {
     fn a_clean_end_of_stream_is_eof_not_an_error() {
         let mut cursor = std::io::Cursor::new(Vec::new());
         assert!(matches!(
-            read_frame::<_, String>(&mut cursor, DEFAULT_MAX_FRAME, DEFAULT_BODY_TIMEOUT),
+            read_frame::<_, String>(
+                &mut cursor,
+                DEFAULT_MAX_FRAME,
+                Some(DEFAULT_BODY_TIMEOUT),
+                DEFAULT_BODY_TIMEOUT
+            ),
             Err(FrameError::Eof)
         ));
     }
@@ -162,7 +177,7 @@ mod tests {
         // deliberately no body
 
         let mut cursor = std::io::Cursor::new(framed);
-        match read_frame::<_, String>(&mut cursor, 1024, DEFAULT_BODY_TIMEOUT) {
+        match read_frame::<_, String>(&mut cursor, 1024, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT) {
             Err(FrameError::TooLarge { len, max }) => {
                 assert_eq!(len, 9_000_000);
                 assert_eq!(max, 1024);
@@ -179,7 +194,12 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(framed);
         assert!(matches!(
-            read_frame::<_, String>(&mut cursor, DEFAULT_MAX_FRAME, DEFAULT_BODY_TIMEOUT),
+            read_frame::<_, String>(
+                &mut cursor,
+                DEFAULT_MAX_FRAME,
+                Some(DEFAULT_BODY_TIMEOUT),
+                DEFAULT_BODY_TIMEOUT
+            ),
             Err(FrameError::Io(_)) | Err(FrameError::Malformed(_))
         ));
     }
@@ -190,7 +210,12 @@ mod tests {
         write_frame(&mut buf, &"a string".to_string()).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         assert!(matches!(
-            read_frame::<_, u32>(&mut cursor, DEFAULT_MAX_FRAME, DEFAULT_BODY_TIMEOUT),
+            read_frame::<_, u32>(
+                &mut cursor,
+                DEFAULT_MAX_FRAME,
+                Some(DEFAULT_BODY_TIMEOUT),
+                DEFAULT_BODY_TIMEOUT
+            ),
             Err(FrameError::Malformed(_))
         ));
     }
@@ -258,26 +283,52 @@ mod tests {
         let result = read_frame::<_, String>(
             &mut StallsAfter::new(header_only),
             DEFAULT_MAX_FRAME,
+            Some(DEFAULT_BODY_TIMEOUT),
             Duration::from_millis(200),
         );
         assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
     }
 
-    /// The other half of the rule: waiting for a frame to *begin* is unbounded, because a client
-    /// that polls once a second leaves the connection idle in between and must not be dropped.
+    /// The request loop's own case: reading the *next* request from an attached client owes
+    /// nothing, because a client that polls once a second leaves the connection idle in between
+    /// and must not be dropped. That is the one call site that passes `None`.
     ///
     /// Asserted without leaking a blocked thread: the reader is silent for 200ms — four times the
-    /// body timeout — and then speaks. A reader that started its deadline before the header would
+    /// body timeout — and then speaks. A reader that applied a deadline to the header would
     /// return `Timeout`; the correct one reads the frame.
     #[test]
-    fn an_idle_connection_is_not_timed_out_before_a_frame_begins() {
+    fn a_request_loops_wait_for_the_next_frame_is_unbounded() {
         let mut idle_then_busy =
             QuietThenSpeaks { quiet_reads_left: 10, given: Cursor::new(framed("hello")) };
         let got: String =
-            read_frame(&mut idle_then_busy, DEFAULT_MAX_FRAME, Duration::from_millis(50))
-                .expect("an idle connection must not be dropped before a frame begins");
+            read_frame(&mut idle_then_busy, DEFAULT_MAX_FRAME, None, Duration::from_millis(50))
+                .expect("a request loop must not drop an idle client before a frame begins");
         assert_eq!(got, "hello");
+    }
+
+    /// A header wait that *is* owed — a token, a greeting, a reply — must time out rather than
+    /// hold the reader forever. This is the client waiting on a Pi that went silent the instant
+    /// it accepted the request: never a byte back, not even `WouldBlock` yet to retry against.
+    #[test]
+    fn an_owed_header_that_never_arrives_times_out() {
+        struct NeverSpeaks;
+        impl Read for NeverSpeaks {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "no data yet"))
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let result = read_frame::<_, String>(
+            &mut NeverSpeaks,
+            DEFAULT_MAX_FRAME,
+            Some(Duration::from_millis(200)),
+            DEFAULT_BODY_TIMEOUT,
+        );
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
     }
 
     /// A frame that arrives in pieces, with stalls between them, must still be read — the
@@ -286,9 +337,43 @@ mod tests {
     fn a_body_arriving_in_pieces_is_reassembled() {
         let bytes = framed("hello");
         let mut piecewise = StallsAfter::new(bytes);
-        let got: String =
-            read_frame(&mut piecewise, DEFAULT_MAX_FRAME, Duration::from_secs(5)).unwrap();
+        let got: String = read_frame(
+            &mut piecewise,
+            DEFAULT_MAX_FRAME,
+            Some(DEFAULT_BODY_TIMEOUT),
+            Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(got, "hello");
+    }
+
+    /// A peer that trickles — always producing a byte before the socket would ever report
+    /// `WouldBlock` — must still be bound by the deadline. Neither `StallsAfter` nor
+    /// `QuietThenSpeaks` trickles; both alternate silence with delivering everything at once,
+    /// which is exactly why a deadline check that lived only in the `WouldBlock` arm slipped past
+    /// them: a peer that never goes quiet never reaches that arm at all.
+    #[test]
+    fn a_trickling_body_still_times_out() {
+        struct Trickles {
+            given: Cursor<Vec<u8>>,
+        }
+        impl Read for Trickles {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                let n = 1.min(buf.len());
+                self.given.read(&mut buf[..n])
+            }
+        }
+
+        let bytes = framed("hello");
+        let mut trickling = Trickles { given: Cursor::new(bytes) };
+        let result = read_frame::<_, String>(
+            &mut trickling,
+            DEFAULT_MAX_FRAME,
+            Some(DEFAULT_BODY_TIMEOUT),
+            Duration::from_millis(50),
+        );
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
     }
 
     /// A peer that closes mid-body is a fault, not a clean end — `Eof` means "closed between
@@ -299,8 +384,12 @@ mod tests {
         truncated.extend_from_slice(&(64u32).to_be_bytes());
         truncated.extend_from_slice(b"{\"partial\":");
 
-        let result =
-            read_frame::<_, String>(&mut Cursor::new(truncated), DEFAULT_MAX_FRAME, Duration::from_secs(5));
+        let result = read_frame::<_, String>(
+            &mut Cursor::new(truncated),
+            DEFAULT_MAX_FRAME,
+            Some(DEFAULT_BODY_TIMEOUT),
+            Duration::from_secs(5),
+        );
         assert!(matches!(result, Err(FrameError::Io(_))), "got {result:?}");
     }
 }

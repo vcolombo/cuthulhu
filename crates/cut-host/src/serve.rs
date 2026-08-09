@@ -176,7 +176,9 @@ fn serve_client(
 
     // The token before anything else: an unauthenticated frame must never reach a
     // device, and a failed attempt is slowed so the port cannot be worked through.
-    let presented: String = read_frame(&mut tls_stream, 1024, DEFAULT_BODY_TIMEOUT).map_err(io::Error::other)?;
+    let presented: String =
+        read_frame(&mut tls_stream, 1024, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT)
+            .map_err(io::Error::other)?;
     if !token_matches(&presented, token) {
         eprintln!("cut host: {peer} presented a bad token");
         thread::sleep(std::time::Duration::from_secs(2));
@@ -196,7 +198,9 @@ fn serve_client(
         while let Ok(event) = events.try_recv() {
             write_frame(&mut tls_stream, &event)?;
         }
-        match read_frame::<_, Request>(&mut tls_stream, max_frame, DEFAULT_BODY_TIMEOUT) {
+        // `None`: this read owes the client nothing. It is idle between polls, not stalled
+        // mid-frame, and must not be dropped for waiting.
+        match read_frame::<_, Request>(&mut tls_stream, max_frame, None, DEFAULT_BODY_TIMEOUT) {
             Ok(request) => {
                 if let Request::Dispatch { ref device, .. } = request {
                     eprintln!("cut host: {peer} dispatched to {device}");

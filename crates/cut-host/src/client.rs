@@ -134,7 +134,12 @@ impl HostClient {
                 _ => ClientError::Transport(e.to_string()),
             }
         })?;
-        match read_frame::<_, Response>(&mut stream, 4096, crate::frame::DEFAULT_BODY_TIMEOUT) {
+        match read_frame::<_, Response>(
+            &mut stream,
+            4096,
+            Some(crate::frame::DEFAULT_BODY_TIMEOUT),
+            crate::frame::DEFAULT_BODY_TIMEOUT,
+        ) {
             Ok(Response::Ok) => {}
             Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
             Err(e) => {
@@ -214,9 +219,12 @@ impl HostClient {
         let mut stream = self.stream.lock().unwrap();
         write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
+            // A reply is owed the moment the request above was written: a Pi that goes silent
+            // from here must not hold this mutex, and every other call, forever.
             match read_frame::<_, Incoming>(
                 &mut *stream,
                 crate::frame::DEFAULT_MAX_FRAME,
+                Some(crate::frame::DEFAULT_BODY_TIMEOUT),
                 crate::frame::DEFAULT_BODY_TIMEOUT,
             ) {
                 // ponytail: event frames are read only to be discarded — there is no

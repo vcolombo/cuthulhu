@@ -7,7 +7,7 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
@@ -103,7 +103,6 @@ pub struct HostClient {
     /// handful of clients and a desktop makes one call at a time, so a lock is the
     /// whole of the concurrency story here.
     stream: Mutex<Tls>,
-    events: mpsc::Receiver<Event>,
 }
 
 impl HostClient {
@@ -149,16 +148,7 @@ impl HostClient {
             }
         }
 
-        // ponytail: events are drained by each request's reply loop rather than by a
-        // reader thread of their own, which means a client that makes no calls sees
-        // no events. Phase 2's desktop polls `snapshots` anyway; give events their
-        // own connection when a UI wants them pushed.
-        let (_tx, rx) = mpsc::channel();
-        Ok(HostClient { stream: Mutex::new(stream), events: rx })
-    }
-
-    pub fn events(&self) -> &mpsc::Receiver<Event> {
-        &self.events
+        Ok(HostClient { stream: Mutex::new(stream) })
     }
 
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, ClientError> {
@@ -223,10 +213,12 @@ impl HostClient {
         write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
             match read_frame::<_, Incoming>(&mut *stream, crate::frame::DEFAULT_MAX_FRAME) {
-                Ok(Incoming::Event(event)) => {
-                    let _ = event; // ponytail: dropped, not queued; see `connect`'s note on `events()`
-                    continue;
-                }
+                // ponytail: event frames are read only to be discarded — there is no
+                // queue and no accessor, so a client that never calls anything sees no
+                // events and a client that calls rarely misses whatever arrived between
+                // calls. Phase 2's UI will need events pushed, not implied by a
+                // Snapshot's absence; give them a connection of their own then.
+                Ok(Incoming::Event(_event)) => continue,
                 Ok(Incoming::Response(Response::Refused(r))) => return Err(ClientError::Refused(r)),
                 Ok(Incoming::Response(response)) => return Ok(response),
                 Err(FrameError::Eof) =>

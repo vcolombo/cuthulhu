@@ -139,12 +139,6 @@ impl Host {
     ) -> Result<(), Refusal> {
         let slot = self.slot(device).ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
 
-        // Already accepted. Saying so again is the whole guard against a client
-        // that retried after a dropped reply cutting the same material twice.
-        if slot.dispatches.lock().unwrap().contains(&dispatch_id) {
-            return Ok(());
-        }
-
         if slot.info.machine_id != machine_id {
             return Err(Refusal::MachineMismatch {
                 dispatched: machine_id.to_string(),
@@ -164,7 +158,13 @@ impl Host {
         check_passes(&passes, driver.profile(), &driver.caps())
             .map_err(|fault| Refusal::Preflight(fault.to_string()))?;
 
-        slot.dispatches.lock().unwrap().insert(dispatch_id);
+        // One lock acquisition, not two: `insert` reports whether the id was already
+        // there, so a duplicate cannot slip through the gap a separate `contains`
+        // would leave. That gap is where a client's retry after a dropped reply
+        // would become a second cut of the same material.
+        if !slot.dispatches.lock().unwrap().insert(dispatch_id) {
+            return Ok(());
+        }
 
         let host = self.clone();
         let device = device.to_string();

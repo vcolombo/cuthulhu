@@ -7,6 +7,7 @@
 //! exists rather than a Transport that forwards bytes to a desktop still driving.
 
 pub mod check;
+pub mod client;
 pub mod config;
 pub mod frame;
 pub mod host;

@@ -20,8 +20,9 @@ Copy the binary to `/usr/local/bin/cuthulhu-cutd`.
 `/etc/cuthulhu/cutd.toml`:
 
 ```toml
-# The address to listen on. A Cut Host refuses to start on a public address
-# unless you pass --allow-public-bind, because a client can make a blade move.
+# The address to listen on. `0.0.0.0` is not a private address as far as the
+# daemon is concerned, so binding it — as below — needs `--allow-public-bind` on
+# the command line (see the systemd unit) or the daemon refuses to start.
 bind = "0.0.0.0:7878"
 
 # The shared secret a client presents. Generate one and keep it secret:
@@ -55,7 +56,7 @@ Description=Cuthulhu Cut Host
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/cuthulhu-cutd --config /etc/cuthulhu/cutd.toml
+ExecStart=/usr/local/bin/cuthulhu-cutd --config /etc/cuthulhu/cutd.toml --allow-public-bind
 Restart=on-failure
 User=cuthulhu
 StateDirectory=cuthulhu

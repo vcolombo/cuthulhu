@@ -6,6 +6,7 @@
 //! what a request means, and it is what the tests drive. `serve` adds a listener,
 //! a certificate and a token to it and nothing else.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::TcpListener;
 use std::path::Path;
@@ -21,10 +22,21 @@ use crate::protocol::{Request, Response};
 /// anything beyond this is a bug or an attempt to exhaust it.
 pub const MAX_CLIENTS: usize = 8;
 
-/// Compares every byte regardless of where the first difference is, so the time
-/// taken says nothing about how much of the token was right.
-pub fn token_matches(presented: &str, expected: &str) -> bool {
-    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+/// The name of the token that matched, or `None`. Every candidate is compared in full, so the
+/// time taken says nothing about how much of a token was right — and comparing all of them,
+/// rather than stopping at the first match, keeps that true as clients are added.
+pub fn match_token(presented: &str, tokens: &BTreeMap<String, String>) -> Option<String> {
+    let mut matched: Option<String> = None;
+    for (name, value) in tokens {
+        if constant_time_eq(presented, value) {
+            matched = Some(name.clone());
+        }
+    }
+    matched
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
     }
@@ -126,7 +138,7 @@ pub fn serve_on(listener: TcpListener, host: Arc<Host>, config: Config) -> io::R
     );
 
     let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let token = Arc::new(config.token);
+    let tokens = Arc::new(config.tokens);
     let max_frame = config.max_frame;
 
     for stream in listener.incoming() {
@@ -136,9 +148,9 @@ pub fn serve_on(listener: TcpListener, host: Arc<Host>, config: Config) -> io::R
         }
         clients.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let (host, tls, token, clients) = (host.clone(), tls.clone(), token.clone(), clients.clone());
+        let (host, tls, tokens, clients) = (host.clone(), tls.clone(), tokens.clone(), clients.clone());
         thread::spawn(move || {
-            if let Err(e) = serve_client(stream, tls, &host, &token, max_frame) {
+            if let Err(e) = serve_client(stream, tls, &host, &*tokens, max_frame) {
                 eprintln!("cut host: client ended: {e}");
             }
             clients.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -159,7 +171,7 @@ fn serve_client(
     stream: std::net::TcpStream,
     tls: Arc<rustls::ServerConfig>,
     host: &Arc<Host>,
-    token: &str,
+    tokens: &BTreeMap<String, String>,
     max_frame: usize,
 ) -> io::Result<()> {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
@@ -179,11 +191,12 @@ fn serve_client(
     let presented: String =
         read_frame(&mut tls_stream, 1024, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT)
             .map_err(io::Error::other)?;
-    if !token_matches(&presented, token) {
-        eprintln!("cut host: {peer} presented a bad token");
+    let Some(client) = match_token(&presented, tokens) else {
+        eprintln!("cut host: {peer} presented a token matching no client");
         thread::sleep(std::time::Duration::from_secs(2));
         return Err(io::Error::other("bad token"));
-    }
+    };
+    eprintln!("cut host: {peer} authenticated as `{client}`");
     write_frame(&mut tls_stream, &Response::Ok)?;
 
     // Events for every cutter go out on this connection; requests come back on it.
@@ -203,7 +216,7 @@ fn serve_client(
         match read_frame::<_, Request>(&mut tls_stream, max_frame, None, DEFAULT_BODY_TIMEOUT) {
             Ok(request) => {
                 if let Request::Dispatch { ref device, .. } = request {
-                    eprintln!("cut host: {peer} dispatched to {device}");
+                    eprintln!("cut host: `{client}` dispatched to {device}");
                 }
                 let response = handle_request(host, request);
                 write_frame(&mut tls_stream, &response)?;
@@ -271,13 +284,29 @@ mod tests {
         assert!(matches!(handle_request(&host, Request::Cancel { device: CAMEO.into() }), Response::Ok));
     }
 
-    /// Constant-time or not, it has to be *correct* first.
+    fn tokens() -> std::collections::BTreeMap<String, String> {
+        [("workshop-laptop".to_string(), "aaa".to_string()),
+         ("office-desktop".to_string(), "bbb".to_string())]
+            .into_iter()
+            .collect()
+    }
+
     #[test]
-    fn a_token_matches_only_itself() {
-        assert!(token_matches("s3cret", "s3cret"));
-        assert!(!token_matches("s3cret", "s3crey"));
-        assert!(!token_matches("s3cre", "s3cret"), "a prefix is not a match");
-        assert!(!token_matches("", "s3cret"));
-        assert!(!token_matches("s3cret", ""));
+    fn a_token_matches_only_itself_and_reports_which_name_it_was() {
+        assert_eq!(match_token("aaa", &tokens()).as_deref(), Some("workshop-laptop"));
+        assert_eq!(match_token("bbb", &tokens()).as_deref(), Some("office-desktop"));
+        assert_eq!(match_token("aab", &tokens()), None);
+        assert_eq!(match_token("aa", &tokens()), None, "a prefix is not a match");
+        assert_eq!(match_token("", &tokens()), None);
+    }
+
+    /// Revoking one client must leave the others working — the property the whole change exists
+    /// for, and the one a shared key cannot offer.
+    #[test]
+    fn removing_one_token_leaves_the_others_working() {
+        let mut remaining = tokens();
+        remaining.remove("workshop-laptop");
+        assert_eq!(match_token("aaa", &remaining), None, "the revoked client is out");
+        assert_eq!(match_token("bbb", &remaining).as_deref(), Some("office-desktop"));
     }
 }

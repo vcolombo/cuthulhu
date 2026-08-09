@@ -38,6 +38,9 @@ fn main() {
     if host.devices().is_empty() {
         eprintln!("cut host: no cutter is attached; clients will see an empty list");
     }
+    for name in config.tokens.keys() {
+        eprintln!("cut host: client `{name}` may connect");
+    }
 
     if let Err(e) = serve(host, config, allow_public_bind) {
         fail(&e.to_string());

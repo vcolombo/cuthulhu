@@ -37,9 +37,11 @@ exists.
 # actually want this reachable from outside your LAN.
 bind = "192.168.1.50:7878"
 
-# The shared secret a client presents. Generate one and keep it secret:
+# One token per client, named so you can tell them apart. Generate each with:
 #   head -c 32 /dev/urandom | base64
-token = "REPLACE-ME"
+# Revoking a client is deleting its line and restarting; the others keep working.
+[tokens]
+workshop-laptop = "REPLACE-ME"
 ```
 
 ```sh
@@ -105,7 +107,18 @@ has multiple LAN interfaces and you want the daemon reachable on all of them, sa
 `bind = "0.0.0.0:7878"` in `cutd.toml` and add the flag. Anything that can reach that port is then
 trusted with the same authority as a paired desktop, limited only by the token.
 
-## Rotating the token
+## Rotating a token
 
-Change `token` in `cutd.toml` and restart. Every paired desktop must be paired again — the token is
-the whole of the trust, and there is one for the host.
+Change that client's line under `[tokens]` in `cutd.toml` and restart. Only that desktop needs to be
+paired again — the other entries, and the clients holding them, are untouched.
+
+## Revoking one client
+
+Delete that client's line from `[tokens]` and restart:
+
+```sh
+sudo systemctl restart cuthulhu-cutd
+```
+
+Every other client keeps working. `journalctl -u cuthulhu-cutd` names which client authenticated
+and which dispatched each Job, so you can tell which line to remove.

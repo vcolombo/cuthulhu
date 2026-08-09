@@ -9,7 +9,7 @@
 //! structural, not implemented.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::thread;
 
 use driver_core::manager::DeviceManager;
@@ -75,10 +75,19 @@ impl Host {
         let host = Arc::new(Host { order, slots, subscribers: Mutex::new(Vec::new()), factory });
 
         for (device, events) in pumps {
-            let host = host.clone();
+            // Weak, not Arc: a strong capture here would hold `host` alive forever, since
+            // this thread only exits when `events` ends, and `events` only ends when the
+            // `DeviceManager` this pump reads from — reachable solely through `host.slots`
+            // — drops. An Arc'd pump waiting on the object that waits on the pump is a
+            // cycle neither side can break. Upgrading per event instead means the last
+            // external `Arc<Host>` drop lets `Host` drop, which drops `slots`, which drops
+            // each `DeviceManager`, which drops its `cmd_tx`; the worker's `cmd_rx.recv()`
+            // then errors, the worker returns and drops its event sender, and `events`
+            // ends this loop — normally before the next `upgrade()` even has to fail.
+            let host = Arc::downgrade(&host);
             thread::spawn(move || {
-                // Ends when the manager drops its sender, which happens at shutdown.
                 for event in events {
+                    let Some(host) = host.upgrade() else { break };
                     host.broadcast(Event { device: device.clone(), event });
                 }
             });
@@ -269,5 +278,24 @@ mod tests {
     fn an_idle_host_reports_no_active_cut() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         assert!(!host.is_any_cut_active(), "nothing dispatched yet");
+    }
+
+    /// A pump holding a strong `Arc<Host>` would leak: `Host` never drops while its
+    /// own pump threads keep it alive, so `events` never ends, so the pump never
+    /// exits. Dropping every external handle to `host` here must be enough on its
+    /// own — no `shutdown` call, nothing else pinning it — for the teardown chain
+    /// (`Host` drops `slots` drops each `DeviceManager` drops its `cmd_tx`, the
+    /// worker's `recv()` errors and it returns, dropping the event sender the pump
+    /// is reading) to reach the pump and end it. `recv_timeout` bounds the wait so a
+    /// regression to the old strong-Arc pump fails this test instead of hanging it.
+    #[test]
+    fn dropping_the_host_lets_its_event_pumps_end() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let rx = host.subscribe();
+        drop(host);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("pump outlived its Host: {other:?}"),
+        }
     }
 }

@@ -94,7 +94,7 @@ fn a_refusal_reaches_the_client_as_its_sentence() {
     match client.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![off_the_bed]) {
         Err(ClientError::Refused(cut_host::protocol::Refusal::Preflight(fault))) => {
             let message = fault.to_string();
-            assert!(message.contains("300 x 300"), "got: {message}");
+            assert!(message.contains("300 x 200"), "got: {message}");
         }
         other => panic!("expected a Preflight refusal, got {other:?}"),
     }

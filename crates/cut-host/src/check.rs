@@ -113,7 +113,7 @@ mod tests {
     use geometry::Point;
 
     fn profile() -> MachineProfile {
-        MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 300.0 }
+        MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 200.0 }
     }
     fn caps() -> MachineCaps {
         MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false }
@@ -158,7 +158,7 @@ mod tests {
         match check_passes(&[bad], &profile(), &caps()) {
             Err(PassFault::OutOfBounds { pass, bounds }) => {
                 assert_eq!(pass, 0);
-                assert_eq!(bounds, (300.0, 300.0));
+                assert_eq!(bounds, (300.0, 200.0));
             }
             other => panic!("expected OutOfBounds, got {other:?}"),
         }

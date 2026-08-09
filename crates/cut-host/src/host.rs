@@ -315,7 +315,7 @@ pub mod testing {
         }
         fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
             let profile = match machine_id {
-                "cameo5" => MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 300.0 },
+                "cameo5" => MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 200.0 },
                 "puma" => MachineProfile { id: "puma".into(), name: "Puma".into(), width_mm: 600.0, height_mm: 600.0 },
                 _ => return None,
             };
@@ -356,7 +356,7 @@ pub mod testing {
         fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
             match machine_id {
                 "cameo5" => Some(Box::new(TestDriver {
-                    profile: MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 300.0 },
+                    profile: MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 200.0 },
                     caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: true },
                 })),
                 _ => None,
@@ -445,11 +445,11 @@ mod tests {
             .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![off_the_bed])
             .unwrap_err();
         match refusal {
-            // The Cameo's test bed is 300x300; the Puma's is 600x600, so this is
+            // The Cameo's test bed is 300x200; the Puma's is 600x600, so this is
             // refused only because the check ran against the machine actually there.
             Refusal::Preflight(fault) => {
                 let message = fault.to_string();
-                assert!(message.contains("300 x 300"), "got: {message}");
+                assert!(message.contains("300 x 200"), "got: {message}");
             }
             other => panic!("expected Preflight, got {other:?}"),
         }

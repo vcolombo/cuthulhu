@@ -47,7 +47,8 @@ impl std::fmt::Display for PreflightError {
             // it does not have. Divisor matches the rule's own `64 * 1024 * 1024`. Rounds
             // up so a value just over the limit cannot print as if it were at or under it.
             PreflightError::OutputTooLarge(bytes) =>
-                write!(f, "the encoded cut is about {} MB, over the 64 MB limit", bytes.div_ceil(1024 * 1024)),
+                write!(f, "the encoded cut is about {} MB, over the {} MB limit",
+                       bytes.div_ceil(1024 * 1024), MAX_ENCODED_BYTES / (1024 * 1024)),
         }
     }
 }

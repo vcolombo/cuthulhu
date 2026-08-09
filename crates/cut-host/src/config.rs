@@ -53,7 +53,7 @@ impl Config {
         }
         let bind = file
             .bind
-            .unwrap_or_else(|| "0.0.0.0:7878".into())
+            .unwrap_or_else(|| "127.0.0.1:7878".into())
             .parse()
             .map_err(|e| ConfigError::Malformed(format!("bind: {e}")))?;
 

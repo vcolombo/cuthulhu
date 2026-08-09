@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use driver_core::{MachineProfile, MachineCaps, Settings};
 use document::NodeId;
+use geometry::Point;
 use crate::passes::ColorPass;
 
 pub struct ConfiguredPass<'a> {
@@ -69,6 +70,42 @@ impl PreflightError {
     }
 }
 
+/// The estimate `preflight` and a Cut Host both weight geometry by. Not a
+/// measurement — 16 bytes a point, times that Pass's own repeat_count.
+pub const BYTES_PER_POINT: usize = 16;
+/// The ceiling that estimate is refused against.
+pub const MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether a point falls off the machine's bed. Shared so that a Cut Host,
+/// checking a dispatch against the machine actually attached, refuses at exactly
+/// the same edge the desktop does.
+pub fn point_out_of_bounds(p: &Point, profile: &MachineProfile) -> bool {
+    p.x < 0.0 || p.x > profile.width_mm || p.y < 0.0 || p.y > profile.height_mm
+}
+
+/// The setting that is out of range and the sentence saying so, or `None`.
+/// A setting the machine does not support is ignored rather than refused —
+/// the Drivers skip those values, so refusing them would reject a cut over a
+/// number that will never reach the wire.
+///
+/// Cameo bounds from docs/protocol/silhouette-cameo5.md §Settings ranges.
+pub fn settings_out_of_range(s: &Settings, caps: &MachineCaps) -> Option<&'static str> {
+    if s.repeat_count < 1 || s.repeat_count > 10 {
+        return Some("repeat_count must be 1..=10");
+    }
+    if let Some(speed) = s.speed {
+        if caps.supports_speed && !(1..=30).contains(&speed) {
+            return Some("speed must be 1..=30");
+        }
+    }
+    if let Some(force) = s.force {
+        if caps.supports_force && !(1..=33).contains(&force) {
+            return Some("force must be 1..=33");
+        }
+    }
+    None
+}
+
 /// Validate a cut job before encoding. Rules checked in order (first violation wins):
 /// 1. All enabled passes empty → NothingToCut
 /// 2. Any NaN/inf coordinate → NonFiniteGeometry
@@ -124,8 +161,7 @@ pub fn preflight(
             for shape in &pass.pass.shapes {
                 for polyline in &shape.polylines {
                     for point in polyline {
-                        if point.x < 0.0 || point.x > profile.width_mm ||
-                           point.y < 0.0 || point.y > profile.height_mm {
+                        if point_out_of_bounds(point, profile) {
                             return Err(PreflightError::OutOfBounds {
                                 node: shape.node_id,
                                 bounds: (0.0, 0.0, profile.width_mm, profile.height_mm),
@@ -139,25 +175,8 @@ pub fn preflight(
 
     // Rule 5: repeat_count outside 1..=10 or speed/force out of bounds → SettingsOutOfRange
     for pass in passes.iter().filter(|p| p.enabled) {
-        let settings = &pass.settings;
-
-        // repeat_count must be 1..=10
-        if settings.repeat_count < 1 || settings.repeat_count > 10 {
-            return Err(PreflightError::SettingsOutOfRange("repeat_count must be 1..=10"));
-        }
-
-        // Speed bounds: 1..=30 when supported; unsupported speed is ignored (drivers skip it)
-        if let Some(speed) = settings.speed {
-            if caps.supports_speed && (speed < 1 || speed > 30) {
-                return Err(PreflightError::SettingsOutOfRange("speed must be 1..=30"));
-            }
-        }
-
-        // Force bounds: 1..=33 when supported; unsupported force is ignored (drivers skip it)
-        if let Some(force) = settings.force {
-            if caps.supports_force && (force < 1 || force > 33) {
-                return Err(PreflightError::SettingsOutOfRange("force must be 1..=33"));
-            }
+        if let Some(message) = settings_out_of_range(&pass.settings, caps) {
+            return Err(PreflightError::SettingsOutOfRange(message));
         }
     }
 
@@ -183,11 +202,11 @@ pub fn preflight(
             }
         }
         let pass_bytes = pass_points
-            .saturating_mul(16)
+            .saturating_mul(BYTES_PER_POINT)
             .saturating_mul(pass.settings.repeat_count as usize);
         estimated_size = estimated_size.saturating_add(pass_bytes);
     }
-    if estimated_size > 64 * 1024 * 1024 {
+    if estimated_size > MAX_ENCODED_BYTES {
         return Err(PreflightError::OutputTooLarge(estimated_size));
     }
 

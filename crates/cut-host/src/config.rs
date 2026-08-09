@@ -48,7 +48,6 @@ struct ConfigFile {
     cert_dir: Option<PathBuf>,
 }
 
-#[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
     /// Named per client, so revoking one desktop leaves the others working. A `BTreeMap` rather
@@ -56,6 +55,21 @@ pub struct Config {
     pub tokens: BTreeMap<String, String>,
     pub max_frame: usize,
     pub cert_dir: PathBuf,
+}
+
+/// Hand-written rather than derived: `tokens` holds the secrets that authorize a client to
+/// make a blade move, and a derived `Debug` would print them verbatim into whatever log or
+/// panic message formatted a `Config`. The names are the useful half for debugging anyway —
+/// they are what an operator matches against `journalctl` when deciding which line to revoke.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("tokens", &self.tokens.keys().collect::<Vec<_>>())
+            .field("max_frame", &self.max_frame)
+            .field("cert_dir", &self.cert_dir)
+            .finish()
+    }
 }
 
 impl Config {
@@ -175,5 +189,18 @@ mod tests {
     fn a_token_with_an_empty_value_is_refused() {
         let dir = write_config("bind = \"127.0.0.1:7878\"\n\n[tokens]\nlaptop = \"\"\n");
         assert!(matches!(Config::load(&dir.path().join("cutd.toml")), Err(ConfigError::NoToken)));
+    }
+
+    /// A derived `Debug` here would print every client's token. The names are safe and useful;
+    /// the values are neither.
+    #[test]
+    fn debug_shows_which_clients_exist_and_never_their_tokens() {
+        let dir = write_config(
+            "bind = \"127.0.0.1:7878\"\n\n[tokens]\nworkshop-laptop = \"sup3rs3cret\"\n",
+        );
+        let config = Config::load(&dir.path().join("cutd.toml")).unwrap();
+        let shown = format!("{config:?}");
+        assert!(shown.contains("workshop-laptop"), "the client names are the useful half: {shown}");
+        assert!(!shown.contains("sup3rs3cret"), "a token value reached a Debug string: {shown}");
     }
 }

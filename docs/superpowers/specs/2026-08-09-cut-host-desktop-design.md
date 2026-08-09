@@ -41,17 +41,17 @@ is a feature, not plumbing.
 
 ## Scope
 
-In scope: `hosts.json` and pairing, per-client tokens, `DeviceInfo.host`, the `Cutters` enum in
-`apps/desktop/src/device.rs`, merging remote cutters into the device list, a live status list, and
-polling a remote cut's progress.
+In scope: `hosts.json` and pairing, per-client tokens, `DeviceInfo.host`, holding every paired
+host in `apps/desktop/src/device.rs`, merging remote cutters into the device list, a live status
+list, and polling a remote cut's progress.
 
 Out of scope, decided deliberately:
 
 - **A second connection for pushed events.** OctoPrint pushes state twice a second; a 1 Hz poll of
-  `Snapshot` carries the same information at a comparable rate, reuses everything phase 1 built,
-  and holds no connection open — which matters while issue #97 stands, because an idle held-open
-  connection is exactly the failure it describes. Phase 1 left a `ponytail:` note naming the second
-  connection as the upgrade path; this is not yet the moment.
+  `Snapshot` carries the same information at a comparable rate and reuses everything phase 1 built.
+  Phase 1 left a `ponytail:` note naming the second connection as the upgrade path; this is not yet
+  the moment. Note this is not an argument about holding sockets — see *Connections are held open*
+  below, which is why #97 is a prerequisite either way.
 - **A status web UI on the Pi.** Two of the four comparables put monitoring on the device, and it
   is worth revisiting — but it is an HTTP server and a frontend, and the desktop's own list answers
   the same question for far less.

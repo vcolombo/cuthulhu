@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use driver_core::manager::{CutPass, DeviceManager};
+use driver_core::manager::{CutPass, DeviceError, DeviceManager};
 use driver_core::{DeviceBackendFactory, DeviceInfo};
 
 use crate::check::check_passes;
@@ -161,9 +161,19 @@ impl Host {
         // One lock acquisition, not two: `insert` reports whether the id was already
         // there, so a duplicate cannot slip through the gap a separate `contains`
         // would leave. That gap is where a client's retry after a dropped reply
-        // would become a second cut of the same material.
-        if !slot.dispatches.lock().unwrap().insert(dispatch_id) {
+        // would become a second cut of the same material. Checked before `actions`
+        // so a retry of a Job already mid-cut stays the no-op it always was, rather
+        // than being told Busy by the very state its own first dispatch caused.
+        if !slot.dispatches.lock().unwrap().insert(dispatch_id.clone()) {
             return Ok(());
+        }
+
+        // What is legal now is `actions`' answer, not ours to infer. A cutter that
+        // never connected is kept so its snapshot can say so, and accepting a Job
+        // for it would burn the dispatch id on work that cannot start.
+        if !slot.manager.status().actions.cut {
+            slot.dispatches.lock().unwrap().remove(&dispatch_id);
+            return Err(Refusal::Device(DeviceError::Busy));
         }
 
         let host = self.clone();
@@ -172,9 +182,13 @@ impl Host {
             let Some(slot) = host.slot(&device) else { return };
             match slot.manager.cut(passes) {
                 Ok(job_id) => *slot.job_id.lock().unwrap() = Some(job_id),
-                // The events already carried the failure and `CutStatus` already
-                // reports it; this thread has nobody to return to.
-                Err(e) => eprintln!("cut host: {device} refused the job: {e:?}"),
+                Err(e) => {
+                    // A refusal before any motion emits no event and moves no state,
+                    // so nothing else will tell anyone. Give the id back: a retry
+                    // after a Job that never started must be able to run.
+                    slot.dispatches.lock().unwrap().remove(&dispatch_id);
+                    eprintln!("cut host: {device} refused the job: {e:?}");
+                }
             }
         });
         Ok(())
@@ -310,6 +324,36 @@ pub mod testing {
             }))
         }
     }
+
+    /// One cutter that never connects. `candidate: false` so `DeviceManager::connect`
+    /// needs no probe reply before failing — unlike `TwoCutterFactory`'s Puma, there
+    /// is no successful open to script a read for.
+    pub struct NeverConnectsFactory;
+
+    pub const UNREACHABLE: &str = "usb:9:9";
+
+    impl DeviceBackendFactory for NeverConnectsFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            vec![DeviceInfo {
+                instance_id: UNREACHABLE.into(),
+                machine_id: "cameo5".into(),
+                transport: TransportKind::Usb { locator: "9:9".into() },
+                candidate: false,
+            }]
+        }
+        fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            match machine_id {
+                "cameo5" => Some(Box::new(TestDriver {
+                    profile: MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 300.0 },
+                    caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: true },
+                })),
+                _ => None,
+            }
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Err(TransportError::NotFound)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -400,6 +444,19 @@ mod tests {
     fn an_empty_dispatch_is_refused() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         assert!(host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", Vec::new()).is_err());
+    }
+
+    /// The cutter is kept, not dropped, so its snapshot can report the failure —
+    /// but that must not make it look dispatchable to a caller reading `actions`.
+    #[test]
+    fn a_dispatch_to_a_cutter_that_never_connected_is_refused() {
+        let host = Host::start(Arc::new(NeverConnectsFactory));
+        assert!(!host.slot(UNREACHABLE).unwrap().manager.status().actions.cut);
+
+        let refusal = host
+            .dispatch(DispatchId("d-1".into()), UNREACHABLE, "cameo5", vec![square_pass()])
+            .unwrap_err();
+        assert!(matches!(refusal, Refusal::Device(driver_core::manager::DeviceError::Busy)));
     }
 
     /// `dispatch` must return without waiting for the cut. Asserted by time: the

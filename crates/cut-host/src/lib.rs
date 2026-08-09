@@ -6,4 +6,5 @@
 //! network dropping — and the Job continues, which is the whole reason this crate
 //! exists rather than a Transport that forwards bytes to a desktop still driving.
 
+pub mod frame;
 pub mod protocol;

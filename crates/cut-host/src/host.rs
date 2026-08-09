@@ -15,7 +15,7 @@ use std::thread;
 use driver_core::manager::{CutPass, DeviceError, DeviceManager};
 use driver_core::{DeviceBackendFactory, DeviceInfo};
 
-use crate::check::check_passes;
+use crate::check::{check_passes, PassFault};
 use crate::protocol::{DeviceSnapshot, DispatchId, Event, Refusal};
 
 pub(crate) struct DeviceSlot {
@@ -149,7 +149,7 @@ impl Host {
             });
         }
         if passes.is_empty() {
-            return Err(Refusal::Preflight("this cut has no passes".into()));
+            return Err(Refusal::Preflight(PassFault::NoPasses));
         }
 
         // Against the Driver actually attached, which is the only reason to check
@@ -158,8 +158,7 @@ impl Host {
             .factory
             .driver_for(&slot.info.machine_id)
             .ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
-        check_passes(&passes, driver.profile(), &driver.caps())
-            .map_err(|fault| Refusal::Preflight(fault.to_string()))?;
+        check_passes(&passes, driver.profile(), &driver.caps()).map_err(Refusal::Preflight)?;
 
         // One lock acquisition, not two: `insert` reports whether the id was already
         // there, so a duplicate cannot slip through the gap a separate `contains`
@@ -448,7 +447,10 @@ mod tests {
         match refusal {
             // The Cameo's test bed is 300x300; the Puma's is 600x600, so this is
             // refused only because the check ran against the machine actually there.
-            Refusal::Preflight(message) => assert!(message.contains("300 x 300"), "got: {message}"),
+            Refusal::Preflight(fault) => {
+                let message = fault.to_string();
+                assert!(message.contains("300 x 300"), "got: {message}");
+            }
             other => panic!("expected Preflight, got {other:?}"),
         }
     }

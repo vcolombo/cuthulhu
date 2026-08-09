@@ -6,6 +6,7 @@
 //! vocabularies for the same cut, so the protocol adds a device id and an envelope
 //! and invents nothing else.
 
+use crate::check::PassFault;
 use driver_core::manager::{CutPass, DeviceError, DeviceEvent};
 use driver_core::{CutStatus, DeviceInfo};
 use serde::{Deserialize, Serialize};
@@ -59,14 +60,16 @@ pub enum Response {
     Refused(Refusal),
 }
 
-/// `Preflight` carries the sentence rather than a code: the rule that refused owns
-/// its own words, and a second copy of them on the client is the drift PR #90
-/// removed.
+/// `Preflight` carries `PassFault` itself, not its rendered sentence: the sentence
+/// still has exactly one home (`PassFault`'s own `Display`, the drift PR #90
+/// removed), but the *kind* of refusal now survives the network hop too, so phase
+/// 2's UI can branch on it the way `cutplan::PreflightError::code()` lets the
+/// desktop's local path branch on a stale plan.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Refusal {
     UnknownDevice(String),
     MachineMismatch { dispatched: String, attached: String },
-    Preflight(String),
+    Preflight(PassFault),
     Device(DeviceError),
 }
 

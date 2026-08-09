@@ -29,7 +29,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "this host has no cutter called `{d}`"),
             ClientError::Refused(Refusal::MachineMismatch { dispatched, attached }) =>
                 write!(f, "the cut was planned for a `{dispatched}`, but a `{attached}` is attached"),
-            ClientError::Refused(Refusal::Preflight(message)) => write!(f, "{message}"),
+            ClientError::Refused(Refusal::Preflight(fault)) => write!(f, "{fault}"),
             ClientError::Refused(Refusal::Device(e)) => write!(f, "the cutter refused: {e:?}"),
             ClientError::Fingerprint { expected, found } =>
                 write!(f, "this host presented a different certificate than the one paired \

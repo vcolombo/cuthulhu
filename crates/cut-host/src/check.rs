@@ -10,14 +10,21 @@
 use cutplan::preflight::{point_out_of_bounds, settings_out_of_range, BYTES_PER_POINT, MAX_ENCODED_BYTES};
 use driver_core::manager::CutPass;
 use driver_core::{MachineCaps, MachineProfile};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum PassFault {
     NonFinite(usize),
     Degenerate(usize),
     OutOfBounds { pass: usize, bounds: (f64, f64) },
-    Settings { pass: usize, message: &'static str },
+    // `settings_out_of_range` hands back `&'static str`, but a Cut Host's refusal
+    // now crosses the wire (`Refusal::Preflight`), and `Deserialize` cannot produce
+    // a `&'static str` from bytes read off a socket — only an owned `String` can
+    // survive that hop.
+    Settings { pass: usize, message: String },
     TooLarge(usize),
+    /// An empty dispatch: no Pass to number, so no index.
+    NoPasses,
 }
 
 /// Passes are numbered from 1 here, unlike the indices everywhere else in this
@@ -35,6 +42,7 @@ impl std::fmt::Display for PassFault {
             PassFault::TooLarge(bytes) =>
                 write!(f, "the encoded cut is about {} MB, over the {} MB limit",
                        bytes.div_ceil(1024 * 1024), MAX_ENCODED_BYTES / (1024 * 1024)),
+            PassFault::NoPasses => write!(f, "this cut has no passes"),
         }
     }
 }
@@ -78,7 +86,7 @@ pub fn check_passes(
     }
     for (i, pass) in passes.iter().enumerate() {
         if let Some(message) = settings_out_of_range(&pass.job.settings, caps) {
-            return Err(PassFault::Settings { pass: i, message });
+            return Err(PassFault::Settings { pass: i, message: message.to_string() });
         }
     }
 

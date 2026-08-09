@@ -117,6 +117,8 @@ impl HostClient {
             .with_no_client_auth();
 
         let tcp = TcpStream::connect(addr).map_err(|e| ClientError::Transport(e.to_string()))?;
+        tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
@@ -132,7 +134,7 @@ impl HostClient {
                 _ => ClientError::Transport(e.to_string()),
             }
         })?;
-        match read_frame::<_, Response>(&mut stream, 4096) {
+        match read_frame::<_, Response>(&mut stream, 4096, crate::frame::DEFAULT_BODY_TIMEOUT) {
             Ok(Response::Ok) => {}
             Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
             Err(e) => {
@@ -212,7 +214,11 @@ impl HostClient {
         let mut stream = self.stream.lock().unwrap();
         write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
-            match read_frame::<_, Incoming>(&mut *stream, crate::frame::DEFAULT_MAX_FRAME) {
+            match read_frame::<_, Incoming>(
+                &mut *stream,
+                crate::frame::DEFAULT_MAX_FRAME,
+                crate::frame::DEFAULT_BODY_TIMEOUT,
+            ) {
                 // ponytail: event frames are read only to be discarded — there is no
                 // queue and no accessor, so a client that never calls anything sees no
                 // events and a client that calls rarely misses whatever arrived between

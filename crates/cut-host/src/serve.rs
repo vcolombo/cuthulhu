@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::config::Config;
-use crate::frame::{read_frame, write_frame, FrameError};
+use crate::frame::{read_frame, write_frame, FrameError, DEFAULT_BODY_TIMEOUT, SOCKET_POLL_INTERVAL};
 use crate::host::Host;
 use crate::protocol::{Request, Response};
 
@@ -163,12 +163,20 @@ fn serve_client(
     max_frame: usize,
 ) -> io::Result<()> {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+
+    // The frame layer re-checks its deadline whenever a read comes back empty, so the socket
+    // needs to come back empty rather than block indefinitely. This value only sets how promptly
+    // a stalled frame is noticed; `DEFAULT_BODY_TIMEOUT` decides how long one is tolerated.
+    stream
+        .set_read_timeout(Some(SOCKET_POLL_INTERVAL))
+        .map_err(|e| io::Error::other(format!("could not set a read timeout: {e}")))?;
+
     let conn = rustls::ServerConnection::new(tls).map_err(io::Error::other)?;
     let mut tls_stream = rustls::StreamOwned::new(conn, stream);
 
     // The token before anything else: an unauthenticated frame must never reach a
     // device, and a failed attempt is slowed so the port cannot be worked through.
-    let presented: String = read_frame(&mut tls_stream, 1024).map_err(io::Error::other)?;
+    let presented: String = read_frame(&mut tls_stream, 1024, DEFAULT_BODY_TIMEOUT).map_err(io::Error::other)?;
     if !token_matches(&presented, token) {
         eprintln!("cut host: {peer} presented a bad token");
         thread::sleep(std::time::Duration::from_secs(2));
@@ -188,7 +196,7 @@ fn serve_client(
         while let Ok(event) = events.try_recv() {
             write_frame(&mut tls_stream, &event)?;
         }
-        match read_frame::<_, Request>(&mut tls_stream, max_frame) {
+        match read_frame::<_, Request>(&mut tls_stream, max_frame, DEFAULT_BODY_TIMEOUT) {
             Ok(request) => {
                 if let Request::Dispatch { ref device, .. } = request {
                     eprintln!("cut host: {peer} dispatched to {device}");

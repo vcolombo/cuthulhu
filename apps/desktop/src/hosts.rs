@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use driver_core::{DeviceInfo, HostId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedHost {
     pub id: HostId,
     /// What the operator calls it. Free to change without invalidating anything, which is why
@@ -22,6 +22,21 @@ pub struct PairedHost {
     /// The certificate fingerprint accepted at pairing. A change is a refusal, never a prompt.
     pub fingerprint: String,
     pub token: String,
+}
+
+/// Hand-written rather than derived, mirroring `cut_host::config::Config`: `token` is the secret
+/// that authorizes this desktop to make a blade move, and a derived `Debug` would print it
+/// verbatim into whatever log or panic message formatted a `PairedHost`.
+impl std::fmt::Debug for PairedHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairedHost")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("address", &self.address)
+            .field("fingerprint", &self.fingerprint)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -175,6 +190,15 @@ mod tests {
             fingerprint: "aa:bb:cc".into(),
             token: "s3cret".into(),
         }
+    }
+
+    /// A stray `{:?}` in a log or panic message must not leak the token, mirroring
+    /// `cut_host::config::Config`'s hand-written `Debug`.
+    #[test]
+    fn debug_never_prints_the_token() {
+        let debugged = format!("{:?}", a_host("host-1", "Workshop Pi"));
+        assert!(!debugged.contains("s3cret"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
     }
 
     #[test]

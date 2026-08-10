@@ -77,6 +77,13 @@ impl std::fmt::Debug for Config {
 /// prints load errors to stderr, which under the unit is the journal). `span()` only gives a
 /// byte range, not the line/column an operator can act on, so keep the first line of `Display`
 /// instead — "TOML parse error at line N, column M" — and drop the snippet that follows it.
+//
+// ponytail: that fixed header is only the first line when the underlying `toml_edit` error
+// carries a span; a span-less error (from `serde::de::Error::custom`, e.g. a required field,
+// an enum, or `deny_unknown_fields`) puts its raw message on the first line instead, which can
+// be the field content itself. This holds today because `ConfigFile` is all-`Option` fields
+// with no custom `Deserialize` — every error toml can produce here does carry a span. Add any
+// of those to `ConfigFile` and this needs to filter on content, not position.
 fn describe(error: toml::de::Error) -> String {
     error.to_string().lines().next().unwrap_or_default().to_string()
 }

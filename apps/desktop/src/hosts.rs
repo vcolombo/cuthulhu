@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use driver_core::HostId;
+use driver_core::{DeviceInfo, HostId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,9 +105,51 @@ pub fn next_id(existing: &[PairedHost]) -> HostId {
     HostId(format!("host-{}", highest + 1))
 }
 
+/// Mark every device as belonging to `id`.
+///
+/// A Cut Host does not know its own `HostId` — the desktop mints it at pairing and the daemon
+/// has never heard of it — so everything a host returns arrives saying `host: None`, which is
+/// the value that means "plugged into this computer". Whoever fetches must stamp, or every
+/// remote cutter routes to the local Transport.
+pub fn stamp_host(id: &HostId, devices: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
+    devices
+        .into_iter()
+        .map(|d| DeviceInfo { host: Some(id.clone()), ..d })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use driver_core::{DeviceInfo, TransportKind};
+
+    fn a_device(instance: &str) -> DeviceInfo {
+        DeviceInfo {
+            instance_id: instance.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "sn:CAMEO-A".into() },
+            candidate: false,
+            host: None,
+        }
+    }
+
+    /// A Cut Host does not know its own id, so everything it returns says `host: None` — which
+    /// is the value that means "plugged into this computer". Unstamped, every remote cutter
+    /// would be routed to the local DeviceManager.
+    #[test]
+    fn fetched_devices_are_stamped_with_the_host_they_came_from() {
+        let id = HostId("host-1".into());
+        let stamped = stamp_host(&id, vec![a_device("usb:sn:A"), a_device("serial:sn:B")]);
+
+        assert_eq!(stamped.len(), 2);
+        assert!(stamped.iter().all(|d| d.host.as_ref() == Some(&id)), "{stamped:?}");
+        assert_eq!(stamped[0].instance_id, "usb:sn:A", "the cutter's own id is untouched");
+    }
+
+    #[test]
+    fn stamping_nothing_yields_nothing() {
+        assert!(stamp_host(&HostId("host-1".into()), Vec::new()).is_empty());
+    }
 
     fn a_host(id: &str, name: &str) -> PairedHost {
         PairedHost {

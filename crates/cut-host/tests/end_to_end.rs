@@ -100,6 +100,32 @@ fn a_refusal_reaches_the_client_as_its_sentence() {
     }
 }
 
+#[test]
+fn a_pair_check_lists_the_cutters_and_leaves_no_connection_behind() {
+    let host = start_test_host();
+    let devices = HostClient::pair_check(&host.addr, TOKEN, &host.fingerprint).unwrap();
+    assert_eq!(devices.len(), 2, "the test host has two cutters");
+    assert!(devices.iter().all(|d| d.host.is_none()), "a daemon does not know its own id");
+}
+
+#[test]
+fn a_pair_check_with_the_wrong_token_fails_before_anything_is_saved() {
+    let host = start_test_host();
+    assert!(HostClient::pair_check(&host.addr, "not-the-token", &host.fingerprint).is_err());
+}
+
+#[test]
+fn a_pair_check_against_a_different_certificate_is_refused() {
+    let host = start_test_host();
+    let wrong = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:\
+                 00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff";
+    match HostClient::pair_check(&host.addr, TOKEN, wrong) {
+        Err(ClientError::Fingerprint { .. }) => {}
+        Err(e) => panic!("expected a fingerprint refusal, got {e:?}"),
+        Ok(_) => panic!("a certificate that was not the pinned one was accepted"),
+    }
+}
+
 fn await_phase(client: &HostClient, device: &str, want: Phase) -> driver_core::CutStatus {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

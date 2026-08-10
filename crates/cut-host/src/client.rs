@@ -158,6 +158,20 @@ impl HostClient {
         Ok(HostClient { stream: Mutex::new(stream) })
     }
 
+    /// Prove a host before anything about it is written down: connect, list its cutters, and
+    /// drop the connection.
+    ///
+    /// Pairing that saves first and discovers later is how an operator ends up with an entry
+    /// that has never worked. `connect` alone proves the fingerprint and the token; listing
+    /// proves the daemon is actually serving.
+    pub fn pair_check(
+        addr: &str,
+        token: &str,
+        pinned_fingerprint: &str,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        HostClient::connect(addr, token, pinned_fingerprint)?.devices()
+    }
+
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, ClientError> {
         match self.call(Request::ListDevices)? {
             Response::Devices(d) => Ok(d),

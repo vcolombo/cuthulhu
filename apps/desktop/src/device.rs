@@ -535,6 +535,11 @@ mod tests {
     fn with_no_host_paired_the_device_list_is_the_local_one() {
         let dev = test_device_setup();
         let listed = dev.list_devices();
+
+        // Not just "nothing is host-tagged" — an empty list satisfies that vacuously, and the
+        // regression this guards against is exactly one that returns nothing.
+        assert!(!listed.is_empty(), "the local factory's devices must still be listed");
+        assert_eq!(listed.len(), TestFactory.list_devices().len());
         assert!(listed.iter().all(|d| d.host.is_none()), "{listed:?}");
     }
 

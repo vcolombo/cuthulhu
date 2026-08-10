@@ -6,8 +6,9 @@
 //! because a Pi on a home network has no name an authority would sign.
 
 use std::io;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
@@ -98,6 +99,14 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
 
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+/// How long to wait for a Cut Host to accept a connection.
+///
+/// A host that refuses is instant; one that is silently unreachable — a dropped SYN, a
+/// firewall discarding rather than refusing — would otherwise block for the OS default,
+/// which is tens of seconds. The desktop holds a lock across this call while listing
+/// devices, so an unbounded wait here is a frozen device list.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct HostClient {
     /// Serialized: one request and its reply at a time. A Cut Host answers a
     /// handful of clients and a desktop makes one call at a time, so a lock is the
@@ -116,7 +125,16 @@ impl HostClient {
             .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
 
-        let tcp = TcpStream::connect(addr).map_err(|e| ClientError::Transport(e.to_string()))?;
+        // ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
+        // bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
+        // IP, so this is the common path, not an edge case. `CONNECT_TIMEOUT` below covers the
+        // connect itself; a hung resolver is a real, if rarer, way this can still block. Bound
+        // it too (a helper thread, or a crate with an async resolver) if that turns out to bite.
+        let mut addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
+        let sock_addr = addrs.next()
+            .ok_or_else(|| ClientError::Transport(format!("`{addr}` resolved to no address")))?;
+        let tcp = TcpStream::connect_timeout(&sock_addr, CONNECT_TIMEOUT)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
@@ -275,5 +293,28 @@ fn unexpected(response: Response) -> ClientError {
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         ClientError::Transport(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A host that is silently unreachable — a dropped SYN, a firewall discarding rather than
+    /// refusing — must not hang past `CONNECT_TIMEOUT`. `10.255.255.1` is the conventional
+    /// black-holed address: routable, never answering.
+    #[test]
+    fn connect_to_a_silently_unreachable_host_fails_within_the_timeout() {
+        let start = Instant::now();
+        let err = match HostClient::connect("10.255.255.1:7878", "token", "aa:bb:cc") {
+            Ok(_) => panic!("nothing should answer this address"),
+            Err(e) => e,
+        };
+        assert!(
+            start.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
+            "took {:?}, longer than the timeout allows for: {err}",
+            start.elapsed()
+        );
     }
 }

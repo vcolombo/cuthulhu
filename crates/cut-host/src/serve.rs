@@ -8,15 +8,58 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+use socket2::{SockRef, TcpKeepalive};
 
 use crate::config::Config;
 use crate::frame::{read_frame, write_frame, FrameError, DEFAULT_BODY_TIMEOUT, SOCKET_POLL_INTERVAL};
 use crate::host::Host;
 use crate::protocol::{Request, Response};
+
+/// How long a stream may sit silent before the OS sends the first probe. The
+/// request loop's read (`serve_client`) waits with no deadline of its own — a
+/// desktop that polls only while a dialog is open is *meant* to go quiet for as
+/// long as the operator leaves it alone (see the amending comment on #103), so
+/// nothing at the application layer may treat silence as absence. Only a kernel
+/// probe can tell a suspended peer from a quiet one, since both look identical
+/// on the wire until then. A minute keeps eight stacked lid-closes from
+/// exhausting `MAX_CLIENTS` long before anyone notices, without probing a
+/// healthy LAN connection often enough to be chatter.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// Gap between probes once idle time is exceeded.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Failed probes tolerated before the OS reports the connection dead — worst
+/// case `KEEPALIVE_IDLE + KEEPALIVE_RETRIES * KEEPALIVE_INTERVAL` (2 minutes)
+/// before a slot is freed.
+const KEEPALIVE_RETRIES: u32 = 4;
+
+/// Turn on TCP keepalive so a peer that vanishes without closing (laptop
+/// suspended, access point dropped — no FIN or RST ever arrives) is eventually
+/// reaped instead of holding a `MAX_CLIENTS` slot forever. `SockRef` borrows the
+/// stream's socket to set the option without taking ownership of the fd, so the
+/// caller keeps using `stream` as normal afterwards.
+///
+/// A failure here is logged and swallowed, not propagated: refusing to serve a
+/// client because a socket option did not apply would recreate the exhaustion
+/// this exists to fix, only faster. `with_retries` needs socket2's `all`
+/// feature to exist at all, but once enabled it — like `with_time` and
+/// `with_interval` — is implemented for both Linux (`TCP_KEEPIDLE`/`TCP_KEEPCNT`)
+/// and macOS (`TCP_KEEPALIVE`/`TCP_KEEPCNT`), so developing on a Mac exercises
+/// the same code path the Pi runs.
+fn enable_keepalive(stream: &TcpStream, peer: &str) {
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    if let Err(e) = SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        eprintln!("cut host: could not enable keepalive for {peer}: {e}");
+    }
+}
 
 /// The maximum clients served at once. A Cut Host answers a handful of desktops;
 /// anything beyond this is a bug or an attempt to exhaust it.
@@ -146,6 +189,8 @@ pub fn serve_on(listener: TcpListener, host: Arc<Host>, config: Config) -> io::R
         if clients.load(std::sync::atomic::Ordering::SeqCst) >= MAX_CLIENTS {
             continue; // dropped without ceremony; a real client retries
         }
+        let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into());
+        enable_keepalive(&stream, &peer);
         clients.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let (host, tls, tokens, clients) = (host.clone(), tls.clone(), tokens.clone(), clients.clone());
@@ -298,6 +343,22 @@ mod tests {
         assert_eq!(match_token("aab", &tokens()), None);
         assert_eq!(match_token("aa", &tokens()), None, "a prefix is not a match");
         assert_eq!(match_token("", &tokens()), None);
+    }
+
+    /// Not a test that a dead peer is actually reaped — that needs a suspended machine or a
+    /// firewall rule to fake convincingly, and a mock would only test the mock. This instead
+    /// catches the regression that matters day to day: someone deleting the `enable_keepalive`
+    /// call from the accept loop.
+    #[test]
+    fn an_accepted_stream_has_keepalive_enabled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        enable_keepalive(&server, "test");
+
+        assert!(socket2::SockRef::from(&server).keepalive().unwrap());
     }
 
     /// Revoking one client must leave the others working — the property the whole change exists

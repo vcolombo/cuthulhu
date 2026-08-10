@@ -68,6 +68,11 @@ impl HostConnection {
     }
 }
 
+enum Route {
+    Local,
+    Host(HostId),
+}
+
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
 /// through here and never touch the document mutex.
 pub struct DeviceManagerHandle {
@@ -157,8 +162,48 @@ impl DeviceManagerHandle {
             .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{machine_id}`")))
     }
 
+    /// Where a call about `device` has to go. `None` is this computer; `Some(id)` is that host.
+    ///
+    /// An id nobody has paired is refused rather than falling back to local hardware: a Job
+    /// aimed at a Pi must never be cut on the machine sitting on the desk.
+    fn route(&self, device: &DeviceInfo) -> Result<Route, IpcError> {
+        match &device.host {
+            None => Ok(Route::Local),
+            Some(id) if self.hosts.lock().unwrap().contains_key(id) => Ok(Route::Host(id.clone())),
+            Some(id) => Err(IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0))),
+        }
+    }
+
+    /// Run `f` against the client for `id`, connecting if needed.
+    fn with_host<T>(
+        &self,
+        id: &HostId,
+        f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
+    ) -> Result<T, IpcError> {
+        let mut hosts = self.hosts.lock().unwrap();
+        let host = hosts
+            .get_mut(id)
+            .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))?;
+        // Not `let client = host.ensure().ok_or_else(...)?;` — that binding would keep `host`'s
+        // mutable borrow alive through the `None` arm's `host.last_error` read. Matching in
+        // place lets the borrow end with the arm that doesn't need it.
+        match host.ensure() {
+            Some(client) => f(client).map_err(|e| IpcError::new("host_error", e.to_string())),
+            None => Err(IpcError::new("host_unreachable", host.last_error.clone().unwrap_or_default())),
+        }
+    }
+
     pub fn connect(&self, info: DeviceInfo) -> Result<(), IpcError> {
-        self.manager()?.connect(info.clone()).map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+        match self.route(&info)? {
+            Route::Local => {
+                self.manager()?
+                    .connect(info.clone())
+                    .map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
+            // A Cut Host connects each cutter itself at startup, so aiming at one is a local
+            // bookkeeping act: there is no remote connection to open.
+            Route::Host(_) => {}
+        }
         *self.connected.lock().unwrap() = Some(info);
         Ok(())
     }
@@ -173,23 +218,63 @@ impl DeviceManagerHandle {
     /// never blocks on the worker — so the window-close handler and the IPC
     /// command can both call it freely, even mid-transmit.
     pub fn status(&self) -> CutStatus {
-        match self.local_manager.lock().unwrap().as_ref() {
-            Some(mgr) => mgr.status(),
-            None => CutStatus::disconnected(),
+        let aimed = self.connected.lock().unwrap().clone();
+        let Some(device) = aimed else { return CutStatus::disconnected() };
+        match self.route(&device) {
+            Ok(Route::Local) | Err(_) => match self.local_manager.lock().unwrap().as_ref() {
+                Some(mgr) => mgr.status(),
+                None => CutStatus::disconnected(),
+            },
+            Ok(Route::Host(id)) => self
+                .with_host(&id, |c| c.snapshots())
+                .ok()
+                .and_then(|snaps| {
+                    snaps.into_iter().find(|s| s.info.instance_id == device.instance_id).map(|s| s.status)
+                })
+                // A host that cannot be reached mid-cut is not a finished cut: the Job is still
+                // running on the Pi, and saying `Idle` here would invite a second dispatch.
+                .unwrap_or_else(|| CutStatus::disconnected()),
         }
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
-        self.manager()?.cancel();
-        Ok(())
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.cancel();
+                Ok(())
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.cancel(&device))
+            }
+        }
     }
 
     pub fn resume(&self) -> Result<(), IpcError> {
-        self.manager()?.resume().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.resume().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.resume(&device))
+            }
+        }
     }
 
     pub fn confirm_pass_done(&self) -> Result<(), IpcError> {
-        self.manager()?.confirm_pass_done().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.confirm_pass_done().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.confirm_pass_done(&device))
+            }
+        }
     }
 
     /// Normal-exit lifecycle path: take the sole stored `Arc`, unwrap it, and
@@ -266,7 +351,34 @@ impl DeviceManagerHandle {
     /// document lock (see `prepare_cut`) and from an async command so it
     /// doesn't freeze the Tauri main loop.
     pub fn execute_cut(&self, passes: Vec<CutPass>) -> Result<u64, IpcError> {
-        self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                // `execute_cut` takes only the Passes, so both the device and the machine it is
+                // for come from what the dialog is aimed at — which is also what `route` just
+                // resolved, so the two cannot disagree.
+                let aimed = aimed.expect("a route implies a device");
+                let (device, machine_id) = (aimed.instance_id, aimed.machine_id);
+                // A fresh id per attempt: this is a new Job, not a retry of a dropped reply,
+                // and reusing one would make the host treat it as already accepted.
+                let dispatch_id = cut_host::protocol::DispatchId(format!(
+                    "{}-{}",
+                    device,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                self.with_host(&id, |c| c.dispatch(dispatch_id, &device, &machine_id, passes))?;
+                // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
+                // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
+                // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
+                Ok(0)
+            }
+        }
     }
 
     /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
@@ -559,6 +671,28 @@ mod tests {
         let reasons = dev.host_errors();
         assert_eq!(reasons.len(), 1, "the host stays known: {reasons:?}");
         assert!(reasons[0].1.is_some(), "and says why it is unreachable");
+    }
+
+    /// A cutter with no host is this computer's, and must reach the local DeviceManager — the
+    /// path every existing user is on.
+    #[test]
+    fn a_local_device_still_routes_to_the_local_manager() {
+        let dev = test_device_setup();
+        assert_eq!(dev.status().phase, driver_core::Phase::Idle);
+        assert!(dev.cancel().is_ok(), "a local cancel reaches the local manager");
+    }
+
+    /// Naming a host that was forgotten (or never paired) must be refused rather than falling
+    /// back to the local cutter — a Job aimed at a Pi must never be cut on the desk.
+    #[test]
+    fn a_device_naming_an_unknown_host_is_refused_not_run_locally() {
+        let dev = test_device_setup();
+        let elsewhere = DeviceInfo {
+            host: Some(HostId("host-does-not-exist".into())),
+            ..test_instance()
+        };
+        let err = dev.connect(elsewhere).unwrap_err();
+        assert_eq!(err.code, "unknown_host", "got {err:?}");
     }
 
     #[test]

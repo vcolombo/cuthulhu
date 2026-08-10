@@ -72,10 +72,19 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// `toml::de::Error`'s own `Display` renders the offending source line verbatim, so a stray
+/// quote on a token line would print that token straight to the operator's log (the daemon
+/// prints load errors to stderr, which under the unit is the journal). `span()` only gives a
+/// byte range, not the line/column an operator can act on, so keep the first line of `Display`
+/// instead — "TOML parse error at line N, column M" — and drop the snippet that follows it.
+fn describe(error: toml::de::Error) -> String {
+    error.to_string().lines().next().unwrap_or_default().to_string()
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Unreadable(e.to_string()))?;
-        let file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Malformed(e.to_string()))?;
+        let file: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Malformed(describe(e)))?;
 
         if file.token.is_some() {
             return Err(ConfigError::LegacyToken);
@@ -189,6 +198,19 @@ mod tests {
     fn a_token_with_an_empty_value_is_refused() {
         let dir = write_config("bind = \"127.0.0.1:7878\"\n\n[tokens]\nlaptop = \"\"\n");
         assert!(matches!(Config::load(&dir.path().join("cutd.toml")), Err(ConfigError::NoToken)));
+    }
+
+    /// The other way a token can reach the journal: toml's own Display renders the
+    /// offending source line, and the daemon prints load errors to stderr.
+    #[test]
+    fn a_malformed_config_reports_where_without_quoting_the_line() {
+        let dir = write_config("bind = \"127.0.0.1:7878\"\n\n[tokens]\nlaptop = \"sup3rs3cret\n");
+        let message = match Config::load(&dir.path().join("cutd.toml")) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unterminated quote must not parse"),
+        };
+        assert!(!message.contains("sup3rs3cret"), "a token value reached the error: {message}");
+        assert!(message.contains("line"), "an operator still needs to be told where: {message}");
     }
 
     /// A derived `Debug` here would print every client's token. The names are safe and useful;

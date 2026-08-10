@@ -198,10 +198,13 @@ impl DeviceManagerHandle {
         HostClient::pair_check(&address, &token, &fingerprint)
             .map_err(|e| IpcError::new("host_unreachable", e.to_string()))?;
 
-        let id = crate::hosts::next_id(&self.paired_hosts());
-        let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
-
+        // ponytail: reads paired_hosts() once, mints, saves, then add_hosts — three separate lock
+        // acquisitions, so two concurrent pair() calls can mint the same id and one save can
+        // overwrite the other's add_host. Fine for a single modal pairing dialog; if that stops
+        // being true, hold `hosts` across mint-and-save or mint from a counter that isn't a re-read.
         let mut prospective = self.paired_hosts();
+        let id = crate::hosts::next_id(&prospective);
+        let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
         prospective.push(paired.clone());
         crate::hosts::save(hosts_path, &prospective)
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
@@ -217,7 +220,14 @@ impl DeviceManagerHandle {
         // An unreachable host answers nothing, so it reports nothing as active — and there was
         // nothing `cancel` could have stopped there either. Only a host that answers and says
         // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
-        if let Ok(snapshots) = self.with_host(id, |c| c.snapshots()) {
+        //
+        // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
+        // `DEFAULT_BODY_TIMEOUT`): `with_host` holds the `hosts` lock across this call, and that
+        // lock also guards `status`/`route`/`list_devices`/the window-close guard. A host that
+        // completes TLS and then stalls must not hang all of those for 30s on a guard check. A
+        // Pi that cannot answer within 2s is one the operator is likely forgetting precisely
+        // because it is unreachable, so falling through to the forget is the right default.
+        if let Ok(snapshots) = self.with_host(id, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
             if snapshots.iter().any(|s| s.status.is_active()) {
                 return Err(IpcError::new(
                     "host_busy",

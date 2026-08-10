@@ -191,14 +191,22 @@ impl HostClient {
     }
 
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, ClientError> {
-        match self.call(Request::ListDevices)? {
+        match self.call(Request::ListDevices, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Devices(d) => Ok(d),
             other => Err(unexpected(other)),
         }
     }
 
     pub fn snapshots(&self) -> Result<Vec<DeviceSnapshot>, ClientError> {
-        match self.call(Request::Snapshot)? {
+        self.snapshots_within(crate::frame::DEFAULT_BODY_TIMEOUT)
+    }
+
+    /// Same as `snapshots`, but bounded by `timeout` rather than the full
+    /// `DEFAULT_BODY_TIMEOUT`. For a status poll a stale answer is fine — the next poll is a
+    /// second away — but holding whatever lock guards this client for 30s while a Job-carrying
+    /// call would rightly wait that long is not.
+    pub fn snapshots_within(&self, timeout: Duration) -> Result<Vec<DeviceSnapshot>, ClientError> {
+        match self.call(Request::Snapshot, timeout)? {
             Response::Snapshots(s) => Ok(s),
             other => Err(unexpected(other)),
         }
@@ -211,12 +219,15 @@ impl HostClient {
         machine_id: &str,
         passes: Vec<CutPass>,
     ) -> Result<(), ClientError> {
-        match self.call(Request::Dispatch {
-            dispatch_id,
-            device: device.to_string(),
-            machine_id: machine_id.to_string(),
-            passes,
-        })? {
+        match self.call(
+            Request::Dispatch {
+                dispatch_id,
+                device: device.to_string(),
+                machine_id: machine_id.to_string(),
+                passes,
+            },
+            crate::frame::DEFAULT_BODY_TIMEOUT,
+        )? {
             Response::Accepted { .. } => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -235,7 +246,7 @@ impl HostClient {
     }
 
     fn expect_ok(&self, request: Request) -> Result<(), ClientError> {
-        match self.call(request)? {
+        match self.call(request, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Ok => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -247,7 +258,12 @@ impl HostClient {
     /// the Dispatch response that started it, or a connect-time event still queued
     /// from before this client's subscription began (`serve.rs`'s `serve_client`
     /// drains before it blocks on the next request, not after).
-    fn call(&self, request: Request) -> Result<Response, ClientError> {
+    ///
+    /// `body_timeout` is a caller's choice, not a constant: a Job-carrying call (dispatch,
+    /// cancel, resume) is rightly owed the full `DEFAULT_BODY_TIMEOUT`, but a status poll would
+    /// rather see a stale answer next second than hold this client's lock for 30s — see
+    /// `snapshots_within`.
+    fn call(&self, request: Request, body_timeout: Duration) -> Result<Response, ClientError> {
         let mut stream = self.stream.lock().unwrap();
         write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
@@ -256,8 +272,8 @@ impl HostClient {
             match read_frame::<_, Incoming>(
                 &mut *stream,
                 crate::frame::DEFAULT_MAX_FRAME,
-                Some(crate::frame::DEFAULT_BODY_TIMEOUT),
-                crate::frame::DEFAULT_BODY_TIMEOUT,
+                Some(body_timeout),
+                body_timeout,
             ) {
                 // ponytail: event frames are read only to be discarded — there is no
                 // queue and no accessor, so a client that never calls anything sees no

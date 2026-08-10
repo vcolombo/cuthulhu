@@ -73,6 +73,12 @@ enum Route {
     Host(HostId),
 }
 
+/// How long `status()` will wait on a Cut Host before reporting disconnected. Short on purpose:
+/// this is the window-close guard's own read, and it goes through the same `hosts` lock as every
+/// other host call, so a poll that waited the full `DEFAULT_BODY_TIMEOUT` (30s) would make a quit
+/// mid-cut look hung for half a minute.
+const STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
 /// through here and never touch the document mutex.
 pub struct DeviceManagerHandle {
@@ -221,12 +227,19 @@ impl DeviceManagerHandle {
         let aimed = self.connected.lock().unwrap().clone();
         let Some(device) = aimed else { return CutStatus::disconnected() };
         match self.route(&device) {
-            Ok(Route::Local) | Err(_) => match self.local_manager.lock().unwrap().as_ref() {
+            Ok(Route::Local) => match self.local_manager.lock().unwrap().as_ref() {
                 Some(mgr) => mgr.status(),
                 None => CutStatus::disconnected(),
             },
+            // An unknown host is not a local cutter. Falling through to the local manager here
+            // would report its `Idle` — and so `actions.cut` — for a device this desktop cannot
+            // reach, offering a cut that `execute_cut` would then refuse.
+            Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => self
-                .with_host(&id, |c| c.snapshots())
+                // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s): this is the window-close
+                // guard's own read, and a stale snapshot is fine when the next poll is a second
+                // away, but a 30s hold of `hosts` behind a stalled host is not.
+                .with_host(&id, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
                 .ok()
                 .and_then(|snaps| {
                     snaps.into_iter().find(|s| s.info.instance_id == device.instance_id).map(|s| s.status)
@@ -693,6 +706,19 @@ mod tests {
         };
         let err = dev.connect(elsewhere).unwrap_err();
         assert_eq!(err.code, "unknown_host", "got {err:?}");
+    }
+
+    /// A device aimed at a host that was forgotten (or never paired) must report a status the UI
+    /// cannot act on. Asserted on `actions`, not `phase` — this project's rule is that a caller
+    /// learns what is legal from `actions` and never re-derives it from the phase.
+    #[test]
+    fn status_for_a_device_on_an_unknown_host_is_not_a_local_idle() {
+        let dev = test_device_setup();
+        dev.connected.lock().unwrap().replace(DeviceInfo {
+            host: Some(HostId("host-does-not-exist".into())),
+            ..test_instance()
+        });
+        assert!(!dev.status().actions.cut, "an unreachable host must not offer a cut it cannot run");
     }
 
     #[test]

@@ -56,8 +56,16 @@ pub(crate) struct HostConnection {
 impl HostConnection {
     /// Connect if not already connected, and remember the reason if that fails.
     fn ensure(&mut self) -> Option<&HostClient> {
+        self.ensure_within(cut_host::client::CONNECT_TIMEOUT)
+    }
+
+    /// Same as `ensure`, but the reconnect attempt is capped at `timeout` rather than always
+    /// spending the full `CONNECT_TIMEOUT` — a caller with a short total budget for the whole
+    /// call (a status poll behind a lock that must never block for long) must not have that
+    /// budget eaten by a reconnect it did not choose the length of.
+    fn ensure_within(&mut self, timeout: std::time::Duration) -> Option<&HostClient> {
         if self.client.is_none() {
-            match HostClient::connect(&self.paired.address, &self.paired.token, &self.paired.fingerprint) {
+            match HostClient::connect_within(&self.paired.address, &self.paired.token, &self.paired.fingerprint, timeout) {
                 Ok(c) => {
                     self.client = Some(c);
                     self.last_error = None;
@@ -222,12 +230,15 @@ impl DeviceManagerHandle {
         // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
         //
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
-        // `DEFAULT_BODY_TIMEOUT`): `with_host` holds the `hosts` lock across this call, and that
-        // lock also guards `status`/`route`/`list_devices`/the window-close guard. A host that
-        // completes TLS and then stalls must not hang all of those for 30s on a guard check. A
-        // Pi that cannot answer within 2s is one the operator is likely forgetting precisely
-        // because it is unreachable, so falling through to the forget is the right default.
-        if let Ok(snapshots) = self.with_host(id, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
+        // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read.
+        // `with_host_within` holds the `hosts` lock across this call, and that lock also guards
+        // `status`/`route`/`list_devices`/the window-close guard. A host that completes TLS and
+        // then stalls must not hang all of those for 30s on a guard check, and a host that is
+        // simply offline must not spend `CONNECT_TIMEOUT` reconnecting before that budget even
+        // starts. A Pi that cannot answer within 2s total is one the operator is likely
+        // forgetting precisely because it is unreachable, so falling through to the forget is
+        // the right default.
+        if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
             if snapshots.iter().any(|s| s.status.is_active()) {
                 return Err(IpcError::new(
                     "host_busy",
@@ -267,20 +278,36 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// Run `f` against the client for `id`, connecting if needed.
+    /// Run `f` against the client for `id`, connecting if needed. Spends the full
+    /// `CONNECT_TIMEOUT` on a reconnect: for a Job-carrying call (cancel, resume, confirm,
+    /// dispatch) that is rightly owed the same budget a fresh pairing would get.
     fn with_host<T>(
         &self,
         id: &HostId,
+        f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
+    ) -> Result<T, IpcError> {
+        self.with_host_within(id, cut_host::client::CONNECT_TIMEOUT, f)
+    }
+
+    /// Same as `with_host`, but `connect_timeout` bounds the reconnect leg too, not just the
+    /// body read inside `f`. `with_host` alone only bounds what `f` does — a dropped connection
+    /// still reconnects via the unbounded default, so a caller with a short total budget for the
+    /// whole call (the window-close guard reading `status()`, which "must never block") could
+    /// still block for DNS resolution plus the full `CONNECT_TIMEOUT` before `f` ever runs.
+    fn with_host_within<T>(
+        &self,
+        id: &HostId,
+        connect_timeout: std::time::Duration,
         f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
     ) -> Result<T, IpcError> {
         let mut hosts = self.hosts.lock().unwrap();
         let host = hosts
             .get_mut(id)
             .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))?;
-        // Not `let client = host.ensure().ok_or_else(...)?;` — that binding would keep `host`'s
-        // mutable borrow alive through the `None` arm's `host.last_error` read. Matching in
-        // place lets the borrow end with the arm that doesn't need it.
-        match host.ensure() {
+        // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
+        // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
+        // in place lets the borrow end with the arm that doesn't need it.
+        match host.ensure_within(connect_timeout) {
             Some(client) => f(client).map_err(|e| IpcError::new("host_error", e.to_string())),
             None => Err(IpcError::new("host_unreachable", host.last_error.clone().unwrap_or_default())),
         }
@@ -341,10 +368,12 @@ impl DeviceManagerHandle {
             // reach, offering a cut that `execute_cut` would then refuse.
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => self
-                // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s): this is the window-close
-                // guard's own read, and a stale snapshot is fine when the next poll is a second
-                // away, but a 30s hold of `hosts` behind a stalled host is not.
-                .with_host(&id, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
+                // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
+                // body read: this is the window-close guard's own read, and a stale snapshot is
+                // fine when the next poll is a second away, but a 30s hold of `hosts` behind a
+                // stalled host — or a `CONNECT_TIMEOUT` reconnect before the read even starts —
+                // is not.
+                .with_host_within(&id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
                 .ok()
                 .and_then(|snaps| {
                     snaps.into_iter().find(|s| s.info.instance_id == device.instance_id).map(|s| s.status)

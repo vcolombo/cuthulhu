@@ -116,6 +116,19 @@ pub struct HostClient {
 
 impl HostClient {
     pub fn connect(addr: &str, token: &str, pinned_fingerprint: &str) -> Result<HostClient, ClientError> {
+        Self::connect_within(addr, token, pinned_fingerprint, CONNECT_TIMEOUT)
+    }
+
+    /// Same as `connect`, but the connect attempt is capped at `timeout` rather than always
+    /// spending the full `CONNECT_TIMEOUT` — a caller with a short total budget for the whole
+    /// call (a status poll behind a lock that must never block for long) must not have that
+    /// budget eaten by a reconnect it did not choose the length of.
+    pub fn connect_within(
+        addr: &str,
+        token: &str,
+        pinned_fingerprint: &str,
+        timeout: Duration,
+    ) -> Result<HostClient, ClientError> {
         let verifier = Arc::new(PinnedCert {
             fingerprint: pinned_fingerprint.to_string(),
             seen: Mutex::new(None),
@@ -127,14 +140,35 @@ impl HostClient {
 
         // ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
         // bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
-        // IP, so this is the common path, not an edge case. `CONNECT_TIMEOUT` below covers the
+        // IP, so this is the common path, not an edge case. `timeout` below covers the
         // connect itself; a hung resolver is a real, if rarer, way this can still block. Bound
         // it too (a helper thread, or a crate with an async resolver) if that turns out to bite.
-        let mut addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
-        let sock_addr = addrs.next()
-            .ok_or_else(|| ClientError::Transport(format!("`{addr}` resolved to no address")))?;
-        let tcp = TcpStream::connect_timeout(&sock_addr, CONNECT_TIMEOUT)
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        //
+        // A single deadline covers every resolved address, not a fresh `timeout` per address:
+        // mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
+        // that is the one address that cannot work — trying it with the whole budget and only
+        // then trying the IPv4 that would have worked turns "first contact" into a timeout.
+        let addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last_err = None;
+        let mut tcp = None;
+        for sock_addr in addrs {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(&sock_addr, remaining) {
+                Ok(s) => {
+                    tcp = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| match last_err {
+            Some(e) => ClientError::Transport(e.to_string()),
+            None => ClientError::Transport(format!("`{addr}` resolved to no address")),
+        })?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")

@@ -87,7 +87,9 @@ pub fn list_machines(state: tauri::State<AppStateHandle>) -> Result<Vec<MachineP
 
 // --- device / cut / preset commands: operate over DeviceManagerHandle, never AppStateHandle's mutex ---
 
-#[tauri::command]
+// async: dials every paired host to refresh its device list (30s budget per host, by design —
+// see DeviceManagerHandle::list_devices) — on the main thread one wedged Pi freezes the window.
+#[tauri::command(async)]
 pub fn list_devices(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<DeviceInfo>, IpcError> {
     Ok(dev.list_devices())
 }
@@ -103,9 +105,11 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
-// Non-blocking — safe to call even while a cut is mid-transmit, since the status is
-// published rather than asked of the worker (see DeviceManagerHandle::status).
-#[tauri::command]
+// async: non-blocking for a local device — the status is published rather than asked of the
+// worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
+// network (bounded by STATUS_POLL_TIMEOUT), and it is called after every connect/cancel/resume/
+// confirm, so it must not run on the main thread.
+#[tauri::command(async)]
 pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {
     Ok(dev.status())
 }
@@ -171,7 +175,9 @@ pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
 
-#[tauri::command]
+// async: takes the same `hosts` mutex `list_devices` can hold for up to 30s per host — on the
+// main thread that is a frozen window, not just a slow one.
+#[tauri::command(async)]
 pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHostView>, IpcError> {
     Ok(dev.host_views())
 }

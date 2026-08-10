@@ -857,6 +857,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "cutplan",
+ "dirs",
  "document",
  "driver-core",
  "driver-registry",
@@ -867,6 +868,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "trace",
 ]
 

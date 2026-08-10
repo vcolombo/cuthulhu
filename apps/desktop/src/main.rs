@@ -82,8 +82,11 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                // Non-blocking read: the worker thread may be busy mid-transmit,
-                // and this handler must never block on it.
+                // Non-blocking for a local device: the worker publishes status rather than being
+                // asked for it. Aimed at a host, this is a synchronous network round trip on the
+                // UI thread — bounded (roughly 2x STATUS_POLL_TIMEOUT, see DeviceManagerHandle::
+                // status) but not instant, and DNS ahead of it is unbounded with std. A closing
+                // window can briefly stall on a wedged Pi; it will not hang forever.
                 if dev.status().is_active() {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();

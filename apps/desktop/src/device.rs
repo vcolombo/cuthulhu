@@ -96,10 +96,12 @@ pub struct PairedHostView {
     pub unreachable: Option<String>,
 }
 
-/// How long `status()` will wait on a Cut Host before reporting disconnected. Short on purpose:
-/// this is the window-close guard's own read, and it goes through the same `hosts` lock as every
-/// other host call, so a poll that waited the full `DEFAULT_BODY_TIMEOUT` (30s) would make a quit
-/// mid-cut look hung for half a minute.
+/// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
+/// reconnect, then body read — not the total. Short on purpose: this is the window-close guard's
+/// own read, and it goes through the same `hosts` lock as every other host call, so a poll that
+/// waited the full `DEFAULT_BODY_TIMEOUT` (30s) on either leg would make a quit mid-cut look hung.
+/// Spent twice in sequence, the real cap is **2x this value** (4s) — plus DNS resolution, which
+/// std gives no way to bound at all (see the `ponytail:` note in `cut_host::client`).
 const STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
@@ -235,9 +237,11 @@ impl DeviceManagerHandle {
         // `status`/`route`/`list_devices`/the window-close guard. A host that completes TLS and
         // then stalls must not hang all of those for 30s on a guard check, and a host that is
         // simply offline must not spend `CONNECT_TIMEOUT` reconnecting before that budget even
-        // starts. A Pi that cannot answer within 2s total is one the operator is likely
-        // forgetting precisely because it is unreachable, so falling through to the forget is
-        // the right default.
+        // starts. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
+        // legs, in sequence) is one the operator is likely forgetting precisely because it is
+        // unreachable, so falling through to the forget is the right default. That figure does
+        // not include DNS resolution, which std gives no way to bound (see `cut_host::client`'s
+        // `ponytail:` note) — a hung resolver is the one way this can still exceed it.
         if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
             if snapshots.iter().any(|s| s.status.is_active()) {
                 return Err(IpcError::new(
@@ -298,8 +302,12 @@ impl DeviceManagerHandle {
     /// Same as `with_host`, but `connect_timeout` bounds the reconnect leg too, not just the
     /// body read inside `f`. `with_host` alone only bounds what `f` does — a dropped connection
     /// still reconnects via the unbounded default, so a caller with a short total budget for the
-    /// whole call (the window-close guard reading `status()`, which "must never block") could
-    /// still block for DNS resolution plus the full `CONNECT_TIMEOUT` before `f` ever runs.
+    /// whole call (the window-close guard reading `status()`) could still block for the full
+    /// `CONNECT_TIMEOUT` before `f` ever runs. `connect_timeout` closes that hole, but only that
+    /// one: DNS resolution happens before `connect_within`'s deadline is even computed, and std
+    /// gives no way to bound it (the `ponytail:` note in `cut_host::client` says so directly) —
+    /// so the true wait here is `connect_timeout` twice over (reconnect, then body) plus
+    /// whatever a hung resolver costs, not a hard total.
     fn with_host_within<T>(
         &self,
         id: &HostId,
@@ -388,7 +396,9 @@ impl DeviceManagerHandle {
                 // body read: this is the window-close guard's own read, and a stale snapshot is
                 // fine when the next poll is a second away, but a 30s hold of `hosts` behind a
                 // stalled host — or a `CONNECT_TIMEOUT` reconnect before the read even starts —
-                // is not.
+                // is not. The real total is roughly 2x `STATUS_POLL_TIMEOUT` (4s), not one
+                // `STATUS_POLL_TIMEOUT` — and DNS resolution sits outside that entirely,
+                // unbounded, ahead of both legs (see `cut_host::client`'s `ponytail:` note).
                 .with_host_within(&id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
                 .ok()
                 .and_then(|snaps| {

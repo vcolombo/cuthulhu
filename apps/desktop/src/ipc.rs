@@ -107,7 +107,8 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
 
 // async: non-blocking for a local device — the status is published rather than asked of the
 // worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
-// network (bounded by STATUS_POLL_TIMEOUT), and it is called after every connect/cancel/resume/
+// network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) plus an
+// unbounded DNS/mDNS resolve ahead of both, and it is called after every connect/cancel/resume/
 // confirm, so it must not run on the main thread.
 #[tauri::command(async)]
 pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {

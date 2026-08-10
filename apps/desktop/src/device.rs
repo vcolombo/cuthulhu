@@ -347,7 +347,17 @@ impl DeviceManagerHandle {
     }
 
     pub fn disconnect(&self) -> Result<(), IpcError> {
-        self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            // A remote cutter's connection belongs to the Cut Host, not this desktop — the
+            // mirror of `connect`'s remote arm, which never opened one here to close. Routing
+            // this unconditionally to the local manager used to close the local cutter's
+            // transport and discard its parked job while aimed at a Pi, silently.
+            None | Some(Route::Local) => {
+                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
+            Some(Route::Host(_)) => {}
+        }
         *self.connected.lock().unwrap() = None;
         Ok(())
     }
@@ -849,6 +859,24 @@ mod tests {
 
         // A refused connect is not a half-connect: the aim must not have moved either.
         assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, None, "aim must stay local");
+    }
+
+    /// A remote cutter's connection belongs to the Cut Host, not this desktop. Routing
+    /// `disconnect` unconditionally to the local manager used to close the local cutter's
+    /// transport and discard its parked job while the operator was aimed at a Pi, silently.
+    #[test]
+    fn disconnect_while_aimed_at_a_host_leaves_the_local_manager_untouched() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() });
+
+        dev.disconnect().expect("disconnecting a remote aim is bookkeeping only");
+        assert!(dev.connected.lock().unwrap().is_none(), "the aim itself must still clear");
+
+        // Re-aim locally: if `disconnect` had reached the local manager, this would now read
+        // `Disconnected` instead of the `Idle` it started at.
+        dev.connected.lock().unwrap().replace(test_instance());
+        assert_eq!(dev.status().phase, Phase::Idle, "the local manager's connection must have survived untouched");
     }
 
     /// Naming a host that was forgotten (or never paired) must be refused rather than falling

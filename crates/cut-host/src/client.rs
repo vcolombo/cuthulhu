@@ -103,8 +103,9 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 ///
 /// A host that refuses is instant; one that is silently unreachable — a dropped SYN, a
 /// firewall discarding rather than refusing — would otherwise block for the OS default,
-/// which is tens of seconds. The desktop holds a lock across this call while listing
-/// devices, so an unbounded wait here is a frozen device list.
+/// which is tens of seconds. The desktop holds *that host's* connection lock across this call
+/// while listing devices — not the lock over all hosts — so an unbounded wait here is a frozen
+/// device list, but no longer a frozen everything-else.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct HostClient {

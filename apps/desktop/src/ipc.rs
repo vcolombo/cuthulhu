@@ -176,9 +176,9 @@ pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
 
-// async: reads each paired host's connection, so it can queue behind whichever one host
-// `list_devices` is dialling at that moment (up to that host's 30s, not the whole sweep) — on the
-// main thread that is a frozen window, not just a slow one.
+// async: reads each paired host's connection in the same order `list_devices` dials them, so
+// against a sweep of unreachable hosts it trails one host behind and can approach the sweep's
+// total — on the main thread that is a frozen window, not just a slow one.
 #[tauri::command(async)]
 pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHostView>, IpcError> {
     Ok(dev.host_views())

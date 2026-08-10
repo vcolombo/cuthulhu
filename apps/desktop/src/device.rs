@@ -204,9 +204,11 @@ impl DeviceManagerHandle {
 
     /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
     ///
-    /// Reads each connection in turn, so it can still queue behind whatever one host is currently
-    /// dialling — one host's call, though, not the whole sweep the map lock used to make it wait
-    /// for.
+    /// Reads each connection in turn, so it still waits on a host `list_devices` is dialling. It
+    /// walks the same map in the same order, so against a sweep of unreachable hosts it trails one
+    /// host behind and the total approaches the sweep's — the same wait as before, just no longer
+    /// blocking anything else meanwhile. No safety verb is on this path, which is why that is
+    /// tolerable here and would not be on `status` or `cancel`.
     pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
         self.host_conns()
             .into_iter()

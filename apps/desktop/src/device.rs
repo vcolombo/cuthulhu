@@ -252,6 +252,12 @@ impl DeviceManagerHandle {
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
 
         self.remove_host(id);
+        // Otherwise `get_connected_device` keeps answering with a device `list_devices` no
+        // longer lists: the aim would survive the host it named.
+        let mut connected = self.connected.lock().unwrap();
+        if connected.as_ref().and_then(|d| d.host.as_ref()) == Some(id) {
+            *connected = None;
+        }
         Ok(())
     }
 
@@ -1113,5 +1119,41 @@ mod tests {
 
         dev.forget(&id, &hosts_path).expect("nothing is running on it");
         assert!(dev.paired_hosts().is_empty());
+    }
+
+    /// Otherwise `get_connected_device` keeps answering with a device `list_devices` no longer
+    /// lists — the aim would silently outlive the host it named.
+    #[test]
+    fn forgetting_the_connected_host_clears_the_aim() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+
+        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
+    }
+
+    /// Forgetting one host must not disturb an aim pointed at a different one.
+    #[test]
+    fn forgetting_an_unrelated_host_leaves_the_aim_alone() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+
+        dev.forget(&HostId("host-elsewhere".into()), &hosts_path).expect("nothing is running on it");
+        assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
     }
 }

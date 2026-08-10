@@ -176,7 +176,8 @@ pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
 }
 
-// async: takes the same `hosts` mutex `list_devices` can hold for up to 30s per host — on the
+// async: reads each paired host's connection, so it can queue behind whichever one host
+// `list_devices` is dialling at that moment (up to that host's 30s, not the whole sweep) — on the
 // main thread that is a frozen window, not just a slow one.
 #[tauri::command(async)]
 pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHostView>, IpcError> {

@@ -87,6 +87,22 @@ pub fn default_hosts_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("cuthulhu").join("hosts.json"))
 }
 
+/// What startup calls: never lets a missing config directory, or a missing, unreadable, or
+/// corrupt `hosts.json`, keep the app from launching on its local cutter — pairing a Pi is meant
+/// to be optional, so a broken save of that preference must not become a reason to refuse to
+/// start. `on_error` is how the operator is still told, since silently discarding a corrupt file
+/// is how they'd end up re-pairing over the top of hosts they still have without knowing why.
+pub fn load_or_warn(path: Option<&Path>, on_error: impl FnOnce(&HostsError)) -> Vec<PairedHost> {
+    let Some(path) = path else { return Vec::new() };
+    match load(path) {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            on_error(&e);
+            Vec::new()
+        }
+    }
+}
+
 /// The next unused id.
 ///
 /// Counts past the highest ever used rather than filling gaps: a saved reference to a host the
@@ -216,5 +232,26 @@ mod tests {
     #[test]
     fn an_unrecognised_id_shape_does_not_stop_a_new_one() {
         assert_eq!(next_id(&[a_host("imported-by-hand", "a")]), HostId("host-1".into()));
+    }
+
+    /// Pairing a Pi is optional. A corrupt `hosts.json` must not be a reason the app refuses to
+    /// start on its local cutter — it must be reported and treated as no hosts, not propagated.
+    #[test]
+    fn a_corrupt_file_yields_no_hosts_instead_of_blocking_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let mut warned = false;
+        let hosts = load_or_warn(Some(&path), |_| warned = true);
+        assert!(hosts.is_empty(), "a corrupt file must not surface as paired hosts");
+        assert!(warned, "the operator should still be told, just not blocked by it");
+    }
+
+    /// A system with no config directory at all is the same story: no hosts, no crash.
+    #[test]
+    fn no_config_directory_yields_no_hosts() {
+        let hosts = load_or_warn(None, |_| panic!("nothing to warn about"));
+        assert!(hosts.is_empty());
     }
 }

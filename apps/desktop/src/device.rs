@@ -73,6 +73,20 @@ enum Route {
     Host(HostId),
 }
 
+/// What the UI is told about a paired Cut Host.
+///
+/// Deliberately not `PairedHost`: that holds the token, and anything sent to the webview can
+/// reach a `console.log` or a devtools session. The UI needs to render a row and address the
+/// host by id; it does not need the secret.
+#[derive(Clone, Debug, Serialize)]
+pub struct PairedHostView {
+    pub id: HostId,
+    pub name: String,
+    pub address: String,
+    /// Why this host cannot be reached, or `None` when it can.
+    pub unreachable: Option<String>,
+}
+
 /// How long `status()` will wait on a Cut Host before reporting disconnected. Short on purpose:
 /// this is the window-close guard's own read, and it goes through the same `hosts` lock as every
 /// other host call, so a poll that waited the full `DEFAULT_BODY_TIMEOUT` (30s) would make a quit
@@ -144,10 +158,6 @@ impl DeviceManagerHandle {
     }
 
     /// Every paired host and why it is unreachable, or `None` if it is not.
-    // ponytail: only tests call this until Task 6 wires it to an IPC command, so a normal
-    // (non-test) build sees it as unused. Suppressed rather than left to warn, since the CI
-    // gate is warning-free builds, not just passing tests.
-    #[allow(dead_code)]
     pub(crate) fn host_errors(&self) -> Vec<(HostId, Option<String>)> {
         self.hosts
             .lock()
@@ -155,6 +165,27 @@ impl DeviceManagerHandle {
             .iter()
             .map(|(id, h)| (id.clone(), h.last_error.clone()))
             .collect()
+    }
+
+    /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
+    ///
+    /// Built on `host_errors` plus `paired_hosts` rather than a third scan of the map — two
+    /// short locks instead of one is a fine trade for not maintaining the same iteration twice.
+    pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
+        let errors: HashMap<HostId, Option<String>> = self.host_errors().into_iter().collect();
+        self.paired_hosts()
+            .into_iter()
+            .map(|p| {
+                let unreachable = errors.get(&p.id).cloned().flatten();
+                PairedHostView { id: p.id, name: p.name, address: p.address, unreachable }
+            })
+            .collect()
+    }
+
+    /// Every paired host as saved, for `pair_host`/`forget_host` to re-derive `hosts.json`'s
+    /// on-disk contents and to mint the next id against.
+    pub(crate) fn paired_hosts(&self) -> Vec<PairedHost> {
+        self.hosts.lock().unwrap().values().map(|h| h.paired.clone()).collect()
     }
 
     /// Capability is the Driver's answer, not ours — the Driver that encodes the
@@ -730,5 +761,29 @@ mod tests {
         dev.remove_host(&HostId("host-1".into()));
         assert!(dev.host_errors().is_empty());
         assert!(dev.list_devices().iter().all(|d| d.host.is_none()));
+    }
+
+    /// The token must not leave the Rust side. A view type is the guard, and this is what stops
+    /// a later refactor from "simplifying" it back to sending `PairedHost`.
+    #[test]
+    fn a_host_view_carries_no_token() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        // `unreachable` is `None` here on purpose: nothing has dialled this host yet, and the
+        // view reports what is known rather than provoking a connection to find out.
+        let views = dev.host_views();
+        assert_eq!(views.len(), 1);
+        let json = serde_json::to_string(&views[0]).unwrap();
+        assert!(!json.contains("s3cret"), "a token reached the view: {json}");
+        assert!(json.contains("host-1"), "the id is what the UI addresses: {json}");
+    }
+
+    #[test]
+    fn pairing_mints_an_id_that_does_not_collide() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let next = crate::hosts::next_id(&dev.paired_hosts());
+        assert_eq!(next, HostId("host-2".into()));
     }
 }

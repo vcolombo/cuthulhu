@@ -2,9 +2,9 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
-use driver_core::{CutStatus, DeviceInfo, MachineCaps};
+use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
-use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PlanCutResponse};
+use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PairedHostView, PlanCutResponse};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 
@@ -169,6 +169,55 @@ pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
 #[tauri::command]
 pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
+}
+
+#[tauri::command]
+pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHostView>, IpcError> {
+    Ok(dev.host_views())
+}
+
+/// Prove a host without saving it. The pairing dialog calls this before `pair_host`, so an
+/// entry that has never worked is never written.
+#[tauri::command]
+pub fn test_host(address: String, token: String, fingerprint: String) -> Result<Vec<DeviceInfo>, IpcError> {
+    cut_host::client::HostClient::pair_check(&address, &token, &fingerprint)
+        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))
+}
+
+#[tauri::command]
+pub fn pair_host(
+    dev: tauri::State<DeviceManagerHandle>,
+    name: String,
+    address: String,
+    token: String,
+    fingerprint: String,
+) -> Result<PairedHostView, IpcError> {
+    // Prove it before writing it down, so a saved host has always worked at least once.
+    cut_host::client::HostClient::pair_check(&address, &token, &fingerprint)
+        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))?;
+
+    let paired = crate::hosts::PairedHost {
+        id: crate::hosts::next_id(&dev.paired_hosts()),
+        name,
+        address,
+        fingerprint,
+        token,
+    };
+    dev.add_host(paired.clone());
+    save_hosts(&dev)?;
+    Ok(PairedHostView { id: paired.id, name: paired.name, address: paired.address, unreachable: None })
+}
+
+#[tauri::command]
+pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId) -> Result<(), IpcError> {
+    dev.remove_host(&id);
+    save_hosts(&dev)
+}
+
+fn save_hosts(dev: &DeviceManagerHandle) -> Result<(), IpcError> {
+    let path = crate::hosts::default_hosts_path()
+        .ok_or_else(|| IpcError::new("no_config_dir", "this system has no configuration directory"))?;
+    crate::hosts::save(&path, &dev.paired_hosts()).map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))
 }
 
 /// Paths the user has actually chosen in the native picker this session.

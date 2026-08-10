@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 
 use desktop::device::DeviceManagerHandle;
 use driver_registry::HardwareBackendFactory;
+use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
 
@@ -23,6 +24,15 @@ fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
 
 fn main() {
     let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
+
+    // A host that fails to load is not a reason to refuse to start — the desktop still cuts on
+    // local hardware, and the operator can re-pair. Say so once rather than failing silently.
+    let paired = hosts::load_or_warn(hosts::default_hosts_path().as_deref(), |e| {
+        eprintln!("cuthulhu: paired hosts could not be loaded: {e}")
+    });
+    for host in paired {
+        dev_handle.add_host(host);
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -59,6 +69,10 @@ fn main() {
             ipc::machine_caps,
             ipc::save_preset,
             ipc::delete_preset,
+            ipc::list_hosts,
+            ipc::test_host,
+            ipc::pair_host,
+            ipc::forget_host,
             ipc::trace_image,
             ipc::trace_controls,
             ipc::load_image_preview,

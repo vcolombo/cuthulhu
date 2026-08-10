@@ -286,8 +286,26 @@ impl DeviceManagerHandle {
         }
     }
 
+    /// Whether the local `DeviceManager` currently has a cut in flight, asked directly rather
+    /// than through `status()` at the current aim — the whole point is to catch this *before*
+    /// the aim moves away from local, which is what would make `status()` stop seeing it.
+    fn local_cut_is_active(&self) -> bool {
+        match self.local_manager.lock().unwrap().as_ref() {
+            Some(mgr) => mgr.status().is_active(),
+            None => false,
+        }
+    }
+
     pub fn connect(&self, info: DeviceInfo) -> Result<(), IpcError> {
-        match self.route(&info)? {
+        let route = self.route(&info)?;
+        // A moving blade must not become unstoppable: the window-close guard and `cancel` both
+        // read the *current* aim, so moving it to a host mid-cut would deafen the guard (it would
+        // see the host's `Idle` instead) and mis-route `cancel` to a machine that was never
+        // asked to stop. Mirrors `forget`'s busy refusal.
+        if matches!(route, Route::Host(_)) && self.local_cut_is_active() {
+            return Err(IpcError::new("device_error", format!("{:?}", driver_core::manager::DeviceError::Busy)));
+        }
+        match route {
             Route::Local => {
                 self.manager()?
                     .connect(info.clone())
@@ -780,6 +798,28 @@ mod tests {
         let dev = test_device_setup();
         assert_eq!(dev.status().phase, driver_core::Phase::Idle);
         assert!(dev.cancel().is_ok(), "a local cancel reaches the local manager");
+    }
+
+    /// A moving blade must not become unstoppable: the window-close guard and `cancel` both act
+    /// on the *current* aim, so letting `connect` move it to a host mid-cut would deafen the
+    /// guard (it would see the host's `Idle`) and mis-route `cancel` to a machine that was never
+    /// asked to stop. Mirrors `forget`'s own busy refusal.
+    #[test]
+    fn connect_refuses_to_move_the_aim_off_an_active_local_cut() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        assert!(dev.status().is_active(), "the local cut must be parked mid-flight for this test to mean anything");
+
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let elsewhere = DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() };
+        let err = dev.connect(elsewhere).unwrap_err();
+        assert_eq!(err.code, "device_error", "got {err:?}");
+
+        // A refused connect is not a half-connect: the aim must not have moved either.
+        assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, None, "aim must stay local");
     }
 
     /// Naming a host that was forgotten (or never paired) must be refused rather than falling

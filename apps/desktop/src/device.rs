@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use cut_host::client::HostClient;
@@ -126,7 +127,7 @@ impl DeviceManagerHandle {
     /// Local hardware plus every paired Cut Host's cutters, in one list.
     ///
     /// A host that cannot be reached contributes nothing here and its reason shows up in
-    /// `host_errors` — the list is what can be cut on, not what has been configured.
+    /// `host_views` — the list is what can be cut on, not what has been configured.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut all = self.local_factory.list_devices();
         let mut hosts = self.hosts.lock().unwrap();
@@ -157,35 +158,80 @@ impl DeviceManagerHandle {
         self.hosts.lock().unwrap().remove(id);
     }
 
-    /// Every paired host and why it is unreachable, or `None` if it is not.
-    pub(crate) fn host_errors(&self) -> Vec<(HostId, Option<String>)> {
+    /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
+    pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
         self.hosts
             .lock()
             .unwrap()
-            .iter()
-            .map(|(id, h)| (id.clone(), h.last_error.clone()))
-            .collect()
-    }
-
-    /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
-    ///
-    /// Built on `host_errors` plus `paired_hosts` rather than a third scan of the map — two
-    /// short locks instead of one is a fine trade for not maintaining the same iteration twice.
-    pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
-        let errors: HashMap<HostId, Option<String>> = self.host_errors().into_iter().collect();
-        self.paired_hosts()
-            .into_iter()
-            .map(|p| {
-                let unreachable = errors.get(&p.id).cloned().flatten();
-                PairedHostView { id: p.id, name: p.name, address: p.address, unreachable }
+            .values()
+            .map(|h| PairedHostView {
+                id: h.paired.id.clone(),
+                name: h.paired.name.clone(),
+                address: h.paired.address.clone(),
+                unreachable: h.last_error.clone(),
             })
             .collect()
     }
 
-    /// Every paired host as saved, for `pair_host`/`forget_host` to re-derive `hosts.json`'s
-    /// on-disk contents and to mint the next id against.
+    /// Every paired host as saved, for `pair`/`forget` to re-derive `hosts.json`'s on-disk
+    /// contents and to mint the next id against.
     pub(crate) fn paired_hosts(&self) -> Vec<PairedHost> {
         self.hosts.lock().unwrap().values().map(|h| h.paired.clone()).collect()
+    }
+
+    /// Pairs a Cut Host: prove it works, mint an id, persist — and only once the save has
+    /// actually landed, hold it in memory.
+    ///
+    /// `hosts::save` is written atomic for exactly this class of failure (full disk, read-only
+    /// config dir); ordering the in-memory insert after it means a failed save leaves disk and
+    /// memory agreeing (host absent from both) instead of a phantom host live in the device list
+    /// while the operator was told pairing failed.
+    pub fn pair(
+        &self,
+        name: String,
+        address: String,
+        token: String,
+        fingerprint: String,
+        hosts_path: &Path,
+    ) -> Result<HostId, IpcError> {
+        // Prove it before writing it down, so a saved host has always worked at least once.
+        HostClient::pair_check(&address, &token, &fingerprint)
+            .map_err(|e| IpcError::new("host_unreachable", e.to_string()))?;
+
+        let id = crate::hosts::next_id(&self.paired_hosts());
+        let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
+
+        let mut prospective = self.paired_hosts();
+        prospective.push(paired.clone());
+        crate::hosts::save(hosts_path, &prospective)
+            .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
+
+        self.add_host(paired);
+        Ok(id)
+    }
+
+    /// Forgets a Cut Host: refuses while any of its cutters is mid-cut, since the moment it is
+    /// gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could no
+    /// longer be stopped. Persist-then-mutate for the same reason as `pair`.
+    pub fn forget(&self, id: &HostId, hosts_path: &Path) -> Result<(), IpcError> {
+        // An unreachable host answers nothing, so it reports nothing as active — and there was
+        // nothing `cancel` could have stopped there either. Only a host that answers and says
+        // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
+        if let Ok(snapshots) = self.with_host(id, |c| c.snapshots()) {
+            if snapshots.iter().any(|s| s.status.is_active()) {
+                return Err(IpcError::new(
+                    "host_busy",
+                    "a cut is active on this host; cancel it before forgetting",
+                ));
+            }
+        }
+
+        let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
+        crate::hosts::save(hosts_path, &prospective)
+            .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
+
+        self.remove_host(id);
+        Ok(())
     }
 
     /// Capability is the Driver's answer, not ours — the Driver that encodes the
@@ -712,9 +758,9 @@ mod tests {
         let listed = dev.list_devices();
         assert!(listed.iter().all(|d| d.host.is_none()), "an unreachable host contributes none");
 
-        let reasons = dev.host_errors();
-        assert_eq!(reasons.len(), 1, "the host stays known: {reasons:?}");
-        assert!(reasons[0].1.is_some(), "and says why it is unreachable");
+        let views = dev.host_views();
+        assert_eq!(views.len(), 1, "the host stays known: {views:?}");
+        assert!(views[0].unreachable.is_some(), "and says why it is unreachable");
     }
 
     /// A cutter with no host is this computer's, and must reach the local DeviceManager — the
@@ -756,10 +802,10 @@ mod tests {
     fn forgetting_a_host_removes_it_and_its_cutters() {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
-        assert_eq!(dev.host_errors().len(), 1, "known as soon as it is added");
+        assert_eq!(dev.host_views().len(), 1, "known as soon as it is added");
 
         dev.remove_host(&HostId("host-1".into()));
-        assert!(dev.host_errors().is_empty());
+        assert!(dev.host_views().is_empty());
         assert!(dev.list_devices().iter().all(|d| d.host.is_none()));
     }
 
@@ -785,5 +831,180 @@ mod tests {
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
         let next = crate::hosts::next_id(&dev.paired_hosts());
         assert_eq!(next, HostId("host-2".into()));
+    }
+
+    // --- pair()/forget(): network refusals, persist-then-mutate, busy-host refusal ---
+    //
+    // `crates/cut-host/tests/fixtures/mod.rs` has this exact fixture already, but it lives in a
+    // separate integration-test crate and cannot be imported from here — so this is the same
+    // loopback host, built from the same public `cut_host` API, kept alive by the same
+    // `_dir: TempDir` trick (dropping it deletes the cert directory `serve_on` reads its key from).
+
+    struct LoopbackHost {
+        addr: String,
+        fingerprint: String,
+        _dir: tempfile::TempDir,
+    }
+
+    const HOST_TOKEN: &str = "test-token";
+
+    fn start_loopback_host() -> LoopbackHost {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let config = cut_host::config::Config {
+            bind: listener.local_addr().unwrap(),
+            tokens: [("test-client".to_string(), HOST_TOKEN.to_string())].into_iter().collect(),
+            max_frame: cut_host::frame::DEFAULT_MAX_FRAME,
+            cert_dir: dir.path().to_path_buf(),
+        };
+        // Generated before `Host::start`, so the client has something to pin before the
+        // server has accepted anything.
+        let fingerprint = cut_host::serve::fingerprint_of_cert_dir(&config.cert_dir).unwrap();
+        let host = cut_host::host::Host::start(Arc::new(cut_host::host::testing::TwoCutterFactory));
+
+        std::thread::spawn(move || {
+            let _ = cut_host::serve::serve_on(listener, host, config);
+        });
+        LoopbackHost { addr, fingerprint, _dir: dir }
+    }
+
+    /// A regular file where a directory needs to be, so `create_dir_all` — and therefore every
+    /// `hosts::save` — fails without touching real filesystem permissions.
+    fn unwritable_hosts_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        blocker.join("hosts.json")
+    }
+
+    #[test]
+    fn pairing_with_the_wrong_token_is_refused_and_saves_nothing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), "wrong-token".into(), host.fingerprint.clone(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists(), "a pairing that never proved itself must not be written");
+    }
+
+    #[test]
+    fn pairing_with_the_wrong_fingerprint_is_refused_and_saves_nothing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), "wrong:fingerprint".into(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists());
+    }
+
+    #[test]
+    fn pairing_an_unreachable_address_is_refused_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        // The conventional black-holed address: routable, never answering.
+        let err = dev.pair("Pi".into(), "10.255.255.1:7878".into(), "token".into(), "aa:bb:cc".into(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists());
+    }
+
+    #[test]
+    fn a_pair_that_fails_to_save_adds_nothing_in_memory() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = unwritable_hosts_path(dir.path());
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path);
+        assert!(err.is_err(), "the save must fail against this path");
+        assert!(dev.paired_hosts().is_empty(), "a failed save must not leave a phantom host in memory");
+    }
+
+    #[test]
+    fn a_forget_that_fails_to_save_removes_nothing_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = unwritable_hosts_path(dir.path());
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path);
+        assert!(err.is_err(), "the save must fail against this path");
+        assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
+    }
+
+    #[test]
+    fn a_host_with_an_active_cut_refuses_to_be_forgotten() {
+        use std::time::{Duration, Instant};
+
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        // `dispatch` returns as soon as the daemon accepts the id; the cut itself runs on a
+        // thread there (`Host::dispatch`). Poll until the cutter reports busy rather than
+        // asserting on a race.
+        let client = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        client
+            .dispatch(
+                cut_host::protocol::DispatchId("d-1".into()),
+                cut_host::host::testing::CAMEO,
+                "cameo5",
+                vec![CutPass {
+                    job: driver_core::Job {
+                        polylines: vec![vec![
+                            geometry::Point { x: 0.0, y: 0.0 },
+                            geometry::Point { x: 10.0, y: 0.0 },
+                            geometry::Point { x: 10.0, y: 10.0 },
+                            geometry::Point { x: 0.0, y: 0.0 },
+                        ]],
+                        settings: driver_core::Settings::default(),
+                    },
+                }],
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let busy = client
+                .snapshots()
+                .unwrap()
+                .iter()
+                .any(|s| s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active());
+            if busy {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the cutter never went active");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let err = dev.forget(&id, &hosts_path).expect_err("a moving blade must not become unstoppable");
+        assert_eq!(err.code, "host_busy");
+        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+    }
+
+    #[test]
+    fn an_idle_host_is_forgotten() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        assert!(dev.paired_hosts().is_empty());
     }
 }

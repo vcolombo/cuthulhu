@@ -254,4 +254,14 @@ mod tests {
         let hosts = load_or_warn(None, |_| panic!("nothing to warn about"));
         assert!(hosts.is_empty());
     }
+
+    /// A file that exists but cannot be read as text (here, it is actually a directory) must not
+    /// be confused with a missing one — `NotFound` means "no hosts yet", anything else is real.
+    #[test]
+    fn an_unreadable_path_is_an_error_not_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        std::fs::create_dir(&path).unwrap(); // reading a directory as a file fails non-NotFound
+        assert!(matches!(load(&path), Err(HostsError::Unreadable(_))));
+    }
 }

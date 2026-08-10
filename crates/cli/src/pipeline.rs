@@ -386,6 +386,7 @@ mod tests {
             machine_id: "puma".into(),
             transport: driver_core::TransportKind::Serial { path: "/dev/ttyS9".into(), baud: 9600 },
             candidate: true,
+            host: None,
         };
         let err = resolve_device_info("puma", std::slice::from_ref(&enumerated_port), None, 9600)
             .expect_err("must not guess which serial port is the Puma");
@@ -425,6 +426,7 @@ mod tests {
             machine_id: "cameo5".into(),
             transport: driver_core::TransportKind::Usb { locator: "1:4".into() },
             candidate: false,
+            host: None,
         }];
         let info = resolve_device_info("cameo5", &attached, Some("/dev/ttyUSB0"), 9600).expect("attached Cameo");
         assert_eq!(info.transport, driver_core::TransportKind::Usb { locator: "1:4".into() });

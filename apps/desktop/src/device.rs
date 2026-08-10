@@ -324,6 +324,7 @@ mod tests {
             machine_id: "cameo5".into(),
             transport: TransportKind::Usb { locator: "1:4".into() },
             candidate: false,
+            host: None,
         }
     }
 

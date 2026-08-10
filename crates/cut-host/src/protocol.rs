@@ -86,8 +86,8 @@ mod tests {
     use super::*;
     use driver_core::manager::{CutPass, DeviceError, DeviceEvent, DeviceEventKind};
     use driver_core::{
-        Actions, ByteProgress, CutStatus, DeviceInfo, Ended, Job, PassPosition, Phase, Settings,
-        TransportKind,
+        Actions, ByteProgress, CutStatus, DeviceInfo, Ended, HostId, Job, PassPosition, Phase,
+        Settings, TransportKind,
     };
     use geometry::Point;
 
@@ -97,7 +97,17 @@ mod tests {
             machine_id: "cameo5".into(),
             transport: TransportKind::Usb { locator: "1:4".into() },
             candidate: false,
+            host: None,
         }
+    }
+
+    /// `driver-core` has no `serde_json` dependency to assert this round trip itself
+    /// (task 1 brief); `cut-host` already does, since the protocol it carries has to.
+    #[test]
+    fn a_host_id_round_trips_through_serde() {
+        let id = HostId("host-1".into());
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<HostId>(&json).unwrap(), id);
     }
 
     fn a_pass() -> CutPass {

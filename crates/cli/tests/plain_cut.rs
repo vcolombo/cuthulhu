@@ -160,6 +160,7 @@ fn info() -> DeviceInfo {
         machine_id: "cameo5".into(),
         transport: TransportKind::Usb { locator: "0:0".into() },
         candidate: false,
+        host: None,
     }
 }
 

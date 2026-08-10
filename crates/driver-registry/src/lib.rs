@@ -52,6 +52,9 @@ fn cameo5_devices() -> Vec<DeviceInfo> {
             machine_id: CAMEO5.into(),
             transport: TransportKind::Usb { locator },
             candidate: false, // USB is discriminated by VID/PID — not a guess
+            // Enumerated here, so it is on this computer. A Cut Host's cutters get their id
+            // stamped on by whoever fetched them, because the daemon does not know its own.
+            host: None,
         })
         .collect()
 }
@@ -64,6 +67,7 @@ fn puma_devices() -> Vec<DeviceInfo> {
             machine_id: PUMA.into(),
             transport: TransportKind::Serial { path, baud: 9600 },
             candidate: true, // any serial port could be a Puma — needs operator confirmation
+            host: None,
         })
         .collect()
 }
@@ -91,6 +95,7 @@ pub fn device_at_port(machine_id: &str, path: &str, baud: u32) -> Option<DeviceI
         machine_id: machine_id.to_string(),
         transport: TransportKind::Serial { path: path.to_string(), baud },
         candidate: true,
+        host: None,
     })
 }
 

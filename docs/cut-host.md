@@ -28,6 +28,15 @@ exists.
 
 ## Configure
 
+Create the directory before anything writes into it, owned by the account created above:
+
+```sh
+sudo install -d -m 0700 -o cuthulhu -g cuthulhu /etc/cuthulhu /var/lib/cuthulhu
+```
+
+`0700` owned by `cuthulhu` rather than root: the unit below runs the daemon as `User=cuthulhu`, and
+it has to be able to traverse the directory and read the file to load its own config.
+
 `/etc/cuthulhu/cutd.toml`:
 
 ```toml
@@ -45,13 +54,9 @@ workshop-laptop = "REPLACE-ME"
 ```
 
 ```sh
-sudo install -d -m 0700 -o cuthulhu -g cuthulhu /etc/cuthulhu /var/lib/cuthulhu
 sudo chown cuthulhu:cuthulhu /etc/cuthulhu/cutd.toml
 sudo chmod 0600 /etc/cuthulhu/cutd.toml
 ```
-
-`0700` owned by `cuthulhu` rather than root: the unit below runs the daemon as `User=cuthulhu`, and
-it has to be able to traverse the directory and read the file to load its own config.
 
 The certificate is generated into `/var/lib/cuthulhu/` on first run. Its fingerprint is printed at
 startup — that is what you confirm when pairing a desktop.
@@ -64,6 +69,26 @@ A Puma is reached over serial. Give the daemon's user access to the port:
 sudo usermod -a -G dialout cuthulhu
 ```
 
+## USB cutters
+
+A Cameo is reached directly over USB (`nusb` opens `/dev/bus/usb/...` on Linux), and Raspberry Pi
+OS leaves those device nodes `root:root 0664`. The `uaccess` tag that would normally grant access
+only applies to a logged-in seat user, which the `cuthulhu` system account is not, so without a
+rule the daemon's claim fails permission-denied and it reports "no cutter is attached" even though
+one is plugged in. Add a rule granting the `cuthulhu` group access to the Cameo's vendor id:
+
+```
+# /etc/udev/rules.d/60-cuthulhu.rules
+SUBSYSTEM=="usb", ATTR{idVendor}=="3844", MODE="0660", GROUP="cuthulhu"
+```
+
+```sh
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+A Cameo already plugged in when the rule is added keeps its old permissions until it is replugged
+(or the Pi is rebooted) — that is when udev re-evaluates the rule against it.
+
 ## Run it as a service
 
 `/etc/systemd/system/cuthulhu-cutd.service`:
@@ -72,16 +97,24 @@ sudo usermod -a -G dialout cuthulhu
 [Unit]
 Description=Cuthulhu Cut Host
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/cuthulhu-cutd --config /etc/cuthulhu/cutd.toml
 Restart=on-failure
+RestartSec=5
 User=cuthulhu
 StateDirectory=cuthulhu
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`After=` alone is a documented no-op: nothing pulls `network-online.target` into the boot
+transaction, so the ordering never applies without the matching `Wants=`. And a Pi commonly
+reaches `multi-user.target` before DHCP hands it an address, so `bind`ing a specific address like
+the example above fails on the first try; `RestartSec=5` gives the network time to come up instead
+of exhausting systemd's default restart burst and leaving the unit `failed`.
 
 ```sh
 sudo systemctl enable --now cuthulhu-cutd

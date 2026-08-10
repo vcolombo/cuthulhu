@@ -33,7 +33,7 @@ Two gaps those left open, both tracked and neither blocking: **#102** (the write
 ## Global Constraints
 
 - **SPDX header on every new file**: `// SPDX-License-Identifier: GPL-3.0-or-later`.
-- **`cargo test --workspace --locked`** is what CI runs; `--locked` is mandatory. This plan **does** add one dependency — `apps/desktop` gains `cut-host = { path = "../../crates/cut-host" }`, which it does not have today — so `Cargo.lock` is committed in the same commit as that change (Task 3). No third-party crate is added; everything else is already in the workspace.
+- **`cargo test --workspace --locked`** is what CI runs; `--locked` is mandatory. This plan **does** add one dependency — `apps/desktop` gains `cut-host = { path = "../../crates/cut-host" }`, which it does not have today — so `Cargo.lock` is committed in the same commit as that change (Task 4, where `HostClient` first enters `apps/desktop`). No third-party crate is added; everything else is already in the workspace.
 - **`CONTEXT.md` is normative vocabulary.** Use **Pass**, **Job**, **Driver**, **Transport**, **Preflight**, **Cut Host**. Never "proxy", "server", "relay" or "bridge" for the Cut Host.
 - **A caller is told about a cut through one value.** Render from `CutStatus::actions`; never reconstruct what is legal from a phase. `DeviceState` is `pub(crate)` in `driver-core` and must stay unreachable.
 - **Comments explain why, not what.** Where a step carries a comment, that comment is part of the deliverable. Do not add restating ones.
@@ -614,6 +614,11 @@ Add to `mod tests` in `apps/desktop/src/device.rs`:
         // Nothing is listening on this port, so connecting fails.
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
 
+        // `add_host` records the host without dialling it — connections are lazy — so the
+        // failure only exists once something asks for its cutters.
+        let listed = dev.list_devices();
+        assert!(listed.iter().all(|d| d.host.is_none()), "an unreachable host contributes none");
+
         let reasons = dev.host_errors();
         assert_eq!(reasons.len(), 1, "the host stays known: {reasons:?}");
         assert!(reasons[0].1.is_some(), "and says why it is unreachable");
@@ -623,7 +628,7 @@ Add to `mod tests` in `apps/desktop/src/device.rs`:
     fn forgetting_a_host_removes_it_and_its_cutters() {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
-        assert_eq!(dev.host_errors().len(), 1);
+        assert_eq!(dev.host_errors().len(), 1, "known as soon as it is added");
 
         dev.remove_host(&HostId("host-1".into()));
         assert!(dev.host_errors().is_empty());
@@ -989,6 +994,8 @@ Add to `mod tests` in `apps/desktop/src/device.rs` (the handle is what these com
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
 
+        // `unreachable` is `None` here on purpose: nothing has dialled this host yet, and the
+        // view reports what is known rather than provoking a connection to find out.
         let views = dev.host_views();
         assert_eq!(views.len(), 1);
         let json = serde_json::to_string(&views[0]).unwrap();

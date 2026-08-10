@@ -344,7 +344,10 @@ impl DeviceManagerHandle {
         // see the host's `Idle` instead) and mis-route `cancel` to a machine that was never
         // asked to stop. Mirrors `forget`'s busy refusal.
         if matches!(route, Route::Host(_)) && self.local_cut_is_active() {
-            return Err(IpcError::new("device_error", format!("{:?}", driver_core::manager::DeviceError::Busy)));
+            return Err(IpcError::new(
+                "device_error",
+                "a cut is active on the local cutter; cancel it before switching to another device",
+            ));
         }
         match route {
             Route::Local => {

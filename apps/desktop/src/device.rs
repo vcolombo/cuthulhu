@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use cut_host::client::HostClient;
 use cutplan::presets::{
     default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
     SettingsOverride,
 };
 use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
-use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, MachineCaps};
+use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, HostId, MachineCaps};
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::PairedHost;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -38,15 +41,43 @@ pub struct ConfiguredPassDto {
     pub repeat_count: Option<u32>,
 }
 
+/// One paired Cut Host: what was saved about it, its connection if it has one, and why it has
+/// none if it does not.
+///
+/// A host that is down keeps its entry so its cutters can be listed as unreachable rather than
+/// disappearing — a cutter that vanishes looks like one that was never paired (#42).
+pub(crate) struct HostConnection {
+    pub paired: PairedHost,
+    pub client: Option<HostClient>,
+    pub last_error: Option<String>,
+}
+
+impl HostConnection {
+    /// Connect if not already connected, and remember the reason if that fails.
+    fn ensure(&mut self) -> Option<&HostClient> {
+        if self.client.is_none() {
+            match HostClient::connect(&self.paired.address, &self.paired.token, &self.paired.fingerprint) {
+                Ok(c) => {
+                    self.client = Some(c);
+                    self.last_error = None;
+                }
+                Err(e) => self.last_error = Some(e.to_string()),
+            }
+        }
+        self.client.as_ref()
+    }
+}
+
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
 /// through here and never touch the document mutex.
 pub struct DeviceManagerHandle {
-    factory: Arc<dyn DeviceBackendFactory>,
-    // ponytail: brief says `Arc<DeviceManager>`; `DeviceManager::shutdown(self)`
-    // consumes by value, so the Arc is wrapped in Option to let `shutdown()`
-    // `.take()` it out and `Arc::try_unwrap` it. Upgrade if a design ever needs
-    // several live handles to the same manager (not the case here — one per app).
-    manager: Mutex<Option<Arc<DeviceManager>>>,
+    local_factory: Arc<dyn DeviceBackendFactory>,
+    // ponytail: brief said `Arc<DeviceManager>`; `DeviceManager::shutdown(self)` consumes by
+    // value, so the Arc is wrapped in Option to let `shutdown()` take it out and unwrap it.
+    local_manager: Mutex<Option<Arc<DeviceManager>>>,
+    /// Every paired Cut Host, connected lazily. Held together rather than one-at-a-time
+    /// because `list_devices` asks all of them and the device list shows them together.
+    hosts: Mutex<HashMap<HostId, HostConnection>>,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -54,20 +85,65 @@ impl DeviceManagerHandle {
     pub fn new(factory: Arc<dyn DeviceBackendFactory>) -> (Self, std::sync::mpsc::Receiver<DeviceEvent>) {
         let (mgr, events) = DeviceManager::spawn(factory.clone());
         let handle = DeviceManagerHandle {
-            factory,
-            manager: Mutex::new(Some(Arc::new(mgr))),
+            local_factory: factory,
+            local_manager: Mutex::new(Some(Arc::new(mgr))),
+            hosts: Mutex::new(HashMap::new()),
             connected: Mutex::new(None),
         };
         (handle, events)
     }
 
     fn manager(&self) -> Result<Arc<DeviceManager>, IpcError> {
-        self.manager.lock().unwrap().clone()
+        self.local_manager.lock().unwrap().clone()
             .ok_or_else(|| IpcError::new("shut_down", "device manager has been shut down"))
     }
 
+    /// Local hardware plus every paired Cut Host's cutters, in one list.
+    ///
+    /// A host that cannot be reached contributes nothing here and its reason shows up in
+    /// `host_errors` — the list is what can be cut on, not what has been configured.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
-        self.factory.list_devices()
+        let mut all = self.local_factory.list_devices();
+        let mut hosts = self.hosts.lock().unwrap();
+        for (id, host) in hosts.iter_mut() {
+            let Some(client) = host.ensure() else { continue };
+            match client.devices() {
+                Ok(devices) => all.extend(crate::hosts::stamp_host(id, devices)),
+                Err(e) => {
+                    // The connection went away between `ensure` and here; drop it so the next
+                    // call reconnects rather than reusing a dead one.
+                    host.last_error = Some(e.to_string());
+                    host.client = None;
+                }
+            }
+        }
+        all
+    }
+
+    pub fn add_host(&self, paired: PairedHost) {
+        let id = paired.id.clone();
+        self.hosts
+            .lock()
+            .unwrap()
+            .insert(id, HostConnection { paired, client: None, last_error: None });
+    }
+
+    pub fn remove_host(&self, id: &HostId) {
+        self.hosts.lock().unwrap().remove(id);
+    }
+
+    /// Every paired host and why it is unreachable, or `None` if it is not.
+    // ponytail: only tests call this until Task 6 wires it to an IPC command, so a normal
+    // (non-test) build sees it as unused. Suppressed rather than left to warn, since the CI
+    // gate is warning-free builds, not just passing tests.
+    #[allow(dead_code)]
+    pub(crate) fn host_errors(&self) -> Vec<(HostId, Option<String>)> {
+        self.hosts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, h)| (id.clone(), h.last_error.clone()))
+            .collect()
     }
 
     /// Capability is the Driver's answer, not ours — the Driver that encodes the
@@ -75,7 +151,7 @@ impl DeviceManagerHandle {
     /// `Result`, not `Option`: an id the registry cannot build means the caller
     /// is out of sync with it, which is worth surfacing rather than defaulting.
     pub fn caps_for(&self, machine_id: &str) -> Result<MachineCaps, IpcError> {
-        self.factory
+        self.local_factory
             .driver_for(machine_id)
             .map(|d| d.caps())
             .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{machine_id}`")))
@@ -97,7 +173,7 @@ impl DeviceManagerHandle {
     /// never blocks on the worker — so the window-close handler and the IPC
     /// command can both call it freely, even mid-transmit.
     pub fn status(&self) -> CutStatus {
-        match self.manager.lock().unwrap().as_ref() {
+        match self.local_manager.lock().unwrap().as_ref() {
             Some(mgr) => mgr.status(),
             None => CutStatus::disconnected(),
         }
@@ -121,7 +197,7 @@ impl DeviceManagerHandle {
     /// clone is briefly alive), that's a non-fatal race at process exit — log
     /// and move on rather than block or panic.
     pub fn shutdown(&self) {
-        let Some(arc) = self.manager.lock().unwrap().take() else { return };
+        let Some(arc) = self.local_manager.lock().unwrap().take() else { return };
         match Arc::try_unwrap(arc) {
             Ok(mgr) => mgr.shutdown(),
             Err(_) => eprintln!("device manager shutdown skipped: a call was still in flight"),
@@ -143,7 +219,7 @@ impl DeviceManagerHandle {
             return Err(IpcError::new("device_mismatch", "connected device changed since planning"));
         }
 
-        let driver = self.factory.driver_for(&connected.machine_id)
+        let driver = self.local_factory.driver_for(&connected.machine_id)
             .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{}`", connected.machine_id)))?;
         let profile = driver.profile().clone();
         let caps = driver.caps();
@@ -438,5 +514,56 @@ mod tests {
         assert_eq!(json["supportsSpeed"], serde_json::json!(true));
         assert_eq!(json["supportsForce"], serde_json::json!(false));
         assert_eq!(json["needsOperatorPassConfirm"], serde_json::json!(true));
+    }
+
+    use crate::hosts::PairedHost;
+    use driver_core::HostId;
+
+    fn a_paired_host(id: &str, addr: &str) -> PairedHost {
+        PairedHost {
+            id: HostId(id.into()),
+            name: "Workshop Pi".into(),
+            address: addr.into(),
+            fingerprint: "aa:bb:cc".into(),
+            token: "s3cret".into(),
+        }
+    }
+
+    /// A user who never pairs a Pi must see exactly what they see today. This is the test that
+    /// says the feature is optional by construction rather than by intention.
+    #[test]
+    fn with_no_host_paired_the_device_list_is_the_local_one() {
+        let dev = test_device_setup();
+        let listed = dev.list_devices();
+        assert!(listed.iter().all(|d| d.host.is_none()), "{listed:?}");
+    }
+
+    /// A host that cannot be reached keeps its place in the list rather than vanishing — a
+    /// cutter that disappears looks like one that was never paired.
+    #[test]
+    fn an_unreachable_host_is_still_listed_with_its_reason() {
+        let dev = test_device_setup();
+        // Nothing is listening on this port, so connecting fails.
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        // `add_host` records the host without dialling it — connections are lazy — so the
+        // failure only exists once something asks for its cutters.
+        let listed = dev.list_devices();
+        assert!(listed.iter().all(|d| d.host.is_none()), "an unreachable host contributes none");
+
+        let reasons = dev.host_errors();
+        assert_eq!(reasons.len(), 1, "the host stays known: {reasons:?}");
+        assert!(reasons[0].1.is_some(), "and says why it is unreachable");
+    }
+
+    #[test]
+    fn forgetting_a_host_removes_it_and_its_cutters() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        assert_eq!(dev.host_errors().len(), 1, "known as soon as it is added");
+
+        dev.remove_host(&HostId("host-1".into()));
+        assert!(dev.host_errors().is_empty());
+        assert!(dev.list_devices().iter().all(|d| d.host.is_none()));
     }
 }

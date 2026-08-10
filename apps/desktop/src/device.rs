@@ -353,8 +353,16 @@ impl DeviceManagerHandle {
                     .map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
             }
             // A Cut Host connects each cutter itself at startup, so aiming at one is a local
-            // bookkeeping act: there is no remote connection to open.
-            Route::Host(_) => {}
+            // bookkeeping act: there is no remote connection to open. But the local manager must
+            // still be released — `DeviceManager::connect` refuses anything but
+            // `Disconnected`/`Error`, so leaving it `Idle` after aiming away would strand the
+            // operator on the Pi for the rest of the session, unable to aim back at their own
+            // cutter. Safe unconditionally: the guard above already refused this arm if a local
+            // cut is active, so this can only disconnect an idle (or already-disconnected)
+            // manager — freeing the USB device for other software as a side effect.
+            Route::Host(_) => {
+                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
         }
         *self.connected.lock().unwrap() = Some(info);
         Ok(())
@@ -875,6 +883,20 @@ mod tests {
 
         // A refused connect is not a half-connect: the aim must not have moved either.
         assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, None, "aim must stay local");
+    }
+
+    /// Aiming at a host used to leave the local `DeviceManager` connected and `Idle` — and
+    /// `DeviceManager::connect` refuses anything but `Disconnected`/`Error` — so re-aiming
+    /// locally afterward returned `Busy`, stranding the operator's own cutter for the rest of
+    /// the session. `connect`'s `Route::Host` arm must release the local manager first.
+    #[test]
+    fn re_aiming_locally_after_a_host_succeeds() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let elsewhere = DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() };
+        dev.connect(elsewhere).expect("aiming at a host is bookkeeping only");
+
+        dev.connect(test_instance()).expect("must be able to aim back at the local cutter");
     }
 
     /// A remote cutter's connection belongs to the Cut Host, not this desktop. Routing

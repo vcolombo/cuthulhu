@@ -162,11 +162,14 @@ impl HostClient {
                     tcp = Some(s);
                     break;
                 }
-                Err(e) => last_err = Some(e),
+                // Named, not just the error: with several resolved addresses tried in turn, "the
+                // host could not be reached (Connection refused)" alone leaves the operator no
+                // way to tell which of them actually failed.
+                Err(e) => last_err = Some((sock_addr, e)),
             }
         }
         let tcp = tcp.ok_or_else(|| match last_err {
-            Some(e) => ClientError::Transport(e.to_string()),
+            Some((sock_addr, e)) => ClientError::Transport(format!("{sock_addr}: {e}")),
             None => ClientError::Transport(format!("`{addr}` resolved to no address")),
         })?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))

@@ -189,12 +189,14 @@ impl HostClient {
                 _ => ClientError::Transport(e.to_string()),
             }
         })?;
-        match read_frame::<_, Response>(
-            &mut stream,
-            4096,
-            Some(crate::frame::DEFAULT_BODY_TIMEOUT),
-            crate::frame::DEFAULT_BODY_TIMEOUT,
-        ) {
+        // The same `deadline` the connect loop used, not a fresh `timeout` and not
+        // `DEFAULT_BODY_TIMEOUT`: a peer that finishes the TLS handshake and then stalls before
+        // the greeting must not hold a caller's short budget open for the full 30s (what this
+        // used to pass), and must not get a *second* full `timeout` on top of what the connect
+        // loop already spent either — or `connect_within` as a whole could cost 2x its budget
+        // instead of 1x.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match read_frame::<_, Response>(&mut stream, 4096, Some(remaining), remaining) {
             Ok(Response::Ok) => {}
             Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
             Err(e) => {

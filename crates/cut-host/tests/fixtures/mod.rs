@@ -31,7 +31,7 @@ pub fn start_test_host() -> TestHost {
 
     let config = Config {
         bind: listener.local_addr().unwrap(),
-        token: TOKEN.to_string(),
+        tokens: [("test-client".to_string(), TOKEN.to_string())].into_iter().collect(),
         max_frame: cut_host::frame::DEFAULT_MAX_FRAME,
         cert_dir: dir.path().to_path_buf(),
     };

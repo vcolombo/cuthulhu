@@ -206,10 +206,14 @@ export function CutDialog({
   // A refusal keeps the row and shows the host's own words: the Rust side refuses with
   // `host_busy` while a cut is active there, and a row that vanished and came back would say
   // "gone" about the one host that still has a blade moving.
+  // A success re-reads both lists rather than dropping the host here. `devices` still holds that
+  // host's cutters, and a cutter naming a host nobody is paired with is precisely what earns an
+  // orphan section — so removing the row on its own renamed it to a raw host id and captioned it
+  // "not paired with this computer", which is a warning about a host the operator just dismissed.
   const forget = (id: string) => {
     forgetFrom(hosts, id, ipc.forgetHost).then((r) => {
-      setHosts(r.hosts);
-      if (r.message !== null) onError(r.message);
+      if (r.message === null) refreshList();
+      else onError(r.message);
     });
   };
 

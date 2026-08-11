@@ -216,6 +216,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let connected: DeviceInfo | null = null;
   let status: CutStatus = DISCONNECTED;
   let deviceStateCalls = 0;
+  let listDeviceCalls = 0;
   let nextJobId = 1;
   let jobId: number | null = null;
   let planPasses: { color: number | null; enabled: boolean }[] = [];
@@ -327,9 +328,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   }
 
   Object.assign(commands, {
-    // A host that answers slowly rather than not at all — the case a poll can queue behind,
-    // since nothing has failed and nothing will time out.
-    list_devices: () => (opts?.slowList ? new Promise((r) => setTimeout(() => r(devices), 3000)) : devices),
+    // A copy, as a Rust `Vec<DeviceInfo>` crossing the IPC boundary is. Handing out the live
+    // array let a later mutation here reach into React's own state and repair a list the
+    // frontend had not re-read — a fake that quietly fixes the frontend's bugs for it.
+    //
+    // Slow from the second call on when asked, so the first read (the one that puts a host in
+    // the list at all) does not itself eat the window a test is trying to observe.
+    list_devices: () => {
+      const slow = opts?.slowList && listDeviceCalls++ > 0;
+      return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
+    },
     connect_device: (a) => {
       const info = a.info as DeviceInfo;
       connected = info;
@@ -483,6 +491,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       if (hosts.some((h) => h.id === a.id && h.id === "host-1"))
         throw ipcError("host_busy", "a cut is active on this host; cancel it before forgetting");
       hosts = hosts.filter((h) => h.id !== a.id);
+      // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
+      // pairing that was just discarded, so it cannot still be reporting what is attached to it.
+      for (let i = devices.length - 1; i >= 0; i--) if (devices[i].host === a.id) devices.splice(i, 1);
       return null;
     },
     save_preset: () => null,
@@ -660,6 +671,29 @@ test("a refused token pairs nothing and says so in the host's own words", async 
 
   await expect(page.getByRole("alert")).toHaveText("the token was refused");
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+});
+
+// A host that is forgotten has to leave with its cutters. Dropping the row alone leaves them
+// naming a host nobody is paired with, which is the one thing `groupDevices` refuses to hide:
+// the row comes back as a raw host id under "this Cut Host is not paired with this computer".
+// The count is taken once, not awaited — the wrong row is the state right after the click, and
+// an assertion that retries would sit there until something else repaired it.
+test("forgetting a host takes its cutters with it, instead of renaming the row to a raw id", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  await page.getByLabel("Address").fill("pi.local:7878");
+  await page.getByLabel("Token").fill("correct-horse");
+  await page.getByLabel("Name (optional)").fill("Workshop Pi");
+  await page.getByRole("button", { name: "Pair", exact: true }).click();
+  await page.getByRole("button", { name: /It matches/ }).click();
+  await expect(page.getByRole("button", { name: "Forget Workshop Pi" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
+  await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+  expect(await page.getByText("this Cut Host is not paired with this computer").count()).toBe(0);
+  expect(await page.getByText("host-2").count()).toBe(0);
 });
 
 // The teardown is the deliverable, not the interval. A leaked interval keeps a Cut Host

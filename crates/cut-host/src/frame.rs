@@ -20,9 +20,9 @@ pub const DEFAULT_MAX_FRAME: usize = 32 * 1024 * 1024;
 /// performance target.
 pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often a blocked read wakes to re-check its deadline. The socket's own `SO_RCVTIMEO`,
-/// set by whoever owns the connection; the value only decides how promptly a stalled frame
-/// is noticed, not how long it is tolerated.
+/// How often a blocked read or write wakes to re-check its deadline. The socket's own
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`, set by whoever owns the connection; the value only decides how
+/// promptly a stalled frame is noticed, not how long it is tolerated.
 pub const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const CLOSED_MID_FRAME: &str = "the peer closed part-way through a frame";
@@ -52,13 +52,75 @@ impl std::fmt::Display for FrameError {
 }
 impl std::error::Error for FrameError {}
 
-pub fn write_frame<W: Write>(w: &mut W, value: &impl Serialize) -> io::Result<()> {
-    let body = serde_json::to_vec(value).map_err(io::Error::other)?;
+/// Write one frame, giving up on `timeout` rather than blocking forever.
+///
+/// The mirror of `read_frame`'s rule, and for the same reason: a peer that stops *reading* blocks
+/// this side once its receive window closes, with no RST and no FIN to notice. Bounding only the
+/// read half left the failure half-closed — a client freezing on a megabyte of polylines, and, on
+/// the daemon, a worker pinned in a write to a client that authenticated and then stopped draining.
+///
+/// A timeout mid-frame leaves part of a frame on the wire, which the peer would read as the next
+/// length header. That is why this reports `Timeout` rather than trying to recover: every caller
+/// drops the connection on an error from here, and a dropped connection cannot be misread.
+pub fn write_frame<W: Write>(
+    w: &mut W,
+    value: &impl Serialize,
+    timeout: Duration,
+) -> Result<(), FrameError> {
+    let body = serde_json::to_vec(value).map_err(|e| FrameError::Malformed(e.to_string()))?;
     let len = u32::try_from(body.len())
-        .map_err(|_| io::Error::other(format!("frame of {} bytes exceeds u32", body.len())))?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(&body)?;
-    w.flush()
+        .map_err(|_| FrameError::TooLarge { len: body.len(), max: u32::MAX as usize })?;
+
+    let deadline = Instant::now() + timeout;
+    drain(w, &len.to_be_bytes(), deadline)?;
+    drain(w, &body, deadline)?;
+
+    // Retried on the same deadline rather than called once: with rustls this is where the bytes
+    // actually reach the socket, and a `WouldBlock` there is a full receive window, not a fault.
+    // rustls keeps whatever it could not send, so a later flush resumes rather than re-sends.
+    loop {
+        match w.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if would_block(&e) => {
+                if Instant::now() >= deadline {
+                    return Err(FrameError::Timeout);
+                }
+            }
+            Err(e) => return Err(FrameError::Io(e.to_string())),
+        }
+    }
+}
+
+fn would_block(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
+/// Write all of `buf`, or fail — the write-side twin of `fill`, and it exists for the same reason
+/// `read_exact` could not be used there: `write_all` does not say how much it wrote before
+/// failing, so retrying a `WouldBlock` would resend bytes the peer already has and desynchronise
+/// the stream. This tracks its own progress so a retry resumes exactly where it stopped.
+///
+/// The retry is paced by the socket (`SO_SNDTIMEO`, `SOCKET_POLL_INTERVAL`), the same way `fill`
+/// is paced by `SO_RCVTIMEO`.
+fn drain(w: &mut impl Write, buf: &[u8], deadline: Instant) -> Result<(), FrameError> {
+    let mut written = 0;
+    while written < buf.len() {
+        // Before every write, not only a blocked one: a peer draining a byte at a time, always
+        // just faster than the socket timeout, never produces `WouldBlock` to check against.
+        if Instant::now() >= deadline {
+            return Err(FrameError::Timeout);
+        }
+        match w.write(&buf[written..]) {
+            Ok(0) => return Err(FrameError::Io("the peer stopped accepting the frame".into())),
+            Ok(n) => written += n,
+            Err(e) if would_block(&e) => {}
+            Err(e) => return Err(FrameError::Io(e.to_string())),
+        }
+    }
+    Ok(())
 }
 
 /// Fill `buf` completely, or fail — retrying reads that merely found no data yet, and giving up
@@ -106,7 +168,11 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<
 }
 
 /// Read one frame. `header_timeout` bounds the wait for it to *begin*; `body_timeout` bounds the
-/// rest of it, header and body alike, once the first byte has arrived.
+/// whole of the rest, header and body together, once the first byte has arrived.
+///
+/// One deadline for the remainder, not one per half. Two sequential deadlines made the worst case
+/// `header_timeout + 2x body_timeout` — three times the number anyone reading a call site has in
+/// their head — which a peer could spend by trickling a header and then stalling on the body (#118).
 ///
 /// The rule is not "headers are unbounded, bodies are not" — it is that a frame that is *owed*
 /// has a deadline, and a frame that may never come does not. A daemon's request loop reading the
@@ -128,7 +194,10 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(
     // eight above it — for the life of the process. Keepalive does not reach that peer; it is
     // alive and acknowledging, just not talking.
     fill(r, &mut header[..1], header_timeout.map(|d| Instant::now() + d))?;
-    fill(r, &mut header[1..], Some(Instant::now() + body_timeout)).map_err(|e| match e {
+    // Taken once, here: from the first byte on, the rest of this frame is owed, and everything
+    // that remains of it shares the one budget.
+    let owed = Instant::now() + body_timeout;
+    fill(r, &mut header[1..], Some(owed)).map_err(|e| match e {
         // A caller loops on `Eof` meaning "the peer left between frames"; past the first byte it
         // left mid-frame instead.
         FrameError::Eof => FrameError::Io(CLOSED_MID_FRAME.into()),
@@ -141,7 +210,7 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(
         return Err(FrameError::TooLarge { len, max });
     }
     let mut body = vec![0u8; len];
-    fill(r, &mut body, Some(Instant::now() + body_timeout))?;
+    fill(r, &mut body, Some(owed))?;
     serde_json::from_slice(&body).map_err(|e| FrameError::Malformed(e.to_string()))
 }
 
@@ -152,8 +221,8 @@ mod tests {
     #[test]
     fn a_frame_round_trips_through_a_pipe() {
         let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &"hello".to_string()).unwrap();
-        write_frame(&mut buf, &42u32).unwrap();
+        write_frame(&mut buf, &"hello".to_string(), DEFAULT_BODY_TIMEOUT).unwrap();
+        write_frame(&mut buf, &42u32, DEFAULT_BODY_TIMEOUT).unwrap();
 
         let mut cursor = std::io::Cursor::new(buf);
         let first: String =
@@ -220,7 +289,7 @@ mod tests {
     #[test]
     fn a_body_that_is_not_the_expected_shape_is_malformed() {
         let mut buf: Vec<u8> = Vec::new();
-        write_frame(&mut buf, &"a string".to_string()).unwrap();
+        write_frame(&mut buf, &"a string".to_string(), DEFAULT_BODY_TIMEOUT).unwrap();
         let mut cursor = std::io::Cursor::new(buf);
         assert!(matches!(
             read_frame::<_, u32>(
@@ -281,7 +350,7 @@ mod tests {
 
     fn framed(value: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &value.to_string()).unwrap();
+        write_frame(&mut buf, &value.to_string(), DEFAULT_BODY_TIMEOUT).unwrap();
         buf
     }
 
@@ -432,6 +501,44 @@ mod tests {
         assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
     }
 
+    /// The whole of a frame past its first byte shares one budget. Trickling the header and then
+    /// stalling on the body used to buy `2x body_timeout`, so a peer could hold a reader — and, on
+    /// the daemon, one of eight client slots — for three times the number at the call site (#118).
+    #[test]
+    fn a_frame_that_stalls_after_a_trickled_header_spends_one_budget_not_two() {
+        struct HeaderThenNothing {
+            given: Cursor<Vec<u8>>,
+        }
+        impl Read for HeaderThenNothing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                let one = 1.min(buf.len());
+                match self.given.read(&mut buf[..one])? {
+                    0 => Err(io::Error::new(io::ErrorKind::WouldBlock, "no data yet")),
+                    n => Ok(n),
+                }
+            }
+        }
+
+        let mut header_only = Vec::new();
+        header_only.extend_from_slice(&(64u32).to_be_bytes());
+
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let result = read_frame::<_, String>(
+            &mut HeaderThenNothing { given: Cursor::new(header_only) },
+            DEFAULT_MAX_FRAME,
+            Some(DEFAULT_BODY_TIMEOUT),
+            budget,
+        );
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
+        assert!(
+            started.elapsed() < budget * 2,
+            "the header and the body were given a budget each: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A peer that closes mid-body is a fault, not a clean end — `Eof` means "closed between
     /// frames" and a caller loops on it.
     #[test]
@@ -447,5 +554,85 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(matches!(result, Err(FrameError::Io(_))), "got {result:?}");
+    }
+
+    /// A writer that accepts nothing, as a socket does once the peer has stopped reading and its
+    /// receive window has closed. No RST, no FIN — the connection is alive and simply will not
+    /// take another byte.
+    struct NeverDrains;
+    impl Write for NeverDrains {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(20));
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "the window is closed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The defect this half exists for: a client whose host stops reading must fail on a deadline
+    /// rather than hold its mutex — and, on the daemon, a client that authenticates and then stops
+    /// draining must not pin a worker.
+    #[test]
+    fn a_peer_that_never_drains_times_out_rather_than_blocking() {
+        let started = std::time::Instant::now();
+        let result = write_frame(&mut NeverDrains, &"hello".to_string(), Duration::from_millis(200));
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
+    }
+
+    /// The other end: a slow but healthy transfer — a large dispatch over a weak link — still
+    /// completes, and arrives byte-for-byte. A retry that resent what it had already written would
+    /// show up here as a corrupt frame rather than as a hang.
+    #[test]
+    fn a_slow_but_healthy_peer_still_receives_the_whole_frame() {
+        /// Accepts one byte per call, and reports `WouldBlock` between each.
+        struct DrainsSlowly {
+            got: Vec<u8>,
+            stall_next: bool,
+        }
+        impl Write for DrainsSlowly {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.stall_next = !self.stall_next;
+                if self.stall_next {
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "not yet"));
+                }
+                self.got.push(buf[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut slow = DrainsSlowly { got: Vec::new(), stall_next: false };
+        write_frame(&mut slow, &"hello".to_string(), Duration::from_secs(5)).unwrap();
+        assert_eq!(slow.got, framed("hello"), "the frame arrived changed");
+    }
+
+    /// rustls puts the bytes on the socket in `flush`, so a peer that takes the plaintext and then
+    /// stops draining is only visible there. A `flush` retried without a deadline is the same hang
+    /// in a different place.
+    #[test]
+    fn a_flush_that_never_completes_times_out() {
+        struct AcceptsThenStallsInFlush;
+        impl Write for AcceptsThenStallsInFlush {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                std::thread::sleep(Duration::from_millis(20));
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "the window is closed"))
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let result = write_frame(
+            &mut AcceptsThenStallsInFlush,
+            &"hello".to_string(),
+            Duration::from_millis(200),
+        );
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
     }
 }

@@ -14,12 +14,16 @@ use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
 
 use crate::frame::{read_frame, write_frame, FrameError};
-use crate::protocol::{DeviceSnapshot, DispatchId, Event, Refusal, Request, Response};
+use crate::protocol::{Admitted, DeviceSnapshot, DispatchId, Event, Refusal, Request, Response};
 
 #[derive(Debug)]
 pub enum ClientError {
     Refused(Refusal),
     Fingerprint { expected: String, found: String },
+    /// The host answered, and refused the token. Distinct from `Transport` because the operator's
+    /// next move is: re-pair with the token from the Pi's `cutd.toml` — not wait for a host that
+    /// is merely asleep (#112).
+    Unauthorized,
     Transport(String),
 }
 
@@ -35,6 +39,8 @@ impl std::fmt::Display for ClientError {
             ClientError::Fingerprint { expected, found } =>
                 write!(f, "this host presented a different certificate than the one paired \
                            (expected {expected}, found {found})"),
+            ClientError::Unauthorized =>
+                write!(f, "this host refused the token; pair again with the one in its `cutd.toml`"),
             ClientError::Transport(m) => write!(f, "the host could not be reached ({m})"),
         }
     }
@@ -158,20 +164,38 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
 
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+/// `addr`'s resolved addresses, or a failure once `deadline` passes.
+///
+/// `to_socket_addrs()` is synchronous and takes no timeout, so the only way to bound the *wait*
+/// is to stop waiting: the resolve runs on a thread of its own and the answer is taken over a
+/// channel. A Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by a literal IP, so
+/// this is the common path — and mDNS on a flaky network is the ordinary way a resolver wedges.
+///
+/// ponytail: on a genuine timeout the thread stays blocked in the resolver and leaks, exactly as
+/// `driver-silhouette`'s `usb.rs` read does and for the same reason. One thread per hung resolve
+/// on a path that runs once per connect is a very different budget from a tight read loop; the
+/// upgrade is an async resolver crate, at the cost of a dependency.
+fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = addr.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(owned.to_socket_addrs().map(|a| a.collect::<Vec<_>>()));
+    });
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(ClientError::Transport(e.to_string())),
+        Err(_) => Err(ClientError::Transport(format!("`{addr}` could not be resolved in time"))),
+    }
+}
+
 /// The first of `addr`'s resolved addresses that answers before `deadline`.
 ///
-/// ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
-/// bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
-/// IP, so this is the common path, not an edge case. `deadline` covers the connects only;
-/// a hung resolver is a real, if rarer, way this can still block. Bound it too (a helper
-/// thread, or a crate with an async resolver) if that turns out to bite.
-///
-/// A single deadline covers every resolved address, not a fresh budget per address:
-/// mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
+/// A single deadline covers the resolve and every resolved address, not a fresh budget per
+/// address: mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
 /// that is the one address that cannot work — trying it with the whole budget and only
 /// then trying the IPv4 that would have worked turns "first contact" into a timeout.
 fn connect_by_deadline(addr: &str, deadline: Instant) -> Result<TcpStream, ClientError> {
-    let addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
+    let addrs = resolve_by_deadline(addr, deadline)?;
     let mut last_err = None;
     for sock_addr in addrs {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -210,6 +234,10 @@ pub fn probe_fingerprint(addr: &str, timeout: Duration) -> Result<String, Client
     // `SOCKET_POLL_INTERVAL` so that the deadline bounds the whole handshake rather than each
     // read within it — `complete_io` on its own would grant a fresh wait per read.
     tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    // The handshake writes as well as reads, and a peer that accepts the connection and then stops
+    // reading blocks those writes with no error to notice. Same pacing, same reason as the read.
+    tcp.set_write_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
         .map_err(|e| ClientError::Transport(e.to_string()))?;
 
     let config = rustls::ClientConfig::builder()
@@ -301,13 +329,21 @@ impl HostClient {
         let tcp = connect_by_deadline(addr, deadline)?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
+        // Both directions bounded, not just the read: a host that stops draining freezes every
+        // write on this connection — and they all happen under one mutex (#102).
+        tcp.set_write_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
 
-        write_frame(&mut stream, &token.to_string()).map_err(|e| {
+        // Bounded by what is left of the connect budget, like the greeting read below: the
+        // handshake happens inside this write, and a peer that completes the TCP connect and then
+        // stops reading must not hold a short-budget caller open past it.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        write_frame(&mut stream, &token.to_string(), remaining).map_err(|e| {
             // A handshake that failed on the pin reaches here as an I/O error, so
             // the more useful message is the one the verifier can give.
             match verifier.seen.lock().unwrap().clone() {
@@ -325,6 +361,10 @@ impl HostClient {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match read_frame::<_, Response>(&mut stream, 4096, Some(remaining), remaining) {
             Ok(Response::Ok) => {}
+            // The host answered and said no. Before it did, this arrived as a dropped connection —
+            // the same thing an asleep Pi looks like, and the two need opposite things from the
+            // operator.
+            Ok(Response::Unauthorized) => return Err(ClientError::Unauthorized),
             Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
             Err(e) => {
                 if let Some(found) = verifier.seen.lock().unwrap().clone() {
@@ -378,13 +418,15 @@ impl HostClient {
         }
     }
 
+    /// `Admitted` is the answer, not `()`: a host that recognised this id started nothing, and the
+    /// caller is the only one who can put that in front of the operator (#121).
     pub fn dispatch(
         &self,
         dispatch_id: DispatchId,
         device: &str,
         machine_id: &str,
         passes: Vec<CutPass>,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Admitted, ClientError> {
         match self.call(
             Request::Dispatch {
                 dispatch_id,
@@ -394,7 +436,7 @@ impl HostClient {
             },
             crate::frame::DEFAULT_BODY_TIMEOUT,
         )? {
-            Response::Accepted { .. } => Ok(()),
+            Response::Accepted { admitted, .. } => Ok(admitted),
             other => Err(unexpected(other)),
         }
     }
@@ -435,7 +477,11 @@ impl HostClient {
     /// `snapshots_within`.
     fn call(&self, request: Request, body_timeout: Duration) -> Result<Response, ClientError> {
         let mut stream = self.stream.lock().unwrap();
-        write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
+        // The write is bounded by the same budget as the reply, and for the same reason: a host
+        // that stops draining mid-dispatch — megabytes of polylines over a weak link — would
+        // otherwise hold this mutex, and every other call on this host, forever (#102).
+        write_frame(&mut *stream, &request, body_timeout)
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
             // A reply is owed the moment the request above was written: a Pi that goes silent
             // from here must not hold this mutex, and every other call, forever.

@@ -21,10 +21,17 @@ fn a_client_lists_the_cutters_on_a_host() {
     assert_eq!(devices.len(), 2);
 }
 
+/// And refused *by name*. A daemon that closed the connection instead reached the operator as
+/// "the host could not be reached", which is what an asleep Pi looks like — one calls for
+/// re-pairing with the token from `cutd.toml`, the other for waiting (#112).
 #[test]
-fn a_bad_token_is_refused() {
+fn a_bad_token_is_refused_as_a_rejected_token_rather_than_an_unreachable_host() {
     let host = start_test_host();
-    assert!(HostClient::connect(&host.addr, "not-the-token", &host.fingerprint).is_err());
+    match HostClient::connect(&host.addr, "not-the-token", &host.fingerprint) {
+        Err(ClientError::Unauthorized) => {}
+        Err(e) => panic!("expected the token to be named as the problem, got {e:?}"),
+        Ok(_) => panic!("a token matching no client was accepted"),
+    }
 }
 
 #[test]

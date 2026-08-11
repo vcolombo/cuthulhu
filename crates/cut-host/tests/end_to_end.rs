@@ -126,6 +126,25 @@ fn a_pair_check_against_a_different_certificate_is_refused() {
     }
 }
 
+/// What a first pairing does before it has anything to pin, and the equality is the point: a
+/// probe that returned a fingerprint the pinning path would not accept would be worse than no
+/// probe, so this asserts both that it matches what the host's cert directory reports *and* that
+/// pinning it actually connects.
+///
+/// It is also the assertion that a probe does not authenticate. `probe_fingerprint` takes no
+/// token — there is no credential in its signature to present — so succeeding here against a host
+/// that would refuse an unknown one is the observable half of that guarantee; the signature is
+/// the other half.
+#[test]
+fn a_probe_learns_the_fingerprint_the_pinned_path_accepts_without_presenting_a_token() {
+    let host = start_test_host();
+    let probed = cut_host::client::probe_fingerprint(&host.addr, Duration::from_secs(5)).unwrap();
+    assert_eq!(probed, host.fingerprint);
+
+    let devices = HostClient::pair_check(&host.addr, TOKEN, &probed).unwrap();
+    assert_eq!(devices.len(), 2, "the probed fingerprint is the one the pinned path accepts");
+}
+
 fn await_phase(client: &HostClient, device: &str, want: Phase) -> driver_core::CutStatus {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

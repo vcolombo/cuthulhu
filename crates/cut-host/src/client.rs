@@ -8,7 +8,7 @@
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
@@ -97,7 +97,163 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
     }
 }
 
+/// Accepts any certificate, because a first pairing has nothing to compare one against — that
+/// is the whole of trust-on-first-use, and `probe_fingerprint` is its only caller.
+///
+/// Safe here for two reasons that only hold together, and safe nowhere else because no other
+/// call site has both. Nothing secret crosses a probe: it sends no token and no request, so a
+/// host that lied about its identity is handed nothing it did not already have. And the
+/// fingerprint a probe returns is not trusted, it is *shown* — what gets pinned is what the
+/// operator confirmed against the Pi's own console, and every connection after that goes through
+/// `PinnedCert` against the pinned value. Neither `connect` nor `connect_within` takes a
+/// verifier — each builds its own `PinnedCert` from the fingerprint it was given — so there is
+/// no parameter this type could be passed to and the misuse will not compile.
+///
+/// The signature checks below stay real rather than being waved through with the certificate:
+/// they are what makes the reported fingerprint belong to a peer that holds the matching private
+/// key, rather than to anyone who can replay somebody else's certificate.
+#[derive(Debug)]
+struct AnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message, cert, dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+/// The first of `addr`'s resolved addresses that answers before `deadline`.
+///
+/// ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
+/// bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
+/// IP, so this is the common path, not an edge case. `deadline` covers the connects only;
+/// a hung resolver is a real, if rarer, way this can still block. Bound it too (a helper
+/// thread, or a crate with an async resolver) if that turns out to bite.
+///
+/// A single deadline covers every resolved address, not a fresh budget per address:
+/// mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
+/// that is the one address that cannot work — trying it with the whole budget and only
+/// then trying the IPv4 that would have worked turns "first contact" into a timeout.
+fn connect_by_deadline(addr: &str, deadline: Instant) -> Result<TcpStream, ClientError> {
+    let addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
+    let mut last_err = None;
+    for sock_addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&sock_addr, remaining) {
+            Ok(s) => return Ok(s),
+            // Named, not just the error: with several resolved addresses tried in turn, "the
+            // host could not be reached (Connection refused)" alone leaves the operator no
+            // way to tell which of them actually failed.
+            Err(e) => last_err = Some((sock_addr, e)),
+        }
+    }
+    Err(match last_err {
+        Some((sock_addr, e)) => ClientError::Transport(format!("{sock_addr}: {e}")),
+        None => ClientError::Transport(format!("`{addr}` resolved to no address")),
+    })
+}
+
+/// The fingerprint of the certificate `addr` presents, learned by completing a TLS handshake and
+/// doing nothing else with the connection.
+///
+/// The one entry point that does not already know the fingerprint, because it is what a *first*
+/// pairing has: an address the operator has typed and nothing to compare against. The alternative
+/// it replaces was to connect with a deliberately wrong fingerprint and read the real one back out
+/// of the refusal's prose.
+///
+/// No token is sent and no `Request` is written — there is no credential in this signature to
+/// send — and the connection is closed as soon as the certificate is in hand. See `AnyCert` for
+/// why accepting any certificate is safe on this path and on no other.
+pub fn probe_fingerprint(addr: &str, timeout: Duration) -> Result<String, ClientError> {
+    let deadline = Instant::now() + timeout;
+    let mut tcp = connect_by_deadline(addr, deadline)?;
+    // Same pacing as every other read in this crate: the socket comes back empty every
+    // `SOCKET_POLL_INTERVAL` so that the deadline bounds the whole handshake rather than each
+    // read within it — `complete_io` on its own would grant a fresh wait per read.
+    tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCert))
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+    while conn.is_handshaking() {
+        if Instant::now() >= deadline {
+            return Err(ClientError::Transport(
+                "the host accepted a connection but did not finish a TLS handshake in time".into(),
+            ));
+        }
+        match conn.complete_io(&mut tcp) {
+            // rustls reports no progress only when it wants neither a read nor a write, which
+            // part-way through a handshake means it will never finish: retrying that spins.
+            Ok((0, 0)) => return Err(ClientError::Transport("the TLS handshake stalled".into())),
+            Ok(_) => {}
+            // The read timeout above surfaces as `WouldBlock` on unix and `TimedOut` on Windows,
+            // and neither is a fault — it is this loop's cue to re-check the deadline.
+            Err(e) if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ) => {}
+            Err(e) => return Err(ClientError::Transport(e.to_string())),
+        }
+    }
+
+    let found = conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(crate::serve::fingerprint)
+        .ok_or_else(|| ClientError::Transport("the host presented no certificate".into()))?;
+    // A close_notify rather than a bare drop: a Cut Host logs a client that vanishes as a fault,
+    // and a probe that worked is not one — an operator reading the Pi's console while pairing
+    // should not be shown an error for the step that succeeded.
+    conn.send_close_notify();
+    let _ = conn.write_tls(&mut tcp);
+    Ok(found)
+}
 
 /// How long to wait for a Cut Host to accept a connection.
 ///
@@ -139,40 +295,10 @@ impl HostClient {
             .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
 
-        // ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
-        // bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
-        // IP, so this is the common path, not an edge case. `timeout` below covers the
-        // connect itself; a hung resolver is a real, if rarer, way this can still block. Bound
-        // it too (a helper thread, or a crate with an async resolver) if that turns out to bite.
-        //
-        // A single deadline covers every resolved address, not a fresh `timeout` per address:
-        // mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
-        // that is the one address that cannot work — trying it with the whole budget and only
-        // then trying the IPv4 that would have worked turns "first contact" into a timeout.
-        let addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
-        let deadline = std::time::Instant::now() + timeout;
-        let mut last_err = None;
-        let mut tcp = None;
-        for sock_addr in addrs {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match TcpStream::connect_timeout(&sock_addr, remaining) {
-                Ok(s) => {
-                    tcp = Some(s);
-                    break;
-                }
-                // Named, not just the error: with several resolved addresses tried in turn, "the
-                // host could not be reached (Connection refused)" alone leaves the operator no
-                // way to tell which of them actually failed.
-                Err(e) => last_err = Some((sock_addr, e)),
-            }
-        }
-        let tcp = tcp.ok_or_else(|| match last_err {
-            Some((sock_addr, e)) => ClientError::Transport(format!("{sock_addr}: {e}")),
-            None => ClientError::Transport(format!("`{addr}` resolved to no address")),
-        })?;
+        // The deadline outlives the connect: the greeting read below shares it, so a peer that
+        // answers slowly and then stalls cannot cost this call twice its budget.
+        let deadline = Instant::now() + timeout;
+        let tcp = connect_by_deadline(addr, deadline)?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
@@ -365,6 +491,23 @@ mod tests {
         let start = Instant::now();
         let err = match HostClient::connect("10.255.255.1:7878", "token", "aa:bb:cc") {
             Ok(_) => panic!("nothing should answer this address"),
+            Err(e) => e,
+        };
+        assert!(
+            start.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
+            "took {:?}, longer than the timeout allows for: {err}",
+            start.elapsed()
+        );
+    }
+
+    /// The probe shares `connect_by_deadline` with `connect`, so it inherits that bound — this
+    /// pins that it is actually reached, since the pairing dialog calls the probe first and a
+    /// mistyped address is the ordinary way to arrive here.
+    #[test]
+    fn a_probe_of_a_silently_unreachable_host_fails_within_the_timeout() {
+        let start = Instant::now();
+        let err = match probe_fingerprint("10.255.255.1:7878", CONNECT_TIMEOUT) {
+            Ok(f) => panic!("nothing should answer this address, got {f}"),
             Err(e) => e,
         };
         assert!(

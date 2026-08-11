@@ -70,6 +70,7 @@ fn main() {
             ipc::save_preset,
             ipc::delete_preset,
             ipc::list_hosts,
+            ipc::probe_host,
             ipc::test_host,
             ipc::pair_host,
             ipc::forget_host,

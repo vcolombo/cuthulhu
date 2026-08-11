@@ -238,6 +238,16 @@ export function CutDialog({
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
+  // Keeps the aim on purpose, unlike `disconnect`: the cutter is still there and still this
+  // desktop's, it has simply had its transport re-opened. The status refresh is the point —
+  // `actions.cut` is what was withheld and what should come back.
+  const reconnect = () => {
+    ipc
+      .reconnectDevice()
+      .then(refreshDeviceState)
+      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+  };
+
   // A refusal keeps the row and shows the host's own words: the Rust side refuses with
   // `host_busy` while a cut is active there, and a row that vanished and came back would say
   // "gone" about the one host that still has a blade moving.
@@ -359,7 +369,7 @@ export function CutDialog({
                 // `null` is what says so rather than something that reads as ready.
                 const aimed = connected?.instance_id === d.instance_id ? status : null;
                 const badge = deviceBadge(aimed);
-                const control = connectedControl(aimed);
+                const control = connectedControl(aimed, d.host !== null);
                 return (
                 <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <span>
@@ -376,8 +386,12 @@ export function CutDialog({
                           both a cut and a connect from that state, so without this the operator's
                           exit is restarting the app. Withheld mid-Job — see `connectedControl`. */}
                       {control ? (
-                        <button aria-label={`Disconnect ${d.instance_id}`} style={btn} onClick={disconnect}>
-                          {control}
+                        <button
+                          aria-label={`${control.label} ${d.instance_id}`}
+                          style={btn}
+                          onClick={() => (control.verb === "reconnect" ? reconnect() : disconnect())}
+                        >
+                          {control.label}
                         </button>
                       ) : null}
                     </>

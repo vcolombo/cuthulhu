@@ -137,10 +137,16 @@ export function deviceBadge(status: CutStatus | null): { label: string; tone: "i
  * `null` while a Job is in flight: a disconnect there drops the transport under a moving blade
  * and abandons the Job silently. "A Job exists" is read from `actions` — the only three verbs a
  * Job ever offers — not from the phase.
+ *
+ * A cutter on a Cut Host reconnects instead of disconnecting, because this desktop never opened
+ * that transport: `disconnect_device` there only drops the aim, leaving the cutter exactly as
+ * stuck as before. `reconnect_device` routes to the host's own verb, which re-opens it.
  */
-export function connectedControl(status: CutStatus | null): string | null {
+export function connectedControl(
+  status: CutStatus | null, onHost: boolean,
+): { label: string; verb: "disconnect" | "reconnect" } | null {
   if (status !== null && (status.actions.cancel || status.actions.resume || status.actions.confirm)) {
     return null;
   }
-  return "Disconnect";
+  return onHost ? { label: "Reconnect", verb: "reconnect" } : { label: "Disconnect", verb: "disconnect" };
 }

@@ -196,8 +196,15 @@ describe("connectedControl", () => {
   // disconnect leaves the operator restarting the app to use the cutter again.
   it("offers a disconnect after a cancel whose stop was never confirmed", () => {
     const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
-    expect(connectedControl(unconfirmed)).toBe("Disconnect");
-    expect(connectedControl(null)).toBe("Disconnect");
+    expect(connectedControl(unconfirmed, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+    expect(connectedControl(null, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+  });
+
+  // A remote cutter's transport belongs to the Pi, so this desktop's disconnect only drops the
+  // aim and leaves the cutter as stuck as it was. Only the host's own verb re-opens it.
+  it("asks a Cut Host to re-open its own cutter rather than dropping the aim", () => {
+    const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
+    expect(connectedControl(unconfirmed, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
   });
 
   // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a
@@ -205,7 +212,8 @@ describe("connectedControl", () => {
   it("withholds it while a Job is in flight, whatever the phase says", () => {
     for (const live of [{ cancel: true }, { resume: true }, { confirm: true }]) {
       const status: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, ...live } };
-      expect(connectedControl(status)).toBeNull();
+      expect(connectedControl(status, false)).toBeNull();
+      expect(connectedControl(status, true)).toBeNull();
     }
   });
 });

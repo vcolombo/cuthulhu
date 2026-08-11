@@ -264,6 +264,32 @@ impl Host {
         self.with_slot(device, |slot| slot.manager.confirm_pass_done().map_err(Refusal::Device))
     }
 
+    /// Drop the cutter's transport and open it again, re-running `DeviceManager::connect`'s
+    /// identity probe against real hardware.
+    ///
+    /// This is the daemon's whole answer to a cancel whose stop nothing confirmed.
+    /// `driver-core` refuses another Job there until the transport is re-opened, and the daemon
+    /// otherwise connects each cutter exactly once at startup — so without this, one cancelled
+    /// Puma takes that cutter out until someone restarts `cuthulhu-cutd`. Re-opening is also the
+    /// only honest clearance available: it makes the machine answer a status query again, rather
+    /// than the software deciding the blade must have stopped by now.
+    ///
+    /// Refused while a Job is in flight, which is the one thing this must never do — dropping a
+    /// transport under a moving blade abandons the Job with nothing left to cancel it. Asked of
+    /// `driver-core`'s own predicate rather than a second reading of the phases.
+    pub fn reconnect(&self, device: &str) -> Result<(), Refusal> {
+        self.with_slot(device, |slot| {
+            if slot.manager.status().is_active() {
+                return Err(Refusal::Device(DeviceError::Busy));
+            }
+            // ponytail: an admitted dispatch not yet inside `manager.cut` is not covered — that
+            // window is a thread spawn wide and costs the dispatch a `Busy` it can retry, with no
+            // motion either way. Take the admission lock here too if that ever stops being true.
+            slot.manager.disconnect().map_err(Refusal::Device)?;
+            slot.manager.connect(slot.info.clone()).map_err(Refusal::Device)
+        })
+    }
+
     fn with_slot(
         &self,
         device: &str,
@@ -808,6 +834,59 @@ mod tests {
         assert!(matches!(host.cancel("usb:9:9"), Err(Refusal::UnknownDevice(_))));
         assert!(matches!(host.resume("usb:9:9"), Err(Refusal::UnknownDevice(_))));
         assert!(matches!(host.confirm_pass_done("usb:9:9"), Err(Refusal::UnknownDevice(_))));
+        assert!(matches!(host.reconnect("usb:9:9"), Err(Refusal::UnknownDevice(_))));
+    }
+
+    /// The daemon connects each cutter once at startup, so without `reconnect` a cancel whose
+    /// stop nothing confirmed takes that cutter out until `cuthulhu-cutd` is restarted — and
+    /// `TestDriver` parks rather than polls, so no cancel of one can ever confirm. Asserted
+    /// through `actions` and the dispatch it governs, never a phase: `Idle` is what the cutter
+    /// reports on both sides of the reconnect.
+    #[test]
+    fn a_reconnect_is_the_way_back_from_a_cancel_that_could_not_confirm_the_stop() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), PUMA, "puma", vec![square_pass()]).unwrap();
+        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+
+        host.cancel(PUMA).unwrap();
+        let stuck = wait_for_ended(&host, PUMA, driver_core::Ended::Cancelled);
+        assert!(!stuck.actions.cut, "nothing saw the machine stop, so no Job may follow it");
+        assert!(matches!(
+            host.dispatch(DispatchId("d-2".into()), PUMA, "puma", vec![square_pass()]),
+            Err(Refusal::Device(DeviceError::Busy))
+        ));
+
+        host.reconnect(PUMA).unwrap();
+        assert!(host.slot(PUMA).unwrap().manager.status().actions.cut, "a re-opened cutter takes a Job again");
+        host.dispatch(DispatchId("d-3".into()), PUMA, "puma", vec![square_pass()]).unwrap();
+        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+    }
+
+    /// Harmless on a healthy cutter, and refused on a busy one — dropping a transport under a
+    /// moving blade would abandon the Job with nothing left to cancel it.
+    #[test]
+    fn a_reconnect_leaves_an_idle_cutter_alone_and_refuses_a_busy_one() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.reconnect(CAMEO).expect("an idle cutter re-opens");
+        assert!(host.slot(CAMEO).unwrap().manager.status().actions.cut);
+
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
+        // And the parked Job is still there to be answered, not silently dropped.
+        assert!(host.slot(CAMEO).unwrap().manager.status().actions.confirm);
+    }
+
+    fn wait_for_ended(host: &Arc<Host>, device: &str, want: driver_core::Ended) -> driver_core::CutStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let status = host.slot(device).expect("known cutter").manager.status();
+            if status.ended == Some(want) {
+                return status;
+            }
+            assert!(std::time::Instant::now() < deadline, "{device} never ended {want:?}, sat at {:?}", status.phase);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// A verb the cutter cannot accept right now comes back as the Device error the

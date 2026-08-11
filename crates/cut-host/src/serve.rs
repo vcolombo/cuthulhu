@@ -100,6 +100,7 @@ pub fn handle_request(host: &Arc<Host>, request: Request) -> Response {
         Request::Cancel { device } => once(host.cancel(&device)),
         Request::Resume { device } => once(host.resume(&device)),
         Request::ConfirmPassDone { device } => once(host.confirm_pass_done(&device)),
+        Request::Reconnect { device } => once(host.reconnect(&device)),
     }
 }
 
@@ -322,6 +323,7 @@ mod tests {
             Request::Cancel { device: "usb:9:9".into() },
             Request::Resume { device: "usb:9:9".into() },
             Request::ConfirmPassDone { device: "usb:9:9".into() },
+            Request::Reconnect { device: "usb:9:9".into() },
         ] {
             assert!(matches!(handle_request(&host, request), Response::Refused(_)));
         }

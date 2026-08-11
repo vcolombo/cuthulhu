@@ -411,6 +411,10 @@ impl HostClient {
         self.expect_ok(Request::ConfirmPassDone { device: device.to_string() })
     }
 
+    pub fn reconnect(&self, device: &str) -> Result<(), ClientError> {
+        self.expect_ok(Request::Reconnect { device: device.to_string() })
+    }
+
     fn expect_ok(&self, request: Request) -> Result<(), ClientError> {
         match self.call(request, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Ok => Ok(()),

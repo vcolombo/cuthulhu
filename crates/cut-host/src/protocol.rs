@@ -29,9 +29,11 @@ pub struct DeviceSnapshot {
 
 /// `device` is always a `DeviceInfo::instance_id`.
 ///
-/// There is deliberately no `Connect`/`Disconnect`: the host connects each cutter
-/// it enumerates and holds it, so two clients cannot race over one cutter's
+/// There is deliberately no separate `Connect`/`Disconnect`: the host connects each
+/// cutter it enumerates and holds it, so two clients cannot race over one cutter's
 /// connection state and a client that dies mid-Job cannot orphan a Transport.
+/// `Reconnect` is one transition the host performs itself for the same reason — a
+/// client can ask for the cutter to be re-opened, never leave it closed.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     ListDevices,
@@ -45,6 +47,11 @@ pub enum Request {
     Cancel { device: String },
     Resume { device: String },
     ConfirmPassDone { device: String },
+    /// Drop the cutter's transport and open it again, re-running the identity probe
+    /// against real hardware. The way back from a cancel whose stop nothing
+    /// confirmed — there is deliberately no verb for *declaring* a stop confirmed,
+    /// which would be the guess this exists instead of.
+    Reconnect { device: String },
 }
 
 /// `Accepted` carries no `job_id`: `DeviceManager::cut` does not return one until
@@ -151,6 +158,7 @@ mod tests {
             Request::Cancel { device: "usb:1:4".into() },
             Request::Resume { device: "usb:1:4".into() },
             Request::ConfirmPassDone { device: "usb:1:4".into() },
+            Request::Reconnect { device: "usb:1:4".into() },
         ] {
             let json = serde_json::to_string(&sent).unwrap();
             let back: Request = serde_json::from_str(&json).unwrap();

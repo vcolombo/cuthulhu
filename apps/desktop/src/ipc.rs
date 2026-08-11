@@ -105,6 +105,12 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
+// async for the same reasons as connect_device, plus a remote arm that talks to the Pi.
+#[tauri::command(async)]
+pub fn reconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.reconnect()
+}
+
 // async: non-blocking for a local device — the status is published rather than asked of the
 // worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
 // network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) plus an

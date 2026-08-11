@@ -481,6 +481,28 @@ impl DeviceManagerHandle {
         Ok(())
     }
 
+    /// Drop the aimed cutter's transport and open it again, re-running the identity probe
+    /// against real hardware.
+    ///
+    /// The way back from a cancel whose stop nothing confirmed — `driver-core` refuses both a
+    /// cut and a connect from that state. Locally that is the dialog's Disconnect followed by
+    /// Connect, done in one call; on a Cut Host it has to be the host's own verb, since this
+    /// desktop never opened that transport and `disconnect` there is bookkeeping only.
+    pub fn reconnect(&self) -> Result<(), IpcError> {
+        let aimed = self.connected.lock().unwrap().clone();
+        let Some(device) = aimed else {
+            return Err(IpcError::new("device_error", "no device is connected"));
+        };
+        match self.route(&device)? {
+            Route::Local => {
+                let mgr = self.manager()?;
+                mgr.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+                mgr.connect(device).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Route::Host(id) => self.with_host(&id, |c| c.reconnect(&device.instance_id)),
+        }
+    }
+
     /// Where the cut has got to. Reads `driver-core`'s published status, which
     /// never blocks on the worker — so the window-close handler and the IPC
     /// command can both call it freely, even mid-transmit.
@@ -1638,6 +1660,47 @@ mod tests {
 
     /// The finding's own scenario, end to end: the host takes dispatch `d1` and starts cutting,
     /// the reply is lost, the Job finishes, and the operator presses Cut again.
+    /// The remote half of the exit. This desktop never opened the Pi's transport, so its own
+    /// `disconnect` there is bookkeeping and would leave the cutter exactly as stuck — only the
+    /// host's `Reconnect` re-opens it. Driven over the real loopback host so the verb is proved on
+    /// the wire, not just in the router. Asserted through `actions`: the phase reads `Idle` on
+    /// both sides of the reconnect.
+    #[test]
+    fn reconnecting_a_remote_cutter_clears_a_cancel_that_could_not_confirm_the_stop() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
+        // The host's TestDriver parks rather than polls, so nothing can confirm a stop there.
+        wait_for_remote(&dev, |s| s.actions.confirm, "the Job to park");
+        dev.cancel().expect("cancel");
+        wait_for_remote(&dev, |s| s.ended == Some(driver_core::Ended::Cancelled), "the cancel to land");
+        assert!(!dev.status().actions.cut, "nothing saw the machine stop, so no Job may follow it");
+
+        dev.reconnect().expect("the host re-opens its own cutter");
+        assert!(dev.status().actions.cut, "a re-opened cutter takes a Job again");
+    }
+
+    fn wait_for_remote(dev: &DeviceManagerHandle, want: impl Fn(&CutStatus) -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = dev.status();
+            if want(&s) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "waited out {what}, sat at {:?}", s.phase);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn a_retry_after_a_lost_reply_does_not_cut_the_material_twice() {
         use std::sync::atomic::Ordering;

@@ -89,17 +89,24 @@ export function staleSection(previous: DeviceSection, e: unknown): DeviceSection
 // cutters can share the same phase (e.g. "Disconnected") while one is legal to cut and the
 // other isn't; only `actions` tells them apart. `phase` may still end up in UI copy as
 // descriptive text, but nothing below branches on it.
-export function deviceBadge(status: CutStatus | null): { label: string; tone: "idle" | "busy" | "attention" | "gone" } {
+export function deviceBadge(status: CutStatus | null): { label: string; tone: "idle" | "busy" | "attention" | "unknown" | "gone" } {
   if (status === null) {
     // No status has arrived for this cutter yet (distinct from DISCONNECTED_STATUS, which is a
     // known "nothing legal" state). Not "gone" — we haven't tried and failed, we just don't know
     // — and not "idle" either, since that would offer a cut before one is confirmed legal.
-    return { label: "Unknown", tone: "attention" };
+    //
+    // Its own tone, not "attention", which conflated two different things: "we may not offer a
+    // cut" and "the operator should look at this". Only the first is true here, and every cutter
+    // on a freshly opened dialog is in this state — a UI that raises an alarm about the most
+    // ordinary thing it ever shows has spent the alarm before anything is wrong.
+    return { label: "Unknown", tone: "unknown" };
   }
   const { actions, ended } = status;
   if (actions.cut) {
     return { label: ended === "Cancelled" ? "Ready (last cut cancelled)" : "Ready", tone: "idle" };
   }
+  // The one tone that asks for a person: a Puma parked mid-Job waiting for a colour swap is
+  // someone being asked to walk over to it.
   if (actions.confirm || actions.resume) {
     return { label: "Needs attention", tone: "attention" };
   }

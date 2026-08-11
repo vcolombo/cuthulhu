@@ -152,9 +152,18 @@ describe("deviceBadge", () => {
     expect(deviceBadge(ready).tone).toBe("idle");
   });
 
-  it("renders unknown status as attention, not gone and not ready", () => {
-    const badge = deviceBadge(null);
-    expect(badge.tone).toBe("attention");
+  // Its own tone, and quiet. Not "gone" (nothing has been tried and failed) and not "idle"
+  // (that would offer a cut before one is legal) — but not "attention" either, which is the tone
+  // that asks for a person. Every cutter on a freshly opened dialog is unpolled, so an alarm
+  // here is an alarm about the most ordinary state the dialog has.
+  it("gives an unpolled cutter its own tone, so it does not read as needing a person", () => {
+    expect(deviceBadge(null).tone).toBe("unknown");
+  });
+
+  it("keeps attention for the states that genuinely want the operator", () => {
+    const swap: CutStatus = { ...aStatus(), actions: { ...aStatus().actions, resume: true } };
+    expect(deviceBadge(swap).tone).toBe("attention");
+    expect(deviceBadge(null).tone).not.toBe("attention");
   });
 
   it("flags AwaitingConfirmation-style states even though their phase differs from Idle", () => {

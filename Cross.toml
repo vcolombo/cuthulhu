@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# What `cross build --target aarch64-unknown-linux-gnu` needs to work at all, so the command
+# `docs/cut-host.md` opens with is reproducible rather than something each person rediscovers.
+#
+# `serialport` pulls in `libudev`, a C library resolved through `pkg-config` at build time — so a
+# cross build needs the *target's* copy, which the image does not carry by default. Everything
+# else the build needs (the aarch64 compiler and its libc headers) the image already has.
+# `$CROSS_DEB_ARCH` is set by cross to the Debian architecture matching the target (`arm64` here),
+# which keeps this correct if another target is ever added.
+#
+# Where `pkg-config` then *looks* is set in `.cargo/config.toml`, not here: it has to hold for a
+# plain `cargo build --target` too, and an environment variable that only exists inside cross
+# would make the two disagree.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends libudev-dev:$CROSS_DEB_ARCH pkg-config",
+]

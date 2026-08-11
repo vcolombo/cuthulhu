@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# What a cross build of the Cut Host needs to find the *target's* libudev, so the command
+# `docs/cut-host.md` opens with works as written rather than needing environment variables nobody
+# would guess.
+#
+# `serialport` pulls in `libudev-sys`, which asks `pkg-config` for the library. Cross-compiling,
+# `pkg-config` still searches the host's own directories and finds the host's copy or nothing at
+# all — `PKG_CONFIG_ALLOW_CROSS` only lifts the refusal to answer, it does not change where it
+# looks. `PKG_CONFIG_LIBDIR` is what replaces the search path.
+#
+# Both are scoped so they cannot affect an ordinary build: `ALLOW_CROSS` means nothing when host
+# and target agree, and the `_aarch64-unknown-linux-gnu` suffix is `pkg-config`'s own convention
+# for "only when building for this target", so a native build on a Pi is untouched too.
+[env]
+PKG_CONFIG_ALLOW_CROSS = "1"
+PKG_CONFIG_LIBDIR_aarch64-unknown-linux-gnu = "/usr/lib/aarch64-linux-gnu/pkgconfig"

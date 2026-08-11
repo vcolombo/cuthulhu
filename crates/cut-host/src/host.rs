@@ -27,8 +27,27 @@ pub(crate) struct DeviceSlot {
     /// `None` between `dispatch` returning and `cut()` assigning it — a
     /// snapshot-only client racing that window sees an active cutter with no id.
     pub job_id: Mutex<Option<u64>>,
+    pub admission: Mutex<Admission>,
+}
+
+/// What a dispatch has to claim, in one place so it can be claimed at once.
+///
+/// The two halves are one transaction — claim the id and claim the cutter, or
+/// neither — and splitting them is what let a caller be told a Job was accepted
+/// that never existed. They live together so no lock ordering can get that wrong.
+#[derive(Default)]
+pub(crate) struct Admission {
     /// Dispatch ids already accepted for this cutter. A repeat starts nothing.
-    pub dispatches: Mutex<HashSet<DispatchId>>,
+    accepted: HashSet<DispatchId>,
+    /// Set from admitting a dispatch until its worker's `manager.cut` returns.
+    /// `actions.cut` cannot cover that window on its own: the cut runs on a thread
+    /// of its own, so until it has told the `DeviceManager` anything, the cutter
+    /// still publishes itself as free and a second dispatch would be admitted too.
+    //
+    // ponytail: a panic inside `manager.cut` would leave this set and the cutter
+    // unclaimable until the daemon restarts. `cut` is a channel round-trip that
+    // does not unwrap; give this an RAII guard if that ever stops being true.
+    starting: bool,
 }
 
 pub struct Host {
@@ -71,7 +90,7 @@ impl Host {
                     info,
                     manager: Arc::new(manager),
                     job_id: Mutex::new(None),
-                    dispatches: Mutex::new(HashSet::new()),
+                    admission: Mutex::new(Admission::default()),
                 },
             );
         }
@@ -160,35 +179,56 @@ impl Host {
             .ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
         check_passes(&passes, driver.profile(), &driver.caps()).map_err(Refusal::Preflight)?;
 
-        // One lock acquisition, not two: `insert` reports whether the id was already
-        // there, so a duplicate cannot slip through the gap a separate `contains`
-        // would leave. That gap is where a client's retry after a dropped reply
-        // would become a second cut of the same material. Checked before `actions`
-        // so a retry of a Job already mid-cut stays the no-op it always was, rather
-        // than being told Busy by the very state its own first dispatch caused.
-        if !slot.dispatches.lock().unwrap().insert(dispatch_id.clone()) {
-            return Ok(());
-        }
-
-        // What is legal now is `actions`' answer, not ours to infer. A cutter that
-        // never connected is kept so its snapshot can say so, and accepting a Job
-        // for it would burn the dispatch id on work that cannot start.
-        if !slot.manager.status().actions.cut {
-            slot.dispatches.lock().unwrap().remove(&dispatch_id);
-            return Err(Refusal::Device(DeviceError::Busy));
+        // One critical section for both claims, so no other request can see a
+        // half-claimed cutter. Split, the id was visible as taken while the cutter
+        // was still being asked about: a concurrent retry read that id, was told
+        // Accepted, and then the first request found the cutter Busy and handed the
+        // id back — a caller promised a Job that never existed, and the id free
+        // again for a third attempt to spend.
+        //
+        // `status()` reads the cell the worker publishes and never blocks
+        // (`driver-core/src/manager.rs:117`), so the device is not called from
+        // under this lock, only asked what it last said.
+        {
+            let mut admission = slot.admission.lock().unwrap();
+            // `insert` reports whether the id was already there, so a duplicate
+            // cannot slip through the gap a separate `contains` would leave. That
+            // gap is where a client's retry after a dropped reply would become a
+            // second cut of the same material. Checked before the cutter so a retry
+            // of a Job already mid-cut stays the no-op it always was, rather than
+            // being told Busy by the very state its own first dispatch caused.
+            if !admission.accepted.insert(dispatch_id.clone()) {
+                return Ok(());
+            }
+            // What is legal now is `actions`' answer, not ours to infer — plus the
+            // one thing `actions` cannot yet know, an already-admitted dispatch on
+            // its way to the manager. A cutter that never connected is kept so its
+            // snapshot can say so, and accepting a Job for it would burn the
+            // dispatch id on work that cannot start.
+            if admission.starting || !slot.manager.status().actions.cut {
+                admission.accepted.remove(&dispatch_id);
+                return Err(Refusal::Device(DeviceError::Busy));
+            }
+            admission.starting = true;
         }
 
         let host = self.clone();
         let device = device.to_string();
         thread::spawn(move || {
             let Some(slot) = host.slot(&device) else { return };
-            match slot.manager.cut(passes) {
+            // Only now is the claim the manager's to publish: `cut` returns once the
+            // Job has reached its first pause point or finished, so from here
+            // `actions` describes this Job rather than the cutter it found free.
+            let outcome = slot.manager.cut(passes);
+            let mut admission = slot.admission.lock().unwrap();
+            admission.starting = false;
+            match outcome {
                 Ok(job_id) => *slot.job_id.lock().unwrap() = Some(job_id),
                 Err(e) => {
                     // A refusal before any motion emits no event and moves no state,
                     // so nothing else will tell anyone. Give the id back: a retry
                     // after a Job that never started must be able to run.
-                    slot.dispatches.lock().unwrap().remove(&dispatch_id);
+                    admission.accepted.remove(&dispatch_id);
                     eprintln!("cut host: {device} refused the job: {e:?}");
                 }
             }
@@ -503,6 +543,107 @@ mod tests {
         // no-op rather than surfacing an error to a client that did nothing wrong.
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
         assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job_after_first);
+    }
+
+    /// Runs `dispatch` on two threads released together, so both are inside it at
+    /// once. A barrier is enough to reach the window that matters here: it is as
+    /// wide as a thread spawn plus a command round-trip, so the second dispatch
+    /// arrives long before the first one's worker has told the manager anything.
+    fn dispatch_together(
+        host: &Arc<Host>,
+        device: &str,
+        ids: [&str; 2],
+    ) -> [Result<(), Refusal>; 2] {
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            let one = s.spawn(|| {
+                gate.wait();
+                host.dispatch(DispatchId(ids[0].into()), device, "cameo5", vec![square_pass()])
+            });
+            gate.wait();
+            let other =
+                host.dispatch(DispatchId(ids[1].into()), device, "cameo5", vec![square_pass()]);
+            [one.join().unwrap(), other]
+        })
+    }
+
+    fn holds_dispatch_id(host: &Host, device: &str, id: &str) -> bool {
+        let admission = host.slot(device).unwrap().admission.lock().unwrap();
+        admission.accepted.contains(&DispatchId(id.into()))
+    }
+
+    /// The retry and its own original, arriving together at a cutter that is busy.
+    /// Neither can start a Job, so neither may be told one was accepted — the split
+    /// claim told the retry exactly that, because it could see an id whose owner was
+    /// still being refused. And the id must not survive a dispatch that started
+    /// nothing, or the operator's next attempt is silently a no-op.
+    #[test]
+    fn two_dispatches_of_one_id_to_a_busy_cutter_promise_no_job() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-first".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        let job = *host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+
+        // Free-running rather than paired at a barrier: the window a split claim
+        // leaves is only the few instructions between releasing the dedupe lock and
+        // reading `actions`, which is narrower than the microsecond it takes a
+        // barrier to wake a thread. Two threads looping out of step sweep across it
+        // instead of aiming at it, and sample it thousands of times.
+        let answers = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..20_000)
+                            .map(|_| {
+                                host.dispatch(
+                                    DispatchId("d-retry".into()),
+                                    CAMEO,
+                                    "cameo5",
+                                    vec![square_pass()],
+                                )
+                            })
+                            .filter(|a| !matches!(a, Err(Refusal::Device(DeviceError::Busy))))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            racers.into_iter().flat_map(|r| r.join().unwrap()).collect::<Vec<_>>()
+        });
+
+        assert!(answers.is_empty(), "a busy cutter promised {answers:?}");
+        assert!(!holds_dispatch_id(&host, CAMEO, "d-retry"), "an id kept for a Job that never was");
+        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job, "the Job never changed");
+    }
+
+    /// Two different ids at an idle cutter. Exactly one may be accepted: the cut
+    /// runs on a thread of its own, so `actions` still reads free for as long as it
+    /// takes that thread to reach the manager, and a claim that is not held across
+    /// that gap admits both. The loser must be refused here and not spawn anything,
+    /// because a second Job that merely waits for the first is the queueing this
+    /// design refuses.
+    #[test]
+    fn two_dispatches_to_one_idle_cutter_start_exactly_one_job() {
+        for round in 0..8 {
+            let host = Host::start(Arc::new(TwoCutterFactory));
+            let answers = dispatch_together(&host, CAMEO, ["d-a", "d-b"]);
+
+            let accepted = answers.iter().filter(|a| a.is_ok()).count();
+            assert_eq!(accepted, 1, "round {round}: an idle cutter took {accepted} Jobs");
+            let refusal = answers.iter().find_map(|a| a.as_ref().err()).unwrap();
+            assert!(matches!(refusal, Refusal::Device(DeviceError::Busy)), "got {refusal:?}");
+
+            let first = wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+            assert!(first.actions.confirm);
+            host.confirm_pass_done(CAMEO).unwrap();
+            let done = wait_for(&host, CAMEO, driver_core::Phase::Idle);
+            assert_eq!(done.ended, Some(driver_core::Ended::Completed));
+
+            // Nothing was left holding a Job, so nothing starts once the first ends.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let after = host.slot(CAMEO).unwrap().manager.status();
+            assert_eq!(after.phase, driver_core::Phase::Idle, "round {round}: a second Job queued");
+            assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), Some(1));
+        }
     }
 
     #[test]

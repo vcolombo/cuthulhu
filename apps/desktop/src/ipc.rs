@@ -227,10 +227,13 @@ pub fn pair_host(
     Ok(PairedHostView { id, name, address, unreachable: None })
 }
 
-// async: the busy check dials the host the same way `test_host` does (see there for why).
+// async: the idle check dials the host the same way `test_host` does (see there for why).
+//
+// `force` is the operator accepting that a host which cannot be asked may still be cutting. The
+// UI only offers it after an unforced attempt has already been refused — see `DeviceManagerHandle::forget`.
 #[tauri::command(async)]
-pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId) -> Result<(), IpcError> {
-    dev.forget(&id, &hosts_path()?)
+pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId, force: bool) -> Result<(), IpcError> {
+    dev.forget(&id, &hosts_path()?, force)
 }
 
 fn hosts_path() -> Result<PathBuf, IpcError> {

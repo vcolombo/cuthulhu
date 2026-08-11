@@ -304,30 +304,50 @@ impl DeviceManagerHandle {
         Ok(id)
     }
 
-    /// Forgets a Cut Host: refuses while any of its cutters is mid-cut, since the moment it is
-    /// gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could no
-    /// longer be stopped. Persist-then-mutate for the same reason as `pair`.
-    pub fn forget(&self, id: &HostId, hosts_path: &Path) -> Result<(), IpcError> {
-        // An unreachable host answers nothing, so it reports nothing as active — and there was
-        // nothing `cancel` could have stopped there either. Only a host that answers and says
-        // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
-        //
+    /// Forgets a Cut Host: refuses unless it can confirm the host is idle, since the moment the
+    /// host is gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could
+    /// no longer be stopped. Persist-then-mutate for the same reason as `pair`.
+    ///
+    /// **Silence is not idleness.** This used to let every network error fall through to the
+    /// deletion, on the reasoning that a Pi which cannot answer cannot be busy and that a Pi gone
+    /// for good must not become unforgettable. The first half is false and is the whole point of
+    /// the product: drop Wi-Fi mid-Job and the Pi keeps cutting. Forgetting there discards the
+    /// token and the route needed to cancel, resume or confirm that Job once the network comes
+    /// back — the one machine that could stop the blade throws away the key. The second half is
+    /// still true, which is why the escape hatch is `force` rather than absent.
+    ///
+    /// The two refusals carry different codes because the operator's next move differs: cancel
+    /// the cut, versus decide whether an unreachable Pi is really idle.
+    ///
+    /// `force` skips nothing but the *unconfirmed* case. A host that answers "busy" is a host
+    /// this desktop can still reach, so `cancel` is available and the blade was never orphaned;
+    /// there is no case for cutting that route while it works.
+    pub fn forget(&self, id: &HostId, hosts_path: &Path, force: bool) -> Result<(), IpcError> {
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
         // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
         // anything else waits on it: this holds only this host's connection lock, so a stall here
         // delays calls aimed at this host and nothing else. It is bounded because the operator is
         // usually forgetting a host *precisely* because it has stopped answering, and making them
-        // wait 30s for a dead Pi's permission to stop asking about it is the wrong answer to
-        // that. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
-        // legs, in sequence; plus DNS, which std gives no way to bound, see `cut_host::client`'s
-        // `ponytail:` note) falls through to the forget.
-        if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
-            if snapshots.iter().any(|s| s.status.is_active()) {
+        // wait 30s before they can even be offered the force is the wrong answer to that.
+        match self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
+            Ok(snapshots) if snapshots.iter().any(|s| s.status.is_active()) => {
                 return Err(IpcError::new(
                     "host_busy",
                     "a cut is active on this host; cancel it before forgetting",
-                ));
+                ))
             }
+            Ok(_) => {}
+            Err(e) if !force => {
+                return Err(IpcError::new(
+                    "host_unconfirmed",
+                    format!(
+                        "this Cut Host could not be asked whether it is cutting ({}); if it is, \
+                         forgetting it discards the only way to stop it",
+                        e.message
+                    ),
+                ))
+            }
+            Err(_) => {}
         }
 
         let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
@@ -1310,9 +1330,30 @@ mod tests {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
 
-        let err = dev.forget(&HostId("host-1".into()), &hosts_path);
-        assert!(err.is_err(), "the save must fail against this path");
+        // Forced, so this reaches the save at all: unforced it would stop at the idle check,
+        // and the failure under test here is the write, not the network.
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path, true);
+        assert_eq!(err.unwrap_err().code, "hosts_unwritable");
         assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
+    }
+
+    /// The reversal: a host that cannot be asked is not a host known to be idle. Drop Wi-Fi
+    /// mid-Job and the Pi keeps cutting — discarding the token there throws away the only route
+    /// left to cancel it. Refused unforced, with its own code, and let through by the force the
+    /// operator has to ask for explicitly.
+    #[test]
+    fn an_unreachable_host_refuses_to_be_forgotten_until_it_is_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path, false).expect_err("silence is not idleness");
+        assert_eq!(err.code, "host_unconfirmed", "distinct from the busy refusal: {err:?}");
+        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+
+        dev.forget(&HostId("host-1".into()), &hosts_path, true).expect("a Pi that is gone for good must stay forgettable");
+        assert!(dev.paired_hosts().is_empty());
     }
 
     #[test]
@@ -1365,9 +1406,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let err = dev.forget(&id, &hosts_path).expect_err("a moving blade must not become unstoppable");
+        let err = dev.forget(&id, &hosts_path, false).expect_err("a moving blade must not become unstoppable");
         assert_eq!(err.code, "host_busy");
         assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+
+        // Force is for a host that cannot answer, not one that answered "busy": this host is
+        // reachable, so `cancel` still works and the blade was never orphaned.
+        let forced = dev.forget(&id, &hosts_path, true).expect_err("force must not override a confirmed cut");
+        assert_eq!(forced.code, "host_busy");
+        assert_eq!(dev.paired_hosts().len(), 1, "still paired");
     }
 
     /// The two cutters here share an `instance_id` on purpose — the local factory's device and
@@ -1431,7 +1478,7 @@ mod tests {
             .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
             .expect("this host answers and the fingerprint matches");
 
-        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        dev.forget(&id, &hosts_path, false).expect("it answers, and nothing is running on it");
         assert!(dev.paired_hosts().is_empty());
     }
 
@@ -1449,7 +1496,7 @@ mod tests {
             .expect("this host answers and the fingerprint matches");
         dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
-        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        dev.forget(&id, &hosts_path, false).expect("it answers, and nothing is running on it");
         assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
     }
 
@@ -1543,7 +1590,9 @@ mod tests {
         dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
         dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
-        dev.forget(&HostId("host-elsewhere".into()), &hosts_path).expect("nothing is running on it");
+        // Forced: this one is unreachable, and an unreachable host is no longer forgettable
+        // without it. What the test is about is the *other* host's aim, which must not move.
+        dev.forget(&HostId("host-elsewhere".into()), &hosts_path, true).expect("forced");
         assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
     }
 

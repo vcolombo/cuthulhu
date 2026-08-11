@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
+import { deviceBadge, forgetFrom, groupDevices } from "../hosts/deviceList";
+import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
 import {
@@ -73,6 +75,8 @@ export function CutDialog({
   onClose,
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
+  const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
+  const [pairing, setPairing] = useState(false);
   const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
   // The machine id rides along with the caps: `connected` can change before an
   // in-flight fetch resolves, and showing one machine's capability against another
@@ -87,6 +91,10 @@ export function CutDialog({
 
   useEffect(() => {
     ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    // Separate chain from the devices above, for the same reason the caps and presets fetches
+    // are separate: a Cut Host that cannot be listed must not blank the local cutters, which are
+    // the ones still usable when it is.
+    ipc.listHosts().then(setHosts).catch((e) => onError(ipc.ipcErrorMessage(e)));
     // Reopening the dialog after a connect earlier in the session lost the local
     // `connected` state (it lives only in this component) even though the backend
     // is still connected — seed it from the manager's own cache so Start Cut isn't
@@ -154,6 +162,24 @@ export function CutDialog({
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
+  // A refusal keeps the row and shows the host's own words: the Rust side refuses with
+  // `host_busy` while a cut is active there, and a row that vanished and came back would say
+  // "gone" about the one host that still has a blade moving.
+  const forget = (id: string) => {
+    forgetFrom(hosts, id, ipc.forgetHost).then((r) => {
+      setHosts(r.hosts);
+      if (r.message !== null) onError(r.message);
+    });
+  };
+
+  const paired = (host: ipc.PairedHostView) => {
+    setHosts((prev) => [...prev, host]);
+    setPairing(false);
+    // The host's cutters are only in the device list once it has been re-read; `runPairing`'s
+    // Test listed them to prove the token, not to populate this.
+    ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+  };
+
   const caps = connected && capsFor?.machineId === connected.machine_id ? capsFor.caps : ALL_ENABLED;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
 
@@ -193,6 +219,7 @@ export function CutDialog({
   };
 
   return (
+    <>
     <div style={panelStyle}>
       <div role="dialog" aria-modal="true" aria-label="Cut" style={dialogStyle}>
         <div style={{ display: "flex", alignItems: "center" }}>
@@ -205,26 +232,65 @@ export function CutDialog({
 
         <div>
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>Device</div>
-          {devices.length === 0 ? (
+          {/* Only when there is nothing at all. A paired host with no cutters attached is a
+              different fact, and it has its own section saying so. */}
+          {devices.length === 0 && hosts.length === 0 ? (
             <div style={{ fontSize: 12, color: "var(--muted)" }}>
               No devices found — connect a cutter and reopen this dialog.
             </div>
           ) : null}
-          {devices.map((d) => (
-            <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-              <span>
-                {d.machine_id}
-                {d.candidate ? " (unverified serial device)" : ""}
-              </span>
-              {connected?.instance_id === d.instance_id ? (
-                <span style={{ color: "var(--ready)" }}>connected</span>
-              ) : (
-                <button style={btn} onClick={() => connect(d)}>
-                  Connect
-                </button>
+          {groupDevices(devices, hosts).map((section) => (
+            <div key={section.hostId ?? "local"} style={{ marginBottom: 6 }}>
+              {/* The local section's header is suppressed when it is the only one, so a user with
+                  no Cut Host sees the flat list this dialog has always shown. */}
+              {section.hostId === null && hosts.length === 0 ? null : (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                  <strong>{section.title}</strong>
+                  {section.address ? <span style={{ color: "var(--muted)" }}>{section.address}</span> : null}
+                  {section.stale ? <span style={{ color: "var(--muted)" }}>last known</span> : null}
+                  <div style={{ flex: 1 }} />
+                  {hosts.some((h) => h.id === section.hostId) ? (
+                    <button
+                      aria-label={`Forget ${section.title}`}
+                      style={btn}
+                      onClick={() => forget(section.hostId!)}
+                    >
+                      Forget
+                    </button>
+                  ) : null}
+                </div>
               )}
+              {/* An unreachable host keeps its cutters listed below this, not hidden (#42). */}
+              {section.unreachable ? (
+                <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
+              ) : null}
+              {section.devices.map((d) => (
+                <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                  <span>
+                    {d.machine_id}
+                    {d.candidate ? " (unverified serial device)" : ""}
+                  </span>
+                  {/* Only the aimed-at cutter has a status; the rest have not been asked, and
+                      `null` is what says so rather than something that reads as ready. */}
+                  <span style={{ color: "var(--muted)" }}>
+                    {deviceBadge(connected?.instance_id === d.instance_id ? status : null).label}
+                  </span>
+                  {connected?.instance_id === d.instance_id ? (
+                    <span style={{ color: "var(--ready)" }}>connected</span>
+                  ) : (
+                    <button style={btn} onClick={() => connect(d)}>
+                      Connect
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
           ))}
+          {/* Pairing lives in the device list on purpose: someone hunting for their Pi looks
+              here, and finds nothing if it lives in a settings screen. */}
+          <button style={btn} onClick={() => setPairing(true)}>
+            Add a Cut Host…
+          </button>
         </div>
 
         {machineMismatch && connected ? (
@@ -369,5 +435,7 @@ export function CutDialog({
         </div>
       </div>
     </div>
+    {pairing ? <PairHostDialog onPaired={paired} onClose={() => setPairing(false)} /> : null}
+    </>
   );
 }

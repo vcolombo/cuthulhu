@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -193,6 +193,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
     { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true, host: null },
   ];
+
+  // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
+  // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
+  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
+  if (opts?.seedBusyHost) {
+    hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
+               unreachable: "the host could not be reached (timed out)" }];
+    devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
+                   transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
+  }
 
   let connected: DeviceInfo | null = null;
   let status: CutStatus = DISCONNECTED;
@@ -427,13 +437,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
     machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
-    // No paired hosts yet, so existing assertions (device list, connect flow) are
-    // unaffected. probe/test/pair/forget are stubs a later task exercises.
-    list_hosts: () => [],
+    // Empty unless a test asks for a host, so existing assertions (device list, connect flow)
+    // are unaffected. probe/test/pair stay stubs until a test drives the pairing dialog.
+    list_hosts: () => hosts,
     probe_host: () => unimplemented("probe_host"),
     test_host: () => unimplemented("test_host"),
     pair_host: () => unimplemented("pair_host"),
-    forget_host: () => unimplemented("forget_host"),
+    // Mirrors `DeviceManager::forget`: a host with an active cut refuses, and the desktop must
+    // keep the row rather than discard the token for a Job it could no longer cancel.
+    forget_host: (a) => {
+      if (hosts.some((h) => h.id === a.id && h.id === "host-1"))
+        throw ipcError("host_busy", "a cut is active on this host; cancel it before forgetting");
+      hosts = hosts.filter((h) => h.id !== a.id);
+      return null;
+    },
     save_preset: () => null,
     delete_preset: () => null,
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.
@@ -549,6 +566,28 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 });
 
+// The one test that drives the Cut Host surface end to end. It is here rather than in a unit
+// test because the parts it checks are exactly the ones a unit test cannot: that the grouped
+// list reaches the dialog at all, and that a refusal from the backend leaves the row on screen.
+test("an unreachable host keeps its cutters listed, and refusing to be forgotten keeps its row", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // Listed with the reason, not hidden — a cutter that vanishes looks exactly like one that was
+  // never paired (#42).
+  await expect(page.getByText("Workshop Pi")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
+  // badge says so rather than offering a cut for a status nobody has asked for.
+  await expect(page.getByText("Unknown")).toHaveCount(3);
+
+  await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
+  // The Rust side's own words, and the row still there (#94).
+  await expect(page.getByText("a cut is active on this host; cancel it before forgetting")).toBeVisible();
+  await expect(page.getByText("Workshop Pi")).toBeVisible();
+});
+
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -560,7 +599,7 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancelled")).toBeVisible();
+  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -578,7 +617,7 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   // The backend says which ending it was, so the two endings cannot be confused: this
   // is the case the mock could not express while a finished cut only rested on `Idle`.
   await expect(page.getByText("Job complete")).toBeVisible();
-  await expect(page.getByText("Cancelled")).toHaveCount(0);
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -651,7 +690,7 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Cut" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
-  await expect(page.getByText("Cancelled")).toHaveCount(0);
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
 });
 
 test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {

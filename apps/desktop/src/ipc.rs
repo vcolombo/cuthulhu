@@ -184,6 +184,17 @@ pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHo
     Ok(dev.host_views())
 }
 
+/// Learn the fingerprint a host presents, so the pairing dialog can show it for confirmation
+/// before anything is pinned. The first step of a first pairing, ahead of `test_host`: until the
+/// operator has confirmed it there is no fingerprint to hand `test_host`.
+///
+/// async: the probe dials the host the same way `test_host` does (see there for why).
+#[tauri::command(async)]
+pub fn probe_host(address: String) -> Result<String, IpcError> {
+    cut_host::client::probe_fingerprint(&address, cut_host::client::CONNECT_TIMEOUT)
+        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))
+}
+
 /// Prove a host without saving it. The pairing dialog calls this before `pair_host`, so an
 /// entry that has never worked is never written.
 ///

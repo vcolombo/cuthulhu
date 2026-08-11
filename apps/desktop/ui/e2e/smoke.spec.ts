@@ -726,10 +726,22 @@ test("the dialog polls while it is open, and stops once it is closed", async ({ 
   expect(await polls()).toBe(closed);
 });
 
+// The Pi is optional, and a desktop without one has nothing polling can tell it: a local
+// cutter's status is pushed. Before this branch `list_devices` ran once per dialog open, and it
+// walks the USB bus and the serial ports — running it every second for a user who owns no host
+// is a cost with no answer on the other end of it.
+test("a desktop with no Cut Host paired does not poll at all", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.waitForTimeout(2500);
+  expect(await pollCount(page)()).toBe(0);
+});
+
 // The other half of polling safely: an unreachable host can take seconds to answer, and a tick
 // that waits its turn instead of being skipped builds a backlog that outlives whatever wedged it.
 test("a tick whose last request is still in flight is skipped, not queued", async ({ page }) => {
-  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, slowList: true });
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true, slowList: true });
   await page.goto("/");
   const polls = pollCount(page);
 

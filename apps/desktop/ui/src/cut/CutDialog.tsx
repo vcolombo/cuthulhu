@@ -165,12 +165,18 @@ export function CutDialog({
 
   // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
   // request/reply connection, so this interval is the only thing that moves a remote cutter's
-  // progress. It runs exactly as long as this dialog is mounted.
+  // progress. It runs exactly as long as this dialog is mounted and a host is paired.
+  //
+  // With no host there is no gap to fill — a local cutter's status is pushed by the
+  // device-event listener in `App.tsx` — and the cost is not nothing: `list_devices` resolves
+  // to `HardwareBackendFactory::list_devices`, which walks the USB bus and the serial ports.
+  // The Pi is optional, and a desktop without one pays for it once per dialog, as before.
   //
   // Clearing it is the deliverable, not tidiness. A leaked interval keeps a Cut Host connection
   // warm forever and the daemon caps concurrent clients at eight (#103), so one leaked per
   // dialog-open exhausts a Pi, which then refuses every new connection until it is restarted.
   useEffect(() => {
+    if (hosts.length === 0) return;
     // ponytail: one interval for the whole list, not one per host — the two calls behind it each
     // cover every host at once. Per-host intervals are the upgrade if one slow host ever starts
     // holding up the others' rows, and they cost a teardown each.
@@ -185,7 +191,9 @@ export function CutDialog({
       });
     }, 1000);
     return () => clearInterval(id);
-  }, [refreshList, refreshDeviceState]);
+    // Length, not the array: a poll that replaces `hosts` with an equal list every second would
+    // otherwise tear the interval down and rebuild it every second.
+  }, [refreshList, refreshDeviceState, hosts.length]);
 
   const connect = (info: ipc.DeviceInfo) => {
     ipc

@@ -97,11 +97,14 @@ pub struct PairedHostView {
 }
 
 /// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
-/// reconnect, then body read — not the total. Short on purpose: this is the window-close guard's
-/// own read, and it goes through the same `hosts` lock as every other host call, so a poll that
-/// waited the full `DEFAULT_BODY_TIMEOUT` (30s) on either leg would make a quit mid-cut look hung.
-/// Spent twice in sequence, the real cap is **2x this value** (4s) — plus DNS resolution, which
-/// std gives no way to bound at all (see the `ponytail:` note in `cut_host::client`).
+/// reconnect, then body read — not the total. Spent twice in sequence the real cap is **2x this
+/// value** (4s), plus DNS resolution, which std gives no way to bound at all (see the `ponytail:`
+/// note in `cut_host::client`).
+///
+/// Short because this is the window-close guard's own read and a quit mid-cut must not look hung.
+/// It is no longer what keeps the *rest* of the app moving: the poll holds only its own host's
+/// connection lock (see `hosts`), so overrunning this budget queues calls aimed at that one host
+/// and leaves `cancel`, the device list and every other host alone.
 const STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
@@ -111,9 +114,21 @@ pub struct DeviceManagerHandle {
     // ponytail: brief said `Arc<DeviceManager>`; `DeviceManager::shutdown(self)` consumes by
     // value, so the Arc is wrapped in Option to let `shutdown()` take it out and unwrap it.
     local_manager: Mutex<Option<Arc<DeviceManager>>>,
-    /// Every paired Cut Host, connected lazily. Held together rather than one-at-a-time
-    /// because `list_devices` asks all of them and the device list shows them together.
-    hosts: Mutex<HashMap<HostId, HostConnection>>,
+    /// Every paired Cut Host, connected lazily, each behind a lock of its own.
+    ///
+    /// Two locks rather than one because reaching a host is a network call. Under a single
+    /// map-wide lock a wedged Pi held it for the length of whatever timeout that call had, and
+    /// every other host verb — `cancel` included, the one that stops a moving blade — queued
+    /// behind it; each such call got its own timeout in turn, and `to_socket_addrs` is one that
+    /// cannot be given one at all. Per-connection locks confine the wait to calls aimed at the
+    /// host actually doing the waiting, which makes an unbounded one survivable instead of
+    /// something to keep patching.
+    ///
+    /// **Lock order, and the only one: map, then connection — never the reverse.** Nothing may
+    /// take `hosts` while holding a `HostConnection`. Take the map lock only long enough to clone
+    /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
+    /// after; no network call may run with the map lock held.
+    hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -134,17 +149,38 @@ impl DeviceManagerHandle {
             .ok_or_else(|| IpcError::new("shut_down", "device manager has been shut down"))
     }
 
+    /// The connection for `id`, lifted out from under the map lock so the caller dials with only
+    /// that one connection held. See `hosts` for why the ordering is the invariant.
+    fn host_conn(&self, id: &HostId) -> Result<Arc<Mutex<HostConnection>>, IpcError> {
+        self.hosts
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))
+    }
+
+    /// Every connection, lifted out the same way, for the callers that visit all of them.
+    fn host_conns(&self) -> Vec<(HostId, Arc<Mutex<HostConnection>>)> {
+        self.hosts.lock().unwrap().iter().map(|(id, c)| (id.clone(), c.clone())).collect()
+    }
+
     /// Local hardware plus every paired Cut Host's cutters, in one list.
     ///
     /// A host that cannot be reached contributes nothing here and its reason shows up in
     /// `host_views` — the list is what can be cut on, not what has been configured.
+    ///
+    /// Deliberately still serial, so N unreachable hosts still cost N connect timeouts *for this
+    /// call*. What they no longer cost is every other host verb: the map lock is gone before the
+    /// first dial, so only calls aimed at the host being dialled wait behind it.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut all = self.local_factory.list_devices();
-        let mut hosts = self.hosts.lock().unwrap();
-        for (id, host) in hosts.iter_mut() {
+        for (id, conn) in self.host_conns() {
+            let mut guard = conn.lock().unwrap();
+            let host = &mut *guard;
             let Some(client) = host.ensure() else { continue };
             match client.devices() {
-                Ok(devices) => all.extend(crate::hosts::stamp_host(id, devices)),
+                Ok(devices) => all.extend(crate::hosts::stamp_host(&id, devices)),
                 Err(e) => {
                     // The connection went away between `ensure` and here; drop it so the next
                     // call reconnects rather than reusing a dead one.
@@ -158,10 +194,8 @@ impl DeviceManagerHandle {
 
     pub fn add_host(&self, paired: PairedHost) {
         let id = paired.id.clone();
-        self.hosts
-            .lock()
-            .unwrap()
-            .insert(id, HostConnection { paired, client: None, last_error: None });
+        let conn = HostConnection { paired, client: None, last_error: None };
+        self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
 
     pub fn remove_host(&self, id: &HostId) {
@@ -169,16 +203,23 @@ impl DeviceManagerHandle {
     }
 
     /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
+    ///
+    /// Reads each connection in turn, so it still waits on a host `list_devices` is dialling. It
+    /// walks the same map in the same order, so against a sweep of unreachable hosts it trails one
+    /// host behind and the total approaches the sweep's — the same wait as before, just no longer
+    /// blocking anything else meanwhile. No safety verb is on this path, which is why that is
+    /// tolerable here and would not be on `status` or `cancel`.
     pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
-        self.hosts
-            .lock()
-            .unwrap()
-            .values()
-            .map(|h| PairedHostView {
-                id: h.paired.id.clone(),
-                name: h.paired.name.clone(),
-                address: h.paired.address.clone(),
-                unreachable: h.last_error.clone(),
+        self.host_conns()
+            .into_iter()
+            .map(|(_, conn)| {
+                let h = conn.lock().unwrap();
+                PairedHostView {
+                    id: h.paired.id.clone(),
+                    name: h.paired.name.clone(),
+                    address: h.paired.address.clone(),
+                    unreachable: h.last_error.clone(),
+                }
             })
             .collect()
     }
@@ -186,7 +227,7 @@ impl DeviceManagerHandle {
     /// Every paired host as saved, for `pair`/`forget` to re-derive `hosts.json`'s on-disk
     /// contents and to mint the next id against.
     pub(crate) fn paired_hosts(&self) -> Vec<PairedHost> {
-        self.hosts.lock().unwrap().values().map(|h| h.paired.clone()).collect()
+        self.host_conns().into_iter().map(|(_, conn)| conn.lock().unwrap().paired.clone()).collect()
     }
 
     /// Pairs a Cut Host: prove it works, mint an id, persist — and only once the save has
@@ -232,16 +273,14 @@ impl DeviceManagerHandle {
         // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
         //
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
-        // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read.
-        // `with_host_within` holds the `hosts` lock across this call, and that lock also guards
-        // `status`/`route`/`list_devices`/the window-close guard. A host that completes TLS and
-        // then stalls must not hang all of those for 30s on a guard check, and a host that is
-        // simply offline must not spend `CONNECT_TIMEOUT` reconnecting before that budget even
-        // starts. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
-        // legs, in sequence) is one the operator is likely forgetting precisely because it is
-        // unreachable, so falling through to the forget is the right default. That figure does
-        // not include DNS resolution, which std gives no way to bound (see `cut_host::client`'s
-        // `ponytail:` note) — a hung resolver is the one way this can still exceed it.
+        // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
+        // anything else waits on it: this holds only this host's connection lock, so a stall here
+        // delays calls aimed at this host and nothing else. It is bounded because the operator is
+        // usually forgetting a host *precisely* because it has stopped answering, and making them
+        // wait 30s for a dead Pi's permission to stop asking about it is the wrong answer to
+        // that. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
+        // legs, in sequence; plus DNS, which std gives no way to bound, see `cut_host::client`'s
+        // `ponytail:` note) falls through to the forget.
         if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
             if snapshots.iter().any(|s| s.status.is_active()) {
                 return Err(IpcError::new(
@@ -303,21 +342,23 @@ impl DeviceManagerHandle {
     /// body read inside `f`. `with_host` alone only bounds what `f` does — a dropped connection
     /// still reconnects via the unbounded default, so a caller with a short total budget for the
     /// whole call (the window-close guard reading `status()`) could still block for the full
-    /// `CONNECT_TIMEOUT` before `f` ever runs. `connect_timeout` closes that hole, but only that
-    /// one: DNS resolution happens before `connect_within`'s deadline is even computed, and std
-    /// gives no way to bound it (the `ponytail:` note in `cut_host::client` says so directly) —
-    /// so the true wait here is `connect_timeout` twice over (reconnect, then body) plus
-    /// whatever a hung resolver costs, not a hard total.
+    /// `CONNECT_TIMEOUT` before `f` ever runs.
+    ///
+    /// The true wait is still not a hard total: `connect_timeout` twice over (reconnect, then
+    /// body), plus whatever a hung resolver costs, since DNS is resolved before
+    /// `connect_within`'s deadline is even computed and std gives no way to bound it (the
+    /// `ponytail:` note in `cut_host::client`). What makes that acceptable rather than the next
+    /// thing to patch is *whose* wait it is: the map lock is released before the connection is
+    /// locked, so all of it is spent by calls aimed at this host and by nothing else.
     fn with_host_within<T>(
         &self,
         id: &HostId,
         connect_timeout: std::time::Duration,
         f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
     ) -> Result<T, IpcError> {
-        let mut hosts = self.hosts.lock().unwrap();
-        let host = hosts
-            .get_mut(id)
-            .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))?;
+        let conn = self.host_conn(id)?;
+        let mut guard = conn.lock().unwrap();
+        let host = &mut *guard;
         // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
         // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
         // in place lets the borrow end with the arm that doesn't need it.
@@ -404,12 +445,12 @@ impl DeviceManagerHandle {
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => self
                 // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
-                // body read: this is the window-close guard's own read, and a stale snapshot is
-                // fine when the next poll is a second away, but a 30s hold of `hosts` behind a
-                // stalled host — or a `CONNECT_TIMEOUT` reconnect before the read even starts —
-                // is not. The real total is roughly 2x `STATUS_POLL_TIMEOUT` (4s), not one
-                // `STATUS_POLL_TIMEOUT` — and DNS resolution sits outside that entirely,
-                // unbounded, ahead of both legs (see `cut_host::client`'s `ponytail:` note).
+                // body read: this is the window-close guard's own read, a stale snapshot is fine
+                // when the next poll is a second away, and a quit mid-cut must not look hung. The
+                // real total is roughly 2x `STATUS_POLL_TIMEOUT` (4s), not one — and DNS sits
+                // outside that entirely, unbounded, ahead of both legs (see `cut_host::client`'s
+                // `ponytail:` note). Overrunning it now costs a late status for this host rather
+                // than a stalled application: only this host's connection is held here.
                 .with_host_within(&id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
                 .ok()
                 .and_then(|snaps| {
@@ -1172,6 +1213,82 @@ mod tests {
 
         dev.forget(&id, &hosts_path).expect("nothing is running on it");
         assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
+    }
+
+    /// A TCP listener that accepts and then says nothing at all — a Pi that answers the SYN and
+    /// then wedges, which is the shape that used to hold the `hosts` map lock for everyone.
+    /// Loopback rather than a black-holed address on purpose: how long an unroutable address
+    /// takes to fail is the network's business, and a test that needs a real stall must not
+    /// depend on it.
+    fn start_silent_host() -> (String, std::sync::mpsc::Receiver<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (accepted, saw_accept) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Held rather than dropped: closing the socket would let the client fail instantly,
+            // which is the one thing this fixture must not do.
+            let mut open = Vec::new();
+            while let Ok((sock, _)) = listener.accept() {
+                open.push(sock);
+                let _ = accepted.send(());
+            }
+        });
+        (addr, saw_accept)
+    }
+
+    /// The property the per-connection locks buy: a call aimed at one host is not delayed by a
+    /// call already in flight against another. Before the split this failed — `with_host` held
+    /// the whole `hosts` map across its network call, so the healthy host's answer queued behind
+    /// the wedged host's timeout, and so did `cancel` and the window-close guard's `status()`.
+    ///
+    /// Deterministic without sleeping on a guess: the healthy call is only made once the wedged
+    /// connection's own lock is *observed* taken, and the assertion is ordering ("the healthy one
+    /// answered first"), not a duration.
+    #[test]
+    fn a_call_to_one_host_is_not_delayed_by_a_wedged_call_to_another() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (silent_addr, saw_accept) = start_silent_host();
+        let healthy = start_loopback_host();
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-wedged", &silent_addr));
+        dev.add_host(PairedHost {
+            id: HostId("host-healthy".into()),
+            name: "Workshop Pi".into(),
+            address: healthy.addr.clone(),
+            fingerprint: healthy.fingerprint.clone(),
+            token: HOST_TOKEN.into(),
+        });
+
+        // Taken before anything is in flight, so that observing it later cannot itself be what
+        // blocks — under the old shape this very call would have queued on the map lock, and the
+        // test would have failed for a reason one step removed from the one it is about.
+        let wedged_conn = dev.host_conn(&HostId("host-wedged".into())).unwrap();
+
+        let wedged_done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = dev.with_host(&HostId("host-wedged".into()), |c| c.devices());
+                wedged_done.store(true, Ordering::SeqCst);
+            });
+
+            // Two anchors, so "in flight" is observed rather than assumed: the fixture has taken
+            // the connection, and the connection's lock is held by the call that took it.
+            saw_accept.recv_timeout(Duration::from_secs(10)).expect("the wedged host was never dialled");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while wedged_conn.try_lock().is_ok() {
+                assert!(Instant::now() < deadline, "the wedged call never took its connection lock");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            dev.with_host(&HostId("host-healthy".into()), |c| c.devices())
+                .expect("the healthy host answers regardless of what the wedged one is doing");
+            assert!(
+                !wedged_done.load(Ordering::SeqCst),
+                "the healthy host only answered once the wedged call gave up — the two are still serialized"
+            );
+        });
     }
 
     /// Forgetting one host must not disturb an aim pointed at a different one.

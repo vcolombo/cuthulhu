@@ -520,9 +520,12 @@ impl DeviceManagerHandle {
     /// *before* calling `execute_cut` (which blocks on the worker thread).
     /// Never touches `AppStateHandle`'s mutex beyond that.
     ///
+    /// The device Preflight ran against comes back with the Passes: it is what
+    /// `execute_cut` compares the aim to, since the two calls do not share a lock.
+    ///
     /// What stays here is what `cutplan` cannot know: which device is plugged
     /// in, which driver serves it, and where the presets file lives.
-    pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<Vec<CutPass>, IpcError> {
+    pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<(DeviceInfo, Vec<CutPass>), IpcError> {
         let connected = self.connected.lock().unwrap().clone()
             .ok_or_else(|| IpcError::new("not_connected", "no device connected"))?;
         if connected.instance_id != request.device_instance_id {
@@ -568,25 +571,41 @@ impl DeviceManagerHandle {
         let planned = plan_passes(&app.editor.doc)
             .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
         let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
-        Ok(plan.cut_passes())
+        Ok((connected, plan.cut_passes()))
     }
 
     /// Submits already-planned passes to the device manager. Blocks until the
     /// worker reaches its first pause point or completion — call this off the
     /// document lock (see `prepare_cut`) and from an async command so it
     /// doesn't freeze the Tauri main loop.
-    pub fn execute_cut(&self, passes: Vec<CutPass>) -> Result<u64, IpcError> {
+    ///
+    /// `planned_for` is the device `prepare_cut` preflighted against. Nothing holds the
+    /// aim still across the two calls — the operator can connect another cutter while
+    /// planning runs — and the machine-mismatch check downstream cannot catch the swap,
+    /// because it would be handed the *new* device's own `machine_id` and so compare it
+    /// against itself. So the aim is re-read and compared here, before anything is sent.
+    pub fn execute_cut(&self, planned_for: DeviceInfo, passes: Vec<CutPass>) -> Result<u64, IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
-        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
-            None | Some(Route::Local) => {
+        // A cutter is its id *and* its host, never the id alone: fallback ids are assigned by
+        // location (`usb:at:1:4`, `serial:at:/dev/ttyUSB0`), so two hosts wired alike hand out
+        // the same string for two different machines.
+        let same_cutter = aimed
+            .as_ref()
+            .is_some_and(|d| d.instance_id == planned_for.instance_id && d.host == planned_for.host);
+        if !same_cutter {
+            return Err(IpcError::new(
+                "device_mismatch",
+                "the connected device changed while this cut was being planned — nothing was sent; re-plan the cut for the device now connected",
+            ));
+        }
+
+        // Routed by the device Preflight approved, now that it is known to be the one aimed at.
+        match self.route(&planned_for)? {
+            Route::Local => {
                 self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
             }
-            Some(Route::Host(id)) => {
-                // `execute_cut` takes only the Passes, so both the device and the machine it is
-                // for come from what the dialog is aimed at — which is also what `route` just
-                // resolved, so the two cannot disagree.
-                let aimed = aimed.expect("a route implies a device");
-                let (device, machine_id) = (aimed.instance_id, aimed.machine_id);
+            Route::Host(id) => {
+                let (device, machine_id) = (planned_for.instance_id, planned_for.machine_id);
                 // A fresh id per attempt: this is a new Job, not a retry of a dropped reply,
                 // and reusing one would make the host treat it as already accepted.
                 let dispatch_id = cut_host::protocol::DispatchId(format!(
@@ -611,8 +630,8 @@ impl DeviceManagerHandle {
     /// is dropped before the blocking `execute_cut` call.
     #[cfg(test)]
     fn cut_from_request(&self, app: &AppState, request: CutRequest) -> Result<u64, IpcError> {
-        let passes = self.prepare_cut(app, request)?;
-        self.execute_cut(passes)
+        let (planned_for, passes) = self.prepare_cut(app, request)?;
+        self.execute_cut(planned_for, passes)
     }
 }
 
@@ -1180,6 +1199,56 @@ mod tests {
         let err = dev.forget(&id, &hosts_path).expect_err("a moving blade must not become unstoppable");
         assert_eq!(err.code, "host_busy");
         assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+    }
+
+    /// The two cutters here share an `instance_id` on purpose — the local factory's device and
+    /// the loopback host's Cameo are both `usb:1:4`, because a fallback id is assigned by
+    /// location and two identically-wired machines really do collide. A guard comparing ids
+    /// alone would call these the same cutter and send A's Passes to B.
+    #[test]
+    fn a_dispatch_whose_aim_moved_after_planning_is_refused() {
+        use std::time::{Duration, Instant};
+
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        // Preflight runs against the local cutter...
+        let (planned_for, passes) = dev.prepare_cut(&app, request_from(plan_for(&app))).unwrap();
+        assert_eq!(planned_for.host, None);
+
+        // ...and the operator connects the Pi's Cameo before the dispatch lands.
+        *dev.connected.lock().unwrap() = Some(DeviceInfo {
+            instance_id: cut_host::host::testing::CAMEO.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: Some(host_id),
+        });
+
+        let err = dev.execute_cut(planned_for, passes).expect_err("Passes approved for A must not go to B");
+        assert_eq!(err.code, "device_mismatch");
+
+        // The daemon accepts a dispatch before its cut thread starts, so a single snapshot could
+        // read idle on a host that is about to move. Hold the assertion open instead.
+        let client = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            let active = client
+                .snapshots()
+                .unwrap()
+                .iter()
+                .any(|s| s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active());
+            assert!(!active, "the refused Passes reached the host anyway");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

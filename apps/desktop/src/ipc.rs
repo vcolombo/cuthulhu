@@ -133,11 +133,11 @@ pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, 
 // loop keeps the UI (and cancel_cut) responsive while it blocks.
 #[tauri::command(async)]
 pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<u64, IpcError> {
-    let passes = {
+    let (planned_for, passes) = {
         let app = state.lock().unwrap();
         dev.prepare_cut(&app, request)?
     };
-    dev.execute_cut(passes)
+    dev.execute_cut(planned_for, passes)
 }
 
 #[tauri::command(async)]

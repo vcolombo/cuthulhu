@@ -233,8 +233,10 @@ export async function pairHost(name: string, address: string, token: string, fin
   return invoke("pair_host", { name, address, token, fingerprint });
 }
 
-export async function forgetHost(id: string): Promise<void> {
-  return invoke("forget_host", { id });
+// `force` is the operator accepting that a host which cannot be asked may still be cutting. Only
+// offered once an unforced attempt has been refused — see `forgetFrom`.
+export async function forgetHost(id: string, force: boolean): Promise<void> {
+  return invoke("forget_host", { id, force });
 }
 
 export async function listPresets(machineId: string) {

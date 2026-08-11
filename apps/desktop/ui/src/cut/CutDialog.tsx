@@ -95,6 +95,8 @@ export function CutDialog({
   // the rows stale instead of blanking them.
   const [listError, setListError] = useState<unknown>(null);
   const [pairing, setPairing] = useState(false);
+  /** The host whose forget was refused because nothing could confirm it is idle, if any. */
+  const [forceHost, setForceHost] = useState<string | null>(null);
   const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
   // The machine id rides along with the caps: `connected` can change before an
   // in-flight fetch resolves, and showing one machine's capability against another
@@ -248,15 +250,20 @@ export function CutDialog({
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
-  // A refusal keeps the row and shows the host's own words: the Rust side refuses with
-  // `host_busy` while a cut is active there, and a row that vanished and came back would say
-  // "gone" about the one host that still has a blade moving.
+  // A refusal keeps the row and shows the host's own words: the Rust side refuses while a cut is
+  // active there and whenever it cannot ask, and a row that vanished and came back would say
+  // "gone" about the one host that might still have a blade moving.
   // A success re-reads both lists rather than dropping the host here. `devices` still holds that
   // host's cutters, and a cutter naming a host nobody is paired with is precisely what earns an
   // orphan section — so removing the row on its own renamed it to a raw host id and captioned it
   // "not paired with this computer", which is a warning about a host the operator just dismissed.
-  const forget = (id: string) => {
-    forgetFrom(hosts, id, ipc.forgetHost).then((r) => {
+  //
+  // The force is offered by `forceHost`, and only for the host whose unforced attempt just came
+  // back `host_unconfirmed` — never standing there ahead of the try that would explain why it
+  // exists.
+  const forget = (id: string, force = false) => {
+    forgetFrom(hosts, id, ipc.forgetHost, force).then((r) => {
+      setForceHost(r.forceable ? id : null);
       if (r.message === null) refreshList();
       else onError(r.message);
     });
@@ -363,6 +370,30 @@ export function CutDialog({
               {/* An unreachable host keeps its cutters listed below this, not hidden (#42). */}
               {section.unreachable ? (
                 <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
+              ) : null}
+              {/* Says what is being accepted rather than asking "are you sure": the risk is not
+                  that the host is gone, it is that it is still cutting and this is the only
+                  desktop that could stop it. Shown only after the plain Forget was refused. */}
+              {forceHost === section.hostId ? (
+                <div style={{ fontSize: 12, color: "var(--cut)", display: "flex", alignItems: "center", gap: 8 }}>
+                  <span>
+                    A cut may still be running on this Cut Host. Forgetting it discards the
+                    credentials this desktop needs to cancel, resume or confirm that cut — it will
+                    not be able to stop it.
+                  </span>
+                  {/* Not "Forget <name> anyway": that name contains this section's own Forget
+                      button's, and a selector for one would match both. */}
+                  <button
+                    aria-label={`Discard ${section.title} anyway`}
+                    style={btn}
+                    onClick={() => forget(section.hostId!, true)}
+                  >
+                    Discard anyway
+                  </button>
+                  <button aria-label={`Keep ${section.title}`} style={btn} onClick={() => setForceHost(null)}>
+                    Keep it
+                  </button>
+                </div>
               ) : null}
               {section.devices.map((d) => {
                 // Only the aimed-at cutter has a status; the rest have not been asked, and

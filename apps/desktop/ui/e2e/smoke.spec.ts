@@ -488,11 +488,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       devices.push(PAIRED_CUTTER);
       return host;
     },
-    // Mirrors `DeviceManager::forget`: a host with an active cut refuses, and the desktop must
-    // keep the row rather than discard the token for a Job it could no longer cancel.
+    // Mirrors `DeviceManagerHandle::forget`: a host that cannot be asked whether it is cutting
+    // refuses like one that answered "busy" — the Pi keeps cutting when the network drops, and
+    // the desktop must keep the row rather than discard the token for a Job it could no longer
+    // cancel. Distinct code, because only this one can be forced past.
     forget_host: (a) => {
-      if (hosts.some((h) => h.id === a.id && h.id === "host-1"))
-        throw ipcError("host_busy", "a cut is active on this host; cancel it before forgetting");
+      if (!a.force && hosts.some((h) => h.id === a.id && h.unreachable !== null))
+        throw ipcError(
+          "host_unconfirmed",
+          "this Cut Host could not be asked whether it is cutting (timed out); if it is, forgetting it discards the only way to stop it",
+        );
       hosts = hosts.filter((h) => h.id !== a.id);
       // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
       // pairing that was just discarded, so it cannot still be reporting what is attached to it.
@@ -632,8 +637,16 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
   // The Rust side's own words, and the row still there (#94).
-  await expect(page.getByText("a cut is active on this host; cancel it before forgetting")).toBeVisible();
+  await expect(page.getByText("this Cut Host could not be asked whether it is cutting")).toBeVisible();
   await expect(page.getByText("Workshop Pi")).toBeVisible();
+
+  // Only now is the force on screen, and it says what is being accepted rather than asking
+  // whether the operator is sure.
+  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toBeVisible();
+  await page.getByRole("button", { name: "Discard Workshop Pi anyway" }).click();
+  // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
+  await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+  expect(await page.getByText("Workshop Pi").count()).toBe(0);
 });
 
 // Reaching a Pi starts here, and nothing drove it end to end while the fake refused the three

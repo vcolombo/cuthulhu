@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { ipcErrorMessage, type CutStatus, type DeviceInfo, type PairedHostView } from "../ipc";
+import { ipcErrorCode, ipcErrorMessage, type CutStatus, type DeviceInfo, type PairedHostView } from "../ipc";
 
 export type DeviceSection = {
   /** null for cutters attached to this computer. */
@@ -44,17 +44,27 @@ export function groupDevices(
   }))];
 }
 
-/** The host list after a forget, and the refusal to show if it did not happen. */
-export type ForgetResult = { hosts: PairedHostView[]; message: string | null };
+/**
+ * The host list after a forget, the refusal to show if it did not happen, and whether that
+ * refusal is one a force could get past.
+ */
+export type ForgetResult = { hosts: PairedHostView[]; message: string | null; forceable: boolean };
 
 /**
  * Forget a Cut Host, all or nothing.
  *
- * The row goes only once the Rust side has agreed, never optimistically: it refuses with
- * `host_busy` while a cut is active on that host, because discarding the token would strand a Job
- * the desktop can no longer cancel — a blade still moving on the Pi with nothing left to stop it.
- * Removing the row first and restoring it on refusal would show that host as gone, however
- * briefly, at the one moment it most needs to be reachable.
+ * The row goes only once the Rust side has agreed, never optimistically: it refuses while a cut
+ * is active on that host (`host_busy`) *and* whenever it cannot ask at all (`host_unconfirmed`),
+ * because discarding the token would strand a Job the desktop can no longer cancel — a blade
+ * still moving on the Pi with nothing left to stop it. Removing the row first and restoring it on
+ * refusal would show that host as gone, however briefly, at the one moment it most needs to be
+ * reachable.
+ *
+ * Only the second refusal is `forceable`, and only after it has happened: a Pi that is gone for
+ * good must not become unforgettable, but the failed attempt is what tells the operator there is
+ * something to think about. A force offered before they have tried teaches them to take it by
+ * reflex. A host that answered "busy" is reachable, so `cancel` still works there and no force is
+ * offered at all.
  *
  * A refusal leaves the list untouched rather than partly erased. Nothing here clears a stored
  * token on its own: re-pairing replaces it, and a host that plainly needs attention is better
@@ -63,13 +73,14 @@ export type ForgetResult = { hosts: PairedHostView[]; message: string | null };
  * The refusal is the Rust side's own prose, unaltered (#94).
  */
 export async function forgetFrom(
-  hosts: PairedHostView[], id: string, forget: (id: string) => Promise<void>,
+  hosts: PairedHostView[], id: string, forget: (id: string, force: boolean) => Promise<void>,
+  force = false,
 ): Promise<ForgetResult> {
   try {
-    await forget(id);
-    return { hosts: hosts.filter(h => h.id !== id), message: null };
+    await forget(id, force);
+    return { hosts: hosts.filter(h => h.id !== id), message: null, forceable: false };
   } catch (e) {
-    return { hosts, message: ipcErrorMessage(e) };
+    return { hosts, message: ipcErrorMessage(e), forceable: !force && ipcErrorCode(e) === "host_unconfirmed" };
   }
 }
 

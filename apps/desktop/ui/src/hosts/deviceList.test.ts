@@ -78,18 +78,61 @@ const PAIRED: PairedHostView[] = [
   { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null },
 ];
 
-const runForget = (id: string, forget: (id: string) => Promise<void>) =>
-  forgetFrom(PAIRED, id, forget);
+const runForget = (id: string, forget: (id: string, force: boolean) => Promise<void>, force = false) =>
+  forgetFrom(PAIRED, id, forget, force);
+
+const BUSY = { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+const UNCONFIRMED = {
+  code: "host_unconfirmed",
+  message: "this Cut Host could not be asked whether it is cutting",
+};
 
 describe("forgetFrom", () => {
   it("keeps a host that refuses to be forgotten, and says why", async () => {
     // The Rust side refuses while a cut is active on that host: the desktop would otherwise
     // discard the token for a Job it can no longer cancel.
     const s = await runForget("host-1", async () => {
-      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+      throw BUSY;
     });
     expect(s.hosts.map(h => h.id)).toContain("host-1");
     expect(s.message).toContain("cancel it before forgetting");
+  });
+
+  // The two refusals drive different copy because the operator's next move differs: cancel the
+  // cut, versus decide whether an unreachable Pi is really idle. Only the second offers a force.
+  it("offers a force only for the refusal a force could get past", async () => {
+    const busy = await runForget("host-1", async () => {
+      throw BUSY;
+    });
+    expect(busy.forceable).toBe(false);
+
+    const unconfirmed = await runForget("host-1", async () => {
+      throw UNCONFIRMED;
+    });
+    expect(unconfirmed.forceable).toBe(true);
+  });
+
+  // The failed attempt is what tells the operator there is something to think about. A force
+  // standing there before they have tried teaches them to take it by reflex.
+  it("does not offer the force again on an attempt that already carried it", async () => {
+    const s = await runForget("host-1", async () => {
+      throw UNCONFIRMED;
+    }, true);
+    expect(s.forceable).toBe(false);
+    expect(s.hosts).toEqual(PAIRED);
+  });
+
+  it("passes the force through, and removes the host when it succeeds", async () => {
+    const seen: boolean[] = [];
+    const forget = async (_id: string, force: boolean) => {
+      seen.push(force);
+      if (!force) throw UNCONFIRMED;
+    };
+    const refused = await runForget("host-1", forget);
+    expect(refused.forceable).toBe(true);
+    const forced = await runForget("host-1", forget, true);
+    expect(forced.hosts.map(h => h.id)).toEqual(["host-2"]);
+    expect(seen).toEqual([false, true]);
   });
 
   it("removes the host only once the Rust side has agreed", async () => {
@@ -103,7 +146,7 @@ describe("forgetFrom", () => {
   // than one whose credentials this side quietly dropped.
   it("leaves the list exactly as it was when the forget is refused", async () => {
     const s = await runForget("host-1", async () => {
-      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+      throw BUSY;
     });
     expect(s.hosts).toEqual(PAIRED);
   });

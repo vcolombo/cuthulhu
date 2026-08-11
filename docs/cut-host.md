@@ -103,6 +103,7 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/cuthulhu-cutd --config /etc/cuthulhu/cutd.toml
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30min
 User=cuthulhu
 StateDirectory=cuthulhu
 
@@ -116,13 +117,43 @@ reaches `multi-user.target` before DHCP hands it an address, so `bind`ing a spec
 the example above fails on the first try; `RestartSec=5` gives the network time to come up instead
 of exhausting systemd's default restart burst and leaving the unit `failed`.
 
+`TimeoutStopSec` is the one line here that decides whether a cut survives a stop, and it must be
+longer than your longest realistic Job — see "Stopping it while a cut is running" below.
+
 ```sh
 sudo systemctl enable --now cuthulhu-cutd
 journalctl -u cuthulhu-cutd -f
 ```
 
-A restart kills any cut in flight. `systemctl restart` while a Job is running will ruin the material
-on the mat — check `journalctl` first.
+## Stopping it while a cut is running
+
+`systemctl stop`, `systemctl restart`, a package upgrade and a plain `kill` all send SIGTERM, and
+the daemon refuses to end a Job on one. It logs which cutter is still busy and waits, then exits by
+itself the moment the last cut finishes — a stop issued mid-Job is deferred, not rejected, so you
+can leave the command running and it completes when the material does.
+
+That waiting is only as long as systemd allows. **`TimeoutStopSec` must exceed your longest
+realistic cut.** systemd sends SIGKILL when it expires, and SIGKILL cannot be refused by anything —
+leave it at the default (90 seconds on most systems) and a stop during a half-hour Job abandons the
+cut exactly as before, while the daemon's refusal in the log makes it look like it did not.
+`TimeoutStopSec=infinity` waits forever, at the cost of a genuinely wedged daemon being able to
+block shutdown and reboot indefinitely; the 30 minutes above is the compromise, and it is a number
+to raise if your Jobs are longer.
+
+To stop anyway, signal a second time — the first signal is the guard, the second is you saying you
+mean it, and the cut is abandoned:
+
+```sh
+sudo systemctl kill --signal=SIGTERM cuthulhu-cutd
+```
+
+There is no flag for this, on purpose: the force has to be reachable by whoever is already holding
+the signal rather than needing an edit to the unit file. Ctrl-C twice does the same when running the
+daemon in a terminal.
+
+Abandoning a cut leaves the blade wherever it stopped and the material unusable. Prefer cancelling
+the Job from the desktop first — that stops the machine deliberately, after which the pending stop
+completes on its own.
 
 ## Reaching it
 
@@ -154,4 +185,5 @@ sudo systemctl restart cuthulhu-cutd
 ```
 
 Every other client keeps working. `journalctl -u cuthulhu-cutd` names which client authenticated
-and which dispatched each Job, so you can tell which line to remove.
+and which dispatched each Job, so you can tell which line to remove. A restart issued while a cut is
+running waits for it, as above — the revocation takes effect when the Job ends.

@@ -237,10 +237,7 @@ impl Host {
     }
 
     /// What the daemon's shutdown guard asks, using `driver-core`'s own predicate
-    /// rather than a second reading of the phases.
-    ///
-    /// No caller consults this yet — `cuthulhu-cutd` has no signal handling and no
-    /// shutdown path. Wiring one is later work; this is the predicate it will ask.
+    /// rather than a second reading of the phases. `crate::shutdown` is the caller.
     pub fn is_any_cut_active(&self) -> bool {
         self.slots.values().any(|s| s.manager.status().is_active())
     }

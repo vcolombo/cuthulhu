@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
-import { deviceBadge, forgetFrom, groupDevices } from "../hosts/deviceList";
+import { deviceBadge, forgetFrom, groupDevices, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
@@ -27,7 +27,7 @@ type Props = {
   artboard: { x: number; y: number; w: number; h: number };
   docMachineId: string | null;
   status: ipc.CutStatus;
-  refreshDeviceState: () => void;
+  refreshDeviceState: () => Promise<void>;
   onConvertMachine: (machineId: string) => void;
   onError: (msg: string) => void;
   onClose: () => void;
@@ -76,6 +76,9 @@ export function CutDialog({
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
   const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
+  // What the last read of the two lists failed with, held rather than reported: it is what marks
+  // the rows stale instead of blanking them.
+  const [listError, setListError] = useState<unknown>(null);
   const [pairing, setPairing] = useState(false);
   const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
   // The machine id rides along with the caps: `connected` can change before an
@@ -89,12 +92,26 @@ export function CutDialog({
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
 
+  // The whole device list in one request rather than one per host: `list_devices` already
+  // re-reads every paired host in a single call, and `list_hosts` carries why any of them cannot
+  // be reached.
+  const refreshList = useCallback(
+    () =>
+      Promise.all([ipc.listDevices(), ipc.listHosts()])
+        .then(([d, h]) => {
+          setDevices(d);
+          setHosts(h);
+          setListError(null);
+        })
+        // Kept, not raised: a read that failed leaves the last values it managed on screen,
+        // marked stale. A row that blanks reads as "the cut finished", which is the one wrong
+        // thing to tell someone whose material is still moving under a blade.
+        .catch((e) => setListError(e)),
+    [],
+  );
+
   useEffect(() => {
-    ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
-    // Separate chain from the devices above, for the same reason the caps and presets fetches
-    // are separate: a Cut Host that cannot be listed must not blank the local cutters, which are
-    // the ones still usable when it is.
-    ipc.listHosts().then(setHosts).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    refreshList();
     // Reopening the dialog after a connect earlier in the session lost the local
     // `connected` state (it lives only in this component) even though the backend
     // is still connected — seed it from the manager's own cache so Start Cut isn't
@@ -146,6 +163,30 @@ export function CutDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
+  // request/reply connection, so this interval is the only thing that moves a remote cutter's
+  // progress. It runs exactly as long as this dialog is mounted.
+  //
+  // Clearing it is the deliverable, not tidiness. A leaked interval keeps a Cut Host connection
+  // warm forever and the daemon caps concurrent clients at eight (#103), so one leaked per
+  // dialog-open exhausts a Pi, which then refuses every new connection until it is restarted.
+  useEffect(() => {
+    // ponytail: one interval for the whole list, not one per host — the two calls behind it each
+    // cover every host at once. Per-host intervals are the upgrade if one slow host ever starts
+    // holding up the others' rows, and they cost a teardown each.
+    let inFlight = false;
+    const id = setInterval(() => {
+      // Skipped rather than queued: an unreachable host can take seconds to answer, and ticks
+      // that wait their turn build a backlog that outlives whatever wedged the host.
+      if (inFlight) return;
+      inFlight = true;
+      Promise.all([refreshList(), refreshDeviceState()]).finally(() => {
+        inFlight = false;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [refreshList, refreshDeviceState]);
+
   const connect = (info: ipc.DeviceInfo) => {
     ipc
       .connectDevice(info)
@@ -172,13 +213,18 @@ export function CutDialog({
     });
   };
 
-  const paired = (host: ipc.PairedHostView) => {
-    setHosts((prev) => [...prev, host]);
+  // Both lists come back from the backend, which has just persisted the host — the new row is
+  // never assembled on this side. Appending it here put the same Pi in the list twice, listed
+  // under one name and forgettable once. Its cutters arrive the same way: `runPairing`'s Test
+  // listed them to prove the token, not to populate this.
+  const paired = () => {
     setPairing(false);
-    // The host's cutters are only in the device list once it has been re-read; `runPairing`'s
-    // Test listed them to prove the token, not to populate this.
-    ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    refreshList();
   };
+
+  // A read that failed keeps every section it had, marked stale, rather than emptying the list.
+  const sections = groupDevices(devices, hosts);
+  const shown = listError === null ? sections : sections.map((s) => staleSection(s, listError));
 
   const caps = connected && capsFor?.machineId === connected.machine_id ? capsFor.caps : ALL_ENABLED;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
@@ -239,7 +285,7 @@ export function CutDialog({
               No devices found — connect a cutter and reopen this dialog.
             </div>
           ) : null}
-          {groupDevices(devices, hosts).map((section) => (
+          {shown.map((section) => (
             <div key={section.hostId ?? "local"} style={{ marginBottom: 6 }}>
               {/* The local section's header is suppressed when it is the only one, so a user with
                   no Cut Host sees the flat list this dialog has always shown. */}

@@ -182,8 +182,10 @@ export function App() {
     [refresh],
   );
 
+  // Returns the request so a caller that polls can wait for it: a tick that fires while the last
+  // one is still in flight has to be skipped, and it cannot skip what it cannot see finish.
   const refreshDeviceState = useCallback(() => {
-    ipc
+    return ipc
       .getDeviceState()
       .then(setStatus)
       .catch((e) => setError(ipc.ipcErrorMessage(e)));

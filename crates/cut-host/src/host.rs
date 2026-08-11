@@ -30,6 +30,19 @@ pub(crate) struct DeviceSlot {
     pub admission: Mutex<Admission>,
 }
 
+impl DeviceSlot {
+    /// Whether this cutter is spoken for: a Job in flight, *or* a dispatch admitted and not yet
+    /// inside `manager.cut`.
+    ///
+    /// `actions` cannot answer the second half — that is the whole reason `Admission::starting`
+    /// exists — so anything deciding whether a transport may be dropped has to ask both. One
+    /// predicate rather than two readings, because the two readers (`reconnect` and the shutdown
+    /// guard) are exactly where getting it wrong pulls a transport out from under a moving blade.
+    pub(crate) fn is_claimed(&self) -> bool {
+        self.admission.lock().unwrap().starting || self.manager.status().is_active()
+    }
+}
+
 /// What a dispatch has to claim, in one place so it can be claimed at once.
 ///
 /// The two halves are one transaction — claim the id and claim the cutter, or
@@ -236,10 +249,13 @@ impl Host {
         Ok(())
     }
 
-    /// What the daemon's shutdown guard asks, using `driver-core`'s own predicate
-    /// rather than a second reading of the phases. `crate::shutdown` is the caller.
+    /// What the daemon's shutdown guard asks (`crate::shutdown` is the caller). Built on
+    /// `driver-core`'s own predicate rather than a second reading of the phases, plus the one
+    /// thing that predicate cannot see: a dispatch admitted and not yet inside `manager.cut`.
+    /// Without it a signal landing in that window exits past a Job whose client has already been
+    /// told `Accepted` — see `DeviceSlot::is_claimed`.
     pub fn is_any_cut_active(&self) -> bool {
-        self.slots.values().any(|s| s.manager.status().is_active())
+        self.slots.values().any(|s| s.is_claimed())
     }
 
     /// Cancel, resume and confirm take no client identity on purpose. One token is
@@ -271,17 +287,20 @@ impl Host {
     /// only honest clearance available: it makes the machine answer a status query again, rather
     /// than the software deciding the blade must have stopped by now.
     ///
-    /// Refused while a Job is in flight, which is the one thing this must never do — dropping a
-    /// transport under a moving blade abandons the Job with nothing left to cancel it. Asked of
-    /// `driver-core`'s own predicate rather than a second reading of the phases.
+    /// Refused while the cutter is claimed, which is the one thing this must never do — dropping
+    /// a transport under a moving blade abandons the Job with nothing left to cancel it.
+    ///
+    /// "Claimed" has to include a dispatch that has been admitted and has not yet reached
+    /// `manager.cut`, which `actions` cannot see. `cut` and `disconnect` are two sends on one
+    /// channel: if `Cut` wins that race the worker transmits the Pass — motion — parks, and only
+    /// then processes the `Disconnect`, whose arm drops the transport and the parked Job
+    /// unconditionally. Reading `is_active` alone accepts a reconnect there, which is why this
+    /// asks `is_claimed`.
     pub fn reconnect(&self, device: &str) -> Result<(), Refusal> {
         self.with_slot(device, |slot| {
-            if slot.manager.status().is_active() {
+            if slot.is_claimed() {
                 return Err(Refusal::Device(DeviceError::Busy));
             }
-            // ponytail: an admitted dispatch not yet inside `manager.cut` is not covered — that
-            // window is a thread spawn wide and costs the dispatch a `Busy` it can retry, with no
-            // motion either way. Take the admission lock here too if that ever stops being true.
             slot.manager.disconnect().map_err(Refusal::Device)?;
             slot.manager.connect(slot.info.clone()).map_err(Refusal::Device)
         })
@@ -872,6 +891,27 @@ mod tests {
         assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
         // And the parked Job is still there to be answered, not silently dropped.
         assert!(host.slot(CAMEO).unwrap().manager.status().actions.confirm);
+    }
+
+    /// The window `actions` cannot see: a dispatch admitted and not yet inside `manager.cut`. The
+    /// cutter still publishes `Idle`, so a guard reading only `is_active` accepts — and `cut` and
+    /// `disconnect` are two sends on one channel, so if `Cut` wins that race the worker transmits
+    /// the Pass, parks, and only then processes the `Disconnect` that drops its transport. A
+    /// machine still executing buffered bytes, with the cable pulled.
+    ///
+    /// Driven by setting the state `dispatch` already keeps, rather than by racing two threads at
+    /// a window a thread spawn wide. The fix is a state read, so the state is what to pin: a test
+    /// that has to win a race in order to fail is worse than one that cannot miss.
+    #[test]
+    fn a_dispatch_not_yet_inside_the_manager_blocks_a_reconnect_and_holds_a_shutdown() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        assert!(host.slot(CAMEO).unwrap().manager.status().actions.cut, "idle: `actions` sees nothing");
+        assert!(!host.is_any_cut_active());
+
+        host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+
+        assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
+        assert!(host.is_any_cut_active(), "and the daemon must not exit past it either");
     }
 
     fn wait_for_ended(host: &Arc<Host>, device: &str, want: driver_core::Ended) -> driver_core::CutStatus {

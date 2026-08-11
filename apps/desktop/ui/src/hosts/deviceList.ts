@@ -145,9 +145,14 @@ export function deviceBadge(status: CutStatus | null): { label: string; tone: "i
  * transport is re-opened (`driver-core`'s `Cancelled` arm), and `DeviceManager::connect` refuses
  * from that state too — so with no way to disconnect, one cancelled Puma ends the session.
  *
- * `null` while a Job is in flight: a disconnect there drops the transport under a moving blade
- * and abandons the Job silently. "A Job exists" is read from `actions` — the only three verbs a
+ * `null` while a Job is in flight, and `null` when no status has arrived: a disconnect drops the
+ * transport, and absence of knowledge is absence of permission — the same rule `deviceBadge`
+ * follows for an unpolled cutter. "A Job exists" is read from `actions` — the only three verbs a
  * Job ever offers — not from the phase.
+ *
+ * This is the courtesy, not the guard. `DeviceManagerHandle` refuses both verbs while the local
+ * cutter is working and `Host::reconnect` refuses for a remote one, because the status this reads
+ * lags the worker by one event and must not be the only thing standing in the way.
  *
  * A cutter on a Cut Host reconnects instead of disconnecting, because this desktop never opened
  * that transport: `disconnect_device` there only drops the aim, leaving the cutter exactly as
@@ -156,7 +161,7 @@ export function deviceBadge(status: CutStatus | null): { label: string; tone: "i
 export function connectedControl(
   status: CutStatus | null, onHost: boolean,
 ): { label: string; verb: "disconnect" | "reconnect" } | null {
-  if (status !== null && (status.actions.cancel || status.actions.resume || status.actions.confirm)) {
+  if (status === null || status.actions.cancel || status.actions.resume || status.actions.confirm) {
     return null;
   }
   return onHost ? { label: "Reconnect", verb: "reconnect" } : { label: "Disconnect", verb: "disconnect" };

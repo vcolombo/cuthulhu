@@ -485,6 +485,22 @@ impl DeviceManagerHandle {
         Ok(())
     }
 
+    /// Refuse a verb that would drop the local cutter's transport while it is still working.
+    ///
+    /// `Host::reconnect` answers this same question for a remote cutter, and the webview hides
+    /// the control (`connectedControl`) — but a guard that lives only in TypeScript, reading a
+    /// status documented to lag the worker by one event, must not be the thing standing between a
+    /// moving blade and a dropped transport. Mirrors `connect`'s own refusal.
+    fn refuse_while_the_local_cutter_is_working(&self, before: &str) -> Result<(), IpcError> {
+        if self.local_cut_is_active() {
+            return Err(IpcError::new(
+                "device_error",
+                format!("a cut is active on the local cutter; cancel it before {before}"),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
@@ -493,6 +509,7 @@ impl DeviceManagerHandle {
             // this unconditionally to the local manager used to close the local cutter's
             // transport and discard its parked job while aimed at a Pi, silently.
             None | Some(Route::Local) => {
+                self.refuse_while_the_local_cutter_is_working("disconnecting it")?;
                 self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
             }
             Some(Route::Host(_)) => {}
@@ -515,6 +532,7 @@ impl DeviceManagerHandle {
         };
         match self.route(&device)? {
             Route::Local => {
+                self.refuse_while_the_local_cutter_is_working("reconnecting it")?;
                 let mgr = self.manager()?;
                 mgr.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
                 mgr.connect(device).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
@@ -1155,6 +1173,28 @@ mod tests {
         dev.disconnect().expect("disconnect");
         dev.connect(test_instance()).expect("reconnect");
         assert!(dev.status().actions.cut, "a reconnected cutter accepts a Job again");
+    }
+
+    /// The control the dialog offers is hidden mid-Job, but that guard lives in the webview and
+    /// reads a status documented to lag the worker by one event. Both verbs drop the local
+    /// cutter's transport, so the refusal has to be here too — `Host::reconnect` already answers
+    /// the same question for a remote cutter.
+    #[test]
+    fn dropping_the_local_transport_is_refused_while_a_cut_is_working() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        assert!(dev.status().is_active(), "the Job is parked mid-flight, not finished");
+
+        for refused in [dev.disconnect(), dev.reconnect()] {
+            let err = refused.expect_err("a working cutter must keep its transport");
+            assert_eq!(err.code, "device_error");
+            assert!(err.message.contains("cancel it"), "and must say the way through: {}", err.message);
+        }
+        // Still parked, and still answerable — the refusal changed nothing.
+        assert!(dev.status().actions.confirm);
     }
 
     fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {

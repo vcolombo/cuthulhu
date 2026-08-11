@@ -240,7 +240,13 @@ describe("connectedControl", () => {
   it("offers a disconnect after a cancel whose stop was never confirmed", () => {
     const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
     expect(connectedControl(unconfirmed, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
-    expect(connectedControl(null, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+  });
+
+  // Absence of knowledge is absence of permission, the same rule `deviceBadge(null)` follows.
+  // "No status yet" is not grounds for offering the control that drops a transport.
+  it("offers nothing for a cutter no status has arrived for", () => {
+    expect(connectedControl(null, false)).toBeNull();
+    expect(connectedControl(null, true)).toBeNull();
   });
 
   // A remote cutter's transport belongs to the Pi, so this desktop's disconnect only drops the

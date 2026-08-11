@@ -40,12 +40,11 @@ const POLL: Duration = Duration::from_millis(200);
 
 /// Whether a process signalled `signals` times may exit now.
 ///
-/// `is_any_cut_active` is `driver-core`'s own predicate, the same one the
-/// desktop's window-close guard asks, rather than a second reading of the phases.
-//
-// ponytail: an admitted dispatch not yet inside `manager.cut` is not covered —
-// the same thread-spawn-wide window `Host::reconnect` documents. Take the
-// admission lock here too if that ever stops being narrow enough.
+/// `is_any_cut_active` is built on `driver-core`'s own predicate, the same one the
+/// desktop's window-close guard asks, rather than a second reading of the phases —
+/// and it also covers a dispatch admitted and not yet inside `manager.cut`, which
+/// that predicate cannot see. Without that half, a signal landing in the window
+/// exits past a Job whose client was already told `Accepted`.
 pub fn may_exit(host: &Host, signals: u32) -> bool {
     signals >= FORCE || !host.is_any_cut_active()
 }

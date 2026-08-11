@@ -25,6 +25,8 @@ pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// is noticed, not how long it is tolerated.
 pub const SOCKET_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+const CLOSED_MID_FRAME: &str = "the peer closed part-way through a frame";
+
 #[derive(Debug)]
 pub enum FrameError {
     /// The peer closed cleanly between frames. Not a fault.
@@ -88,7 +90,7 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<
                 } else {
                     // Not `Eof`: a caller loops on `Eof` meaning "the peer left between frames",
                     // and a peer that vanished mid-frame left something behind.
-                    FrameError::Io("the peer closed part-way through a frame".into())
+                    FrameError::Io(CLOSED_MID_FRAME.into())
                 })
             }
             Ok(n) => filled += n,
@@ -103,16 +105,16 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<
     Ok(())
 }
 
-/// Read one frame. `header_timeout` bounds the wait for it to begin; `body_timeout` bounds the
-/// wait for it to finish once the header has arrived.
+/// Read one frame. `header_timeout` bounds the wait for it to *begin*; `body_timeout` bounds the
+/// rest of it, header and body alike, once the first byte has arrived.
 ///
 /// The rule is not "headers are unbounded, bodies are not" — it is that a frame that is *owed*
 /// has a deadline, and a frame that may never come does not. A daemon's request loop reading the
-/// next request from an attached client owes nothing — a desktop polling once a second is idle in
-/// between and must not be dropped for it — so that call site passes `None`. Everywhere else a
-/// frame was promised: a token after a connection was accepted, a greeting after a token was
-/// sent, a reply after a request was sent. A peer that goes silent there would otherwise hold
-/// this reader, and whatever lock is above it, forever.
+/// next request from an attached client owes nothing *before the first byte* — a desktop polling
+/// once a second is idle in between and must not be dropped for it — so that call site passes
+/// `None`. Everywhere else a frame was promised: a token after a connection was accepted, a
+/// greeting after a token was sent, a reply after a request was sent. A peer that goes silent
+/// there would otherwise hold this reader, and whatever lock is above it, forever.
 pub fn read_frame<R: Read, T: DeserializeOwned>(
     r: &mut R,
     max: usize,
@@ -120,7 +122,18 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(
     body_timeout: Duration,
 ) -> Result<T, FrameError> {
     let mut header = [0u8; 4];
-    fill(r, &mut header, header_timeout.map(|d| Instant::now() + d))?;
+    // The header is filled in two goes because the first byte is what turns "may never come" into
+    // "owed": a client that sends one length byte and stops has begun a frame, and waiting out the
+    // other three with no deadline holds this reader — and, in the daemon, the one client slot in
+    // eight above it — for the life of the process. Keepalive does not reach that peer; it is
+    // alive and acknowledging, just not talking.
+    fill(r, &mut header[..1], header_timeout.map(|d| Instant::now() + d))?;
+    fill(r, &mut header[1..], Some(Instant::now() + body_timeout)).map_err(|e| match e {
+        // A caller loops on `Eof` meaning "the peer left between frames"; past the first byte it
+        // left mid-frame instead.
+        FrameError::Eof => FrameError::Io(CLOSED_MID_FRAME.into()),
+        other => other,
+    })?;
 
     let len = u32::from_be_bytes(header) as usize;
     // Before the allocation, not after: the whole point of the cap.
@@ -290,21 +303,64 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
     }
 
-    /// The request loop's own case: reading the *next* request from an attached client owes
-    /// nothing, because a client that polls once a second leaves the connection idle in between
-    /// and must not be dropped. That is the one call site that passes `None`.
+    /// The request loop's own case, and the property the `None` exists to protect: reading the
+    /// *next* request from an attached client owes nothing, because a client that polls once a
+    /// second leaves the connection idle in between and must not be dropped. That is the one call
+    /// site that passes `None`.
     ///
-    /// Asserted without leaking a blocked thread: the reader is silent for 200ms — four times the
-    /// body timeout — and then speaks. A reader that applied a deadline to the header would
-    /// return `Timeout`; the correct one reads the frame.
+    /// Read twice, with a silence before each, because the gap that matters is the one *between
+    /// whole frames* — a desktop with no dialog open sits there for minutes. A deadline that
+    /// leaked onto the header would end the connection during either gap.
+    ///
+    /// Asserted without leaking a blocked thread: each silence is 200ms, four times the body
+    /// timeout, and then the reader speaks.
     #[test]
     fn a_request_loops_wait_for_the_next_frame_is_unbounded() {
-        let mut idle_then_busy =
-            QuietThenSpeaks { quiet_reads_left: 10, given: Cursor::new(framed("hello")) };
+        let mut two = framed("hello");
+        two.extend(framed("again"));
+        let mut idle_then_busy = QuietThenSpeaks { quiet_reads_left: 10, given: Cursor::new(two) };
+
         let got: String =
             read_frame(&mut idle_then_busy, DEFAULT_MAX_FRAME, None, Duration::from_millis(50))
                 .expect("a request loop must not drop an idle client before a frame begins");
         assert_eq!(got, "hello");
+
+        idle_then_busy.quiet_reads_left = 10;
+        let got: String =
+            read_frame(&mut idle_then_busy, DEFAULT_MAX_FRAME, None, Duration::from_millis(50))
+                .expect("nor between one whole frame and the next");
+        assert_eq!(got, "again");
+    }
+
+    /// The defect this change fixes: an authenticated client sends one byte of a length prefix and
+    /// stops. The wait for a frame to *begin* is still unbounded — `None` below — but those other
+    /// three bytes are owed, so the read gives up instead of holding the worker, and the one
+    /// client slot in eight underneath it, until the daemon is restarted.
+    #[test]
+    fn a_header_that_begins_and_stops_times_out_even_where_the_wait_to_begin_did_not() {
+        let started = std::time::Instant::now();
+        let result = read_frame::<_, String>(
+            &mut StallsAfter::new(vec![0u8]),
+            DEFAULT_MAX_FRAME,
+            None,
+            Duration::from_millis(200),
+        );
+        assert!(matches!(result, Err(FrameError::Timeout)), "got {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited far past its deadline");
+    }
+
+    /// A peer that closes after part of a header left mid-frame, so this is `Io` and not `Eof` —
+    /// the request loop treats `Eof` as "the client went away between requests" and returns
+    /// cleanly, which would log a truncated frame as an orderly goodbye.
+    #[test]
+    fn a_peer_that_closes_mid_header_is_a_fault_not_an_eof() {
+        let result = read_frame::<_, String>(
+            &mut Cursor::new(vec![0u8]),
+            DEFAULT_MAX_FRAME,
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(matches!(result, Err(FrameError::Io(_))), "got {result:?}");
     }
 
     /// A header wait that *is* owed — a token, a greeting, a reply — must time out rather than

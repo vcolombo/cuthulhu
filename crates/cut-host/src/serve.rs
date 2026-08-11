@@ -100,6 +100,7 @@ pub fn handle_request(host: &Arc<Host>, request: Request) -> Response {
         Request::Cancel { device } => once(host.cancel(&device)),
         Request::Resume { device } => once(host.resume(&device)),
         Request::ConfirmPassDone { device } => once(host.confirm_pass_done(&device)),
+        Request::Reconnect { device } => once(host.reconnect(&device)),
     }
 }
 
@@ -256,8 +257,12 @@ fn serve_client(
         while let Ok(event) = events.try_recv() {
             write_frame(&mut tls_stream, &event)?;
         }
-        // `None`: this read owes the client nothing. It is idle between polls, not stalled
-        // mid-frame, and must not be dropped for waiting.
+        // `None` buys the client an unbounded wait for its next request to *begin*, and nothing
+        // more: it is idle between polls, not stalled mid-frame, and must not be dropped for
+        // waiting. From the first byte on, `read_frame` holds it to `DEFAULT_BODY_TIMEOUT` —
+        // otherwise a client that sends one length byte and stops keeps this worker, and one of
+        // the `MAX_CLIENTS` slots, until the daemon is restarted. Keepalive does not reach that
+        // peer: it is alive and acknowledging, it just stopped talking.
         match read_frame::<_, Request>(&mut tls_stream, max_frame, None, DEFAULT_BODY_TIMEOUT) {
             Ok(request) => {
                 if let Request::Dispatch { ref device, .. } = request {
@@ -318,6 +323,7 @@ mod tests {
             Request::Cancel { device: "usb:9:9".into() },
             Request::Resume { device: "usb:9:9".into() },
             Request::ConfirmPassDone { device: "usb:9:9".into() },
+            Request::Reconnect { device: "usb:9:9".into() },
         ] {
             assert!(matches!(handle_request(&host, request), Response::Refused(_)));
         }

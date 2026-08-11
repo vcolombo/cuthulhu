@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -78,18 +78,61 @@ const PAIRED: PairedHostView[] = [
   { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null },
 ];
 
-const runForget = (id: string, forget: (id: string) => Promise<void>) =>
-  forgetFrom(PAIRED, id, forget);
+const runForget = (id: string, forget: (id: string, force: boolean) => Promise<void>, force = false) =>
+  forgetFrom(PAIRED, id, forget, force);
+
+const BUSY = { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+const UNCONFIRMED = {
+  code: "host_unconfirmed",
+  message: "this Cut Host could not be asked whether it is cutting",
+};
 
 describe("forgetFrom", () => {
   it("keeps a host that refuses to be forgotten, and says why", async () => {
     // The Rust side refuses while a cut is active on that host: the desktop would otherwise
     // discard the token for a Job it can no longer cancel.
     const s = await runForget("host-1", async () => {
-      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+      throw BUSY;
     });
     expect(s.hosts.map(h => h.id)).toContain("host-1");
     expect(s.message).toContain("cancel it before forgetting");
+  });
+
+  // The two refusals drive different copy because the operator's next move differs: cancel the
+  // cut, versus decide whether an unreachable Pi is really idle. Only the second offers a force.
+  it("offers a force only for the refusal a force could get past", async () => {
+    const busy = await runForget("host-1", async () => {
+      throw BUSY;
+    });
+    expect(busy.forceable).toBe(false);
+
+    const unconfirmed = await runForget("host-1", async () => {
+      throw UNCONFIRMED;
+    });
+    expect(unconfirmed.forceable).toBe(true);
+  });
+
+  // The failed attempt is what tells the operator there is something to think about. A force
+  // standing there before they have tried teaches them to take it by reflex.
+  it("does not offer the force again on an attempt that already carried it", async () => {
+    const s = await runForget("host-1", async () => {
+      throw UNCONFIRMED;
+    }, true);
+    expect(s.forceable).toBe(false);
+    expect(s.hosts).toEqual(PAIRED);
+  });
+
+  it("passes the force through, and removes the host when it succeeds", async () => {
+    const seen: boolean[] = [];
+    const forget = async (_id: string, force: boolean) => {
+      seen.push(force);
+      if (!force) throw UNCONFIRMED;
+    };
+    const refused = await runForget("host-1", forget);
+    expect(refused.forceable).toBe(true);
+    const forced = await runForget("host-1", forget, true);
+    expect(forced.hosts.map(h => h.id)).toEqual(["host-2"]);
+    expect(seen).toEqual([false, true]);
   });
 
   it("removes the host only once the Rust side has agreed", async () => {
@@ -103,7 +146,7 @@ describe("forgetFrom", () => {
   // than one whose credentials this side quietly dropped.
   it("leaves the list exactly as it was when the forget is refused", async () => {
     const s = await runForget("host-1", async () => {
-      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+      throw BUSY;
     });
     expect(s.hosts).toEqual(PAIRED);
   });
@@ -174,5 +217,52 @@ describe("deviceBadge", () => {
   it("shows a running job as busy when only cancel is legal", () => {
     const status: CutStatus = { ...aStatus(), phase: "Sending", actions: { ...aStatus().actions, cancel: true } };
     expect(deviceBadge(status).tone).toBe("busy");
+  });
+
+  // Both rest on "Idle" and both report a cancelled ending, so only `actions.cut` separates a
+  // stop the machine confirmed from one nothing witnessed. The second must not read as ready,
+  // and must not read as "Unreachable" either — the cutter is right there, and someone needs
+  // to look at it.
+  it("tells a confirmed stop from one nothing saw, and asks for a person on the second", () => {
+    const confirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled",
+                                   actions: { ...aStatus().actions, cut: true } };
+    expect(deviceBadge(confirmed).tone).toBe("idle");
+
+    const unconfirmed: CutStatus = { ...confirmed, actions: { ...aStatus().actions, cut: false } };
+    expect(deviceBadge(unconfirmed).tone).toBe("attention");
+    expect(deviceBadge(unconfirmed).label).toMatch(/not confirmed/);
+  });
+});
+
+describe("connectedControl", () => {
+  // The state this exists for. Both a cut and a connect are refused there, so a row with no
+  // disconnect leaves the operator restarting the app to use the cutter again.
+  it("offers a disconnect after a cancel whose stop was never confirmed", () => {
+    const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
+    expect(connectedControl(unconfirmed, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+  });
+
+  // Absence of knowledge is absence of permission, the same rule `deviceBadge(null)` follows.
+  // "No status yet" is not grounds for offering the control that drops a transport.
+  it("offers nothing for a cutter no status has arrived for", () => {
+    expect(connectedControl(null, false)).toBeNull();
+    expect(connectedControl(null, true)).toBeNull();
+  });
+
+  // A remote cutter's transport belongs to the Pi, so this desktop's disconnect only drops the
+  // aim and leaves the cutter as stuck as it was. Only the host's own verb re-opens it.
+  it("asks a Cut Host to re-open its own cutter rather than dropping the aim", () => {
+    const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
+    expect(connectedControl(unconfirmed, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
+  });
+
+  // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a
+  // moving blade, and those three verbs are the only ones a live Job ever offers.
+  it("withholds it while a Job is in flight, whatever the phase says", () => {
+    for (const live of [{ cancel: true }, { resume: true }, { confirm: true }]) {
+      const status: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, ...live } };
+      expect(connectedControl(status, false)).toBeNull();
+      expect(connectedControl(status, true)).toBeNull();
+    }
   });
 });

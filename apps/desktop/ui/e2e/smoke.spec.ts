@@ -402,7 +402,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     cancel_cut: () => {
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
       // Cancelled resting state — nothing is happening, so the phase is Idle, but
-      // `ended` names the cancel and Cut is legal again (status.rs's Cancelled arm).
+      // `ended` names the cancel. Cut is legal again only because this fake stands in
+      // for a pollable cutter whose stop was confirmed; a Puma's never is, and
+      // status.rs's Cancelled arm then withholds `actions.cut`.
       const sent = status.sent?.sent ?? 0;
       const pass = status.pass;
       // CancelRequested then Stopping — two distinct internal states that both report
@@ -486,11 +488,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       devices.push(PAIRED_CUTTER);
       return host;
     },
-    // Mirrors `DeviceManager::forget`: a host with an active cut refuses, and the desktop must
-    // keep the row rather than discard the token for a Job it could no longer cancel.
+    // Mirrors `DeviceManagerHandle::forget`: a host that cannot be asked whether it is cutting
+    // refuses like one that answered "busy" — the Pi keeps cutting when the network drops, and
+    // the desktop must keep the row rather than discard the token for a Job it could no longer
+    // cancel. Distinct code, because only this one can be forced past.
     forget_host: (a) => {
-      if (hosts.some((h) => h.id === a.id && h.id === "host-1"))
-        throw ipcError("host_busy", "a cut is active on this host; cancel it before forgetting");
+      if (!a.force && hosts.some((h) => h.id === a.id && h.unreachable !== null))
+        throw ipcError(
+          "host_unconfirmed",
+          "this Cut Host could not be asked whether it is cutting (timed out); if it is, forgetting it discards the only way to stop it",
+        );
       hosts = hosts.filter((h) => h.id !== a.id);
       // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
       // pairing that was just discarded, so it cannot still be reporting what is attached to it.
@@ -571,7 +578,7 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -592,7 +599,7 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Reaches past the UI on purpose: the canvas drag that issues this command is behind
@@ -630,8 +637,16 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
   // The Rust side's own words, and the row still there (#94).
-  await expect(page.getByText("a cut is active on this host; cancel it before forgetting")).toBeVisible();
+  await expect(page.getByText("this Cut Host could not be asked whether it is cutting")).toBeVisible();
   await expect(page.getByText("Workshop Pi")).toBeVisible();
+
+  // Only now is the force on screen, and it says what is being accepted rather than asking
+  // whether the operator is sure.
+  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toBeVisible();
+  await page.getByRole("button", { name: "Discard Workshop Pi anyway" }).click();
+  // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
+  await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+  expect(await page.getByText("Workshop Pi").count()).toBe(0);
 });
 
 // Reaching a Pi starts here, and nothing drove it end to end while the fake refused the three
@@ -773,7 +788,7 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -788,7 +803,7 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -806,7 +821,7 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -825,7 +840,7 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -844,7 +859,7 @@ test("reopening the dialog after connect recovers the connected device", async (
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByText("connected")).toBeVisible();
 
   await page.getByRole("button", { name: "Close" }).click();
@@ -857,6 +872,22 @@ test("reopening the dialog after connect recovers the connected device", async (
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
+// The exit from a cancel whose stop nothing confirmed. `driver-core` refuses both a cut and a
+// connect from that state, so with no Disconnect in the dialog the operator's only way back to
+// their own cutter is restarting the app — the workaround being "never cancel". This drives the
+// control rather than the command behind it, because the control is what was missing.
+test("a connected cutter offers a disconnect, and the row goes back to offering Connect", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByText("connected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Disconnect", exact: false }).first().click();
+  await expect(page.getByText("connected")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Connect", exact: true }).first()).toBeVisible();
+});
+
 // Inverted deliberately. While the dialog latched its own outcome, "did the last cut
 // finish?" was answered by how long the dialog had been mounted, so a reopened dialog
 // had to show nothing — and this test asserted that. The outcome now comes from the
@@ -867,7 +898,7 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -885,7 +916,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -902,7 +933,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // Recover by reconnecting (the other listed device). The connect lifecycle events
   // carry NO_JOB=0 and must still reach the dialog after a failed job — Start Cut
   // comes back only because the reconnect's Idle status was accepted.
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -912,7 +943,7 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
@@ -929,7 +960,7 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -937,10 +968,10 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
 
-  // No Disconnect control exists in the UI, so drive the command the way the device
-  // dropping out would: straight through the IPC surface.
+  // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
+  // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
@@ -952,18 +983,18 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
-  // No Disconnect control exists in the UI, so drive the command the way the device
-  // dropping out would: straight through the IPC surface.
+  // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
+  // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
   await expect(page.getByText(/complete/i)).toHaveCount(0);
 });

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use cut_host::config::Config;
 use cut_host::host::Host;
 use cut_host::serve::serve;
+use cut_host::shutdown;
 use driver_registry::HardwareBackendFactory;
 
 fn main() {
@@ -41,6 +42,9 @@ fn main() {
     for name in config.tokens.keys() {
         eprintln!("cut host: client `{name}` may connect");
     }
+
+    // Before serving, so the first Job a client dispatches is already covered.
+    shutdown::guard(host.clone());
 
     if let Err(e) = serve(host, config, allow_public_bind) {
         fail(&e.to_string());

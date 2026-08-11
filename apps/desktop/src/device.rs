@@ -129,7 +129,46 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
+    /// Dispatches this desktop sent and never got an answer to, by the Job they carried.
+    ///
+    /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
+    /// cannot cut the same material twice — but only the sender knows whether a given press of
+    /// Cut *is* that retry, and nothing in the Job says so: a retry and a second sheet of the
+    /// same design are byte-identical. What separates them is this entry. It is written before
+    /// the request goes out and cleared by any answer, so a Job still listed here is one whose
+    /// fate is genuinely unknown, and the next dispatch of it reuses the same id.
+    ///
+    /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
+    /// while holding it.
+    in_doubt: Mutex<HashMap<JobKey, cut_host::protocol::DispatchId>>,
     pub connected: Mutex<Option<DeviceInfo>>,
+}
+
+/// One dispatchable Job as this desktop identifies it: which cutter, on which host, carrying
+/// what. Two presses of Cut that agree on all three are the same Job — which is what makes the
+/// second one a candidate for being a retry of the first.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct JobKey {
+    host: HostId,
+    device: String,
+    digest: u64,
+}
+
+/// Hashes the Job as it will go on the wire. Passes carry `f64` geometry, which has no `Hash`;
+/// their serde form is the same bytes `dispatch` sends, so hashing that covers the geometry and
+/// the resolved settings together, and cannot drift from what is actually dispatched.
+///
+/// ponytail: `DefaultHasher` is only guaranteed stable within one process run. That is exactly
+/// the lifetime of `in_doubt`, which is the only thing comparing these — see `execute_cut` for
+/// what a desktop restart costs.
+fn job_digest(machine_id: &str, passes: &[CutPass]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    machine_id.hash(&mut h);
+    // Infallible in practice: the writer is a `Vec`, and Preflight has already refused
+    // non-finite coordinates by the time a Job reaches dispatch.
+    serde_json::to_vec(passes).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 impl DeviceManagerHandle {
@@ -139,6 +178,7 @@ impl DeviceManagerHandle {
             local_factory: factory,
             local_manager: Mutex::new(Some(Arc::new(mgr))),
             hosts: Mutex::new(HashMap::new()),
+            in_doubt: Mutex::new(HashMap::new()),
             connected: Mutex::new(None),
         };
         (handle, events)
@@ -264,30 +304,50 @@ impl DeviceManagerHandle {
         Ok(id)
     }
 
-    /// Forgets a Cut Host: refuses while any of its cutters is mid-cut, since the moment it is
-    /// gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could no
-    /// longer be stopped. Persist-then-mutate for the same reason as `pair`.
-    pub fn forget(&self, id: &HostId, hosts_path: &Path) -> Result<(), IpcError> {
-        // An unreachable host answers nothing, so it reports nothing as active — and there was
-        // nothing `cancel` could have stopped there either. Only a host that answers and says
-        // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
-        //
+    /// Forgets a Cut Host: refuses unless it can confirm the host is idle, since the moment the
+    /// host is gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could
+    /// no longer be stopped. Persist-then-mutate for the same reason as `pair`.
+    ///
+    /// **Silence is not idleness.** This used to let every network error fall through to the
+    /// deletion, on the reasoning that a Pi which cannot answer cannot be busy and that a Pi gone
+    /// for good must not become unforgettable. The first half is false and is the whole point of
+    /// the product: drop Wi-Fi mid-Job and the Pi keeps cutting. Forgetting there discards the
+    /// token and the route needed to cancel, resume or confirm that Job once the network comes
+    /// back — the one machine that could stop the blade throws away the key. The second half is
+    /// still true, which is why the escape hatch is `force` rather than absent.
+    ///
+    /// The two refusals carry different codes because the operator's next move differs: cancel
+    /// the cut, versus decide whether an unreachable Pi is really idle.
+    ///
+    /// `force` skips nothing but the *unconfirmed* case. A host that answers "busy" is a host
+    /// this desktop can still reach, so `cancel` is available and the blade was never orphaned;
+    /// there is no case for cutting that route while it works.
+    pub fn forget(&self, id: &HostId, hosts_path: &Path, force: bool) -> Result<(), IpcError> {
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
         // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
         // anything else waits on it: this holds only this host's connection lock, so a stall here
         // delays calls aimed at this host and nothing else. It is bounded because the operator is
         // usually forgetting a host *precisely* because it has stopped answering, and making them
-        // wait 30s for a dead Pi's permission to stop asking about it is the wrong answer to
-        // that. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
-        // legs, in sequence; plus DNS, which std gives no way to bound, see `cut_host::client`'s
-        // `ponytail:` note) falls through to the forget.
-        if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
-            if snapshots.iter().any(|s| s.status.is_active()) {
+        // wait 30s before they can even be offered the force is the wrong answer to that.
+        match self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
+            Ok(snapshots) if snapshots.iter().any(|s| s.status.is_active()) => {
                 return Err(IpcError::new(
                     "host_busy",
                     "a cut is active on this host; cancel it before forgetting",
-                ));
+                ))
             }
+            Ok(_) => {}
+            Err(e) if !force => {
+                return Err(IpcError::new(
+                    "host_unconfirmed",
+                    format!(
+                        "this Cut Host could not be asked whether it is cutting ({}); if it is, \
+                         forgetting it discards the only way to stop it",
+                        e.message
+                    ),
+                ))
+            }
+            Err(_) => {}
         }
 
         let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
@@ -363,7 +423,20 @@ impl DeviceManagerHandle {
         // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
         // in place lets the borrow end with the arm that doesn't need it.
         match host.ensure_within(connect_timeout) {
-            Some(client) => f(client).map_err(|e| IpcError::new("host_error", e.to_string())),
+            Some(client) => {
+                let out = f(client);
+                if let Err(e @ cut_host::client::ClientError::Transport(_)) = &out {
+                    // A connection that broke mid-call stays broken, and `ensure` only redials
+                    // when there is no client at all — so leaving this one in place fails every
+                    // later verb on this host against the same dead socket. `list_devices` has
+                    // always dropped it here; the call that most needs the same is the retry
+                    // after a lost reply, which is by definition made on a connection that just
+                    // failed (see `execute_cut`).
+                    host.last_error = Some(e.to_string());
+                    host.client = None;
+                }
+                out.map_err(|e| IpcError::new("host_error", e.to_string()))
+            }
             None => Err(IpcError::new("host_unreachable", host.last_error.clone().unwrap_or_default())),
         }
     }
@@ -412,6 +485,22 @@ impl DeviceManagerHandle {
         Ok(())
     }
 
+    /// Refuse a verb that would drop the local cutter's transport while it is still working.
+    ///
+    /// `Host::reconnect` answers this same question for a remote cutter, and the webview hides
+    /// the control (`connectedControl`) — but a guard that lives only in TypeScript, reading a
+    /// status documented to lag the worker by one event, must not be the thing standing between a
+    /// moving blade and a dropped transport. Mirrors `connect`'s own refusal.
+    fn refuse_while_the_local_cutter_is_working(&self, before: &str) -> Result<(), IpcError> {
+        if self.local_cut_is_active() {
+            return Err(IpcError::new(
+                "device_error",
+                format!("a cut is active on the local cutter; cancel it before {before}"),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
@@ -420,12 +509,36 @@ impl DeviceManagerHandle {
             // this unconditionally to the local manager used to close the local cutter's
             // transport and discard its parked job while aimed at a Pi, silently.
             None | Some(Route::Local) => {
+                self.refuse_while_the_local_cutter_is_working("disconnecting it")?;
                 self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
             }
             Some(Route::Host(_)) => {}
         }
         *self.connected.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// Drop the aimed cutter's transport and open it again, re-running the identity probe
+    /// against real hardware.
+    ///
+    /// The way back from a cancel whose stop nothing confirmed — `driver-core` refuses both a
+    /// cut and a connect from that state. Locally that is the dialog's Disconnect followed by
+    /// Connect, done in one call; on a Cut Host it has to be the host's own verb, since this
+    /// desktop never opened that transport and `disconnect` there is bookkeeping only.
+    pub fn reconnect(&self) -> Result<(), IpcError> {
+        let aimed = self.connected.lock().unwrap().clone();
+        let Some(device) = aimed else {
+            return Err(IpcError::new("device_error", "no device is connected"));
+        };
+        match self.route(&device)? {
+            Route::Local => {
+                self.refuse_while_the_local_cutter_is_working("reconnecting it")?;
+                let mgr = self.manager()?;
+                mgr.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+                mgr.connect(device).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Route::Host(id) => self.with_host(&id, |c| c.reconnect(&device.instance_id)),
+        }
     }
 
     /// Where the cut has got to. Reads `driver-core`'s published status, which
@@ -520,9 +633,12 @@ impl DeviceManagerHandle {
     /// *before* calling `execute_cut` (which blocks on the worker thread).
     /// Never touches `AppStateHandle`'s mutex beyond that.
     ///
+    /// The device Preflight ran against comes back with the Passes: it is what
+    /// `execute_cut` compares the aim to, since the two calls do not share a lock.
+    ///
     /// What stays here is what `cutplan` cannot know: which device is plugged
     /// in, which driver serves it, and where the presets file lives.
-    pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<Vec<CutPass>, IpcError> {
+    pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<(DeviceInfo, Vec<CutPass>), IpcError> {
         let connected = self.connected.lock().unwrap().clone()
             .ok_or_else(|| IpcError::new("not_connected", "no device connected"))?;
         if connected.instance_id != request.device_instance_id {
@@ -568,42 +684,117 @@ impl DeviceManagerHandle {
         let planned = plan_passes(&app.editor.doc)
             .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
         let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
-        Ok(plan.cut_passes())
+        Ok((connected, plan.cut_passes()))
     }
 
     /// Submits already-planned passes to the device manager. Blocks until the
     /// worker reaches its first pause point or completion — call this off the
     /// document lock (see `prepare_cut`) and from an async command so it
     /// doesn't freeze the Tauri main loop.
-    pub fn execute_cut(&self, passes: Vec<CutPass>) -> Result<u64, IpcError> {
+    ///
+    /// `planned_for` is the device `prepare_cut` preflighted against. Nothing holds the
+    /// aim still across the two calls — the operator can connect another cutter while
+    /// planning runs — and the machine-mismatch check downstream cannot catch the swap,
+    /// because it would be handed the *new* device's own `machine_id` and so compare it
+    /// against itself. So the aim is re-read and compared here, before anything is sent.
+    pub fn execute_cut(&self, planned_for: DeviceInfo, passes: Vec<CutPass>) -> Result<u64, IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
-        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
-            None | Some(Route::Local) => {
+        // A cutter is its id *and* its host, never the id alone: fallback ids are assigned by
+        // location (`usb:at:1:4`, `serial:at:/dev/ttyUSB0`), so two hosts wired alike hand out
+        // the same string for two different machines.
+        let same_cutter = aimed
+            .as_ref()
+            .is_some_and(|d| d.instance_id == planned_for.instance_id && d.host == planned_for.host);
+        if !same_cutter {
+            return Err(IpcError::new(
+                "device_mismatch",
+                "the connected device changed while this cut was being planned — nothing was sent; re-plan the cut for the device now connected",
+            ));
+        }
+
+        // Routed by the device Preflight approved, now that it is known to be the one aimed at.
+        match self.route(&planned_for)? {
+            Route::Local => {
                 self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
             }
-            Some(Route::Host(id)) => {
-                // `execute_cut` takes only the Passes, so both the device and the machine it is
-                // for come from what the dialog is aimed at — which is also what `route` just
-                // resolved, so the two cannot disagree.
-                let aimed = aimed.expect("a route implies a device");
-                let (device, machine_id) = (aimed.instance_id, aimed.machine_id);
-                // A fresh id per attempt: this is a new Job, not a retry of a dropped reply,
-                // and reusing one would make the host treat it as already accepted.
-                let dispatch_id = cut_host::protocol::DispatchId(format!(
-                    "{}-{}",
-                    device,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0)
-                ));
-                self.with_host(&id, |c| c.dispatch(dispatch_id, &device, &machine_id, passes))?;
-                // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
-                // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
-                // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
-                Ok(0)
+            Route::Host(id) => {
+                let (device, machine_id) = (planned_for.instance_id, planned_for.machine_id);
+                let key = JobKey {
+                    host: id.clone(),
+                    device: device.clone(),
+                    digest: job_digest(&machine_id, &passes),
+                };
+                // The id is the Job's, not the clock's. The host deduplicates on it so a retry
+                // after a dropped reply cannot cut twice — which only works if a retry arrives
+                // under the id it first went out with, and a timestamp never does.
+                //
+                // A digest alone would be too strong the other way: an operator who cuts one
+                // sheet and loads another is dispatching the identical Job on purpose, and must
+                // not be silently swallowed as a duplicate. So the id is the digest plus a
+                // once-per-attempt nonce, and `in_doubt` decides which of the two this is —
+                // reuse while the previous dispatch of this same Job has no answer, mint fresh
+                // once it has one. The desktop is the only party that can tell them apart: it
+                // is the one that knows whether the last try was answered.
+                //
+                // The first Cut after a lost reply is therefore always read as the retry. That
+                // is the safe direction, and it self-clears: the retry gets an answer (the
+                // host's dedupe makes it a no-op if the Job is already running), which frees the
+                // next Cut to be a new Job. A desktop restarted in between loses `in_doubt` and
+                // is back to cutting twice — persisting it is the fix if that stops being rare.
+                let dispatch_id = self.dispatch_id_for(&key);
+                let sent = self.with_host(&id, |c| {
+                    // Written before the request, cleared by any answer — refusals included,
+                    // since a host that refused was reached and its answer is not in doubt.
+                    // What marks a reply lost is this entry outliving the call.
+                    self.in_doubt.lock().unwrap().insert(key.clone(), dispatch_id.clone());
+                    let sent = c.dispatch(dispatch_id.clone(), &device, &machine_id, passes);
+                    if !matches!(sent, Err(cut_host::client::ClientError::Transport(_))) {
+                        self.in_doubt.lock().unwrap().remove(&key);
+                    }
+                    sent
+                });
+                match sent {
+                    // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
+                    // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
+                    // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
+                    Ok(()) => Ok(0),
+                    // Never reached the host at all (no connection) — the entry was never written,
+                    // so this stays the plain error it is.
+                    Err(e) if !self.in_doubt.lock().unwrap().contains_key(&key) => Err(e),
+                    Err(e) => Err(IpcError::new(
+                        "dispatch_unconfirmed",
+                        format!(
+                            "{} — the Job may already be cutting there. Press Cut again to retry \
+                             it: the host recognizes the same Job and will not cut it twice.",
+                            e.message
+                        ),
+                    )),
+                }
             }
         }
+    }
+
+    /// The id this Job goes out under: the one its unanswered dispatch already used, or a fresh
+    /// one. The nonce is wall-clock rather than a counter because a counter restarts at zero with
+    /// the process while the host remembers every id it has seen — a second session would mint
+    /// ids the host already knows and have its cuts silently deduplicated away.
+    fn dispatch_id_for(&self, key: &JobKey) -> cut_host::protocol::DispatchId {
+        if let Some(id) = self.in_doubt.lock().unwrap().get(key) {
+            return id.clone();
+        }
+        // The counter is what makes two attempts in the same clock tick distinct; the clock is
+        // what keeps this run's ids clear of the previous run's. Neither alone is enough.
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        cut_host::protocol::DispatchId(format!(
+            "{}-{:016x}-{}-{}",
+            key.device,
+            key.digest,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
@@ -611,8 +802,8 @@ impl DeviceManagerHandle {
     /// is dropped before the blocking `execute_cut` call.
     #[cfg(test)]
     fn cut_from_request(&self, app: &AppState, request: CutRequest) -> Result<u64, IpcError> {
-        let passes = self.prepare_cut(app, request)?;
-        self.execute_cut(passes)
+        let (planned_for, passes) = self.prepare_cut(app, request)?;
+        self.execute_cut(planned_for, passes)
     }
 }
 
@@ -961,6 +1152,63 @@ mod tests {
         assert_eq!(dev.status().phase, Phase::Idle, "the local manager's connection must have survived untouched");
     }
 
+    /// A cancel whose stop nothing confirmed refuses another cut, and `DeviceManager::connect`
+    /// refuses from that state too — so the disconnect is the whole exit, and the dialog now
+    /// offers one. Asserted through `actions`: the phase is `Idle` either side of the reconnect,
+    /// which is exactly why it cannot answer this.
+    #[test]
+    fn disconnecting_and_reconnecting_makes_a_cut_legal_after_an_unconfirmed_cancel() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+
+        dev.cancel().expect("cancel");
+        // The test Driver parks rather than polls, so nothing can confirm its stop — the Puma's
+        // ordinary case, and the one the operator has to be able to get out of.
+        let stuck = wait_for_cancelled(&dev);
+        assert!(!stuck.actions.cut, "nothing saw the machine stop, so no Job may follow it");
+
+        dev.disconnect().expect("disconnect");
+        dev.connect(test_instance()).expect("reconnect");
+        assert!(dev.status().actions.cut, "a reconnected cutter accepts a Job again");
+    }
+
+    /// The control the dialog offers is hidden mid-Job, but that guard lives in the webview and
+    /// reads a status documented to lag the worker by one event. Both verbs drop the local
+    /// cutter's transport, so the refusal has to be here too — `Host::reconnect` already answers
+    /// the same question for a remote cutter.
+    #[test]
+    fn dropping_the_local_transport_is_refused_while_a_cut_is_working() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        assert!(dev.status().is_active(), "the Job is parked mid-flight, not finished");
+
+        for refused in [dev.disconnect(), dev.reconnect()] {
+            let err = refused.expect_err("a working cutter must keep its transport");
+            assert_eq!(err.code, "device_error");
+            assert!(err.message.contains("cancel it"), "and must say the way through: {}", err.message);
+        }
+        // Still parked, and still answerable — the refusal changed nothing.
+        assert!(dev.status().actions.confirm);
+    }
+
+    fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let s = dev.status();
+            if s.ended == Some(driver_core::Ended::Cancelled) {
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "never cancelled, sat at {:?}", s.phase);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Naming a host that was forgotten (or never paired) must be refused rather than falling
     /// back to the local cutter — a Job aimed at a Pi must never be cut on the desk.
     #[test]
@@ -1122,9 +1370,30 @@ mod tests {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
 
-        let err = dev.forget(&HostId("host-1".into()), &hosts_path);
-        assert!(err.is_err(), "the save must fail against this path");
+        // Forced, so this reaches the save at all: unforced it would stop at the idle check,
+        // and the failure under test here is the write, not the network.
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path, true);
+        assert_eq!(err.unwrap_err().code, "hosts_unwritable");
         assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
+    }
+
+    /// The reversal: a host that cannot be asked is not a host known to be idle. Drop Wi-Fi
+    /// mid-Job and the Pi keeps cutting — discarding the token there throws away the only route
+    /// left to cancel it. Refused unforced, with its own code, and let through by the force the
+    /// operator has to ask for explicitly.
+    #[test]
+    fn an_unreachable_host_refuses_to_be_forgotten_until_it_is_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path, false).expect_err("silence is not idleness");
+        assert_eq!(err.code, "host_unconfirmed", "distinct from the busy refusal: {err:?}");
+        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+
+        dev.forget(&HostId("host-1".into()), &hosts_path, true).expect("a Pi that is gone for good must stay forgettable");
+        assert!(dev.paired_hosts().is_empty());
     }
 
     #[test]
@@ -1177,9 +1446,65 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let err = dev.forget(&id, &hosts_path).expect_err("a moving blade must not become unstoppable");
+        let err = dev.forget(&id, &hosts_path, false).expect_err("a moving blade must not become unstoppable");
         assert_eq!(err.code, "host_busy");
         assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+
+        // Force is for a host that cannot answer, not one that answered "busy": this host is
+        // reachable, so `cancel` still works and the blade was never orphaned.
+        let forced = dev.forget(&id, &hosts_path, true).expect_err("force must not override a confirmed cut");
+        assert_eq!(forced.code, "host_busy");
+        assert_eq!(dev.paired_hosts().len(), 1, "still paired");
+    }
+
+    /// The two cutters here share an `instance_id` on purpose — the local factory's device and
+    /// the loopback host's Cameo are both `usb:1:4`, because a fallback id is assigned by
+    /// location and two identically-wired machines really do collide. A guard comparing ids
+    /// alone would call these the same cutter and send A's Passes to B.
+    #[test]
+    fn a_dispatch_whose_aim_moved_after_planning_is_refused() {
+        use std::time::{Duration, Instant};
+
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        // Preflight runs against the local cutter...
+        let (planned_for, passes) = dev.prepare_cut(&app, request_from(plan_for(&app))).unwrap();
+        assert_eq!(planned_for.host, None);
+
+        // ...and the operator connects the Pi's Cameo before the dispatch lands.
+        *dev.connected.lock().unwrap() = Some(DeviceInfo {
+            instance_id: cut_host::host::testing::CAMEO.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: Some(host_id),
+        });
+
+        let err = dev.execute_cut(planned_for, passes).expect_err("Passes approved for A must not go to B");
+        assert_eq!(err.code, "device_mismatch");
+
+        // The daemon accepts a dispatch before its cut thread starts, so a single snapshot could
+        // read idle on a host that is about to move. Hold the assertion open instead.
+        let client = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            let active = client
+                .snapshots()
+                .unwrap()
+                .iter()
+                .any(|s| s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active());
+            assert!(!active, "the refused Passes reached the host anyway");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -1193,7 +1518,7 @@ mod tests {
             .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
             .expect("this host answers and the fingerprint matches");
 
-        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        dev.forget(&id, &hosts_path, false).expect("it answers, and nothing is running on it");
         assert!(dev.paired_hosts().is_empty());
     }
 
@@ -1211,7 +1536,7 @@ mod tests {
             .expect("this host answers and the fingerprint matches");
         dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
-        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        dev.forget(&id, &hosts_path, false).expect("it answers, and nothing is running on it");
         assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
     }
 
@@ -1305,7 +1630,274 @@ mod tests {
         dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
         dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
-        dev.forget(&HostId("host-elsewhere".into()), &hosts_path).expect("nothing is running on it");
+        // Forced: this one is unreachable, and an unreachable host is no longer forgettable
+        // without it. What the test is about is the *other* host's aim, which must not move.
+        dev.forget(&HostId("host-elsewhere".into()), &hosts_path, true).expect("forced");
         assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
+    }
+
+    // --- dispatch idempotency ---
+    //
+    // Two failures, pulling opposite ways, and both are the material: a retry after a lost reply
+    // that cuts the sheet twice, and a fix so eager that a second sheet can never be cut at all.
+    // Every test below holds one of the two ends down.
+
+    /// A TCP relay in front of a loopback host that can swallow one reply. Everything the client
+    /// sends still reaches the host, so the Job runs; once armed, the host's answer is dropped
+    /// and the connection taken away instead. Waiting for that answer to *exist* before dropping
+    /// it is the point — it means the host had already committed the Job when the sender lost it.
+    struct ReplyEater {
+        addr: String,
+        swallow: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn start_reply_eater(upstream: &str) -> ReplyEater {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let swallow = Arc::new(AtomicBool::new(false));
+        let (upstream, flag) = (upstream.to_string(), swallow.clone());
+
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(server) = std::net::TcpStream::connect(&upstream) else { continue };
+                let (mut from_client, mut to_client) = (client.try_clone().unwrap(), client);
+                let (mut from_server, mut to_server) = (server.try_clone().unwrap(), server);
+
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = from_client.read(&mut buf) {
+                        if n == 0 || to_server.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let armed = flag.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = from_server.read(&mut buf) {
+                        if n == 0 || armed.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if to_client.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_client.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        ReplyEater { addr, swallow }
+    }
+
+    fn host_cameo(host: &HostId) -> DeviceInfo {
+        DeviceInfo {
+            instance_id: cut_host::host::testing::CAMEO.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: Some(host.clone()),
+        }
+    }
+
+    fn a_square(side: f64) -> Vec<CutPass> {
+        vec![CutPass {
+            job: Job {
+                polylines: vec![vec![
+                    geometry::Point { x: 0.0, y: 0.0 },
+                    geometry::Point { x: side, y: 0.0 },
+                    geometry::Point { x: side, y: side },
+                    geometry::Point { x: 0.0, y: 0.0 },
+                ]],
+                settings: driver_core::Settings::default(),
+            },
+        }]
+    }
+
+    fn cameo_is_active(client: &cut_host::client::HostClient) -> bool {
+        client
+            .snapshots()
+            .map(|snaps| {
+                snaps.iter().any(|s| {
+                    s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active()
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, complaint: &str) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done() {
+            assert!(Instant::now() < deadline, "{complaint}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Holds an assertion open rather than sampling once: the host accepts a dispatch before its
+    /// cut thread starts, so a single reading can miss a cut that is about to happen.
+    fn stays_false(mut claim: impl FnMut() -> bool, complaint: &str) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            assert!(!claim(), "{complaint}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The finding's own scenario, end to end: the host takes dispatch `d1` and starts cutting,
+    /// the reply is lost, the Job finishes, and the operator presses Cut again.
+    /// The remote half of the exit. This desktop never opened the Pi's transport, so its own
+    /// `disconnect` there is bookkeeping and would leave the cutter exactly as stuck — only the
+    /// host's `Reconnect` re-opens it. Driven over the real loopback host so the verb is proved on
+    /// the wire, not just in the router. Asserted through `actions`: the phase reads `Idle` on
+    /// both sides of the reconnect.
+    #[test]
+    fn reconnecting_a_remote_cutter_clears_a_cancel_that_could_not_confirm_the_stop() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
+        // The host's TestDriver parks rather than polls, so nothing can confirm a stop there.
+        wait_for_remote(&dev, |s| s.actions.confirm, "the Job to park");
+        dev.cancel().expect("cancel");
+        wait_for_remote(&dev, |s| s.ended == Some(driver_core::Ended::Cancelled), "the cancel to land");
+        assert!(!dev.status().actions.cut, "nothing saw the machine stop, so no Job may follow it");
+
+        dev.reconnect().expect("the host re-opens its own cutter");
+        assert!(dev.status().actions.cut, "a re-opened cutter takes a Job again");
+    }
+
+    fn wait_for_remote(dev: &DeviceManagerHandle, want: impl Fn(&CutStatus) -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = dev.status();
+            if want(&s) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "waited out {what}, sat at {:?}", s.phase);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_lost_reply_does_not_cut_the_material_twice() {
+        use std::sync::atomic::Ordering;
+
+        let host = start_loopback_host();
+        let eater = start_reply_eater(&host.addr);
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), eater.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("the relay forwards the pairing check to a host that answers");
+        // Establishes the desktop's own connection through the relay first, so arming it takes
+        // away a dispatch reply rather than a piece of the TLS handshake.
+        dev.list_devices();
+
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        eater.swallow.store(true, Ordering::SeqCst);
+        let err = dev
+            .execute_cut(aimed.clone(), a_square(10.0))
+            .expect_err("the host's answer never came back");
+        assert_eq!(err.code, "dispatch_unconfirmed", "{}", err.message);
+
+        // Straight to the host, around the relay: the Job really did land, and really did run.
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        wait_until(|| cameo_is_active(&direct), "the dispatch never reached the host");
+        direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
+        wait_until(|| !cameo_is_active(&direct), "the job never finished");
+
+        // Connectivity is back and the operator presses Cut on the same design.
+        eater.swallow.store(false, Ordering::SeqCst);
+        dev.execute_cut(aimed, a_square(10.0)).expect("the retry reaches the host");
+
+        stays_false(|| cameo_is_active(&direct), "the same material was cut a second time");
+    }
+
+    /// The other end: the fix must not make a second sheet impossible. Same design, same cutter,
+    /// dispatched again after the first one was answered and finished — and the blade moves.
+    #[test]
+    fn cutting_the_same_design_again_after_an_answered_dispatch_starts_a_new_job() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+
+        dev.execute_cut(aimed.clone(), a_square(10.0)).expect("first sheet");
+        wait_until(|| cameo_is_active(&direct), "the first cut never started");
+        direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
+        wait_until(|| !cameo_is_active(&direct), "the first cut never finished");
+
+        // Fresh material, same file: a legitimate second Job, not a retry of anything.
+        dev.execute_cut(aimed, a_square(10.0)).expect("second sheet");
+        wait_until(|| cameo_is_active(&direct), "the second sheet was refused as a duplicate");
+    }
+
+    fn key_for(passes: &[CutPass]) -> JobKey {
+        JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", passes),
+        }
+    }
+
+    #[test]
+    fn two_different_jobs_to_one_cutter_get_different_ids() {
+        let dev = test_device_setup();
+        assert_ne!(
+            dev.dispatch_id_for(&key_for(&a_square(10.0))),
+            dev.dispatch_id_for(&key_for(&a_square(20.0))),
+            "different geometry is a different Job"
+        );
+
+        // Settings, not only geometry: the same shape cut at a different force is a different
+        // Job, and a digest that missed it would let one be swallowed as a retry of the other.
+        let mut harder = a_square(10.0);
+        harder[0].job.settings.force = Some(driver_core::Settings::default().force.unwrap_or(0) + 1);
+        assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("cameo5", &harder));
+
+        // And the same Passes aimed at a different machine are not interchangeable either.
+        assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("puma", &a_square(10.0)));
+    }
+
+    /// The whole distinction, in the one place it lives. Flip either half and this fails.
+    #[test]
+    fn an_id_is_reused_only_while_its_dispatch_has_no_answer() {
+        let dev = test_device_setup();
+        let key = key_for(&a_square(10.0));
+
+        // Nothing in doubt: every press of Cut is its own Job, however identical.
+        let first = dev.dispatch_id_for(&key);
+        assert_ne!(first, dev.dispatch_id_for(&key), "a deliberate re-cut must not be a duplicate");
+
+        // One dispatch outstanding: the next press of Cut is that dispatch, tried again.
+        dev.in_doubt.lock().unwrap().insert(key.clone(), first.clone());
+        assert_eq!(dev.dispatch_id_for(&key), first, "a retry must arrive under the id it went out with");
+
+        // ...and only for that Job. A different one is never mistaken for the retry.
+        assert_ne!(dev.dispatch_id_for(&key_for(&a_square(20.0))), first);
     }
 }

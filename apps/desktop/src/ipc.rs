@@ -105,6 +105,12 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
+// async for the same reasons as connect_device, plus a remote arm that talks to the Pi.
+#[tauri::command(async)]
+pub fn reconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
+    dev.reconnect()
+}
+
 // async: non-blocking for a local device — the status is published rather than asked of the
 // worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
 // network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) plus an
@@ -133,11 +139,11 @@ pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, 
 // loop keeps the UI (and cancel_cut) responsive while it blocks.
 #[tauri::command(async)]
 pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<u64, IpcError> {
-    let passes = {
+    let (planned_for, passes) = {
         let app = state.lock().unwrap();
         dev.prepare_cut(&app, request)?
     };
-    dev.execute_cut(passes)
+    dev.execute_cut(planned_for, passes)
 }
 
 #[tauri::command(async)]
@@ -221,10 +227,13 @@ pub fn pair_host(
     Ok(PairedHostView { id, name, address, unreachable: None })
 }
 
-// async: the busy check dials the host the same way `test_host` does (see there for why).
+// async: the idle check dials the host the same way `test_host` does (see there for why).
+//
+// `force` is the operator accepting that a host which cannot be asked may still be cutting. The
+// UI only offers it after an unforced attempt has already been refused — see `DeviceManagerHandle::forget`.
 #[tauri::command(async)]
-pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId) -> Result<(), IpcError> {
-    dev.forget(&id, &hosts_path()?)
+pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId, force: bool) -> Result<(), IpcError> {
+    dev.forget(&id, &hosts_path()?, force)
 }
 
 fn hosts_path() -> Result<PathBuf, IpcError> {

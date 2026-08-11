@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
-use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PairedHostView, PlanCutResponse};
+use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 
@@ -138,7 +138,7 @@ pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, 
 // so `cut` never holds the doc mutex while blocked, and running off the main
 // loop keeps the UI (and cancel_cut) responsive while it blocks.
 #[tauri::command(async)]
-pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<u64, IpcError> {
+pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<CutStarted, IpcError> {
     let (planned_for, passes) = {
         let app = state.lock().unwrap();
         dev.prepare_cut(&app, request)?
@@ -198,7 +198,20 @@ pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHo
 #[tauri::command(async)]
 pub fn probe_host(address: String) -> Result<String, IpcError> {
     cut_host::client::probe_fingerprint(&address, cut_host::client::CONNECT_TIMEOUT)
-        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))
+        .map_err(|e| crate::device::host_error(&e))
+}
+
+/// Whether this address is already paired, and whether the certificate just probed is the one
+/// pinned for it. Asked between the probe and the confirm, so a re-pairing after a Pi's
+/// certificate changed is something the operator is told about rather than something they
+/// discover as a second, permanently broken row (#107).
+#[tauri::command]
+pub fn existing_pairing(
+    dev: tauri::State<DeviceManagerHandle>,
+    address: String,
+    fingerprint: String,
+) -> Result<Option<ExistingPairing>, IpcError> {
+    Ok(dev.existing_pairing(&address, &fingerprint))
 }
 
 /// Prove a host without saving it. The pairing dialog calls this before `pair_host`, so an
@@ -210,7 +223,7 @@ pub fn probe_host(address: String) -> Result<String, IpcError> {
 #[tauri::command(async)]
 pub fn test_host(address: String, token: String, fingerprint: String) -> Result<Vec<DeviceInfo>, IpcError> {
     cut_host::client::HostClient::pair_check(&address, &token, &fingerprint)
-        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))
+        .map_err(|e| crate::device::host_error(&e))
 }
 
 // async: pairing dials the host the same way `test_host` does (see there for why).

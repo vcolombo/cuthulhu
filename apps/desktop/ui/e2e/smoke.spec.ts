@@ -160,7 +160,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // per internal state — so a frontend that re-derives permissions has nothing to
   // re-derive them from. ---
 
-  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean };
+  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean; host: string | null };
   type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
   type CutStatus = {
     phase: string;
@@ -190,8 +190,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
 
   const devices: DeviceInfo[] = [
-    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false },
-    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true },
+    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
+    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true, host: null },
   ];
 
   let connected: DeviceInfo | null = null;
@@ -427,6 +427,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
     machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
+    // No paired hosts yet, so existing assertions (device list, connect flow) are
+    // unaffected. probe/test/pair/forget are stubs a later task exercises.
+    list_hosts: () => [],
+    probe_host: () => unimplemented("probe_host"),
+    test_host: () => unimplemented("test_host"),
+    pair_host: () => unimplemented("pair_host"),
+    forget_host: () => unimplemented("forget_host"),
     save_preset: () => null,
     delete_preset: () => null,
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.

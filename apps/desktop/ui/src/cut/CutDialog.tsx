@@ -56,6 +56,17 @@ const dialogStyle: CSSProperties = {
   gap: 10,
 };
 
+// `deviceBadge` decides the tone; the palette is this file's, since a pure module has no
+// business knowing the tokens. Without this the label rendered in one flat grey, so "Cutting",
+// "Ready" and "Unreachable" were the same small muted text as the machine id beside them —
+// six cutters across two hosts with one mid-cut, and nothing on screen picking it out.
+const TONE_COLOR: Record<ReturnType<typeof deviceBadge>["tone"], string> = {
+  idle: "var(--ready)",
+  busy: "var(--accent)",
+  attention: "var(--cut)",
+  gone: "var(--muted)",
+};
+
 const btn: CSSProperties = {
   background: "var(--panel)",
   color: "var(--text)",
@@ -327,16 +338,18 @@ export function CutDialog({
               {section.unreachable ? (
                 <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
               ) : null}
-              {section.devices.map((d) => (
+              {section.devices.map((d) => {
+                // Only the aimed-at cutter has a status; the rest have not been asked, and
+                // `null` is what says so rather than something that reads as ready.
+                const badge = deviceBadge(connected?.instance_id === d.instance_id ? status : null);
+                return (
                 <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <span>
                     {d.machine_id}
                     {d.candidate ? " (unverified serial device)" : ""}
                   </span>
-                  {/* Only the aimed-at cutter has a status; the rest have not been asked, and
-                      `null` is what says so rather than something that reads as ready. */}
-                  <span style={{ color: "var(--muted)" }}>
-                    {deviceBadge(connected?.instance_id === d.instance_id ? status : null).label}
+                  <span data-testid="device-badge" data-tone={badge.tone} style={{ color: TONE_COLOR[badge.tone] }}>
+                    {badge.label}
                   </span>
                   {connected?.instance_id === d.instance_id ? (
                     <span style={{ color: "var(--ready)" }}>connected</span>
@@ -346,7 +359,8 @@ export function CutDialog({
                     </button>
                   )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           ))}
           {/* Pairing lives in the device list on purpose: someone hunting for their Pi looks

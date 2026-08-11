@@ -812,6 +812,12 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+
+  // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
+  // has polled. Four of `deviceBadge`'s unit tests assert on `tone` alone; this is what makes
+  // them describe the product instead of a field it threw away.
+  await expect(page.getByTestId("device-badge").first()).toHaveAttribute("data-tone", "busy");
+  await expect(page.getByTestId("device-badge").nth(1)).toHaveAttribute("data-tone", "attention");
 });
 
 test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {

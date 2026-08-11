@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { deviceBadge, groupDevices } from "./deviceList";
+import { deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -70,6 +70,72 @@ describe("groupDevices", () => {
     expect(sections.filter(s => s.hostId === "host-gone")).toHaveLength(1);
     // A known host keeps its own section; only the unpaired ids get made up.
     expect(sections.find(s => s.hostId === "host-1")!.title).toBe("Workshop Pi");
+  });
+});
+
+const PAIRED: PairedHostView[] = [
+  { id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null },
+  { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null },
+];
+
+const runForget = (id: string, forget: (id: string) => Promise<void>) =>
+  forgetFrom(PAIRED, id, forget);
+
+describe("forgetFrom", () => {
+  it("keeps a host that refuses to be forgotten, and says why", async () => {
+    // The Rust side refuses while a cut is active on that host: the desktop would otherwise
+    // discard the token for a Job it can no longer cancel.
+    const s = await runForget("host-1", async () => {
+      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+    });
+    expect(s.hosts.map(h => h.id)).toContain("host-1");
+    expect(s.message).toContain("cancel it before forgetting");
+  });
+
+  it("removes the host only once the Rust side has agreed", async () => {
+    const s = await runForget("host-1", async () => {});
+    expect(s.hosts.map(h => h.id)).toEqual(["host-2"]);
+    expect(s.message).toBeNull();
+  });
+
+  // The stored token is the Rust side's, kept until re-pairing replaces it. A refusal must leave
+  // the list untouched rather than half-erased: a host that plainly needs attention is better
+  // than one whose credentials this side quietly dropped.
+  it("leaves the list exactly as it was when the forget is refused", async () => {
+    const s = await runForget("host-1", async () => {
+      throw { code: "host_busy", message: "a cut is active on this host; cancel it before forgetting" };
+    });
+    expect(s.hosts).toEqual(PAIRED);
+  });
+
+  it("removes nothing when the forget names a host that is not listed", async () => {
+    const s = await runForget("host-gone", async () => {});
+    expect(s.hosts).toEqual(PAIRED);
+  });
+});
+
+describe("staleSection", () => {
+  const section = () => groupDevices(
+    [{ ...aDevice(), instance_id: "usb:sn:A", host: "host-1" }],
+    [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null }],
+  ).find(s => s.hostId === "host-1")!;
+
+  // The cut is still running on the Pi. A row that blanks or resets reads as "finished", which is
+  // the one wrong thing to tell someone whose material is still moving under a blade.
+  it("keeps the cutters a failed poll could not re-list, and marks them stale", () => {
+    const s = staleSection(section(), { code: "host_unreachable", message: "the host could not be reached (timed out)" });
+    expect(s.devices).toEqual(section().devices);
+    expect(s.stale).toBe(true);
+    expect(s.title).toBe("Workshop Pi");
+  });
+
+  it("shows the host's own words for why the poll failed", () => {
+    const s = staleSection(section(), { code: "host_unreachable", message: "the host could not be reached (timed out)" });
+    expect(s.unreachable).toBe("the host could not be reached (timed out)");
+  });
+
+  it("clears stale once a poll succeeds, since groupDevices builds the section afresh", () => {
+    expect(section().stale).toBe(false);
   });
 });
 

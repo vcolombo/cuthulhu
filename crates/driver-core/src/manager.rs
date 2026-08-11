@@ -141,9 +141,10 @@ impl DeviceManager {
         self.call(|reply| Command::Disconnect { reply })?
     }
 
-    /// The only observation point for detail `CutStatus` deliberately does not
-    /// carry (`completion_known`). Nothing shipping needs it, so it exists for
-    /// the tests in this file and nowhere else.
+    /// The raw state behind the reported one. `actions.cut` is derived from
+    /// `completion_known`, and a test asserting only the derived value cannot tell a
+    /// correct derivation from a lucky one — so the fact itself needs an observation
+    /// point. Nothing shipping reads it; it exists for the tests in this file.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> DeviceState {
         self.call(|reply| Command::Snapshot { reply }).unwrap_or(DeviceState::Disconnected)
@@ -164,10 +165,11 @@ impl DeviceManager {
     /// `try_send` for a worker already *parked* in `WaitingForColorSwap`/
     /// `AwaitingCompletion`. Emits `CancelRequested -> Stopping -> Cancelled
     /// { completion_known }`, which then stays the resting/observable state
-    /// (`snapshot()` can see it) until the next `cut` transitions back to
-    /// `Idle`. `completion_known` is only `true` when an ENQ poll actually
-    /// confirmed the device is ready (never for `needs_operator_pass_confirm`
-    /// machines). A no-op when no job is active.
+    /// until a `cut` or a reconnect transitions back to `Idle`.
+    /// `completion_known` is only `true` when an ENQ poll actually confirmed the
+    /// device is ready (never for `needs_operator_pass_confirm` machines), and it
+    /// is what decides whether `actions.cut` may offer another Job. A no-op when
+    /// no job is active.
     pub fn cancel(&self) {
         // ponytail: a concurrent cancel()/cut() enqueue can race — which job
         // the flag lands on isn't guaranteed by send order alone, but it's
@@ -511,7 +513,12 @@ fn perform_cancel(
     let cancelled = DeviceState::Cancelled { job_id, pass_index, submitted_bytes, completion_known };
     emit_for(job_id, state, cancelled, total_passes, rep);
     // Cancelled stays the resting state (no auto-Idle) so a snapshot/event
-    // drain can actually observe it; Command::Cut clears it back to Idle.
+    // drain can actually observe it; Command::Cut clears it back to Idle — but
+    // only when `completion_known` said the machine was seen to stop. When it did
+    // not, `Command::Disconnect` is the way out, and it is the honest one: it drops
+    // the transport an operator then re-opens, having gone and looked at the
+    // machine. Nothing here decides on their behalf that the blade must have
+    // stopped by now.
     cancel_flag.store(false, Ordering::SeqCst); // consumed: don't poison the next job
 }
 
@@ -622,10 +629,14 @@ fn worker_loop(
                 let _ = reply.send(Ok(()));
             }
             Command::Cut { passes, reply } => {
-                // Idle is the normal rest state; Cancelled is also a valid
-                // start state so a job can be resubmitted with no manual
-                // reset — see perform_cancel's doc comment.
-                if !matches!(state, DeviceState::Idle | DeviceState::Cancelled { .. }) {
+                // Idle is the normal rest state. A cancel whose stop was actually
+                // observed is also a valid start state, so a job can be resubmitted
+                // with no manual reset — see perform_cancel's doc comment. One that
+                // was not is refused rather than started: `Busy` is literally what it
+                // may still be, and the machine is the only thing that can say
+                // otherwise. `status_of` withholds `actions.cut` for the same reason,
+                // so this guard refuses nothing a caller was told it could do.
+                if !matches!(state, DeviceState::Idle | DeviceState::Cancelled { completion_known: true, .. }) {
                     let _ = reply.send(Err(DeviceError::Busy));
                     continue;
                 }
@@ -1377,12 +1388,49 @@ mod tests {
             && matches!(e.kind, DeviceEventKind::StateChanged)
             && e.status.phase == Phase::Cancelling));
 
-        // `completion_known` has no place in `CutStatus` — nothing a caller can do
-        // differs on it — so the resting state is where it stays observable.
+        // What a caller does differs on `completion_known`: it does not start another
+        // Job into a machine nothing saw stop. Asserted through `actions` — the only
+        // thing a caller reads — with the raw state alongside it, so a mapping that
+        // stopped reading the field would fail here rather than pass by coincidence.
         assert!(matches!(
             mgr.snapshot(),
             DeviceState::Cancelled { completion_known, .. } if completion_known == expect_completion_known
         ));
+        assert_eq!(
+            at_cancel.actions.cut, expect_completion_known,
+            "actions must not offer a cut the machine never confirmed it had stopped for"
+        );
+        if !expect_completion_known {
+            assert_eq!(
+                mgr.cut(one_pass_job()).unwrap_err(),
+                DeviceError::Busy,
+                "and the guard refuses what actions withheld, so a caller that ignored actions gains nothing"
+            );
+        }
+        mgr.shutdown();
+    }
+
+    /// The way out of a stop nobody confirmed, and the reason no "mark it ready"
+    /// control is needed: the operator goes to the machine, sees it at rest, and
+    /// reconnects. Disconnect leaves any state, so the cancelled rest state goes with
+    /// the transport — and for a serial candidate the reconnect re-probes real
+    /// hardware rather than taking anyone's word for it.
+    #[test]
+    fn reconnecting_clears_a_cancel_whose_stop_was_never_confirmed() {
+        // A Puma: `needs_operator_pass_confirm`, so no cancel of one can ever confirm.
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(PumaFactory));
+        mgr.connect(puma_info()).unwrap();
+        mgr.cut(one_pass_job()).unwrap();
+        wait_for_phase(&mgr, Phase::AwaitingConfirmation);
+        mgr.cancel();
+
+        let stopped = wait_for_ended(&mgr, Ended::Cancelled);
+        assert!(!stopped.actions.cut, "a Puma's stop is never confirmed, so no Job may follow it");
+        assert_eq!(mgr.cut(one_pass_job()).unwrap_err(), DeviceError::Busy);
+
+        mgr.disconnect().unwrap();
+        mgr.connect(puma_info()).unwrap();
+        assert!(mgr.status().actions.cut, "a reconnected cutter accepts a Job again");
         mgr.shutdown();
     }
 

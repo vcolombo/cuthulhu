@@ -175,4 +175,18 @@ describe("deviceBadge", () => {
     const status: CutStatus = { ...aStatus(), phase: "Sending", actions: { ...aStatus().actions, cancel: true } };
     expect(deviceBadge(status).tone).toBe("busy");
   });
+
+  // Both rest on "Idle" and both report a cancelled ending, so only `actions.cut` separates a
+  // stop the machine confirmed from one nothing witnessed. The second must not read as ready,
+  // and must not read as "Unreachable" either — the cutter is right there, and someone needs
+  // to look at it.
+  it("tells a confirmed stop from one nothing saw, and asks for a person on the second", () => {
+    const confirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled",
+                                   actions: { ...aStatus().actions, cut: true } };
+    expect(deviceBadge(confirmed).tone).toBe("idle");
+
+    const unconfirmed: CutStatus = { ...confirmed, actions: { ...aStatus().actions, cut: false } };
+    expect(deviceBadge(unconfirmed).tone).toBe("attention");
+    expect(deviceBadge(unconfirmed).label).toMatch(/not confirmed/);
+  });
 });

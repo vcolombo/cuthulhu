@@ -113,6 +113,14 @@ export function deviceBadge(status: CutStatus | null): { label: string; tone: "i
   if (actions.cancel) {
     return { label: "Cutting", tone: "busy" };
   }
+  // A cancel with nothing legal left: the Job ended, but no poll saw the machine come to rest
+  // — the ordinary outcome on a Puma, whose abort is queued behind whatever motion is already
+  // buffered. Still derived from `actions` and `ended`, not from the phase (which is `Idle`
+  // here, the same as a confirmed stop). This is why the operator is asked to look: only they
+  // can tell, and reconnecting the cutter is what says they have.
+  if (ended === "Cancelled") {
+    return { label: "Cancelled — stop not confirmed, check the cutter", tone: "attention" };
+  }
   // Nothing is legal. A reachable, idle cutter always has `actions.cut`, so this combination
   // means the cutter (or its host) can't be reached right now — same fact `groupDevices` keeps
   // visible rather than hiding (#42).

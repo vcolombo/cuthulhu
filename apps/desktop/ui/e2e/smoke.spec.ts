@@ -402,7 +402,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     cancel_cut: () => {
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
       // Cancelled resting state — nothing is happening, so the phase is Idle, but
-      // `ended` names the cancel and Cut is legal again (status.rs's Cancelled arm).
+      // `ended` names the cancel. Cut is legal again only because this fake stands in
+      // for a pollable cutter whose stop was confirmed; a Puma's never is, and
+      // status.rs's Cancelled arm then withholds `actions.cut`.
       const sent = status.sent?.sent ?? 0;
       const pass = status.pass;
       // CancelRequested then Stopping — two distinct internal states that both report

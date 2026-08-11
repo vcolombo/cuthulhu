@@ -130,11 +130,19 @@ pub(crate) fn status_of(state: &DeviceState, total_passes: usize, ended: Option<
             (Phase::Cancelling, Actions::default(), None, None, None)
         }
         // A cancelled job is over, so nothing is happening: `Idle`, with `ended`
-        // saying which ending it was. `cut` is legal again, exactly as
-        // `manager.rs`'s cut guard already allows.
-        DeviceState::Cancelled { pass_index, submitted_bytes, .. } => (
+        // saying which ending it was.
+        //
+        // Over is not stopped. `completion_known` is true only when a poll actually
+        // saw the machine come to rest; a Puma cannot be polled at all and its abort
+        // is queued behind whatever motion is already buffered, so false is the
+        // ordinary case there rather than a rare one. Offering a cut then aims a
+        // carriage at a new origin while the last path may still be draining — so
+        // `cut` waits for a stop something actually observed. Reconnecting is how an
+        // operator who can see the machine at rest gets moving again
+        // (`manager.rs`'s `Command::Disconnect` leaves any state).
+        DeviceState::Cancelled { pass_index, submitted_bytes, completion_known, .. } => (
             Phase::Idle,
-            Actions { cut: true, ..Actions::default() },
+            Actions { cut: *completion_known, ..Actions::default() },
             pass(*pass_index),
             Some(ByteProgress { sent: *submitted_bytes, total: *submitted_bytes }),
             None,
@@ -198,11 +206,32 @@ mod tests {
         // Passed no remembered outcome on purpose: a cancelled job rests on a state of
         // its own, so it says how it ended without the worker having to remember.
         let cancelled = status_of(
-            &DeviceState::Cancelled { job_id: 1, pass_index: 1, submitted_bytes: 40, completion_known: false }, 3, None);
+            &DeviceState::Cancelled { job_id: 1, pass_index: 1, submitted_bytes: 40, completion_known: true }, 3, None);
         assert_eq!(cancelled.phase, Phase::Idle, "a cancelled job is no longer in flight");
         assert_eq!(cancelled.ended, Some(Ended::Cancelled));
         assert_eq!(cancelled.pass, Some(PassPosition { index: 1, total: 3 }));
-        assert!(cancelled.actions.cut, "another cut is legal after a cancel");
+    }
+
+    /// A cancel says the job is over; it does not say the blade stopped. Only the poll
+    /// behind `completion_known` can say that, and `actions.cut` is the one value a
+    /// caller reads before starting another Job into the same machine — so it is where
+    /// the difference has to show. Asserted through `actions`, not the phase: both
+    /// cases rest on `Idle`, which is exactly why the phase cannot carry this.
+    #[test]
+    fn another_cut_is_offered_only_when_the_stop_was_confirmed() {
+        let cancelled = |completion_known| {
+            status_of(
+                &DeviceState::Cancelled { job_id: 1, pass_index: 0, submitted_bytes: 40, completion_known },
+                2,
+                None,
+            )
+        };
+        assert!(cancelled(true).actions.cut, "a poll saw the machine at rest, so another Job may start");
+
+        let unconfirmed = cancelled(false);
+        assert!(!unconfirmed.actions.cut, "nothing saw it stop, so nothing may be started into it");
+        assert_eq!(unconfirmed.actions, Actions::default(), "and there is no Job left to cancel, resume or confirm");
+        assert_eq!(unconfirmed.ended, Some(Ended::Cancelled), "it still says how the job ended");
     }
 
     /// A fault is not an ending: it has its own phase and carries the reason, and it

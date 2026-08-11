@@ -21,9 +21,23 @@ export function groupDevices(
     hostId: null, title: "This computer", address: null, unreachable: null,
     devices: devices.filter(d => d.host === null),
   };
-  return [local, ...hosts.map(h => ({
+  const known = hosts.map(h => ({
     hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable,
     devices: devices.filter(d => d.host === h.id),
+  }));
+  // A cutter whose host is in neither list matches no section above — not local, since its `host`
+  // is set, and not any paired host's. Dropping it here would be the same disappearance the rest
+  // of this function exists to prevent, and it is reachable without anything being wrong: a poll
+  // whose `list_devices` resolved before a forget and whose `list_hosts` resolved after sees
+  // exactly this. It gets its own section rather than a guess at which host it meant.
+  const paired = new Set(hosts.map(h => h.id));
+  const orphaned = [...new Set(
+    devices.flatMap(d => (d.host !== null && !paired.has(d.host) ? [d.host] : [])),
+  )];
+  return [local, ...known, ...orphaned.map(id => ({
+    hostId: id, title: id, address: null,
+    unreachable: "this Cut Host is not paired with this computer",
+    devices: devices.filter(d => d.host === id),
   }))];
 }
 

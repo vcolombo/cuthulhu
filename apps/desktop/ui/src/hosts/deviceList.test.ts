@@ -44,6 +44,33 @@ describe("groupDevices", () => {
     );
     expect(sections[0].hostId).toBeNull();
   });
+
+  // Reachable as a race: list_devices resolves before a forget and list_hosts after, so a cutter
+  // names a host that is no longer in the list. It is not local (its `host` is not null) and it
+  // matches no host's section, so it used to land in none of them and blink out of the list —
+  // exactly the disappearance this module exists to prevent (#42).
+  it("gives a cutter naming an unpaired host somewhere to go, rather than dropping it", () => {
+    const orphan: DeviceInfo = { ...aDevice(), instance_id: "usb:sn:A", host: "host-gone" };
+    const sections = groupDevices([orphan], []);
+    expect(sections.flatMap(s => s.devices)).toContainEqual(orphan);
+    const unknown = sections.find(s => s.hostId === "host-gone")!;
+    expect(unknown.unreachable).not.toBeNull();
+  });
+
+  it("keeps every orphan, and does not invent a section for a host that has one already", () => {
+    const devices: DeviceInfo[] = [
+      { ...aDevice(), instance_id: "usb:sn:A", host: "host-gone" },
+      { ...aDevice(), instance_id: "usb:sn:B", host: "host-gone" },
+      { ...aDevice(), instance_id: "usb:sn:C", host: "host-also-gone" },
+      { ...aDevice(), instance_id: "usb:sn:D", host: "host-1" },
+    ];
+    const sections = groupDevices(devices, [{ id: "host-1", name: "Workshop Pi",
+                                              address: "pi.local:7878", unreachable: null }]);
+    expect(sections.flatMap(s => s.devices)).toHaveLength(devices.length);
+    expect(sections.filter(s => s.hostId === "host-gone")).toHaveLength(1);
+    // A known host keeps its own section; only the unpaired ids get made up.
+    expect(sections.find(s => s.hostId === "host-1")!.title).toBe("Workshop Pi");
+  });
 });
 
 describe("deviceBadge", () => {

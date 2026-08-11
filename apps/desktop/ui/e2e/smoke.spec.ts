@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; slowList?: boolean; failList?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -213,8 +213,26 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-2",
   };
 
-  let connected: DeviceInfo | null = null;
-  let status: CutStatus = DISCONNECTED;
+  // A reachable Cut Host with a cutter aimed at and stuck: cancelled, with nothing the operator
+  // may do next. That is the state the Reconnect control exists for, and nothing in this suite
+  // exercised a *remote* connected cutter at all — so the one line joining `connectedControl`'s
+  // answer to `reconnect_device` was covered by neither half's tests (#123).
+  const REMOTE_CUTTER: DeviceInfo = {
+    instance_id: "usb:pi:C", machine_id: "cameo5",
+    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
+  };
+  if (opts?.seedRemoteConnected) {
+    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
+    devices.push(REMOTE_CUTTER);
+  }
+
+  let connected: DeviceInfo | null = opts?.seedRemoteConnected ? REMOTE_CUTTER : null;
+  // A cancel whose stop nothing confirmed: the Job is over, and `driver-core` still refuses a cut
+  // until the transport is re-opened. `Idle` on both sides of the reconnect, which is exactly why
+  // the control is derived from `actions` and not from the phase.
+  let status: CutStatus = opts?.seedRemoteConnected
+    ? { phase: "Idle", ended: "Cancelled", actions: { ...NO_ACTIONS }, pass: null, sent: null, error: null }
+    : DISCONNECTED;
   let deviceStateCalls = 0;
   let listDeviceCalls = 0;
   let nextJobId = 1;
@@ -357,6 +375,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       return null;
     },
+    // Keeps the aim, unlike `disconnect_device`: the cutter is still there and still aimed at, it
+    // has simply had its transport re-opened. On a Cut Host this is the host's own verb — this
+    // desktop never opened that transport, so a disconnect here would leave it exactly as stuck.
+    reconnect_device: () => {
+      if (!connected) throw ipcError("device_error", "no device is connected");
+      status = IDLE;
+      emit("StateChanged");
+      return null;
+    },
     get_device_state: () => {
       // Counted because the dialog's poll is only observable as a call rate: what has to be
       // proven is that it stops, and a stopped interval leaves no other trace.
@@ -394,10 +421,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         status = statusOf("Failed", {}, { error: "Timeout" });
         emit("StateChanged");
         jobId = null;
-        return id;
+        return { job_id: id, duplicate: false };
       }
       runPass(enabledIndices[0], enabledIndices);
-      return jobId;
+      // `duplicate` is the Cut Host's own answer — it is the only party that knows whether it had
+      // already accepted this dispatch id. This fake stands in for a local cutter, which has no
+      // dedupe to be caught by, so it is always false here.
+      return { job_id: jobId, duplicate: false };
     },
     cancel_cut: () => {
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
@@ -473,6 +503,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Sends no token, so it answers whatever the address is — mirroring a TLS handshake that
     // has vouched for nothing yet.
     probe_host: () => HOST_FINGERPRINT,
+    // Whether this address is already paired, asked between the probe and the confirm. Mirrors
+    // `DeviceManagerHandle::existing_pairing`: matched on the address as typed.
+    existing_pairing: (a) => {
+      const already = hosts.find((h) => h.address === a.address);
+      if (!already) return null;
+      return { id: already.id, name: already.name, sameFingerprint: a.fingerprint === HOST_FINGERPRINT };
+    },
     // Refuses the token rather than the address: a host that answers but does not accept this
     // token is the failure the pairing flow exists to catch before anything is saved.
     test_host: (a) => {
@@ -710,6 +747,33 @@ test("forgetting a host takes its cutters with it, instead of renaming the row t
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("this Cut Host is not paired with this computer").count()).toBe(0);
   expect(await page.getByText("host-2").count()).toBe(0);
+});
+
+// The recovery path had both halves tested and the join between them untested: `connectedControl`
+// is unit-tested for which control to show, `Host::reconnect` is tested against a real loopback
+// Cut Host, and the line that turns the first into the second — `verb === "reconnect" ? ... : ...`
+// — was covered by nothing, because the fake's connected device was always local (#123).
+//
+// A remote fixture rather than a `reconnect_device` handler bolted onto a local one: a fake that
+// can ship a wrong command name green is the shape of #85, and the honest version of this test
+// needs a remote connected cutter anyway — nothing in this suite had one.
+test("a stuck cutter on a Cut Host offers Reconnect, and reconnecting makes it cuttable again", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteConnected: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // The cancel nobody could confirm: the badge asks for a person, and Start Cut is withheld.
+  await expect(page.getByText("Bench Pi")).toBeVisible();
+  await expect(page.getByText(/Cancelled — stop not confirmed/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+
+  // Reconnect, not Disconnect: this desktop never opened that transport, and dropping the aim
+  // would leave the cutter exactly as stuck.
+  await expect(page.getByRole("button", { name: "Disconnect usb:pi:C" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Reconnect usb:pi:C" }).click();
+
+  await expect(page.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
 // The teardown is the deliverable, not the interval. A leaked interval keeps a Cut Host

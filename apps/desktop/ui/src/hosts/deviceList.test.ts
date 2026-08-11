@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -264,5 +264,30 @@ describe("connectedControl", () => {
       expect(connectedControl(status, false)).toBeNull();
       expect(connectedControl(status, true)).toBeNull();
     }
+  });
+});
+
+// #114: fallback instance ids are assigned by *where* a device was found, so two Pis with cutters
+// wired the same way hand out the same string for two different machines. Matching on the id alone
+// gave one host's status to the other's row — and Cancel with it.
+describe("sameCutter", () => {
+  it("does not confuse two hosts' cutters that share a fallback id", () => {
+    const onA = { instance_id: "usb:at:1:4", host: "host-1" };
+    const onB = { instance_id: "usb:at:1:4", host: "host-2" };
+    expect(sameCutter(onA, onB)).toBe(false);
+    expect(sameCutter(onA, onA)).toBe(true);
+  });
+
+  // The same string on a Pi and on this computer is the case the Rust dispatch guard already
+  // refuses; `null` is not a wildcard for "any host".
+  it("does not confuse a remote cutter with a local one of the same id", () => {
+    expect(sameCutter({ instance_id: "usb:1:4", host: null }, { instance_id: "usb:1:4", host: "host-1" })).toBe(false);
+    expect(sameCutter({ instance_id: "usb:1:4", host: null }, { instance_id: "usb:1:4", host: null })).toBe(true);
+  });
+
+  // Nothing aimed at is not the same cutter as anything, rather than matching whatever is passed.
+  it("matches nothing when either side is absent", () => {
+    expect(sameCutter(null, { instance_id: "usb:1:4", host: null })).toBe(false);
+    expect(sameCutter(undefined, undefined)).toBe(false);
   });
 });

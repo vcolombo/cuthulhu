@@ -129,7 +129,46 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
+    /// Dispatches this desktop sent and never got an answer to, by the Job they carried.
+    ///
+    /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
+    /// cannot cut the same material twice — but only the sender knows whether a given press of
+    /// Cut *is* that retry, and nothing in the Job says so: a retry and a second sheet of the
+    /// same design are byte-identical. What separates them is this entry. It is written before
+    /// the request goes out and cleared by any answer, so a Job still listed here is one whose
+    /// fate is genuinely unknown, and the next dispatch of it reuses the same id.
+    ///
+    /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
+    /// while holding it.
+    in_doubt: Mutex<HashMap<JobKey, cut_host::protocol::DispatchId>>,
     pub connected: Mutex<Option<DeviceInfo>>,
+}
+
+/// One dispatchable Job as this desktop identifies it: which cutter, on which host, carrying
+/// what. Two presses of Cut that agree on all three are the same Job — which is what makes the
+/// second one a candidate for being a retry of the first.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct JobKey {
+    host: HostId,
+    device: String,
+    digest: u64,
+}
+
+/// Hashes the Job as it will go on the wire. Passes carry `f64` geometry, which has no `Hash`;
+/// their serde form is the same bytes `dispatch` sends, so hashing that covers the geometry and
+/// the resolved settings together, and cannot drift from what is actually dispatched.
+///
+/// ponytail: `DefaultHasher` is only guaranteed stable within one process run. That is exactly
+/// the lifetime of `in_doubt`, which is the only thing comparing these — see `execute_cut` for
+/// what a desktop restart costs.
+fn job_digest(machine_id: &str, passes: &[CutPass]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    machine_id.hash(&mut h);
+    // Infallible in practice: the writer is a `Vec`, and Preflight has already refused
+    // non-finite coordinates by the time a Job reaches dispatch.
+    serde_json::to_vec(passes).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 impl DeviceManagerHandle {
@@ -139,6 +178,7 @@ impl DeviceManagerHandle {
             local_factory: factory,
             local_manager: Mutex::new(Some(Arc::new(mgr))),
             hosts: Mutex::new(HashMap::new()),
+            in_doubt: Mutex::new(HashMap::new()),
             connected: Mutex::new(None),
         };
         (handle, events)
@@ -363,7 +403,20 @@ impl DeviceManagerHandle {
         // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
         // in place lets the borrow end with the arm that doesn't need it.
         match host.ensure_within(connect_timeout) {
-            Some(client) => f(client).map_err(|e| IpcError::new("host_error", e.to_string())),
+            Some(client) => {
+                let out = f(client);
+                if let Err(e @ cut_host::client::ClientError::Transport(_)) = &out {
+                    // A connection that broke mid-call stays broken, and `ensure` only redials
+                    // when there is no client at all — so leaving this one in place fails every
+                    // later verb on this host against the same dead socket. `list_devices` has
+                    // always dropped it here; the call that most needs the same is the retry
+                    // after a lost reply, which is by definition made on a connection that just
+                    // failed (see `execute_cut`).
+                    host.last_error = Some(e.to_string());
+                    host.client = None;
+                }
+                out.map_err(|e| IpcError::new("host_error", e.to_string()))
+            }
             None => Err(IpcError::new("host_unreachable", host.last_error.clone().unwrap_or_default())),
         }
     }
@@ -606,23 +659,82 @@ impl DeviceManagerHandle {
             }
             Route::Host(id) => {
                 let (device, machine_id) = (planned_for.instance_id, planned_for.machine_id);
-                // A fresh id per attempt: this is a new Job, not a retry of a dropped reply,
-                // and reusing one would make the host treat it as already accepted.
-                let dispatch_id = cut_host::protocol::DispatchId(format!(
-                    "{}-{}",
-                    device,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0)
-                ));
-                self.with_host(&id, |c| c.dispatch(dispatch_id, &device, &machine_id, passes))?;
-                // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
-                // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
-                // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
-                Ok(0)
+                let key = JobKey {
+                    host: id.clone(),
+                    device: device.clone(),
+                    digest: job_digest(&machine_id, &passes),
+                };
+                // The id is the Job's, not the clock's. The host deduplicates on it so a retry
+                // after a dropped reply cannot cut twice — which only works if a retry arrives
+                // under the id it first went out with, and a timestamp never does.
+                //
+                // A digest alone would be too strong the other way: an operator who cuts one
+                // sheet and loads another is dispatching the identical Job on purpose, and must
+                // not be silently swallowed as a duplicate. So the id is the digest plus a
+                // once-per-attempt nonce, and `in_doubt` decides which of the two this is —
+                // reuse while the previous dispatch of this same Job has no answer, mint fresh
+                // once it has one. The desktop is the only party that can tell them apart: it
+                // is the one that knows whether the last try was answered.
+                //
+                // The first Cut after a lost reply is therefore always read as the retry. That
+                // is the safe direction, and it self-clears: the retry gets an answer (the
+                // host's dedupe makes it a no-op if the Job is already running), which frees the
+                // next Cut to be a new Job. A desktop restarted in between loses `in_doubt` and
+                // is back to cutting twice — persisting it is the fix if that stops being rare.
+                let dispatch_id = self.dispatch_id_for(&key);
+                let sent = self.with_host(&id, |c| {
+                    // Written before the request, cleared by any answer — refusals included,
+                    // since a host that refused was reached and its answer is not in doubt.
+                    // What marks a reply lost is this entry outliving the call.
+                    self.in_doubt.lock().unwrap().insert(key.clone(), dispatch_id.clone());
+                    let sent = c.dispatch(dispatch_id.clone(), &device, &machine_id, passes);
+                    if !matches!(sent, Err(cut_host::client::ClientError::Transport(_))) {
+                        self.in_doubt.lock().unwrap().remove(&key);
+                    }
+                    sent
+                });
+                match sent {
+                    // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
+                    // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
+                    // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
+                    Ok(()) => Ok(0),
+                    // Never reached the host at all (no connection) — the entry was never written,
+                    // so this stays the plain error it is.
+                    Err(e) if !self.in_doubt.lock().unwrap().contains_key(&key) => Err(e),
+                    Err(e) => Err(IpcError::new(
+                        "dispatch_unconfirmed",
+                        format!(
+                            "{} — the Job may already be cutting there. Press Cut again to retry \
+                             it: the host recognizes the same Job and will not cut it twice.",
+                            e.message
+                        ),
+                    )),
+                }
             }
         }
+    }
+
+    /// The id this Job goes out under: the one its unanswered dispatch already used, or a fresh
+    /// one. The nonce is wall-clock rather than a counter because a counter restarts at zero with
+    /// the process while the host remembers every id it has seen — a second session would mint
+    /// ids the host already knows and have its cuts silently deduplicated away.
+    fn dispatch_id_for(&self, key: &JobKey) -> cut_host::protocol::DispatchId {
+        if let Some(id) = self.in_doubt.lock().unwrap().get(key) {
+            return id.clone();
+        }
+        // The counter is what makes two attempts in the same clock tick distinct; the clock is
+        // what keeps this run's ids clear of the previous run's. Neither alone is enough.
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        cut_host::protocol::DispatchId(format!(
+            "{}-{:016x}-{}-{}",
+            key.device,
+            key.digest,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
@@ -1376,5 +1488,229 @@ mod tests {
 
         dev.forget(&HostId("host-elsewhere".into()), &hosts_path).expect("nothing is running on it");
         assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
+    }
+
+    // --- dispatch idempotency ---
+    //
+    // Two failures, pulling opposite ways, and both are the material: a retry after a lost reply
+    // that cuts the sheet twice, and a fix so eager that a second sheet can never be cut at all.
+    // Every test below holds one of the two ends down.
+
+    /// A TCP relay in front of a loopback host that can swallow one reply. Everything the client
+    /// sends still reaches the host, so the Job runs; once armed, the host's answer is dropped
+    /// and the connection taken away instead. Waiting for that answer to *exist* before dropping
+    /// it is the point — it means the host had already committed the Job when the sender lost it.
+    struct ReplyEater {
+        addr: String,
+        swallow: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn start_reply_eater(upstream: &str) -> ReplyEater {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let swallow = Arc::new(AtomicBool::new(false));
+        let (upstream, flag) = (upstream.to_string(), swallow.clone());
+
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(server) = std::net::TcpStream::connect(&upstream) else { continue };
+                let (mut from_client, mut to_client) = (client.try_clone().unwrap(), client);
+                let (mut from_server, mut to_server) = (server.try_clone().unwrap(), server);
+
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = from_client.read(&mut buf) {
+                        if n == 0 || to_server.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let armed = flag.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = from_server.read(&mut buf) {
+                        if n == 0 || armed.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if to_client.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_client.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        ReplyEater { addr, swallow }
+    }
+
+    fn host_cameo(host: &HostId) -> DeviceInfo {
+        DeviceInfo {
+            instance_id: cut_host::host::testing::CAMEO.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: Some(host.clone()),
+        }
+    }
+
+    fn a_square(side: f64) -> Vec<CutPass> {
+        vec![CutPass {
+            job: Job {
+                polylines: vec![vec![
+                    geometry::Point { x: 0.0, y: 0.0 },
+                    geometry::Point { x: side, y: 0.0 },
+                    geometry::Point { x: side, y: side },
+                    geometry::Point { x: 0.0, y: 0.0 },
+                ]],
+                settings: driver_core::Settings::default(),
+            },
+        }]
+    }
+
+    fn cameo_is_active(client: &cut_host::client::HostClient) -> bool {
+        client
+            .snapshots()
+            .map(|snaps| {
+                snaps.iter().any(|s| {
+                    s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active()
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool, complaint: &str) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done() {
+            assert!(Instant::now() < deadline, "{complaint}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Holds an assertion open rather than sampling once: the host accepts a dispatch before its
+    /// cut thread starts, so a single reading can miss a cut that is about to happen.
+    fn stays_false(mut claim: impl FnMut() -> bool, complaint: &str) {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline {
+            assert!(!claim(), "{complaint}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The finding's own scenario, end to end: the host takes dispatch `d1` and starts cutting,
+    /// the reply is lost, the Job finishes, and the operator presses Cut again.
+    #[test]
+    fn a_retry_after_a_lost_reply_does_not_cut_the_material_twice() {
+        use std::sync::atomic::Ordering;
+
+        let host = start_loopback_host();
+        let eater = start_reply_eater(&host.addr);
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), eater.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("the relay forwards the pairing check to a host that answers");
+        // Establishes the desktop's own connection through the relay first, so arming it takes
+        // away a dispatch reply rather than a piece of the TLS handshake.
+        dev.list_devices();
+
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        eater.swallow.store(true, Ordering::SeqCst);
+        let err = dev
+            .execute_cut(aimed.clone(), a_square(10.0))
+            .expect_err("the host's answer never came back");
+        assert_eq!(err.code, "dispatch_unconfirmed", "{}", err.message);
+
+        // Straight to the host, around the relay: the Job really did land, and really did run.
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        wait_until(|| cameo_is_active(&direct), "the dispatch never reached the host");
+        direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
+        wait_until(|| !cameo_is_active(&direct), "the job never finished");
+
+        // Connectivity is back and the operator presses Cut on the same design.
+        eater.swallow.store(false, Ordering::SeqCst);
+        dev.execute_cut(aimed, a_square(10.0)).expect("the retry reaches the host");
+
+        stays_false(|| cameo_is_active(&direct), "the same material was cut a second time");
+    }
+
+    /// The other end: the fix must not make a second sheet impossible. Same design, same cutter,
+    /// dispatched again after the first one was answered and finished — and the blade moves.
+    #[test]
+    fn cutting_the_same_design_again_after_an_answered_dispatch_starts_a_new_job() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let host_id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        let aimed = host_cameo(&host_id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+
+        dev.execute_cut(aimed.clone(), a_square(10.0)).expect("first sheet");
+        wait_until(|| cameo_is_active(&direct), "the first cut never started");
+        direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
+        wait_until(|| !cameo_is_active(&direct), "the first cut never finished");
+
+        // Fresh material, same file: a legitimate second Job, not a retry of anything.
+        dev.execute_cut(aimed, a_square(10.0)).expect("second sheet");
+        wait_until(|| cameo_is_active(&direct), "the second sheet was refused as a duplicate");
+    }
+
+    fn key_for(passes: &[CutPass]) -> JobKey {
+        JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", passes),
+        }
+    }
+
+    #[test]
+    fn two_different_jobs_to_one_cutter_get_different_ids() {
+        let dev = test_device_setup();
+        assert_ne!(
+            dev.dispatch_id_for(&key_for(&a_square(10.0))),
+            dev.dispatch_id_for(&key_for(&a_square(20.0))),
+            "different geometry is a different Job"
+        );
+
+        // Settings, not only geometry: the same shape cut at a different force is a different
+        // Job, and a digest that missed it would let one be swallowed as a retry of the other.
+        let mut harder = a_square(10.0);
+        harder[0].job.settings.force = Some(driver_core::Settings::default().force.unwrap_or(0) + 1);
+        assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("cameo5", &harder));
+
+        // And the same Passes aimed at a different machine are not interchangeable either.
+        assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("puma", &a_square(10.0)));
+    }
+
+    /// The whole distinction, in the one place it lives. Flip either half and this fails.
+    #[test]
+    fn an_id_is_reused_only_while_its_dispatch_has_no_answer() {
+        let dev = test_device_setup();
+        let key = key_for(&a_square(10.0));
+
+        // Nothing in doubt: every press of Cut is its own Job, however identical.
+        let first = dev.dispatch_id_for(&key);
+        assert_ne!(first, dev.dispatch_id_for(&key), "a deliberate re-cut must not be a duplicate");
+
+        // One dispatch outstanding: the next press of Cut is that dispatch, tried again.
+        dev.in_doubt.lock().unwrap().insert(key.clone(), first.clone());
+        assert_eq!(dev.dispatch_id_for(&key), first, "a retry must arrive under the id it went out with");
+
+        // ...and only for that Job. A different one is never mistaken for the retry.
+        assert_ne!(dev.dispatch_id_for(&key_for(&a_square(20.0))), first);
     }
 }

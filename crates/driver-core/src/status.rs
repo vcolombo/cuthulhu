@@ -6,14 +6,14 @@
 //! state machine is not part of it — callers that branch on which phase permits
 //! which call end up re-deriving the machine, which is what `actions` exists to
 //! prevent.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::manager::{DeviceError, DeviceState};
 
 /// What is happening now, and nothing about what happened before: a job that has
 /// ended is not happening, so every ending rests on `Idle`. Which ending it was is
 /// `CutStatus::ended`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Disconnected,
     Connecting,
@@ -30,7 +30,7 @@ pub enum Phase {
 /// How the last job finished, or `None` when none has. Without it `Idle` means
 /// three things at once — nothing has run, a cut finished, a device just
 /// connected — and every caller has to invent its own memory to tell them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ended {
     Completed,
     Cancelled,
@@ -38,7 +38,7 @@ pub enum Ended {
 
 /// Which calls are legal right now. A caller renders its controls from this and
 /// never needs to know the phase-to-permission rule.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Actions {
     pub cut: bool,
@@ -47,19 +47,19 @@ pub struct Actions {
     pub confirm: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassPosition {
     pub index: usize,
     pub total: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByteProgress {
     pub sent: usize,
     pub total: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CutStatus {
     pub phase: Phase,

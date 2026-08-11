@@ -171,16 +171,45 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 /// channel. A Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by a literal IP, so
 /// this is the common path — and mDNS on a flaky network is the ordinary way a resolver wedges.
 ///
+/// One address may be resolving at a time; a second attempt is refused rather than given a thread
+/// of its own. See `resolve_by_deadline` for why the thread cannot simply be cancelled.
+static RESOLVING: Mutex<std::collections::BTreeSet<String>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
 /// ponytail: on a genuine timeout the thread stays blocked in the resolver and leaks, exactly as
-/// `driver-silhouette`'s `usb.rs` read does and for the same reason. One thread per hung resolve
-/// on a path that runs once per connect is a very different budget from a tight read loop; the
-/// upgrade is an async resolver crate, at the cost of a dependency.
+/// `driver-silhouette`'s `usb.rs` read does and for the same reason — the OS resolver takes no
+/// cancellation. The upgrade is an async resolver crate, at the cost of a dependency.
+///
+/// What makes the leak survivable is `RESOLVING`, not the rarity of the path: this is *not* a
+/// once-per-connect cost. The cut dialog polls every second, and a poll against a host with no
+/// live connection redials — so a resolver that stays wedged would otherwise be handed a fresh
+/// thread every second until the process ran out. Refusing a second attempt while the first is
+/// still out bounds it at one thread per address, and the thread clears its own claim whenever the
+/// resolver finally answers, so a name that resolves slowly once is not blacklisted afterwards.
 fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
+    if !RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).insert(addr.to_string()) {
+        return Err(ClientError::Transport(format!(
+            "`{addr}` is still being resolved from an earlier attempt"
+        )));
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = addr.to_string();
-    std::thread::spawn(move || {
-        let _ = tx.send(owned.to_socket_addrs().map(|a| a.collect::<Vec<_>>()));
+    // `Builder`, not `thread::spawn`: spawn panics when a thread cannot be created, and a client
+    // that cannot resolve a name has to report that, not take the desktop down with it.
+    let spawned = std::thread::Builder::new().name(format!("resolve {addr}")).spawn(move || {
+        let resolved = owned.to_socket_addrs().map(|a| a.collect::<Vec<_>>());
+        // Released here rather than by the waiter, which may have given up long ago — until the
+        // resolver returns there is still a thread out for this address, and that is precisely
+        // what a second attempt must not add to.
+        RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(&owned);
+        let _ = tx.send(resolved);
     });
+    if let Err(e) = spawned {
+        RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+        return Err(ClientError::Transport(format!("could not resolve `{addr}`: {e}")));
+    }
+
     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(ClientError::Transport(e.to_string())),
@@ -548,6 +577,26 @@ mod tests {
             "took {:?}, longer than the timeout allows for: {err}",
             start.elapsed()
         );
+    }
+
+    /// A name that cannot be resolved must fail, and must leave nothing behind that stops the next
+    /// attempt: the in-flight claim exists to bound leaked resolver threads, and a claim released
+    /// only by the waiter would make one failed lookup wedge that address for the process's life.
+    ///
+    /// `.invalid` never resolves, by RFC 2606, so this fails on the resolver's own answer rather
+    /// than on the deadline — which is what leaves the second attempt free to run.
+    #[test]
+    fn a_name_that_cannot_be_resolved_does_not_wedge_later_attempts() {
+        let unresolvable = "cuthulhu-does-not-exist.invalid:7878";
+        for attempt in 1..=2 {
+            let err = HostClient::connect(unresolvable, "token", "aa:bb:cc")
+                .err()
+                .expect("nothing answers a name that does not resolve");
+            assert!(
+                !err.to_string().contains("still being resolved"),
+                "attempt {attempt} was refused by a claim the first attempt never released: {err}"
+            );
+        }
     }
 
     /// The probe shares `connect_by_deadline` with `connect`, so it inherits that bound — this

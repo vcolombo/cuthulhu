@@ -99,10 +99,10 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
                 host's pinned fingerprint — so what is owed is an explanation, not a refusal. */}
             {state.existing && !state.existing.sameFingerprint && (
               <p role="alert" style={{ margin: 0, color: "var(--cut)" }}>
-                “{state.existing.name}” is already paired at this address, and it presented a
-                different certificate then. Either the Cut Host was reinstalled, or something else
-                is answering at this address. Pairing again adds a second entry; the old one will
-                never connect again, and is yours to forget.
+                “{state.existing.name}” is already paired at this address, and the certificate
+                pinned for it is not the one just presented. Either the Cut Host was reinstalled,
+                or something else is answering at this address. Pairing again adds a second entry;
+                the old one will never connect again, and is yours to forget.
               </p>
             )}
             {state.existing && state.existing.sameFingerprint && (

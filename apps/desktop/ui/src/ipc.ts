@@ -77,6 +77,17 @@ export type DeviceInfo = {
   machine_id: string;
   transport: TransportKind;
   candidate: boolean;
+  // null means this cutter is attached to this computer. A Cut Host's cutters carry the id of
+  // the host that owns them, which is what every call routes on.
+  host: string | null;
+};
+
+export type PairedHostView = {
+  id: string;
+  name: string;
+  address: string;
+  /** Why this host cannot be reached, or null when it can. */
+  unreachable: string | null;
 };
 
 export type DeviceError =
@@ -196,6 +207,28 @@ export async function resumeCut(): Promise<void> {
 
 export async function confirmPassDone(): Promise<void> {
   return invoke("confirm_pass_done", {});
+}
+
+export async function listHosts(): Promise<PairedHostView[]> {
+  return invoke("list_hosts", {});
+}
+
+/** The fingerprint a host presents, for the operator to confirm. Sends no token: it runs
+ *  before the operator has confirmed the host's identity. */
+export async function probeHost(address: string): Promise<string> {
+  return invoke("probe_host", { address });
+}
+
+export async function testHost(address: string, token: string, fingerprint: string): Promise<DeviceInfo[]> {
+  return invoke("test_host", { address, token, fingerprint });
+}
+
+export async function pairHost(name: string, address: string, token: string, fingerprint: string): Promise<PairedHostView> {
+  return invoke("pair_host", { name, address, token, fingerprint });
+}
+
+export async function forgetHost(id: string): Promise<void> {
+  return invoke("forget_host", { id });
 }
 
 export async function listPresets(machineId: string) {

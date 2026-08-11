@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
+import { deviceBadge, forgetFrom, groupDevices, staleSection } from "../hosts/deviceList";
+import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
 import {
@@ -25,7 +27,7 @@ type Props = {
   artboard: { x: number; y: number; w: number; h: number };
   docMachineId: string | null;
   status: ipc.CutStatus;
-  refreshDeviceState: () => void;
+  refreshDeviceState: () => Promise<void>;
   onConvertMachine: (machineId: string) => void;
   onError: (msg: string) => void;
   onClose: () => void;
@@ -54,6 +56,21 @@ const dialogStyle: CSSProperties = {
   gap: 10,
 };
 
+// `deviceBadge` decides the tone; the palette is this file's, since a pure module has no
+// business knowing the tokens. Without this the label rendered in one flat grey, so "Cutting",
+// "Ready" and "Unreachable" were the same small muted text as the machine id beside them —
+// six cutters across two hosts with one mid-cut, and nothing on screen picking it out.
+// Red belongs to `attention` alone, which is the tone that asks for a person. `unknown` is the
+// state of every cutter on a freshly opened dialog, so it keeps the muted weight the row had
+// before any of this: quiet is what "nobody has asked yet" should look like.
+const TONE_COLOR: Record<ReturnType<typeof deviceBadge>["tone"], string> = {
+  idle: "var(--ready)",
+  busy: "var(--accent)",
+  attention: "var(--cut)",
+  unknown: "var(--muted)",
+  gone: "var(--muted)",
+};
+
 const btn: CSSProperties = {
   background: "var(--panel)",
   color: "var(--text)",
@@ -73,6 +90,11 @@ export function CutDialog({
   onClose,
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
+  const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
+  // What the last read of the two lists failed with, held rather than reported: it is what marks
+  // the rows stale instead of blanking them.
+  const [listError, setListError] = useState<unknown>(null);
+  const [pairing, setPairing] = useState(false);
   const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
   // The machine id rides along with the caps: `connected` can change before an
   // in-flight fetch resolves, and showing one machine's capability against another
@@ -85,8 +107,26 @@ export function CutDialog({
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
 
+  // The whole device list in one request rather than one per host: `list_devices` already
+  // re-reads every paired host in a single call, and `list_hosts` carries why any of them cannot
+  // be reached.
+  const refreshList = useCallback(
+    () =>
+      Promise.all([ipc.listDevices(), ipc.listHosts()])
+        .then(([d, h]) => {
+          setDevices(d);
+          setHosts(h);
+          setListError(null);
+        })
+        // Kept, not raised: a read that failed leaves the last values it managed on screen,
+        // marked stale. A row that blanks reads as "the cut finished", which is the one wrong
+        // thing to tell someone whose material is still moving under a blade.
+        .catch((e) => setListError(e)),
+    [],
+  );
+
   useEffect(() => {
-    ipc.listDevices().then(setDevices).catch((e) => onError(ipc.ipcErrorMessage(e)));
+    refreshList();
     // Reopening the dialog after a connect earlier in the session lost the local
     // `connected` state (it lives only in this component) even though the backend
     // is still connected — seed it from the manager's own cache so Start Cut isn't
@@ -138,6 +178,38 @@ export function CutDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
+  // request/reply connection, so this interval is the only thing that moves a remote cutter's
+  // progress. It runs exactly as long as this dialog is mounted and a host is paired.
+  //
+  // With no host there is no gap to fill — a local cutter's status is pushed by the
+  // device-event listener in `App.tsx` — and the cost is not nothing: `list_devices` resolves
+  // to `HardwareBackendFactory::list_devices`, which walks the USB bus and the serial ports.
+  // The Pi is optional, and a desktop without one pays for it once per dialog, as before.
+  //
+  // Clearing it is the deliverable, not tidiness. A leaked interval keeps a Cut Host connection
+  // warm forever and the daemon caps concurrent clients at eight (#103), so one leaked per
+  // dialog-open exhausts a Pi, which then refuses every new connection until it is restarted.
+  useEffect(() => {
+    if (hosts.length === 0) return;
+    // ponytail: one interval for the whole list, not one per host — the two calls behind it each
+    // cover every host at once. Per-host intervals are the upgrade if one slow host ever starts
+    // holding up the others' rows, and they cost a teardown each.
+    let inFlight = false;
+    const id = setInterval(() => {
+      // Skipped rather than queued: an unreachable host can take seconds to answer, and ticks
+      // that wait their turn build a backlog that outlives whatever wedged the host.
+      if (inFlight) return;
+      inFlight = true;
+      Promise.all([refreshList(), refreshDeviceState()]).finally(() => {
+        inFlight = false;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+    // Length, not the array: a poll that replaces `hosts` with an equal list every second would
+    // otherwise tear the interval down and rebuild it every second.
+  }, [refreshList, refreshDeviceState, hosts.length]);
+
   const connect = (info: ipc.DeviceInfo) => {
     ipc
       .connectDevice(info)
@@ -153,6 +225,33 @@ export function CutDialog({
       .then((p) => setPresets(p as Preset[]))
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
+
+  // A refusal keeps the row and shows the host's own words: the Rust side refuses with
+  // `host_busy` while a cut is active there, and a row that vanished and came back would say
+  // "gone" about the one host that still has a blade moving.
+  // A success re-reads both lists rather than dropping the host here. `devices` still holds that
+  // host's cutters, and a cutter naming a host nobody is paired with is precisely what earns an
+  // orphan section — so removing the row on its own renamed it to a raw host id and captioned it
+  // "not paired with this computer", which is a warning about a host the operator just dismissed.
+  const forget = (id: string) => {
+    forgetFrom(hosts, id, ipc.forgetHost).then((r) => {
+      if (r.message === null) refreshList();
+      else onError(r.message);
+    });
+  };
+
+  // Both lists come back from the backend, which has just persisted the host — the new row is
+  // never assembled on this side. Appending it here put the same Pi in the list twice, listed
+  // under one name and forgettable once. Its cutters arrive the same way: `runPairing`'s Test
+  // listed them to prove the token, not to populate this.
+  const paired = () => {
+    setPairing(false);
+    refreshList();
+  };
+
+  // A read that failed keeps every section it had, marked stale, rather than emptying the list.
+  const sections = groupDevices(devices, hosts);
+  const shown = listError === null ? sections : sections.map((s) => staleSection(s, listError));
 
   const caps = connected && capsFor?.machineId === connected.machine_id ? capsFor.caps : ALL_ENABLED;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
@@ -193,6 +292,7 @@ export function CutDialog({
   };
 
   return (
+    <>
     <div style={panelStyle}>
       <div role="dialog" aria-modal="true" aria-label="Cut" style={dialogStyle}>
         <div style={{ display: "flex", alignItems: "center" }}>
@@ -205,26 +305,73 @@ export function CutDialog({
 
         <div>
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>Device</div>
-          {devices.length === 0 ? (
+          {/* Only when there is nothing at all. A paired host with no cutters attached is a
+              different fact, and it has its own section saying so. */}
+          {devices.length === 0 && hosts.length === 0 ? (
             <div style={{ fontSize: 12, color: "var(--muted)" }}>
               No devices found — connect a cutter and reopen this dialog.
             </div>
           ) : null}
-          {devices.map((d) => (
-            <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-              <span>
-                {d.machine_id}
-                {d.candidate ? " (unverified serial device)" : ""}
-              </span>
-              {connected?.instance_id === d.instance_id ? (
-                <span style={{ color: "var(--ready)" }}>connected</span>
-              ) : (
-                <button style={btn} onClick={() => connect(d)}>
-                  Connect
-                </button>
+          {shown.map((section) => (
+            <div key={section.hostId ?? "local"} style={{ marginBottom: 6 }}>
+              {/* The local section's header is suppressed when it is the only one, so a user with
+                  no Cut Host sees the flat list this dialog has always shown — but not when the
+                  read failed. The "last known" marker lives in this header, so suppressing it
+                  left the reason below as an unlabelled red line of Rust prose under "Device",
+                  with nothing saying which list it was about or that the rows had stopped
+                  moving. A failure the user cannot place is worse than a heading they did not
+                  need. */}
+              {section.hostId === null && hosts.length === 0 && !section.stale ? null : (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                  <strong>{section.title}</strong>
+                  {section.address ? <span style={{ color: "var(--muted)" }}>{section.address}</span> : null}
+                  {section.stale ? <span style={{ color: "var(--muted)" }}>last known</span> : null}
+                  <div style={{ flex: 1 }} />
+                  {hosts.some((h) => h.id === section.hostId) ? (
+                    <button
+                      aria-label={`Forget ${section.title}`}
+                      style={btn}
+                      onClick={() => forget(section.hostId!)}
+                    >
+                      Forget
+                    </button>
+                  ) : null}
+                </div>
               )}
+              {/* An unreachable host keeps its cutters listed below this, not hidden (#42). */}
+              {section.unreachable ? (
+                <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
+              ) : null}
+              {section.devices.map((d) => {
+                // Only the aimed-at cutter has a status; the rest have not been asked, and
+                // `null` is what says so rather than something that reads as ready.
+                const badge = deviceBadge(connected?.instance_id === d.instance_id ? status : null);
+                return (
+                <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                  <span>
+                    {d.machine_id}
+                    {d.candidate ? " (unverified serial device)" : ""}
+                  </span>
+                  <span data-testid="device-badge" data-tone={badge.tone} style={{ color: TONE_COLOR[badge.tone] }}>
+                    {badge.label}
+                  </span>
+                  {connected?.instance_id === d.instance_id ? (
+                    <span style={{ color: "var(--ready)" }}>connected</span>
+                  ) : (
+                    <button style={btn} onClick={() => connect(d)}>
+                      Connect
+                    </button>
+                  )}
+                </div>
+                );
+              })}
             </div>
           ))}
+          {/* Pairing lives in the device list on purpose: someone hunting for their Pi looks
+              here, and finds nothing if it lives in a settings screen. */}
+          <button style={btn} onClick={() => setPairing(true)}>
+            Add a Cut Host…
+          </button>
         </div>
 
         {machineMismatch && connected ? (
@@ -369,5 +516,7 @@ export function CutDialog({
         </div>
       </div>
     </div>
+    {pairing ? <PairHostDialog onPaired={paired} onClose={() => setPairing(false)} /> : null}
+    </>
   );
 }

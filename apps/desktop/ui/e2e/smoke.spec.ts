@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; slowList?: boolean; failList?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -160,7 +160,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // per internal state — so a frontend that re-derives permissions has nothing to
   // re-derive them from. ---
 
-  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean };
+  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean; host: string | null };
   type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
   type CutStatus = {
     phase: string;
@@ -190,12 +190,33 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
 
   const devices: DeviceInfo[] = [
-    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false },
-    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true },
+    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
+    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true, host: null },
   ];
+
+  // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
+  // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
+  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
+  if (opts?.seedBusyHost) {
+    hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
+               unreachable: "the host could not be reached (timed out)" }];
+    devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
+                   transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
+  }
+
+  // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
+  // enough for the dialog's pairing flow to be driven end to end rather than stubbed out.
+  const HOST_FINGERPRINT = "AB:CD:EF:01:23:45";
+  const HOST_TOKEN = "correct-horse";
+  const PAIRED_CUTTER: DeviceInfo = {
+    instance_id: "usb:pi:B", machine_id: "cameo5",
+    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-2",
+  };
 
   let connected: DeviceInfo | null = null;
   let status: CutStatus = DISCONNECTED;
+  let deviceStateCalls = 0;
+  let listDeviceCalls = 0;
   let nextJobId = 1;
   let jobId: number | null = null;
   let planPasses: { color: number | null; enabled: boolean }[] = [];
@@ -307,7 +328,17 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   }
 
   Object.assign(commands, {
-    list_devices: () => devices,
+    // A copy, as a Rust `Vec<DeviceInfo>` crossing the IPC boundary is. Handing out the live
+    // array let a later mutation here reach into React's own state and repair a list the
+    // frontend had not re-read — a fake that quietly fixes the frontend's bugs for it.
+    //
+    // Slow from the second call on when asked, so the first read (the one that puts a host in
+    // the list at all) does not itself eat the window a test is trying to observe.
+    list_devices: () => {
+      if (opts?.failList) throw ipcError("device_error", "the device list could not be read");
+      const slow = opts?.slowList && listDeviceCalls++ > 0;
+      return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
+    },
     connect_device: (a) => {
       const info = a.info as DeviceInfo;
       connected = info;
@@ -326,7 +357,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       return null;
     },
-    get_device_state: () => status,
+    get_device_state: () => {
+      // Counted because the dialog's poll is only observable as a call rate: what has to be
+      // proven is that it stops, and a stopped interval leaves no other trace.
+      deviceStateCalls++;
+      return status;
+    },
     get_connected_device: () => connected,
     plan_cut: () => planFromDoc(),
     cut: (a) => {
@@ -417,6 +453,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       failNextCut = true;
       return null;
     },
+    // Test hook (no production counterpart): how many times the dialog has asked for a status.
+    __test_poll_count: () => deviceStateCalls,
     confirm_pass_done: () => {
       status = COMPLETED;
       emit("StateChanged");
@@ -427,6 +465,38 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
     machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
+    // Empty unless a test asks for a host, so existing assertions (device list, connect flow)
+    // are unaffected.
+    list_hosts: () => hosts,
+    // Sends no token, so it answers whatever the address is — mirroring a TLS handshake that
+    // has vouched for nothing yet.
+    probe_host: () => HOST_FINGERPRINT,
+    // Refuses the token rather than the address: a host that answers but does not accept this
+    // token is the failure the pairing flow exists to catch before anything is saved.
+    test_host: (a) => {
+      if (a.fingerprint !== HOST_FINGERPRINT) throw ipcError("host_unreachable", "the host's fingerprint changed");
+      if (a.token !== HOST_TOKEN) throw ipcError("host_unreachable", "the token was refused");
+      return [PAIRED_CUTTER];
+    },
+    pair_host: (a) => {
+      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null };
+      hosts.push(host);
+      // The cutter is only in `list_devices` once the host is paired, which is what the dialog
+      // re-reads for: the Test listed it to prove the token, not to populate the device list.
+      devices.push(PAIRED_CUTTER);
+      return host;
+    },
+    // Mirrors `DeviceManager::forget`: a host with an active cut refuses, and the desktop must
+    // keep the row rather than discard the token for a Job it could no longer cancel.
+    forget_host: (a) => {
+      if (hosts.some((h) => h.id === a.id && h.id === "host-1"))
+        throw ipcError("host_busy", "a cut is active on this host; cancel it before forgetting");
+      hosts = hosts.filter((h) => h.id !== a.id);
+      // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
+      // pairing that was just discarded, so it cannot still be reporting what is attached to it.
+      for (let i = devices.length - 1; i >= 0; i--) if (devices[i].host === a.id) devices.splice(i, 1);
+      return null;
+    },
     save_preset: () => null,
     delete_preset: () => null,
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.
@@ -542,6 +612,163 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 });
 
+// The one test that drives the Cut Host surface end to end. It is here rather than in a unit
+// test because the parts it checks are exactly the ones a unit test cannot: that the grouped
+// list reaches the dialog at all, and that a refusal from the backend leaves the row on screen.
+test("an unreachable host keeps its cutters listed, and refusing to be forgotten keeps its row", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // Listed with the reason, not hidden — a cutter that vanishes looks exactly like one that was
+  // never paired (#42).
+  await expect(page.getByText("Workshop Pi")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
+  // badge says so rather than offering a cut for a status nobody has asked for.
+  await expect(page.getByText("Unknown")).toHaveCount(3);
+
+  await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
+  // The Rust side's own words, and the row still there (#94).
+  await expect(page.getByText("a cut is active on this host; cancel it before forgetting")).toBeVisible();
+  await expect(page.getByText("Workshop Pi")).toBeVisible();
+});
+
+// Reaching a Pi starts here, and nothing drove it end to end while the fake refused the three
+// pairing commands. The order is the security property: the fingerprint reaches the operator
+// before the token reaches the host, so a rejected fingerprint has told the far end nothing.
+test("pairing a Cut Host shows its fingerprint first, then lists it with its cutters", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+
+  await page.getByLabel("Address").fill("pi.local:7878");
+  await page.getByLabel("Token").fill("correct-horse");
+  await page.getByLabel("Name (optional)").fill("Workshop Pi");
+  await page.getByRole("button", { name: "Pair", exact: true }).click();
+
+  await expect(page.getByText("AB:CD:EF:01:23:45")).toBeVisible();
+  await page.getByRole("button", { name: /It matches/ }).click();
+
+  // The host is in the device list with the cutter the Test proved, and it can be forgotten —
+  // the whole affordance, from an empty list to a usable remote cutter.
+  await expect(page.getByRole("button", { name: "Forget Workshop Pi" })).toBeVisible();
+  await expect(page.getByText("pi.local:7878")).toBeVisible();
+});
+
+// A wrong token must not leave a host saved. `pair_host` is what persists, and it is never
+// reached: the row would otherwise have to be forgotten by hand before a retry could work.
+test("a refused token pairs nothing and says so in the host's own words", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+
+  await page.getByLabel("Address").fill("pi.local:7878");
+  await page.getByLabel("Token").fill("wrong");
+  await page.getByRole("button", { name: "Pair", exact: true }).click();
+  await page.getByRole("button", { name: /It matches/ }).click();
+
+  await expect(page.getByRole("alert")).toHaveText("the token was refused");
+  await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+});
+
+// A host that is forgotten has to leave with its cutters. Dropping the row alone leaves them
+// naming a host nobody is paired with, which is the one thing `groupDevices` refuses to hide:
+// the row comes back as a raw host id under "this Cut Host is not paired with this computer".
+// The count is taken once, not awaited — the wrong row is the state right after the click, and
+// an assertion that retries would sit there until something else repaired it.
+test("forgetting a host takes its cutters with it, instead of renaming the row to a raw id", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  await page.getByLabel("Address").fill("pi.local:7878");
+  await page.getByLabel("Token").fill("correct-horse");
+  await page.getByLabel("Name (optional)").fill("Workshop Pi");
+  await page.getByRole("button", { name: "Pair", exact: true }).click();
+  await page.getByRole("button", { name: /It matches/ }).click();
+  await expect(page.getByRole("button", { name: "Forget Workshop Pi" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
+  await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
+  expect(await page.getByText("this Cut Host is not paired with this computer").count()).toBe(0);
+  expect(await page.getByText("host-2").count()).toBe(0);
+});
+
+// The teardown is the deliverable, not the interval. A leaked interval keeps a Cut Host
+// connection warm forever, and the daemon caps concurrent clients at eight (#103) — a desktop
+// that leaks one per dialog-open exhausts a Pi, which then refuses every new connection until
+// it is restarted.
+const pollCount = (page: import("@playwright/test").Page) => () =>
+  page.evaluate(
+    () =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "__test_poll_count",
+      ) as Promise<number>,
+  );
+
+test("the dialog polls while it is open, and stops once it is closed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
+  await page.goto("/");
+  const polls = pollCount(page);
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  const opened = await polls();
+  await expect.poll(polls, { timeout: 5000 }).toBeGreaterThan(opened);
+
+  await page.getByRole("button", { name: "Close" }).click();
+  // A tick already in flight when the dialog closed still lands, so settle past one full period
+  // before taking the reading that must not move.
+  await page.waitForTimeout(1500);
+  const closed = await polls();
+  await page.waitForTimeout(2500);
+  expect(await polls()).toBe(closed);
+});
+
+// The stale path, on the desktop that has no host: the local section's heading is normally
+// suppressed, and the "last known" marker lives inside it, so a failed read showed as one
+// unlabelled red line of Rust prose under "Device" — no heading, no marker, no banner.
+test("a device list that cannot be read keeps its heading, so the failure has something to name", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failList: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  await expect(page.getByText("This computer")).toBeVisible();
+  await expect(page.getByText("last known")).toBeVisible();
+  await expect(page.getByText("the device list could not be read")).toBeVisible();
+});
+
+// The Pi is optional, and a desktop without one has nothing polling can tell it: a local
+// cutter's status is pushed. Before this branch `list_devices` ran once per dialog open, and it
+// walks the USB bus and the serial ports — running it every second for a user who owns no host
+// is a cost with no answer on the other end of it.
+test("a desktop with no Cut Host paired does not poll at all", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.waitForTimeout(2500);
+  expect(await pollCount(page)()).toBe(0);
+});
+
+// The other half of polling safely: an unreachable host can take seconds to answer, and a tick
+// that waits its turn instead of being skipped builds a backlog that outlives whatever wedged it.
+test("a tick whose last request is still in flight is skipped, not queued", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true, slowList: true });
+  await page.goto("/");
+  const polls = pollCount(page);
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.waitForTimeout(4500);
+  // Four ticks have fired; at three seconds an answer, at most two of them can have started
+  // requests. Without the skip the count tracks the tick rate instead, and every extra request
+  // is one more thing the host owes an answer to.
+  const seen = await polls();
+  expect(seen).toBeGreaterThanOrEqual(1);
+  expect(seen).toBeLessThanOrEqual(2);
+});
+
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -553,7 +780,7 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancelled")).toBeVisible();
+  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -571,7 +798,7 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   // The backend says which ending it was, so the two endings cannot be confused: this
   // is the case the mock could not express while a finished cut only rested on `Idle`.
   await expect(page.getByText("Job complete")).toBeVisible();
-  await expect(page.getByText("Cancelled")).toHaveCount(0);
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -585,6 +812,13 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+
+  // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
+  // has polled. `deviceBadge`'s unit tests assert on `tone` alone; this is what makes them
+  // describe the product instead of a field it threw away. The unpolled row is `unknown`, not
+  // `attention` — nothing is wrong with it, and red is how this UI says something is.
+  await expect(page.getByTestId("device-badge").first()).toHaveAttribute("data-tone", "busy");
+  await expect(page.getByTestId("device-badge").nth(1)).toHaveAttribute("data-tone", "unknown");
 });
 
 test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {
@@ -644,7 +878,7 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Cut" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
-  await expect(page.getByText("Cancelled")).toHaveCount(0);
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
 });
 
 test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {

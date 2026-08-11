@@ -9,6 +9,15 @@ import {
   type Caps,
   type Preset,
 } from "./viewmodel";
+import type { DeviceInfo } from "../ipc";
+
+const aDevice = (): DeviceInfo => ({
+  instance_id: "usb:mock",
+  machine_id: "cameo5",
+  transport: { Usb: { locator: "mock" } },
+  candidate: false,
+  host: null,
+});
 
 describe("reorderPass", () => {
   it("swaps adjacent passes when within bounds", () => {
@@ -304,5 +313,14 @@ describe("toCutRequest", () => {
     expect(result.passes).toHaveLength(2);
     expect(result.passes[0].preset_id).toBe("preset1");
     expect(result.passes[1].preset_id).toBe("preset2");
+  });
+});
+
+describe("DeviceInfo.host", () => {
+  it("distinguishes a cutter on this computer from one on a Cut Host", () => {
+    const local: DeviceInfo = { ...aDevice(), host: null };
+    const remote: DeviceInfo = { ...aDevice(), instance_id: "usb:sn:PI", host: "host-1" };
+    expect(local.host).toBeNull();
+    expect(remote.host).toBe("host-1");
   });
 });

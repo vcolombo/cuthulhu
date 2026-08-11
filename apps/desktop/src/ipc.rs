@@ -2,9 +2,9 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
-use driver_core::{CutStatus, DeviceInfo, MachineCaps};
+use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
-use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PlanCutResponse};
+use crate::device::{plan_cut_response, CutRequest, DeviceManagerHandle, IpcError, PairedHostView, PlanCutResponse};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 
@@ -87,7 +87,9 @@ pub fn list_machines(state: tauri::State<AppStateHandle>) -> Result<Vec<MachineP
 
 // --- device / cut / preset commands: operate over DeviceManagerHandle, never AppStateHandle's mutex ---
 
-#[tauri::command]
+// async: dials every paired host to refresh its device list (30s budget per host, by design —
+// see DeviceManagerHandle::list_devices) — on the main thread one wedged Pi freezes the window.
+#[tauri::command(async)]
 pub fn list_devices(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<DeviceInfo>, IpcError> {
     Ok(dev.list_devices())
 }
@@ -103,9 +105,12 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
     dev.disconnect()
 }
 
-// Non-blocking — safe to call even while a cut is mid-transmit, since the status is
-// published rather than asked of the worker (see DeviceManagerHandle::status).
-#[tauri::command]
+// async: non-blocking for a local device — the status is published rather than asked of the
+// worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
+// network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) plus an
+// unbounded DNS/mDNS resolve ahead of both, and it is called after every connect/cancel/resume/
+// confirm, so it must not run on the main thread.
+#[tauri::command(async)]
 pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {
     Ok(dev.status())
 }
@@ -169,6 +174,50 @@ pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
 #[tauri::command]
 pub fn delete_preset(id: String) -> Result<(), IpcError> {
     crate::device::delete_preset(&id)
+}
+
+// async: takes the same `hosts` mutex `list_devices` can hold for up to 30s per host — on the
+// main thread that is a frozen window, not just a slow one.
+#[tauri::command(async)]
+pub fn list_hosts(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<PairedHostView>, IpcError> {
+    Ok(dev.host_views())
+}
+
+/// Prove a host without saving it. The pairing dialog calls this before `pair_host`, so an
+/// entry that has never worked is never written.
+///
+/// async: `pair_check` dials the host over the network (5s connect timeout, 30s body timeout,
+/// plus an unbounded DNS/mDNS resolve) — on the main thread a mistyped address would freeze the
+/// window for the length of that wait.
+#[tauri::command(async)]
+pub fn test_host(address: String, token: String, fingerprint: String) -> Result<Vec<DeviceInfo>, IpcError> {
+    cut_host::client::HostClient::pair_check(&address, &token, &fingerprint)
+        .map_err(|e| IpcError::new("host_unreachable", e.to_string()))
+}
+
+// async: pairing dials the host the same way `test_host` does (see there for why).
+#[tauri::command(async)]
+pub fn pair_host(
+    dev: tauri::State<DeviceManagerHandle>,
+    name: String,
+    address: String,
+    token: String,
+    fingerprint: String,
+) -> Result<PairedHostView, IpcError> {
+    let path = hosts_path()?;
+    let id = dev.pair(name.clone(), address.clone(), token, fingerprint, &path)?;
+    Ok(PairedHostView { id, name, address, unreachable: None })
+}
+
+// async: the busy check dials the host the same way `test_host` does (see there for why).
+#[tauri::command(async)]
+pub fn forget_host(dev: tauri::State<DeviceManagerHandle>, id: HostId) -> Result<(), IpcError> {
+    dev.forget(&id, &hosts_path()?)
+}
+
+fn hosts_path() -> Result<PathBuf, IpcError> {
+    crate::hosts::default_hosts_path()
+        .ok_or_else(|| IpcError::new("no_config_dir", "this system has no configuration directory"))
 }
 
 /// Paths the user has actually chosen in the native picker this session.

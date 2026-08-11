@@ -304,12 +304,14 @@ pub mod testing {
                     machine_id: "cameo5".into(),
                     transport: TransportKind::Usb { locator: "1:4".into() },
                     candidate: false,
+                    host: None,
                 },
                 DeviceInfo {
                     instance_id: PUMA.into(),
                     machine_id: "puma".into(),
                     transport: TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 9600 },
                     candidate: true,
+                    host: None,
                 },
             ]
         }
@@ -351,6 +353,7 @@ pub mod testing {
                 machine_id: "cameo5".into(),
                 transport: TransportKind::Usb { locator: "9:9".into() },
                 candidate: false,
+                host: None,
             }]
         }
         fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {

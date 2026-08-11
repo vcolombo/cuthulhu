@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 
 use desktop::device::DeviceManagerHandle;
 use driver_registry::HardwareBackendFactory;
+use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
 
@@ -23,6 +24,15 @@ fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
 
 fn main() {
     let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
+
+    // A host that fails to load is not a reason to refuse to start — the desktop still cuts on
+    // local hardware, and the operator can re-pair. Say so once rather than failing silently.
+    let paired = hosts::load_or_warn(hosts::default_hosts_path().as_deref(), |e| {
+        eprintln!("cuthulhu: paired hosts could not be loaded: {e}")
+    });
+    for host in paired {
+        dev_handle.add_host(host);
+    }
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -59,6 +69,10 @@ fn main() {
             ipc::machine_caps,
             ipc::save_preset,
             ipc::delete_preset,
+            ipc::list_hosts,
+            ipc::test_host,
+            ipc::pair_host,
+            ipc::forget_host,
             ipc::trace_image,
             ipc::trace_controls,
             ipc::load_image_preview,
@@ -68,8 +82,11 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                // Non-blocking read: the worker thread may be busy mid-transmit,
-                // and this handler must never block on it.
+                // Non-blocking for a local device: the worker publishes status rather than being
+                // asked for it. Aimed at a host, this is a synchronous network round trip on the
+                // UI thread — bounded (roughly 2x STATUS_POLL_TIMEOUT, see DeviceManagerHandle::
+                // status) but not instant, and DNS ahead of it is unbounded with std. A closing
+                // window can briefly stall on a wedged Pi; it will not hang forever.
                 if dev.status().is_active() {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();

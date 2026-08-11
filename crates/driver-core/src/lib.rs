@@ -53,12 +53,22 @@ pub enum TransportKind {
     Usb { locator: String }, // "bus:address"
     Serial { path: String, baud: u32 },
 }
+/// Which Cut Host a device is attached to. Opaque, and minted at pairing rather than derived
+/// from the host's address, its display name, or its certificate — all three change in ordinary
+/// use (a static lease, a rename, a regenerated certificate), and an id built on any of them
+/// would make every saved cutter reference point at nothing the first time one did.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HostId(pub String);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub instance_id: String,
     pub machine_id: String,
     pub transport: TransportKind,
     pub candidate: bool,
+    /// The Cut Host this device is attached to, or `None` for one plugged into this computer.
+    /// Local is the absence of a host, not a mode.
+    pub host: Option<HostId>,
 }
 
 pub trait DeviceBackendFactory: Send + Sync {
@@ -137,6 +147,38 @@ impl Transport for MockTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `None` is not a mode — it is the absence of a host, which is what "plugged into this
+    /// computer" is. A user who never pairs a Pi has every device in this state and sees no
+    /// difference from before.
+    #[test]
+    fn a_device_with_no_host_is_local() {
+        let local = DeviceInfo {
+            instance_id: "usb:sn:CAMEO-A".into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "sn:CAMEO-A".into() },
+            candidate: false,
+            host: None,
+        };
+        assert!(local.host.is_none());
+    }
+
+    /// The same cutter reached through two different hosts is two different devices, even though
+    /// #100 makes its `instance_id` identical — the id says which machine, the host says which
+    /// computer owns it.
+    #[test]
+    fn the_same_cutter_on_two_hosts_is_two_devices() {
+        let on_a = DeviceInfo {
+            instance_id: "usb:sn:CAMEO-A".into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "sn:CAMEO-A".into() },
+            candidate: false,
+            host: Some(HostId("host-1".into())),
+        };
+        let on_b = DeviceInfo { host: Some(HostId("host-2".into())), ..on_a.clone() };
+        assert_ne!(on_a, on_b);
+        assert_eq!(on_a.instance_id, on_b.instance_id, "the cutter's own id is unchanged");
+    }
+
     #[test]
     fn mock_transport_records_all_bytes() {
         let mut t = MockTransport::default();
@@ -187,12 +229,14 @@ mod tests {
                     machine_id: "cameo5".into(),
                     transport: TransportKind::Usb { locator: "1:4".into() },
                     candidate: false,
+                    host: None,
                 },
                 DeviceInfo {
                     instance_id: "serial:/dev/ttyUSB0".into(),
                     machine_id: "puma".into(),
                     transport: TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 9600 },
                     candidate: true,
+                    host: None,
                 },
             ]
         }

@@ -819,6 +819,7 @@ mod tests {
             machine_id: "cameo5".into(),
             transport: TransportKind::Usb { locator: "1:4".into() },
             candidate: false,
+            host: None,
         }
     }
 
@@ -956,6 +957,7 @@ mod tests {
             machine_id: "puma".into(),
             transport: TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 9600 },
             candidate: true,
+            host: None,
         }
     }
 

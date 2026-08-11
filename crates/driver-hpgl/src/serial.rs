@@ -38,12 +38,55 @@ fn usable_ports(names: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Names of serial ports that could plausibly be a cutter (not narrowed to Puma devices —
-/// serial has no VID/PID-equivalent discriminator here, so the caller must ask the operator).
-pub fn list_ports() -> Vec<String> {
-    serialport::available_ports()
-        .map(|ports| usable_ports(ports.into_iter().map(|p| p.port_name).collect()))
-        .unwrap_or_default()
+/// One enumerated serial port: the node to open, and what the adapter says about itself.
+///
+/// `serial_number` is the USB-serial adapter's own, not the cutter's — a Puma is a plain RS-232
+/// machine and says nothing over the wire about which one it is. That is still the best identity
+/// available, because the adapter is bolted to one cutter and moves with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortId {
+    /// The device node to open. Assigned in probe order, so it is not an identity.
+    pub path: String,
+    /// The adapter's serial number, where it reports one.
+    pub serial_number: Option<String>,
+}
+
+impl PortId {
+    /// Whether this port still means the same adapter after the OS re-enumerates.
+    ///
+    /// False means the port is named by `/dev/ttyUSB*`-style probe order, which a reboot or a
+    /// replug can hand to a different device. A caller that saves a reference to this port must
+    /// say so rather than implying the name will hold.
+    pub fn is_stable(&self) -> bool {
+        self.serial_number.is_some()
+    }
+}
+
+/// The adapter's serial number, or `None` when it reports none or the port is not USB. Split out
+/// so the rule can be tested without hardware.
+fn port_serial_number(info: &serialport::SerialPortInfo) -> Option<String> {
+    match &info.port_type {
+        // An empty descriptor is one the adapter did not fill in, not an identity.
+        serialport::SerialPortType::UsbPort(usb) => usb
+            .serial_number
+            .as_deref()
+            .map(str::trim)
+            .filter(|sn| !sn.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Serial ports that could plausibly be a cutter (not narrowed to Puma devices — serial has no
+/// VID/PID-equivalent discriminator here, so the caller must ask the operator).
+pub fn list_ports() -> Vec<PortId> {
+    let Ok(ports) = serialport::available_ports() else { return Vec::new() };
+    let keep = usable_ports(ports.iter().map(|p| p.port_name.clone()).collect());
+    ports
+        .iter()
+        .filter(|p| keep.contains(&p.port_name))
+        .map(|p| PortId { path: p.port_name.clone(), serial_number: port_serial_number(p) })
+        .collect()
 }
 
 /// Whether `path` names one of the `enumerated` ports, resolving symlinks before deciding.
@@ -218,5 +261,61 @@ mod tests {
             Err(other) => panic!("{other:?}"),
             Ok(_) => panic!("unexpectedly opened nonexistent port"),
         }
+    }
+
+    fn usb_port(path: &str, serial: Option<&str>) -> serialport::SerialPortInfo {
+        serialport::SerialPortInfo {
+            port_name: path.to_string(),
+            port_type: serialport::SerialPortType::UsbPort(serialport::UsbPortInfo {
+                vid: 0x1a86,
+                pid: 0x7523,
+                serial_number: serial.map(str::to_string),
+                manufacturer: None,
+                product: None,
+                #[cfg(feature = "usbportinfo-interface")]
+                interface: None,
+            }),
+        }
+    }
+
+    /// The bug this guards: two identical adapters that swap `/dev/ttyUSB*` numbers across a
+    /// reboot. Named by path, each would answer to the other's id, and because both are Pumas
+    /// the machine-id check downstream cannot tell them apart — the cut goes to the wrong one.
+    #[test]
+    fn an_adapters_serial_number_survives_a_path_change() {
+        let before = PortId { path: "/dev/ttyUSB0".into(), serial_number: Some("FT-A".into()) };
+        let after = PortId { path: "/dev/ttyUSB1".into(), serial_number: Some("FT-A".into()) };
+        assert_eq!(before.serial_number, after.serial_number, "same adapter, new node");
+        assert!(before.is_stable());
+
+        let other = PortId { path: "/dev/ttyUSB0".into(), serial_number: Some("FT-B".into()) };
+        assert_ne!(before.serial_number, other.serial_number, "same node, different adapter");
+    }
+
+    #[test]
+    fn a_port_reports_whether_its_name_can_be_trusted() {
+        assert!(PortId { path: "/dev/ttyUSB0".into(), serial_number: Some("FT-A".into()) }.is_stable());
+        assert!(!PortId { path: "/dev/ttyUSB0".into(), serial_number: None }.is_stable());
+    }
+
+    #[test]
+    fn a_serial_number_is_read_from_a_usb_port_and_trimmed() {
+        assert_eq!(port_serial_number(&usb_port("/dev/ttyUSB0", Some("FT-A"))), Some("FT-A".into()));
+        assert_eq!(port_serial_number(&usb_port("/dev/ttyUSB0", Some("  FT-A  "))), Some("FT-A".into()));
+    }
+
+    /// A descriptor the adapter left blank is not an identity, and neither is a non-USB port.
+    /// Both must fall back to the path rather than colliding on an empty id.
+    #[test]
+    fn a_blank_or_non_usb_port_reports_no_serial_number() {
+        assert_eq!(port_serial_number(&usb_port("/dev/ttyUSB0", None)), None);
+        assert_eq!(port_serial_number(&usb_port("/dev/ttyUSB0", Some(""))), None);
+        assert_eq!(port_serial_number(&usb_port("/dev/ttyUSB0", Some("   "))), None);
+
+        let native = serialport::SerialPortInfo {
+            port_name: "/dev/ttyS0".to_string(),
+            port_type: serialport::SerialPortType::PciPort,
+        };
+        assert_eq!(port_serial_number(&native), None);
     }
 }

@@ -6,8 +6,9 @@
 //! because a Pi on a home network has no name an authority would sign.
 
 use std::io;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
@@ -98,6 +99,14 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCert {
 
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
+/// How long to wait for a Cut Host to accept a connection.
+///
+/// A host that refuses is instant; one that is silently unreachable — a dropped SYN, a
+/// firewall discarding rather than refusing — would otherwise block for the OS default,
+/// which is tens of seconds. The desktop holds a lock across this call while listing
+/// devices, so an unbounded wait here is a frozen device list.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct HostClient {
     /// Serialized: one request and its reply at a time. A Cut Host answers a
     /// handful of clients and a desktop makes one call at a time, so a lock is the
@@ -107,6 +116,19 @@ pub struct HostClient {
 
 impl HostClient {
     pub fn connect(addr: &str, token: &str, pinned_fingerprint: &str) -> Result<HostClient, ClientError> {
+        Self::connect_within(addr, token, pinned_fingerprint, CONNECT_TIMEOUT)
+    }
+
+    /// Same as `connect`, but the connect attempt is capped at `timeout` rather than always
+    /// spending the full `CONNECT_TIMEOUT` — a caller with a short total budget for the whole
+    /// call (a status poll behind a lock that must never block for long) must not have that
+    /// budget eaten by a reconnect it did not choose the length of.
+    pub fn connect_within(
+        addr: &str,
+        token: &str,
+        pinned_fingerprint: &str,
+        timeout: Duration,
+    ) -> Result<HostClient, ClientError> {
         let verifier = Arc::new(PinnedCert {
             fingerprint: pinned_fingerprint.to_string(),
             seen: Mutex::new(None),
@@ -116,7 +138,40 @@ impl HostClient {
             .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
 
-        let tcp = TcpStream::connect(addr).map_err(|e| ClientError::Transport(e.to_string()))?;
+        // ponytail: `to_socket_addrs()` resolves DNS/mDNS synchronously and std gives no knob to
+        // bound it — a Cut Host is addressed by name (`cuthulhu-pi.local:7878`), not by literal
+        // IP, so this is the common path, not an edge case. `timeout` below covers the
+        // connect itself; a hung resolver is a real, if rarer, way this can still block. Bound
+        // it too (a helper thread, or a crate with an async resolver) if that turns out to bite.
+        //
+        // A single deadline covers every resolved address, not a fresh `timeout` per address:
+        // mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
+        // that is the one address that cannot work — trying it with the whole budget and only
+        // then trying the IPv4 that would have worked turns "first contact" into a timeout.
+        let addrs = addr.to_socket_addrs().map_err(|e| ClientError::Transport(e.to_string()))?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last_err = None;
+        let mut tcp = None;
+        for sock_addr in addrs {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(&sock_addr, remaining) {
+                Ok(s) => {
+                    tcp = Some(s);
+                    break;
+                }
+                // Named, not just the error: with several resolved addresses tried in turn, "the
+                // host could not be reached (Connection refused)" alone leaves the operator no
+                // way to tell which of them actually failed.
+                Err(e) => last_err = Some((sock_addr, e)),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| match last_err {
+            Some((sock_addr, e)) => ClientError::Transport(format!("{sock_addr}: {e}")),
+            None => ClientError::Transport(format!("`{addr}` resolved to no address")),
+        })?;
         tcp.set_read_timeout(Some(crate::frame::SOCKET_POLL_INTERVAL))
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
@@ -134,12 +189,14 @@ impl HostClient {
                 _ => ClientError::Transport(e.to_string()),
             }
         })?;
-        match read_frame::<_, Response>(
-            &mut stream,
-            4096,
-            Some(crate::frame::DEFAULT_BODY_TIMEOUT),
-            crate::frame::DEFAULT_BODY_TIMEOUT,
-        ) {
+        // The same `deadline` the connect loop used, not a fresh `timeout` and not
+        // `DEFAULT_BODY_TIMEOUT`: a peer that finishes the TLS handshake and then stalls before
+        // the greeting must not hold a caller's short budget open for the full 30s (what this
+        // used to pass), and must not get a *second* full `timeout` on top of what the connect
+        // loop already spent either — or `connect_within` as a whole could cost 2x its budget
+        // instead of 1x.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match read_frame::<_, Response>(&mut stream, 4096, Some(remaining), remaining) {
             Ok(Response::Ok) => {}
             Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
             Err(e) => {
@@ -158,15 +215,37 @@ impl HostClient {
         Ok(HostClient { stream: Mutex::new(stream) })
     }
 
+    /// Prove a host before anything about it is written down: connect, list its cutters, and
+    /// drop the connection.
+    ///
+    /// Pairing that saves first and discovers later is how an operator ends up with an entry
+    /// that has never worked. `connect` alone proves the fingerprint and the token; listing
+    /// proves the daemon is actually serving.
+    pub fn pair_check(
+        addr: &str,
+        token: &str,
+        pinned_fingerprint: &str,
+    ) -> Result<Vec<DeviceInfo>, ClientError> {
+        HostClient::connect(addr, token, pinned_fingerprint)?.devices()
+    }
+
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, ClientError> {
-        match self.call(Request::ListDevices)? {
+        match self.call(Request::ListDevices, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Devices(d) => Ok(d),
             other => Err(unexpected(other)),
         }
     }
 
     pub fn snapshots(&self) -> Result<Vec<DeviceSnapshot>, ClientError> {
-        match self.call(Request::Snapshot)? {
+        self.snapshots_within(crate::frame::DEFAULT_BODY_TIMEOUT)
+    }
+
+    /// Same as `snapshots`, but bounded by `timeout` rather than the full
+    /// `DEFAULT_BODY_TIMEOUT`. For a status poll a stale answer is fine — the next poll is a
+    /// second away — but holding whatever lock guards this client for 30s while a Job-carrying
+    /// call would rightly wait that long is not.
+    pub fn snapshots_within(&self, timeout: Duration) -> Result<Vec<DeviceSnapshot>, ClientError> {
+        match self.call(Request::Snapshot, timeout)? {
             Response::Snapshots(s) => Ok(s),
             other => Err(unexpected(other)),
         }
@@ -179,12 +258,15 @@ impl HostClient {
         machine_id: &str,
         passes: Vec<CutPass>,
     ) -> Result<(), ClientError> {
-        match self.call(Request::Dispatch {
-            dispatch_id,
-            device: device.to_string(),
-            machine_id: machine_id.to_string(),
-            passes,
-        })? {
+        match self.call(
+            Request::Dispatch {
+                dispatch_id,
+                device: device.to_string(),
+                machine_id: machine_id.to_string(),
+                passes,
+            },
+            crate::frame::DEFAULT_BODY_TIMEOUT,
+        )? {
             Response::Accepted { .. } => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -203,7 +285,7 @@ impl HostClient {
     }
 
     fn expect_ok(&self, request: Request) -> Result<(), ClientError> {
-        match self.call(request)? {
+        match self.call(request, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Ok => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -215,7 +297,12 @@ impl HostClient {
     /// the Dispatch response that started it, or a connect-time event still queued
     /// from before this client's subscription began (`serve.rs`'s `serve_client`
     /// drains before it blocks on the next request, not after).
-    fn call(&self, request: Request) -> Result<Response, ClientError> {
+    ///
+    /// `body_timeout` is a caller's choice, not a constant: a Job-carrying call (dispatch,
+    /// cancel, resume) is rightly owed the full `DEFAULT_BODY_TIMEOUT`, but a status poll would
+    /// rather see a stale answer next second than hold this client's lock for 30s — see
+    /// `snapshots_within`.
+    fn call(&self, request: Request, body_timeout: Duration) -> Result<Response, ClientError> {
         let mut stream = self.stream.lock().unwrap();
         write_frame(&mut *stream, &request).map_err(|e| ClientError::Transport(e.to_string()))?;
         loop {
@@ -224,8 +311,8 @@ impl HostClient {
             match read_frame::<_, Incoming>(
                 &mut *stream,
                 crate::frame::DEFAULT_MAX_FRAME,
-                Some(crate::frame::DEFAULT_BODY_TIMEOUT),
-                crate::frame::DEFAULT_BODY_TIMEOUT,
+                Some(body_timeout),
+                body_timeout,
             ) {
                 // ponytail: event frames are read only to be discarded — there is no
                 // queue and no accessor, so a client that never calls anything sees no
@@ -261,5 +348,28 @@ fn unexpected(response: Response) -> ClientError {
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         ClientError::Transport(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A host that is silently unreachable — a dropped SYN, a firewall discarding rather than
+    /// refusing — must not hang past `CONNECT_TIMEOUT`. `10.255.255.1` is the conventional
+    /// black-holed address: routable, never answering.
+    #[test]
+    fn connect_to_a_silently_unreachable_host_fails_within_the_timeout() {
+        let start = Instant::now();
+        let err = match HostClient::connect("10.255.255.1:7878", "token", "aa:bb:cc") {
+            Ok(_) => panic!("nothing should answer this address"),
+            Err(e) => e,
+        };
+        assert!(
+            start.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
+            "took {:?}, longer than the timeout allows for: {err}",
+            start.elapsed()
+        );
     }
 }

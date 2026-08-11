@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use cut_host::client::HostClient;
 use cutplan::presets::{
     default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
     SettingsOverride,
 };
 use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
-use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, MachineCaps};
+use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, HostId, MachineCaps};
 use serde::{Deserialize, Serialize};
 
+use crate::hosts::PairedHost;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -38,15 +42,78 @@ pub struct ConfiguredPassDto {
     pub repeat_count: Option<u32>,
 }
 
+/// One paired Cut Host: what was saved about it, its connection if it has one, and why it has
+/// none if it does not.
+///
+/// A host that is down keeps its entry so its cutters can be listed as unreachable rather than
+/// disappearing — a cutter that vanishes looks like one that was never paired (#42).
+pub(crate) struct HostConnection {
+    pub paired: PairedHost,
+    pub client: Option<HostClient>,
+    pub last_error: Option<String>,
+}
+
+impl HostConnection {
+    /// Connect if not already connected, and remember the reason if that fails.
+    fn ensure(&mut self) -> Option<&HostClient> {
+        self.ensure_within(cut_host::client::CONNECT_TIMEOUT)
+    }
+
+    /// Same as `ensure`, but the reconnect attempt is capped at `timeout` rather than always
+    /// spending the full `CONNECT_TIMEOUT` — a caller with a short total budget for the whole
+    /// call (a status poll behind a lock that must never block for long) must not have that
+    /// budget eaten by a reconnect it did not choose the length of.
+    fn ensure_within(&mut self, timeout: std::time::Duration) -> Option<&HostClient> {
+        if self.client.is_none() {
+            match HostClient::connect_within(&self.paired.address, &self.paired.token, &self.paired.fingerprint, timeout) {
+                Ok(c) => {
+                    self.client = Some(c);
+                    self.last_error = None;
+                }
+                Err(e) => self.last_error = Some(e.to_string()),
+            }
+        }
+        self.client.as_ref()
+    }
+}
+
+enum Route {
+    Local,
+    Host(HostId),
+}
+
+/// What the UI is told about a paired Cut Host.
+///
+/// Deliberately not `PairedHost`: that holds the token, and anything sent to the webview can
+/// reach a `console.log` or a devtools session. The UI needs to render a row and address the
+/// host by id; it does not need the secret.
+#[derive(Clone, Debug, Serialize)]
+pub struct PairedHostView {
+    pub id: HostId,
+    pub name: String,
+    pub address: String,
+    /// Why this host cannot be reached, or `None` when it can.
+    pub unreachable: Option<String>,
+}
+
+/// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
+/// reconnect, then body read — not the total. Short on purpose: this is the window-close guard's
+/// own read, and it goes through the same `hosts` lock as every other host call, so a poll that
+/// waited the full `DEFAULT_BODY_TIMEOUT` (30s) on either leg would make a quit mid-cut look hung.
+/// Spent twice in sequence, the real cap is **2x this value** (4s) — plus DNS resolution, which
+/// std gives no way to bound at all (see the `ponytail:` note in `cut_host::client`).
+const STATUS_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Separate Tauri managed state from `AppStateHandle` — device commands go
 /// through here and never touch the document mutex.
 pub struct DeviceManagerHandle {
-    factory: Arc<dyn DeviceBackendFactory>,
-    // ponytail: brief says `Arc<DeviceManager>`; `DeviceManager::shutdown(self)`
-    // consumes by value, so the Arc is wrapped in Option to let `shutdown()`
-    // `.take()` it out and `Arc::try_unwrap` it. Upgrade if a design ever needs
-    // several live handles to the same manager (not the case here — one per app).
-    manager: Mutex<Option<Arc<DeviceManager>>>,
+    local_factory: Arc<dyn DeviceBackendFactory>,
+    // ponytail: brief said `Arc<DeviceManager>`; `DeviceManager::shutdown(self)` consumes by
+    // value, so the Arc is wrapped in Option to let `shutdown()` take it out and unwrap it.
+    local_manager: Mutex<Option<Arc<DeviceManager>>>,
+    /// Every paired Cut Host, connected lazily. Held together rather than one-at-a-time
+    /// because `list_devices` asks all of them and the device list shows them together.
+    hosts: Mutex<HashMap<HostId, HostConnection>>,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -54,20 +121,148 @@ impl DeviceManagerHandle {
     pub fn new(factory: Arc<dyn DeviceBackendFactory>) -> (Self, std::sync::mpsc::Receiver<DeviceEvent>) {
         let (mgr, events) = DeviceManager::spawn(factory.clone());
         let handle = DeviceManagerHandle {
-            factory,
-            manager: Mutex::new(Some(Arc::new(mgr))),
+            local_factory: factory,
+            local_manager: Mutex::new(Some(Arc::new(mgr))),
+            hosts: Mutex::new(HashMap::new()),
             connected: Mutex::new(None),
         };
         (handle, events)
     }
 
     fn manager(&self) -> Result<Arc<DeviceManager>, IpcError> {
-        self.manager.lock().unwrap().clone()
+        self.local_manager.lock().unwrap().clone()
             .ok_or_else(|| IpcError::new("shut_down", "device manager has been shut down"))
     }
 
+    /// Local hardware plus every paired Cut Host's cutters, in one list.
+    ///
+    /// A host that cannot be reached contributes nothing here and its reason shows up in
+    /// `host_views` — the list is what can be cut on, not what has been configured.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
-        self.factory.list_devices()
+        let mut all = self.local_factory.list_devices();
+        let mut hosts = self.hosts.lock().unwrap();
+        for (id, host) in hosts.iter_mut() {
+            let Some(client) = host.ensure() else { continue };
+            match client.devices() {
+                Ok(devices) => all.extend(crate::hosts::stamp_host(id, devices)),
+                Err(e) => {
+                    // The connection went away between `ensure` and here; drop it so the next
+                    // call reconnects rather than reusing a dead one.
+                    host.last_error = Some(e.to_string());
+                    host.client = None;
+                }
+            }
+        }
+        all
+    }
+
+    pub fn add_host(&self, paired: PairedHost) {
+        let id = paired.id.clone();
+        self.hosts
+            .lock()
+            .unwrap()
+            .insert(id, HostConnection { paired, client: None, last_error: None });
+    }
+
+    pub fn remove_host(&self, id: &HostId) {
+        self.hosts.lock().unwrap().remove(id);
+    }
+
+    /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
+    pub(crate) fn host_views(&self) -> Vec<PairedHostView> {
+        self.hosts
+            .lock()
+            .unwrap()
+            .values()
+            .map(|h| PairedHostView {
+                id: h.paired.id.clone(),
+                name: h.paired.name.clone(),
+                address: h.paired.address.clone(),
+                unreachable: h.last_error.clone(),
+            })
+            .collect()
+    }
+
+    /// Every paired host as saved, for `pair`/`forget` to re-derive `hosts.json`'s on-disk
+    /// contents and to mint the next id against.
+    pub(crate) fn paired_hosts(&self) -> Vec<PairedHost> {
+        self.hosts.lock().unwrap().values().map(|h| h.paired.clone()).collect()
+    }
+
+    /// Pairs a Cut Host: prove it works, mint an id, persist — and only once the save has
+    /// actually landed, hold it in memory.
+    ///
+    /// `hosts::save` is written atomic for exactly this class of failure (full disk, read-only
+    /// config dir); ordering the in-memory insert after it means a failed save leaves disk and
+    /// memory agreeing (host absent from both) instead of a phantom host live in the device list
+    /// while the operator was told pairing failed.
+    pub fn pair(
+        &self,
+        name: String,
+        address: String,
+        token: String,
+        fingerprint: String,
+        hosts_path: &Path,
+    ) -> Result<HostId, IpcError> {
+        // Prove it before writing it down, so a saved host has always worked at least once.
+        HostClient::pair_check(&address, &token, &fingerprint)
+            .map_err(|e| IpcError::new("host_unreachable", e.to_string()))?;
+
+        // ponytail: reads paired_hosts() once, mints, saves, then add_hosts — three separate lock
+        // acquisitions, so two concurrent pair() calls can mint the same id and one save can
+        // overwrite the other's add_host. Fine for a single modal pairing dialog; if that stops
+        // being true, hold `hosts` across mint-and-save or mint from a counter that isn't a re-read.
+        let mut prospective = self.paired_hosts();
+        let id = crate::hosts::next_id(&prospective);
+        let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
+        prospective.push(paired.clone());
+        crate::hosts::save(hosts_path, &prospective)
+            .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
+
+        self.add_host(paired);
+        Ok(id)
+    }
+
+    /// Forgets a Cut Host: refuses while any of its cutters is mid-cut, since the moment it is
+    /// gone `cancel` routes to `unknown_host` (see `route`) — a blade still moving could no
+    /// longer be stopped. Persist-then-mutate for the same reason as `pair`.
+    pub fn forget(&self, id: &HostId, hosts_path: &Path) -> Result<(), IpcError> {
+        // An unreachable host answers nothing, so it reports nothing as active — and there was
+        // nothing `cancel` could have stopped there either. Only a host that answers and says
+        // "busy" blocks the forget; already-unpaired and unreachable both fall through it.
+        //
+        // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
+        // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read.
+        // `with_host_within` holds the `hosts` lock across this call, and that lock also guards
+        // `status`/`route`/`list_devices`/the window-close guard. A host that completes TLS and
+        // then stalls must not hang all of those for 30s on a guard check, and a host that is
+        // simply offline must not spend `CONNECT_TIMEOUT` reconnecting before that budget even
+        // starts. A Pi that cannot answer within roughly 2x `STATUS_POLL_TIMEOUT` (4s — the two
+        // legs, in sequence) is one the operator is likely forgetting precisely because it is
+        // unreachable, so falling through to the forget is the right default. That figure does
+        // not include DNS resolution, which std gives no way to bound (see `cut_host::client`'s
+        // `ponytail:` note) — a hung resolver is the one way this can still exceed it.
+        if let Ok(snapshots) = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
+            if snapshots.iter().any(|s| s.status.is_active()) {
+                return Err(IpcError::new(
+                    "host_busy",
+                    "a cut is active on this host; cancel it before forgetting",
+                ));
+            }
+        }
+
+        let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
+        crate::hosts::save(hosts_path, &prospective)
+            .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
+
+        self.remove_host(id);
+        // Otherwise `get_connected_device` keeps answering with a device `list_devices` no
+        // longer lists: the aim would survive the host it named.
+        let mut connected = self.connected.lock().unwrap();
+        if connected.as_ref().and_then(|d| d.host.as_ref()) == Some(id) {
+            *connected = None;
+        }
+        Ok(())
     }
 
     /// Capability is the Driver's answer, not ours — the Driver that encodes the
@@ -75,20 +270,119 @@ impl DeviceManagerHandle {
     /// `Result`, not `Option`: an id the registry cannot build means the caller
     /// is out of sync with it, which is worth surfacing rather than defaulting.
     pub fn caps_for(&self, machine_id: &str) -> Result<MachineCaps, IpcError> {
-        self.factory
+        self.local_factory
             .driver_for(machine_id)
             .map(|d| d.caps())
             .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{machine_id}`")))
     }
 
+    /// Where a call about `device` has to go. `None` is this computer; `Some(id)` is that host.
+    ///
+    /// An id nobody has paired is refused rather than falling back to local hardware: a Job
+    /// aimed at a Pi must never be cut on the machine sitting on the desk.
+    fn route(&self, device: &DeviceInfo) -> Result<Route, IpcError> {
+        match &device.host {
+            None => Ok(Route::Local),
+            Some(id) if self.hosts.lock().unwrap().contains_key(id) => Ok(Route::Host(id.clone())),
+            Some(id) => Err(IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0))),
+        }
+    }
+
+    /// Run `f` against the client for `id`, connecting if needed. Spends the full
+    /// `CONNECT_TIMEOUT` on a reconnect: for a Job-carrying call (cancel, resume, confirm,
+    /// dispatch) that is rightly owed the same budget a fresh pairing would get.
+    fn with_host<T>(
+        &self,
+        id: &HostId,
+        f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
+    ) -> Result<T, IpcError> {
+        self.with_host_within(id, cut_host::client::CONNECT_TIMEOUT, f)
+    }
+
+    /// Same as `with_host`, but `connect_timeout` bounds the reconnect leg too, not just the
+    /// body read inside `f`. `with_host` alone only bounds what `f` does — a dropped connection
+    /// still reconnects via the unbounded default, so a caller with a short total budget for the
+    /// whole call (the window-close guard reading `status()`) could still block for the full
+    /// `CONNECT_TIMEOUT` before `f` ever runs. `connect_timeout` closes that hole, but only that
+    /// one: DNS resolution happens before `connect_within`'s deadline is even computed, and std
+    /// gives no way to bound it (the `ponytail:` note in `cut_host::client` says so directly) —
+    /// so the true wait here is `connect_timeout` twice over (reconnect, then body) plus
+    /// whatever a hung resolver costs, not a hard total.
+    fn with_host_within<T>(
+        &self,
+        id: &HostId,
+        connect_timeout: std::time::Duration,
+        f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
+    ) -> Result<T, IpcError> {
+        let mut hosts = self.hosts.lock().unwrap();
+        let host = hosts
+            .get_mut(id)
+            .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))?;
+        // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
+        // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
+        // in place lets the borrow end with the arm that doesn't need it.
+        match host.ensure_within(connect_timeout) {
+            Some(client) => f(client).map_err(|e| IpcError::new("host_error", e.to_string())),
+            None => Err(IpcError::new("host_unreachable", host.last_error.clone().unwrap_or_default())),
+        }
+    }
+
+    /// Whether the local `DeviceManager` currently has a cut in flight, asked directly rather
+    /// than through `status()` at the current aim — the whole point is to catch this *before*
+    /// the aim moves away from local, which is what would make `status()` stop seeing it.
+    fn local_cut_is_active(&self) -> bool {
+        match self.local_manager.lock().unwrap().as_ref() {
+            Some(mgr) => mgr.status().is_active(),
+            None => false,
+        }
+    }
+
     pub fn connect(&self, info: DeviceInfo) -> Result<(), IpcError> {
-        self.manager()?.connect(info.clone()).map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+        let route = self.route(&info)?;
+        // A moving blade must not become unstoppable: the window-close guard and `cancel` both
+        // read the *current* aim, so moving it to a host mid-cut would deafen the guard (it would
+        // see the host's `Idle` instead) and mis-route `cancel` to a machine that was never
+        // asked to stop. Mirrors `forget`'s busy refusal.
+        if matches!(route, Route::Host(_)) && self.local_cut_is_active() {
+            return Err(IpcError::new(
+                "device_error",
+                "a cut is active on the local cutter; cancel it before switching to another device",
+            ));
+        }
+        match route {
+            Route::Local => {
+                self.manager()?
+                    .connect(info.clone())
+                    .map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
+            // A Cut Host connects each cutter itself at startup, so aiming at one is a local
+            // bookkeeping act: there is no remote connection to open. But the local manager must
+            // still be released — `DeviceManager::connect` refuses anything but
+            // `Disconnected`/`Error`, so leaving it `Idle` after aiming away would strand the
+            // operator on the Pi for the rest of the session, unable to aim back at their own
+            // cutter. Safe unconditionally: the guard above already refused this arm if a local
+            // cut is active, so this can only disconnect an idle (or already-disconnected)
+            // manager — freeing the USB device for other software as a side effect.
+            Route::Host(_) => {
+                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
+        }
         *self.connected.lock().unwrap() = Some(info);
         Ok(())
     }
 
     pub fn disconnect(&self) -> Result<(), IpcError> {
-        self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            // A remote cutter's connection belongs to the Cut Host, not this desktop — the
+            // mirror of `connect`'s remote arm, which never opened one here to close. Routing
+            // this unconditionally to the local manager used to close the local cutter's
+            // transport and discard its parked job while aimed at a Pi, silently.
+            None | Some(Route::Local) => {
+                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+            }
+            Some(Route::Host(_)) => {}
+        }
         *self.connected.lock().unwrap() = None;
         Ok(())
     }
@@ -97,23 +391,74 @@ impl DeviceManagerHandle {
     /// never blocks on the worker — so the window-close handler and the IPC
     /// command can both call it freely, even mid-transmit.
     pub fn status(&self) -> CutStatus {
-        match self.manager.lock().unwrap().as_ref() {
-            Some(mgr) => mgr.status(),
-            None => CutStatus::disconnected(),
+        let aimed = self.connected.lock().unwrap().clone();
+        let Some(device) = aimed else { return CutStatus::disconnected() };
+        match self.route(&device) {
+            Ok(Route::Local) => match self.local_manager.lock().unwrap().as_ref() {
+                Some(mgr) => mgr.status(),
+                None => CutStatus::disconnected(),
+            },
+            // An unknown host is not a local cutter. Falling through to the local manager here
+            // would report its `Idle` — and so `actions.cut` — for a device this desktop cannot
+            // reach, offering a cut that `execute_cut` would then refuse.
+            Err(_) => CutStatus::disconnected(),
+            Ok(Route::Host(id)) => self
+                // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
+                // body read: this is the window-close guard's own read, and a stale snapshot is
+                // fine when the next poll is a second away, but a 30s hold of `hosts` behind a
+                // stalled host — or a `CONNECT_TIMEOUT` reconnect before the read even starts —
+                // is not. The real total is roughly 2x `STATUS_POLL_TIMEOUT` (4s), not one
+                // `STATUS_POLL_TIMEOUT` — and DNS resolution sits outside that entirely,
+                // unbounded, ahead of both legs (see `cut_host::client`'s `ponytail:` note).
+                .with_host_within(&id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
+                .ok()
+                .and_then(|snaps| {
+                    snaps.into_iter().find(|s| s.info.instance_id == device.instance_id).map(|s| s.status)
+                })
+                // A host that cannot be reached mid-cut is not a finished cut: the Job is still
+                // running on the Pi, and saying `Idle` here would invite a second dispatch.
+                .unwrap_or_else(|| CutStatus::disconnected()),
         }
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
-        self.manager()?.cancel();
-        Ok(())
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.cancel();
+                Ok(())
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.cancel(&device))
+            }
+        }
     }
 
     pub fn resume(&self) -> Result<(), IpcError> {
-        self.manager()?.resume().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.resume().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.resume(&device))
+            }
+        }
     }
 
     pub fn confirm_pass_done(&self) -> Result<(), IpcError> {
-        self.manager()?.confirm_pass_done().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.confirm_pass_done().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                let device = aimed.expect("a route implies a device").instance_id;
+                self.with_host(&id, |c| c.confirm_pass_done(&device))
+            }
+        }
     }
 
     /// Normal-exit lifecycle path: take the sole stored `Arc`, unwrap it, and
@@ -121,7 +466,7 @@ impl DeviceManagerHandle {
     /// clone is briefly alive), that's a non-fatal race at process exit — log
     /// and move on rather than block or panic.
     pub fn shutdown(&self) {
-        let Some(arc) = self.manager.lock().unwrap().take() else { return };
+        let Some(arc) = self.local_manager.lock().unwrap().take() else { return };
         match Arc::try_unwrap(arc) {
             Ok(mgr) => mgr.shutdown(),
             Err(_) => eprintln!("device manager shutdown skipped: a call was still in flight"),
@@ -143,7 +488,7 @@ impl DeviceManagerHandle {
             return Err(IpcError::new("device_mismatch", "connected device changed since planning"));
         }
 
-        let driver = self.factory.driver_for(&connected.machine_id)
+        let driver = self.local_factory.driver_for(&connected.machine_id)
             .ok_or_else(|| IpcError::new("unknown_machine", format!("no driver for `{}`", connected.machine_id)))?;
         let profile = driver.profile().clone();
         let caps = driver.caps();
@@ -190,7 +535,34 @@ impl DeviceManagerHandle {
     /// document lock (see `prepare_cut`) and from an async command so it
     /// doesn't freeze the Tauri main loop.
     pub fn execute_cut(&self, passes: Vec<CutPass>) -> Result<u64, IpcError> {
-        self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed.as_ref().map(|d| self.route(d)).transpose()? {
+            None | Some(Route::Local) => {
+                self.manager()?.cut(passes).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+            }
+            Some(Route::Host(id)) => {
+                // `execute_cut` takes only the Passes, so both the device and the machine it is
+                // for come from what the dialog is aimed at — which is also what `route` just
+                // resolved, so the two cannot disagree.
+                let aimed = aimed.expect("a route implies a device");
+                let (device, machine_id) = (aimed.instance_id, aimed.machine_id);
+                // A fresh id per attempt: this is a new Job, not a retry of a dropped reply,
+                // and reusing one would make the host treat it as already accepted.
+                let dispatch_id = cut_host::protocol::DispatchId(format!(
+                    "{}-{}",
+                    device,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                self.with_host(&id, |c| c.dispatch(dispatch_id, &device, &machine_id, passes))?;
+                // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
+                // `DeviceManager::cut` does not return one until the Job reaches a pause point. Nothing reads
+                // this value for a remote cut today; give it the real id when the desktop shows per-Job history.
+                Ok(0)
+            }
+        }
     }
 
     /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
@@ -324,6 +696,7 @@ mod tests {
             machine_id: "cameo5".into(),
             transport: TransportKind::Usb { locator: "1:4".into() },
             candidate: false,
+            host: None,
         }
     }
 
@@ -437,5 +810,385 @@ mod tests {
         assert_eq!(json["supportsSpeed"], serde_json::json!(true));
         assert_eq!(json["supportsForce"], serde_json::json!(false));
         assert_eq!(json["needsOperatorPassConfirm"], serde_json::json!(true));
+    }
+
+    use crate::hosts::PairedHost;
+    use driver_core::HostId;
+
+    fn a_paired_host(id: &str, addr: &str) -> PairedHost {
+        PairedHost {
+            id: HostId(id.into()),
+            name: "Workshop Pi".into(),
+            address: addr.into(),
+            fingerprint: "aa:bb:cc".into(),
+            token: "s3cret".into(),
+        }
+    }
+
+    /// A user who never pairs a Pi must see exactly what they see today. This is the test that
+    /// says the feature is optional by construction rather than by intention.
+    #[test]
+    fn with_no_host_paired_the_device_list_is_the_local_one() {
+        let dev = test_device_setup();
+        let listed = dev.list_devices();
+
+        // Not just "nothing is host-tagged" — an empty list satisfies that vacuously, and the
+        // regression this guards against is exactly one that returns nothing.
+        assert!(!listed.is_empty(), "the local factory's devices must still be listed");
+        assert_eq!(listed.len(), TestFactory.list_devices().len());
+        assert!(listed.iter().all(|d| d.host.is_none()), "{listed:?}");
+    }
+
+    /// A host that cannot be reached keeps its place in the list rather than vanishing — a
+    /// cutter that disappears looks like one that was never paired.
+    #[test]
+    fn an_unreachable_host_is_still_listed_with_its_reason() {
+        let dev = test_device_setup();
+        // Nothing is listening on this port, so connecting fails.
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        // `add_host` records the host without dialling it — connections are lazy — so the
+        // failure only exists once something asks for its cutters.
+        let listed = dev.list_devices();
+        assert!(listed.iter().all(|d| d.host.is_none()), "an unreachable host contributes none");
+
+        let views = dev.host_views();
+        assert_eq!(views.len(), 1, "the host stays known: {views:?}");
+        assert!(views[0].unreachable.is_some(), "and says why it is unreachable");
+    }
+
+    /// A cutter with no host is this computer's, and must reach the local DeviceManager — the
+    /// path every existing user is on.
+    #[test]
+    fn a_local_device_still_routes_to_the_local_manager() {
+        let dev = test_device_setup();
+        assert_eq!(dev.status().phase, driver_core::Phase::Idle);
+        assert!(dev.cancel().is_ok(), "a local cancel reaches the local manager");
+    }
+
+    /// A moving blade must not become unstoppable: the window-close guard and `cancel` both act
+    /// on the *current* aim, so letting `connect` move it to a host mid-cut would deafen the
+    /// guard (it would see the host's `Idle`) and mis-route `cancel` to a machine that was never
+    /// asked to stop. Mirrors `forget`'s own busy refusal.
+    #[test]
+    fn connect_refuses_to_move_the_aim_off_an_active_local_cut() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        assert!(dev.status().is_active(), "the local cut must be parked mid-flight for this test to mean anything");
+
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let elsewhere = DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() };
+        let err = dev.connect(elsewhere).unwrap_err();
+        assert_eq!(err.code, "device_error", "got {err:?}");
+
+        // A refused connect is not a half-connect: the aim must not have moved either.
+        assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, None, "aim must stay local");
+    }
+
+    /// Aiming at a host used to leave the local `DeviceManager` connected and `Idle` — and
+    /// `DeviceManager::connect` refuses anything but `Disconnected`/`Error` — so re-aiming
+    /// locally afterward returned `Busy`, stranding the operator's own cutter for the rest of
+    /// the session. `connect`'s `Route::Host` arm must release the local manager first.
+    #[test]
+    fn re_aiming_locally_after_a_host_succeeds() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let elsewhere = DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() };
+        dev.connect(elsewhere).expect("aiming at a host is bookkeeping only");
+
+        dev.connect(test_instance()).expect("must be able to aim back at the local cutter");
+    }
+
+    /// A remote cutter's connection belongs to the Cut Host, not this desktop. Routing
+    /// `disconnect` unconditionally to the local manager used to close the local cutter's
+    /// transport and discard its parked job while the operator was aimed at a Pi, silently.
+    #[test]
+    fn disconnect_while_aimed_at_a_host_leaves_the_local_manager_untouched() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() });
+
+        dev.disconnect().expect("disconnecting a remote aim is bookkeeping only");
+        assert!(dev.connected.lock().unwrap().is_none(), "the aim itself must still clear");
+
+        // Re-aim locally: if `disconnect` had reached the local manager, this would now read
+        // `Disconnected` instead of the `Idle` it started at.
+        dev.connected.lock().unwrap().replace(test_instance());
+        assert_eq!(dev.status().phase, Phase::Idle, "the local manager's connection must have survived untouched");
+    }
+
+    /// Naming a host that was forgotten (or never paired) must be refused rather than falling
+    /// back to the local cutter — a Job aimed at a Pi must never be cut on the desk.
+    #[test]
+    fn a_device_naming_an_unknown_host_is_refused_not_run_locally() {
+        let dev = test_device_setup();
+        let elsewhere = DeviceInfo {
+            host: Some(HostId("host-does-not-exist".into())),
+            ..test_instance()
+        };
+        let err = dev.connect(elsewhere).unwrap_err();
+        assert_eq!(err.code, "unknown_host", "got {err:?}");
+    }
+
+    /// A device aimed at a host that was forgotten (or never paired) must report a status the UI
+    /// cannot act on. Asserted on `actions`, not `phase` — this project's rule is that a caller
+    /// learns what is legal from `actions` and never re-derives it from the phase.
+    #[test]
+    fn status_for_a_device_on_an_unknown_host_is_not_a_local_idle() {
+        let dev = test_device_setup();
+        dev.connected.lock().unwrap().replace(DeviceInfo {
+            host: Some(HostId("host-does-not-exist".into())),
+            ..test_instance()
+        });
+        assert!(!dev.status().actions.cut, "an unreachable host must not offer a cut it cannot run");
+    }
+
+    #[test]
+    fn forgetting_a_host_removes_it_and_its_cutters() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        assert_eq!(dev.host_views().len(), 1, "known as soon as it is added");
+
+        dev.remove_host(&HostId("host-1".into()));
+        assert!(dev.host_views().is_empty());
+        assert!(dev.list_devices().iter().all(|d| d.host.is_none()));
+    }
+
+    /// The token must not leave the Rust side. A view type is the guard, and this is what stops
+    /// a later refactor from "simplifying" it back to sending `PairedHost`.
+    #[test]
+    fn a_host_view_carries_no_token() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        // `unreachable` is `None` here on purpose: nothing has dialled this host yet, and the
+        // view reports what is known rather than provoking a connection to find out.
+        let views = dev.host_views();
+        assert_eq!(views.len(), 1);
+        let json = serde_json::to_string(&views[0]).unwrap();
+        assert!(!json.contains("s3cret"), "a token reached the view: {json}");
+        assert!(json.contains("host-1"), "the id is what the UI addresses: {json}");
+    }
+
+    #[test]
+    fn pairing_mints_an_id_that_does_not_collide() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let next = crate::hosts::next_id(&dev.paired_hosts());
+        assert_eq!(next, HostId("host-2".into()));
+    }
+
+    // --- pair()/forget(): network refusals, persist-then-mutate, busy-host refusal ---
+    //
+    // `crates/cut-host/tests/fixtures/mod.rs` has this exact fixture already, but it lives in a
+    // separate integration-test crate and cannot be imported from here — so this is the same
+    // loopback host, built from the same public `cut_host` API, kept alive by the same
+    // `_dir: TempDir` trick (dropping it deletes the cert directory `serve_on` reads its key from).
+
+    struct LoopbackHost {
+        addr: String,
+        fingerprint: String,
+        _dir: tempfile::TempDir,
+    }
+
+    const HOST_TOKEN: &str = "test-token";
+
+    fn start_loopback_host() -> LoopbackHost {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let config = cut_host::config::Config {
+            bind: listener.local_addr().unwrap(),
+            tokens: [("test-client".to_string(), HOST_TOKEN.to_string())].into_iter().collect(),
+            max_frame: cut_host::frame::DEFAULT_MAX_FRAME,
+            cert_dir: dir.path().to_path_buf(),
+        };
+        // Generated before `Host::start`, so the client has something to pin before the
+        // server has accepted anything.
+        let fingerprint = cut_host::serve::fingerprint_of_cert_dir(&config.cert_dir).unwrap();
+        let host = cut_host::host::Host::start(Arc::new(cut_host::host::testing::TwoCutterFactory));
+
+        std::thread::spawn(move || {
+            let _ = cut_host::serve::serve_on(listener, host, config);
+        });
+        LoopbackHost { addr, fingerprint, _dir: dir }
+    }
+
+    /// A regular file where a directory needs to be, so `create_dir_all` — and therefore every
+    /// `hosts::save` — fails without touching real filesystem permissions.
+    fn unwritable_hosts_path(dir: &std::path::Path) -> std::path::PathBuf {
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        blocker.join("hosts.json")
+    }
+
+    #[test]
+    fn pairing_with_the_wrong_token_is_refused_and_saves_nothing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), "wrong-token".into(), host.fingerprint.clone(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists(), "a pairing that never proved itself must not be written");
+    }
+
+    #[test]
+    fn pairing_with_the_wrong_fingerprint_is_refused_and_saves_nothing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), "wrong:fingerprint".into(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists());
+    }
+
+    #[test]
+    fn pairing_an_unreachable_address_is_refused_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        // The conventional black-holed address: routable, never answering.
+        let err = dev.pair("Pi".into(), "10.255.255.1:7878".into(), "token".into(), "aa:bb:cc".into(), &hosts_path);
+        assert!(err.is_err());
+        assert!(!hosts_path.exists());
+    }
+
+    #[test]
+    fn a_pair_that_fails_to_save_adds_nothing_in_memory() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = unwritable_hosts_path(dir.path());
+        let dev = test_device_setup();
+
+        let err = dev.pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path);
+        assert!(err.is_err(), "the save must fail against this path");
+        assert!(dev.paired_hosts().is_empty(), "a failed save must not leave a phantom host in memory");
+    }
+
+    #[test]
+    fn a_forget_that_fails_to_save_removes_nothing_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = unwritable_hosts_path(dir.path());
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        let err = dev.forget(&HostId("host-1".into()), &hosts_path);
+        assert!(err.is_err(), "the save must fail against this path");
+        assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
+    }
+
+    #[test]
+    fn a_host_with_an_active_cut_refuses_to_be_forgotten() {
+        use std::time::{Duration, Instant};
+
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        // `dispatch` returns as soon as the daemon accepts the id; the cut itself runs on a
+        // thread there (`Host::dispatch`). Poll until the cutter reports busy rather than
+        // asserting on a race.
+        let client = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        client
+            .dispatch(
+                cut_host::protocol::DispatchId("d-1".into()),
+                cut_host::host::testing::CAMEO,
+                "cameo5",
+                vec![CutPass {
+                    job: driver_core::Job {
+                        polylines: vec![vec![
+                            geometry::Point { x: 0.0, y: 0.0 },
+                            geometry::Point { x: 10.0, y: 0.0 },
+                            geometry::Point { x: 10.0, y: 10.0 },
+                            geometry::Point { x: 0.0, y: 0.0 },
+                        ]],
+                        settings: driver_core::Settings::default(),
+                    },
+                }],
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let busy = client
+                .snapshots()
+                .unwrap()
+                .iter()
+                .any(|s| s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active());
+            if busy {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the cutter never went active");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let err = dev.forget(&id, &hosts_path).expect_err("a moving blade must not become unstoppable");
+        assert_eq!(err.code, "host_busy");
+        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+    }
+
+    #[test]
+    fn an_idle_host_is_forgotten() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+
+        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        assert!(dev.paired_hosts().is_empty());
+    }
+
+    /// Otherwise `get_connected_device` keeps answering with a device `list_devices` no longer
+    /// lists — the aim would silently outlive the host it named.
+    #[test]
+    fn forgetting_the_connected_host_clears_the_aim() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+
+        dev.forget(&id, &hosts_path).expect("nothing is running on it");
+        assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
+    }
+
+    /// Forgetting one host must not disturb an aim pointed at a different one.
+    #[test]
+    fn forgetting_an_unrelated_host_leaves_the_aim_alone() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("this host answers and the fingerprint matches");
+        dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
+        dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+
+        dev.forget(&HostId("host-elsewhere".into()), &hosts_path).expect("nothing is running on it");
+        assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
     }
 }

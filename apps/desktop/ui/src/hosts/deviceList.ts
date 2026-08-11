@@ -126,3 +126,21 @@ export function deviceBadge(status: CutStatus | null): { label: string; tone: "i
   // visible rather than hiding (#42).
   return { label: "Unreachable", tone: "gone" };
 }
+
+/**
+ * Whether the connected cutter's row offers a disconnect, and what it should say.
+ *
+ * It has to offer one at all because a stop nothing confirmed refuses another cut until the
+ * transport is re-opened (`driver-core`'s `Cancelled` arm), and `DeviceManager::connect` refuses
+ * from that state too — so with no way to disconnect, one cancelled Puma ends the session.
+ *
+ * `null` while a Job is in flight: a disconnect there drops the transport under a moving blade
+ * and abandons the Job silently. "A Job exists" is read from `actions` — the only three verbs a
+ * Job ever offers — not from the phase.
+ */
+export function connectedControl(status: CutStatus | null): string | null {
+  if (status !== null && (status.actions.cancel || status.actions.resume || status.actions.confirm)) {
+    return null;
+  }
+  return "Disconnect";
+}

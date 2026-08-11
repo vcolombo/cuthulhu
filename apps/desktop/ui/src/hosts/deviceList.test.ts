@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, staleSection } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -188,5 +188,24 @@ describe("deviceBadge", () => {
     const unconfirmed: CutStatus = { ...confirmed, actions: { ...aStatus().actions, cut: false } };
     expect(deviceBadge(unconfirmed).tone).toBe("attention");
     expect(deviceBadge(unconfirmed).label).toMatch(/not confirmed/);
+  });
+});
+
+describe("connectedControl", () => {
+  // The state this exists for. Both a cut and a connect are refused there, so a row with no
+  // disconnect leaves the operator restarting the app to use the cutter again.
+  it("offers a disconnect after a cancel whose stop was never confirmed", () => {
+    const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
+    expect(connectedControl(unconfirmed)).toBe("Disconnect");
+    expect(connectedControl(null)).toBe("Disconnect");
+  });
+
+  // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a
+  // moving blade, and those three verbs are the only ones a live Job ever offers.
+  it("withholds it while a Job is in flight, whatever the phase says", () => {
+    for (const live of [{ cancel: true }, { resume: true }, { confirm: true }]) {
+      const status: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, ...live } };
+      expect(connectedControl(status)).toBeNull();
+    }
   });
 });

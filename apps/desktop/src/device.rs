@@ -1092,6 +1092,41 @@ mod tests {
         assert_eq!(dev.status().phase, Phase::Idle, "the local manager's connection must have survived untouched");
     }
 
+    /// A cancel whose stop nothing confirmed refuses another cut, and `DeviceManager::connect`
+    /// refuses from that state too — so the disconnect is the whole exit, and the dialog now
+    /// offers one. Asserted through `actions`: the phase is `Idle` either side of the reconnect,
+    /// which is exactly why it cannot answer this.
+    #[test]
+    fn disconnecting_and_reconnecting_makes_a_cut_legal_after_an_unconfirmed_cancel() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+
+        dev.cancel().expect("cancel");
+        // The test Driver parks rather than polls, so nothing can confirm its stop — the Puma's
+        // ordinary case, and the one the operator has to be able to get out of.
+        let stuck = wait_for_cancelled(&dev);
+        assert!(!stuck.actions.cut, "nothing saw the machine stop, so no Job may follow it");
+
+        dev.disconnect().expect("disconnect");
+        dev.connect(test_instance()).expect("reconnect");
+        assert!(dev.status().actions.cut, "a reconnected cutter accepts a Job again");
+    }
+
+    fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let s = dev.status();
+            if s.ended == Some(driver_core::Ended::Cancelled) {
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "never cancelled, sat at {:?}", s.phase);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Naming a host that was forgotten (or never paired) must be refused rather than falling
     /// back to the local cutter — a Job aimed at a Pi must never be cut on the desk.
     #[test]

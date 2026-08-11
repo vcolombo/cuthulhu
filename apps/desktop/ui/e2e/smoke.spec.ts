@@ -573,7 +573,7 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -594,7 +594,7 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Reaches past the UI on purpose: the canvas drag that issues this command is behind
@@ -775,7 +775,7 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -790,7 +790,7 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -808,7 +808,7 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -827,7 +827,7 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -846,7 +846,7 @@ test("reopening the dialog after connect recovers the connected device", async (
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByText("connected")).toBeVisible();
 
   await page.getByRole("button", { name: "Close" }).click();
@@ -859,6 +859,22 @@ test("reopening the dialog after connect recovers the connected device", async (
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
+// The exit from a cancel whose stop nothing confirmed. `driver-core` refuses both a cut and a
+// connect from that state, so with no Disconnect in the dialog the operator's only way back to
+// their own cutter is restarting the app — the workaround being "never cancel". This drives the
+// control rather than the command behind it, because the control is what was missing.
+test("a connected cutter offers a disconnect, and the row goes back to offering Connect", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByText("connected")).toBeVisible();
+
+  await page.getByRole("button", { name: "Disconnect", exact: false }).first().click();
+  await expect(page.getByText("connected")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Connect", exact: true }).first()).toBeVisible();
+});
+
 // Inverted deliberately. While the dialog latched its own outcome, "did the last cut
 // finish?" was answered by how long the dialog had been mounted, so a reopened dialog
 // had to show nothing — and this test asserted that. The outcome now comes from the
@@ -869,7 +885,7 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -887,7 +903,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -904,7 +920,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // Recover by reconnecting (the other listed device). The connect lifecycle events
   // carry NO_JOB=0 and must still reach the dialog after a failed job — Start Cut
   // comes back only because the reconnect's Idle status was accepted.
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
@@ -914,7 +930,7 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
@@ -931,7 +947,7 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -939,10 +955,10 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
 
-  // No Disconnect control exists in the UI, so drive the command the way the device
-  // dropping out would: straight through the IPC surface.
+  // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
+  // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
@@ -954,18 +970,18 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
-  // No Disconnect control exists in the UI, so drive the command the way the device
-  // dropping out would: straight through the IPC surface.
+  // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
+  // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Connect", exact: false }).first().click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
   await expect(page.getByText(/complete/i)).toHaveCount(0);
 });

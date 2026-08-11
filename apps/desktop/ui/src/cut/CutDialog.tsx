@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
-import { deviceBadge, forgetFrom, groupDevices, staleSection } from "../hosts/deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
@@ -226,6 +226,18 @@ export function CutDialog({
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
+  // Clears `connected` locally too: `disconnect_device` is what releases the local manager, and a
+  // row still labelled "connected" would offer no way back to the Connect that clears the state.
+  const disconnect = () => {
+    ipc
+      .disconnectDevice()
+      .then(() => {
+        setConnected(null);
+        refreshDeviceState();
+      })
+      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+  };
+
   // A refusal keeps the row and shows the host's own words: the Rust side refuses with
   // `host_busy` while a cut is active there, and a row that vanished and came back would say
   // "gone" about the one host that still has a blade moving.
@@ -345,7 +357,9 @@ export function CutDialog({
               {section.devices.map((d) => {
                 // Only the aimed-at cutter has a status; the rest have not been asked, and
                 // `null` is what says so rather than something that reads as ready.
-                const badge = deviceBadge(connected?.instance_id === d.instance_id ? status : null);
+                const aimed = connected?.instance_id === d.instance_id ? status : null;
+                const badge = deviceBadge(aimed);
+                const control = connectedControl(aimed);
                 return (
                 <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <span>
@@ -356,7 +370,17 @@ export function CutDialog({
                     {badge.label}
                   </span>
                   {connected?.instance_id === d.instance_id ? (
-                    <span style={{ color: "var(--ready)" }}>connected</span>
+                    <>
+                      <span style={{ color: "var(--ready)" }}>connected</span>
+                      {/* The only way back from a stop nothing confirmed: `driver-core` refuses
+                          both a cut and a connect from that state, so without this the operator's
+                          exit is restarting the app. Withheld mid-Job — see `connectedControl`. */}
+                      {control ? (
+                        <button aria-label={`Disconnect ${d.instance_id}`} style={btn} onClick={disconnect}>
+                          {control}
+                        </button>
+                      ) : null}
+                    </>
                   ) : (
                     <button style={btn} onClick={() => connect(d)}>
                       Connect

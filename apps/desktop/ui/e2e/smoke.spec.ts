@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; slowList?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; slowList?: boolean; failList?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -335,6 +335,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Slow from the second call on when asked, so the first read (the one that puts a host in
     // the list at all) does not itself eat the window a test is trying to observe.
     list_devices: () => {
+      if (opts?.failList) throw ipcError("device_error", "the device list could not be read");
       const slow = opts?.slowList && listDeviceCalls++ > 0;
       return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
     },
@@ -724,6 +725,19 @@ test("the dialog polls while it is open, and stops once it is closed", async ({ 
   const closed = await polls();
   await page.waitForTimeout(2500);
   expect(await polls()).toBe(closed);
+});
+
+// The stale path, on the desktop that has no host: the local section's heading is normally
+// suppressed, and the "last known" marker lives inside it, so a failed read showed as one
+// unlabelled red line of Rust prose under "Device" — no heading, no marker, no banner.
+test("a device list that cannot be read keeps its heading, so the failure has something to name", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failList: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  await expect(page.getByText("This computer")).toBeVisible();
+  await expect(page.getByText("last known")).toBeVisible();
+  await expect(page.getByText("the device list could not be read")).toBeVisible();
 });
 
 // The Pi is optional, and a desktop without one has nothing polling can tell it: a local

@@ -300,8 +300,13 @@ export function CutDialog({
           {shown.map((section) => (
             <div key={section.hostId ?? "local"} style={{ marginBottom: 6 }}>
               {/* The local section's header is suppressed when it is the only one, so a user with
-                  no Cut Host sees the flat list this dialog has always shown. */}
-              {section.hostId === null && hosts.length === 0 ? null : (
+                  no Cut Host sees the flat list this dialog has always shown — but not when the
+                  read failed. The "last known" marker lives in this header, so suppressing it
+                  left the reason below as an unlabelled red line of Rust prose under "Device",
+                  with nothing saying which list it was about or that the rows had stopped
+                  moving. A failure the user cannot place is worse than a heading they did not
+                  need. */}
+              {section.hostId === null && hosts.length === 0 && !section.stale ? null : (
                 <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <strong>{section.title}</strong>
                   {section.address ? <span style={{ color: "var(--muted)" }}>{section.address}</span> : null}

@@ -176,3 +176,27 @@ A pass is not "enabled/disabled": a colour nobody lists in `PlanOptions::passes`
 - Design docs and plans live in `docs/superpowers/specs/` and `docs/superpowers/plans/`; each
   sub-project (protocol spike → drivers+CLI → editor shell → cut workflow → trace → print&cut)
   gets a spec then a plan then implementation.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues on `vcolombo/cuthulhu`, via the `gh` CLI. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`,
+`wontfix`), a workflow axis alongside the type/provenance labels. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
+
+### PR review
+
+When Greptile and Copilot both come back clean on a PR, run a Codex review before merging
+(via the local `/codex:rescue` plugin — Codex is not a PR bot on this repo). The bots being
+satisfied is the trigger for the third pass, not the finish line: three reviewers, three
+different blind spots, and this repo's history has each catching what the others missed.

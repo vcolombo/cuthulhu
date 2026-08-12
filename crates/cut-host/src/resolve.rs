@@ -39,6 +39,11 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
     if host.is_empty() {
         return Err(malformed());
     }
+    // DNS has no empty labels: `cuthulhu..local` can never be answered, and refusing it here
+    // reads better than a resolver timeout blaming the network for a typo.
+    if host.split('.').any(|label| label.is_empty()) {
+        return Err(malformed());
+    }
     if host.ends_with(".local") {
         Ok(Route::Mdns { host, port })
     } else {
@@ -69,13 +74,22 @@ use mdns_sd::{HostnameResolutionEvent, ServiceDaemon};
 static DAEMON: Mutex<Option<ServiceDaemon>> = Mutex::new(None);
 
 fn daemon() -> Result<ServiceDaemon, ClientError> {
-    let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(daemon) = &*slot {
+    if let Some(daemon) = &*DAEMON.lock().unwrap_or_else(|e| e.into_inner()) {
         return Ok(daemon.clone());
     }
+    // Built OUTSIDE the lock: construction enumerates interfaces, binds sockets and spawns a
+    // thread, and a caller resolving a different name must not queue behind any of that.
+    // ponytail: a failed build is re-attempted by every caller with no backoff — the redial
+    // paths arrive about once a second, which is the backoff; add a retry-after stamp if a
+    // multicast-less machine ever shows the churn.
     let created = ServiceDaemon::new().map_err(|e| {
         ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
     })?;
+    let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(raced) = &*slot {
+        // Another caller built one first — theirs is the shared daemon, this one drops.
+        return Ok(raced.clone());
+    }
     *slot = Some(created.clone());
     Ok(created)
 }
@@ -96,8 +110,7 @@ pub(crate) fn resolve_mdns(
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, ClientError> {
-    let daemon = daemon()?;
-    // mdns-sd wants the fully-qualified spelling; `route` stripped the trailing dot off.
+    // mdns-sd wants the fully-qualified spelling; `route` stripped the trailing dots off.
     let fqdn = format!("{host}.");
     let gate = LOCAL_QUERIES
         .lock()
@@ -106,19 +119,27 @@ pub(crate) fn resolve_mdns(
         .or_default()
         .clone();
     // A turn in the queue is waited for in slices, each checked against this caller's OWN
-    // deadline — a plain `lock()` would inherit the holder's budget instead, and a 2s status
-    // poll parked behind a 5s pairing probe would hold that host's other verbs for the
-    // difference. (A poisoned gate lands here too: the caller times out rather than panics.)
+    // deadline and clamped to it — a plain `lock()` would inherit the holder's budget instead,
+    // and a 2s status poll parked behind a 5s pairing probe would hold that host's other verbs
+    // for the difference. A poisoned gate is taken over, like every lock in this module —
+    // treating poison as "busy" would wedge the name for the process's life.
+    // ponytail: wakeup is unordered, so a sleeper can be beaten by a fresh arrival; acceptable
+    // while every caller is deadline-bounded, a Condvar queue if fairness ever matters.
     let _one_query_per_name = loop {
-        if let Ok(guard) = gate.try_lock() {
-            break guard;
+        match gate.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Distinct from the no-answer message: the network was never asked on this
+            // caller's behalf, and the operator should not be sent to debug Wi-Fi for it.
             return Err(ClientError::Transport(format!(
-                "`{host}` was not answered over mDNS in time"
+                "`{host}` was still being resolved by an earlier attempt when time ran out"
             )));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(25).min(remaining));
     };
 
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -127,9 +148,22 @@ pub(crate) fn resolve_mdns(
             "`{host}` was not answered over mDNS in time"
         )));
     }
-    let events = daemon
+    let daemon = daemon()?;
+    let events = match daemon
         .resolve_hostname(&fqdn, Some(remaining.as_millis().try_into().unwrap_or(u64::MAX)))
-        .map_err(|e| ClientError::Transport(format!("could not query `{host}` over mDNS ({e})")))?;
+    {
+        Ok(events) => events,
+        Err(e) => {
+            // A handle whose daemon thread has died fails every query from here on — drop the
+            // cached daemon so the next caller builds a fresh one, rather than wedging
+            // `.local` resolution for the rest of a multi-day run. A well-formed query
+            // erroring at all is the daemon telling us something is wrong with *it*.
+            DAEMON.lock().unwrap_or_else(|e| e.into_inner()).take();
+            return Err(ClientError::Transport(format!(
+                "could not query `{host}` over mDNS ({e})"
+            )));
+        }
+    };
 
     let mut found: Vec<SocketAddr> = Vec::new();
     // First answer ALMOST wins. A responder on separate v4/v6 transports delivers A and AAAA
@@ -146,17 +180,30 @@ pub(crate) fn resolve_mdns(
         }
         match events.recv_timeout(wait_until.saturating_duration_since(Instant::now())) {
             Ok(HostnameResolutionEvent::AddressesFound(_, addrs)) => {
-                found.extend(addrs.iter().map(|scoped| match scoped {
-                    // The scope id is what makes a link-local v6 answer routable —
-                    // `to_ip_addr()` drops it, and `[fe80::…]` with scope 0 connects nowhere.
-                    mdns_sd::ScopedIp::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(
-                        *v6.addr(),
-                        port,
-                        0,
-                        v6.scope_id().index,
-                    )),
-                    _ => SocketAddr::new(scoped.to_ip_addr(), port),
-                }));
+                // The event carries the daemon's whole cached set for the name, not a delta —
+                // extending would dial the first packet's addresses twice once the second
+                // lands. The latest set is the truth; take it whole.
+                found = addrs
+                    .iter()
+                    .map(|scoped| match scoped {
+                        // The scope id is what makes a link-local (fe80::/10) v6 answer
+                        // routable — `to_ip_addr()` drops it, and `[fe80::…]` with scope 0
+                        // connects nowhere. Only link-local, though: stamped onto a global or
+                        // ULA address it pins the route to the receiving interface, which is
+                        // also mdns-sd's own rule for when the scope is displayed.
+                        mdns_sd::ScopedIp::V6(v6)
+                            if v6.addr().segments()[0] & 0xffc0 == 0xfe80 =>
+                        {
+                            SocketAddr::V6(std::net::SocketAddrV6::new(
+                                *v6.addr(),
+                                port,
+                                0,
+                                v6.scope_id().index,
+                            ))
+                        }
+                        _ => SocketAddr::new(scoped.to_ip_addr(), port),
+                    })
+                    .collect();
                 if grace_until.is_none() {
                     grace_until = Some(Instant::now() + Duration::from_millis(150));
                 }
@@ -189,10 +236,11 @@ pub(crate) fn resolve_mdns(
 static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
 
 fn runtime() -> Result<Arc<tokio::runtime::Runtime>, ClientError> {
-    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(runtime) = &*slot {
+    if let Some(runtime) = &*RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) {
         return Ok(runtime.clone());
     }
+    // Built outside the lock, same as `daemon()`: a runtime build spawns a thread, and an
+    // unrelated caller must not wait on it.
     let built = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("cut-host resolve")
@@ -202,6 +250,10 @@ fn runtime() -> Result<Arc<tokio::runtime::Runtime>, ClientError> {
             ClientError::Transport(format!("name resolution has no runtime to run on ({e})"))
         })?;
     let built = Arc::new(built);
+    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(raced) = &*slot {
+        return Ok(raced.clone());
+    }
     *slot = Some(built.clone());
     Ok(built)
 }
@@ -361,9 +413,14 @@ mod tests {
     /// caller typed rather than what the parser choked on.
     #[test]
     fn an_address_without_a_port_is_refused() {
-        for broken in
-            ["cuthulhu-pi.local", "cuthulhu-pi.local:", "cuthulhu-pi.local:port", ":7878", ".:7878"]
-        {
+        for broken in [
+            "cuthulhu-pi.local",
+            "cuthulhu-pi.local:",
+            "cuthulhu-pi.local:port",
+            ":7878",
+            ".:7878",
+            "cuthulhu..local:7878",
+        ] {
             let err = route(broken).expect_err(broken).to_string();
             assert!(err.contains(broken), "error should name `{broken}`: {err}");
         }
@@ -550,28 +607,38 @@ mod tests {
 
     /// A caller queued behind a same-name query must be released by its OWN deadline, not the
     /// holder's: a plain `lock()` on the gate would hand a 300ms status poll the pairing
-    /// probe's multi-second wait — while the poll holds its host's lock. The first caller
-    /// holds the gate for ~2s against an unanswered name; the second, on a 300ms budget,
-    /// must be out in well under a second.
+    /// probe's multi-second wait — while the poll holds its host's lock. The test itself is
+    /// the holder, gripping the gate directly: deterministic whether or not this machine has
+    /// working multicast, and the lower bound proves the caller actually queued rather than
+    /// sailing through a gate nobody held.
     #[test]
     fn a_queued_caller_is_released_by_its_own_deadline_not_the_holders() {
         let host = format!("cuthulhu-queued-{}.local", std::process::id());
-        std::thread::scope(|s| {
-            let long_holder = {
-                let host = host.clone();
-                s.spawn(move || resolve_mdns(&host, 7878, Instant::now() + Duration::from_secs(2)))
-            };
-            // Let the long caller take the gate first.
-            std::thread::sleep(Duration::from_millis(100));
-            let start = Instant::now();
-            let err = resolve_mdns(&host, 7878, start + Duration::from_millis(300))
-                .expect_err("nobody owns this name");
-            assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "a 300ms budget waited {:?} behind the gate holder: {err}",
-                start.elapsed()
-            );
-            long_holder.join().expect("no panic").expect_err("nobody owns this name");
-        });
+        let gate = LOCAL_QUERIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(format!("{host}."))
+            .or_default()
+            .clone();
+        let held = gate.lock().unwrap();
+
+        let start = Instant::now();
+        let err = resolve_mdns(&host, 7878, start + Duration::from_millis(300))
+            .expect_err("the gate is held; no query can be sent");
+        drop(held);
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "returned in {:?} — it never actually queued",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a 300ms budget waited {:?} behind the gate holder: {err}",
+            start.elapsed()
+        );
+        assert!(
+            err.to_string().contains("earlier attempt"),
+            "queue exhaustion must not read as a network failure: {err}"
+        );
     }
 }

@@ -146,8 +146,7 @@ pub struct PairedHostView {
 
 /// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
 /// reconnect, then body read — not the total. Spent twice in sequence the real cap is **2x this
-/// value** (4s), plus DNS resolution, which std gives no way to bound at all (see the `ponytail:`
-/// note in `cut_host::client`).
+/// value** (4s); the DNS/mDNS resolve is bounded inside the reconnect leg's own deadline.
 ///
 /// Short because this is the window-close guard's own read and a quit mid-cut must not look hung.
 /// It is no longer what keeps the *rest* of the app moving: the poll holds only its own host's
@@ -512,11 +511,11 @@ impl DeviceManagerHandle {
     /// `CONNECT_TIMEOUT` before `f` ever runs.
     ///
     /// The true wait is still not a hard total: `connect_timeout` twice over (reconnect, then
-    /// body), plus whatever a hung resolver costs, since DNS is resolved before
-    /// `connect_within`'s deadline is even computed and std gives no way to bound it (the
-    /// `ponytail:` note in `cut_host::client`). What makes that acceptable rather than the next
-    /// thing to patch is *whose* wait it is: the map lock is released before the connection is
-    /// locked, so all of it is spent by calls aimed at this host and by nothing else.
+    /// body), plus the small overshoots the resolver's bounds allow — a grace beat while a
+    /// second address family lands, the answer channel's margin. What makes that acceptable
+    /// rather than the next thing to patch is *whose* wait it is: the map lock is released
+    /// before the connection is locked, so all of it is spent by calls aimed at this host and
+    /// by nothing else.
     fn with_host_within<T>(
         &self,
         id: &HostId,

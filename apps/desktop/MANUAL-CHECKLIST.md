@@ -78,6 +78,10 @@ real network can confirm the swap end to end.
 - [ ] Wedge the network (drop the Pi's Wi-Fi mid-poll) — the desktop's connect attempt fails
       within ~5s, no `resolve …` threads accumulate in Activity Monitor, and the host is
       reachable again once the network returns.
+- [ ] Dual-stack Pi answering A and AAAA as separate packets — the second family lands within
+      the 150ms grace window and the connect loop gets both families, v4 first.
+- [ ] A v6 link-local answer (`fe80::…`) actually connects — the scope id survives from the
+      mDNS answer to the dial (v6-only or v4-blocked network needed to force the path).
 
 ## CLI plain cut path (architecture review candidate 3)
 

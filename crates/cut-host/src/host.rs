@@ -745,10 +745,16 @@ mod tests {
                 vec![square_pass()],
             ));
         });
-        // Generous: this bounds a hang, not how fast dispatch is.
-        rx.recv_timeout(Duration::from_secs(30))
-            .expect("dispatch waited for the cut")
-            .unwrap();
+        // Generous: this bounds a hang, not how fast dispatch is. The two errors are
+        // different verdicts — Timeout is the blocking this test exists to catch,
+        // Disconnected is the helper dying (a panic inside `dispatch`) before replying.
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(admitted) => admitted.unwrap(),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("dispatch waited for the cut"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the dispatch thread died before replying")
+            }
+        };
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
     }
 

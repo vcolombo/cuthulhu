@@ -119,6 +119,11 @@ are accepted and recorded here so nobody re-files them as regressions:
 - **Unicast-`.local`** (enterprise networks serving `.local` from a DNS server, violating RFC
   6762): stops resolving, because `.local` now goes to multicast only. Consistent with the RFC
   and with where the platform vendors have gone.
+- **macOS scoped resolvers** (VPN split-DNS "supplemental match domains", visible in
+  `scutil --dns` but absent from `/etc/resolv.conf`): hickory reads the resolv.conf view only,
+  so a unicast name reachable solely through a scoped resolver stops resolving. Work around by
+  address, or by the host's `.local` name — mDNS consults no DNS configuration at all.
+  (Surfaced by the whole-change review, recorded here for the same reason as the other two.)
 
 Hosts-file names, router-DNS names (`pi.lan`), and search-domain names keep working through
 hickory's system configuration support.
@@ -132,8 +137,10 @@ hickory's system configuration support.
   test (now exercising hickory's NXDOMAIN instead of `getaddrinfo`'s), and both blackhole
   connect-timeout tests.
 - **The cancellation bound is proven, not assumed**: an internal seam takes a hickory
-  `ResolverConfig`, and a test points it at the conventional black-holed address
-  (`10.255.255.1`) and asserts the call returns within its deadline.
+  `ResolverConfig`, and a test points it at a deaf nameserver — a UDP socket the test binds on
+  loopback and never services, silence no network topology can spoil. (The conventional
+  black-holed `10.255.255.1` turned out to answer fast on real networks, via ICMP, which
+  converts the timeout under test into an ordinary error.)
 - **mDNS no-answer smoke test**: resolving `nonexistent-<nonce>.local` must return by the
   deadline whether the runner's multicast works (query sent, nothing answers) or is blocked
   (daemon errors) — it asserts the bound, which is the property this spec exists to buy.

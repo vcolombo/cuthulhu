@@ -195,7 +195,9 @@ Raspberry Pi OS advertises its hostname over mDNS, so the host is at `<hostname>
 discovery service is involved and none is needed. Address a host as `name.local:port` or
 `ip:port`, spelled out: a bare single-label name (`cuthulhu-pi:7878`) is looked up over unicast
 DNS with the desktop's search domains, not over mDNS, so it only works where the router
-registers DHCP names.
+registers DHCP names. On a VPN whose names come from split-DNS scoped resolvers, use the
+address or the `.local` name — the desktop resolves unicast names from the system's
+resolv.conf view only.
 
 ## Binding to every interface
 

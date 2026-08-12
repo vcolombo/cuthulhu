@@ -31,6 +31,14 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
         || ClientError::Transport(format!("`{addr}` is not a host:port address"));
     let (host, port) = addr.rsplit_once(':').ok_or_else(malformed)?;
     let port: u16 = port.parse().map_err(|_| malformed())?;
+    // A host with a colon in it is an unbracketed IPv6 literal, not a name — DNS has no
+    // colons. Refusing with the spelling the parser wanted beats handing `fe80::1` to a
+    // resolver and reporting a lookup failure for a formatting mistake.
+    if host.contains(':') {
+        return Err(ClientError::Transport(format!(
+            "`{addr}` looks like an IPv6 address and port; write it as `[{host}]:{port}`"
+        )));
+    }
     // Trailing dots are the explicit DNS root, not part of the name; mdns-sd and hickory each
     // want their own spelling, so the route carries the bare lower-cased form. All of them go,
     // not one — `name.local..` stripped once still ends in a dot, which would smuggle a `.local`
@@ -102,9 +110,11 @@ fn daemon() -> Result<ServiceDaemon, ClientError> {
 /// paired hosts and pairing-dialog typos; prune on last-caller-out if that ever matters.
 static LOCAL_QUERIES: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
 
-/// `host`'s addresses over mDNS, or a failure once `deadline` passes. Never blocks past the
-/// deadline: the query is unsubscribed on every exit, so a wedged network costs the wait and
-/// nothing else — no thread, no slot, no ceiling.
+/// `host`'s addresses over mDNS, or a failure once `deadline` passes — give or take the
+/// overshoots named on `resolve_by_deadline`, of which this path owns one: the process's
+/// first `.local` lookup constructs the shared daemon (interface enumeration, socket binds),
+/// paid once and not deadline-bounded. Past that, the query is unsubscribed on every exit,
+/// so a wedged network costs the wait and nothing else — no thread, no slot, no ceiling.
 pub(crate) fn resolve_mdns(
     host: &str,
     port: u16,
@@ -144,8 +154,10 @@ pub(crate) fn resolve_mdns(
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
+        // The budget went to waiting a turn, not to the network — same words as the gate
+        // loop's refusal, because it is the same situation one instruction later.
         return Err(ClientError::Transport(format!(
-            "`{host}` was not answered over mDNS in time"
+            "`{host}` was still being resolved by an earlier attempt when time ran out"
         )));
     }
     let daemon = daemon()?;
@@ -313,6 +325,11 @@ fn lookup(
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, ClientError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
+    // A spent budget returns before anything is spawned: the channel margin below exists to
+    // absorb runtime scheduling, not to grant an already-expired caller a fresh quarter second.
+    if remaining.is_zero() {
+        return Err(ClientError::Transport(format!("`{host}` could not be resolved in time")));
+    }
     // Spawned onto this module's own runtime and answered over a channel — never `block_on`:
     // the desktop dials from inside Tauri's tokio workers, and blocking a worker thread on a
     // runtime panics by design. The future carries its own timeout, so a caller that stops
@@ -336,7 +353,10 @@ fn lookup(
 
 /// `addr`'s socket addresses by whichever resolver its shape calls for, ordered for the
 /// connect loop, or a failure once `deadline` passes. The one entry point `client.rs` dials
-/// through; the contract — never block past the deadline — is what #126 bought.
+/// through; the contract #126 bought is "returns within a whisker of `deadline`" — no lookup
+/// is ever parked on a thread that cannot be told to stop. The whisker is named, not implied:
+/// a 250ms answer-channel margin on unicast lookups, and — once per process — the first
+/// `.local` lookup's daemon construction. Callers needing a hard bound budget for those.
 pub(crate) fn resolve_by_deadline(
     addr: &str,
     deadline: Instant,
@@ -420,6 +440,7 @@ mod tests {
             ":7878",
             ".:7878",
             "cuthulhu..local:7878",
+            "fe80::1:7878",
         ] {
             let err = route(broken).expect_err(broken).to_string();
             assert!(err.contains(broken), "error should name `{broken}`: {err}");

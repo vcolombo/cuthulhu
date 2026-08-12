@@ -51,6 +51,65 @@ use hickory_resolver::config::ResolverConfig;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
 
+use mdns_sd::{HostnameResolutionEvent, ServiceDaemon};
+
+/// One daemon for the process, like the runtime above: it owns the multicast sockets and
+/// watches interface changes itself, and a query against it is a subscription that can be
+/// stopped — which is the entire upgrade over handing `.local` to the OS resolver.
+static DAEMON: OnceLock<Result<ServiceDaemon, String>> = OnceLock::new();
+
+fn daemon() -> Result<&'static ServiceDaemon, ClientError> {
+    DAEMON
+        .get_or_init(|| ServiceDaemon::new().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| {
+            ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
+        })
+}
+
+/// `host`'s addresses over mDNS, or a failure once `deadline` passes. Never blocks past the
+/// deadline: the query is unsubscribed on every exit, so a wedged network costs the wait and
+/// nothing else — no thread, no slot, no ceiling.
+pub(crate) fn resolve_mdns(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    let daemon = daemon()?;
+    // mdns-sd wants the fully-qualified spelling; `route` stripped the trailing dot off.
+    let fqdn = format!("{host}.");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let events = daemon
+        .resolve_hostname(&fqdn, Some(remaining.as_millis().try_into().unwrap_or(u64::MAX)))
+        .map_err(|e| ClientError::Transport(format!("could not query `{host}` over mDNS ({e})")))?;
+
+    let mut found: Vec<SocketAddr> = Vec::new();
+    // First answer wins. mDNS responders send their full address set in one shot, and the
+    // dialler beyond this wants addresses to try, not a census — waiting out the deadline to
+    // collect stragglers would spend the connect budget on completeness nobody asked for.
+    while found.is_empty() {
+        match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(HostnameResolutionEvent::AddressesFound(_, addrs)) => {
+                found.extend(addrs.iter().map(|scoped| SocketAddr::new(scoped.to_ip_addr(), port)));
+            }
+            Ok(HostnameResolutionEvent::SearchTimeout(_)) => break,
+            // SearchStarted, AddressesRemoved, SearchStopped, and whatever the non_exhaustive
+            // enum grows later: none of them is an answer, keep waiting for one.
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    // Unsubscribe on every path — the receiver going quiet must not leave a live query
+    // accumulating answers nobody will read.
+    let _ = daemon.stop_resolve_hostname(&fqdn);
+
+    if found.is_empty() {
+        Err(ClientError::Transport(format!("`{host}` was not answered over mDNS in time")))
+    } else {
+        Ok(found)
+    }
+}
+
 /// One worker thread for every lookup this process will ever make, alive for the process —
 /// where the old machinery held up to 128 parked threads. Multi-thread flavour on purpose:
 /// `block_on` against a `current_thread` runtime serializes callers, and a second host must
@@ -240,5 +299,51 @@ mod tests {
             start.elapsed()
         );
         assert!(err.to_string().contains("in time"), "should read as a timeout: {err}");
+    }
+
+    /// The bound is the property, not the answer: a name nobody on the network owns must
+    /// come back by the deadline whether this runner's multicast works (query sent, nothing
+    /// answers) or is blocked entirely (the daemon errors). Both are bounded outcomes; the
+    /// unbounded one this test exists to forbid is waiting on an OS resolver.
+    #[test]
+    fn an_unanswered_local_name_costs_only_the_deadline() {
+        // A name with this process's id in it, so no cached answer from a parallel test run
+        // or a previous one can satisfy it.
+        let host = format!("cuthulhu-nobody-{}.local", std::process::id());
+        let start = Instant::now();
+        let err = resolve_mdns(&host, 7878, start + Duration::from_secs(2))
+            .expect_err("nobody on the network owns this name");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "gave up after {:?}, not by the deadline: {err}",
+            start.elapsed()
+        );
+    }
+
+    /// The positive path needs multicast to actually loop back, which CI runners routinely
+    /// refuse — so this is `#[ignore]`d and run by hand, and the real-hardware version lives
+    /// in `apps/desktop/MANUAL-CHECKLIST.md`. Register a hostname on the shared daemon, then
+    /// resolve it: mdns-sd answers its own queries over the wire, not via a shortcut.
+    #[test]
+    #[ignore = "needs working multicast loopback; run by hand: cargo test -p cut-host -- --ignored"]
+    fn a_registered_local_name_resolves_over_multicast() {
+        let daemon = daemon().expect("multicast daemon");
+        let service = mdns_sd::ServiceInfo::new(
+            "_cuthulhu-test._udp.local.",
+            "resolver-plan-test",
+            "cuthulhu-plan-test.local.",
+            "127.0.0.1",
+            7878,
+            &[("spec", "2026-08-11")][..],
+        )
+        .expect("service info");
+        daemon.register(service).expect("register");
+
+        let addrs = resolve_mdns("cuthulhu-plan-test.local", 7878, Instant::now() + Duration::from_secs(5))
+            .expect("a name this very daemon announces must resolve");
+        assert!(
+            addrs.iter().any(|a| a.ip().is_loopback()),
+            "expected the registered loopback address: {addrs:?}"
+        );
     }
 }

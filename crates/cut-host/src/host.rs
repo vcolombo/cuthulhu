@@ -723,16 +723,32 @@ mod tests {
         assert!(matches!(refusal, Refusal::Device(driver_core::manager::DeviceError::Busy)));
     }
 
-    /// `dispatch` must return without waiting for the cut. Asserted by time: the
-    /// test Driver parks at `AwaitingConfirmation` and stays there until something
-    /// confirms, so a `dispatch` that waited for `DeviceManager::cut` would block
-    /// here forever.
+    /// `dispatch` must return without waiting for the cut. The test Driver parks at
+    /// `AwaitingConfirmation` and stays there until something confirms, so a
+    /// `dispatch` that waited for `DeviceManager::cut` would sit that wait out in
+    /// full — any reply arriving at all is a reply that beat the cut. Proven over a
+    /// channel rather than a wall-time bound, which also measures the scheduler: a
+    /// runner that deschedules the test thread fails the clock with no code change
+    /// (#132, same class as #129).
     #[test]
     fn a_dispatch_returns_before_the_cut_finishes() {
         let host = Host::start(Arc::new(TwoCutterFactory));
-        let started = std::time::Instant::now();
-        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_secs(1), "dispatch waited for the cut");
+        let (tx, rx) = mpsc::channel();
+        let dispatching = host.clone();
+        // `let _`: if this test panics on the timeout below, `rx` is gone and this
+        // send fails on a thread nobody joins — that must not panic over the real one.
+        thread::spawn(move || {
+            let _ = tx.send(dispatching.dispatch(
+                DispatchId("d-1".into()),
+                CAMEO,
+                "cameo5",
+                vec![square_pass()],
+            ));
+        });
+        // Generous: this bounds a hang, not how fast dispatch is.
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("dispatch waited for the cut")
+            .unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
     }
 

@@ -79,7 +79,7 @@ fn a_job_outlives_the_client_that_started_it() {
         client
             .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
             .unwrap();
-        await_phase(&client, CAMEO, Phase::AwaitingConfirmation);
+        await_job(&client, CAMEO);
     } // the laptop closes
 
     let reattached = HostClient::connect(&host.addr, TOKEN, &host.fingerprint).unwrap();
@@ -164,6 +164,22 @@ fn await_phase(client: &HostClient, device: &str, want: Phase) -> driver_core::C
             return snap.status;
         }
         assert!(Instant::now() < deadline, "{device} never reached {want:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The socket-side of `host::testing::wait_for_job`: the pause phase is published before the
+/// dispatch thread records the Job's id, so a snapshot taken at first sight of the phase can
+/// honestly answer `job_id: None` (#129). Waited out here so later snapshots name the Job.
+fn await_job(client: &HostClient, device: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snaps = client.snapshots().unwrap();
+        let snap = snaps.into_iter().find(|s| s.info.instance_id == device).unwrap();
+        if let Some(job_id) = snap.job_id {
+            return job_id;
+        }
+        assert!(Instant::now() < deadline, "{device}'s dispatch never landed a Job");
         std::thread::sleep(Duration::from_millis(20));
     }
 }

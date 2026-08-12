@@ -178,43 +178,40 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 static RESOLVING: Mutex<std::collections::BTreeSet<String>> =
     Mutex::new(std::collections::BTreeSet::new());
 
-/// Resolves whose caller gave up and whose thread has not come back — the leak this file is
-/// honest about, counted so it can be bounded.
+/// Resolver threads alive right now, whether or not anyone is still waiting on one.
 ///
-/// *Abandoned*, not in-flight. Counting resolves in progress made a healthy host pay for wedged
-/// ones: eight stalled lookups held every slot, and the next name — reachable, resolvable, nothing
-/// wrong with it — was refused before it began. A resolve someone is still waiting on is costing a
-/// thread that is about to be reclaimed either way, so it is not what needs a ceiling.
-static ABANDONED_RESOLVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// How many abandoned resolver threads this process tolerates before refusing to start another.
+/// The thing being bounded is threads, so threads are what this counts. Two narrower policies were
+/// tried and both were wrong in their own direction: counting only *stalled* lookups cannot be
+/// enforced exactly, because whether a resolve will be abandoned is not known when it is admitted,
+/// so a burst of simultaneous timeouts sails past the limit together; counting in-flight ones with
+/// a small limit refused a perfectly healthy name because other names were stuck.
 ///
-/// Reaching this takes that many *distinct* names each wedging their own OS resolver, since a
-/// repeat of one name is already refused by `RESOLVING` — so a desktop with a handful of paired
-/// hosts, polling every second, cannot approach it. It is the backstop for a resolver that has
-/// stopped answering entirely, at which point refusing is the honest answer and it self-clears as
-/// the threads return.
-const MAX_ABANDONED_RESOLVES: usize = 64;
+/// One counter, reserved before the thread is spawned and released when it returns, is both exact
+/// and generous — see `MAX_RESOLVER_THREADS`.
+static RESOLVER_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether the waiter or the resolver got there first, so exactly one of them accounts for the
-/// thread. Racing them without this drifts the count upwards — a resolve that finished the instant
-/// its caller gave up would be counted abandoned forever, and enough of those would refuse every
-/// name for the life of the process.
-fn settle_resolve(settled: &std::sync::atomic::AtomicBool, by_the_waiter: bool) {
+/// The ceiling on resolver threads this process will hold at once.
+///
+/// High on purpose. It is a backstop against unbounded growth, not a queue depth: a resolve is
+/// only started for a name that no other resolve is already out for (`RESOLVING`), so reaching
+/// this needs 128 *distinct* names being resolved simultaneously — which a desktop dialling a
+/// handful of Cut Hosts cannot produce, and which a wedged resolver cannot inflate either, since
+/// the repeat attempts a stuck host generates are refused before they get here. Refusing at that
+/// point is the honest answer, and it clears as the threads return.
+const MAX_RESOLVER_THREADS: usize = 128;
+
+/// Take a slot from `counter`, or report that there is none.
+///
+/// One atomic step, because checking and then taking is what let simultaneous callers all see room
+/// and all take it: with the limit one away, a burst of distinct names passed the check together
+/// and left more threads out than the limit allows.
+///
+/// Takes the counter rather than reading the static one, so the rule can be tested on a counter of
+/// the test's own — these tests run in parallel and share the real one, and a test that asserts on
+/// a shared count is asserting on whatever else happened to be running.
+fn claim_slot(counter: &std::sync::atomic::AtomicUsize, max: usize) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
-    let already = settled.swap(true, SeqCst);
-    match (by_the_waiter, already) {
-        // The waiter gave up first: from here the thread is out on its own.
-        (true, false) => {
-            ABANDONED_RESOLVES.fetch_add(1, SeqCst);
-        }
-        // The resolver came back to a caller that had already left.
-        (false, true) => {
-            ABANDONED_RESOLVES.fetch_sub(1, SeqCst);
-        }
-        // The resolver answered in time, or the waiter is tidying up after it. Nothing was leaked.
-        _ => {}
-    }
+    counter.fetch_update(SeqCst, SeqCst, |out| (out < max).then_some(out + 1)).is_ok()
 }
 
 /// ponytail: on a genuine timeout the thread stays blocked in the resolver and leaks, exactly as
@@ -233,7 +230,7 @@ fn settle_resolve(settled: &std::sync::atomic::AtomicBool, by_the_waiter: bool) 
 /// `MAX_ABANDONED_RESOLVES` bounds the total. It counts only the threads nobody is waiting on any
 /// more: a healthy name must not be refused because other names are stalled.
 fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::Ordering::SeqCst;
 
     // An address that is already an address needs no resolver, no thread and no ceiling.
     // `to_socket_addrs` would answer this from the string itself too, but only after being handed
@@ -244,12 +241,6 @@ fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::So
         return Ok(vec![literal]);
     }
 
-    if ABANDONED_RESOLVES.load(SeqCst) >= MAX_ABANDONED_RESOLVES {
-        return Err(ClientError::Transport(
-            "too many host names are stuck being resolved; this machine's resolver is not answering"
-                .into(),
-        ));
-    }
     {
         let mut in_flight = RESOLVING.lock().unwrap_or_else(|e| e.into_inner());
         if in_flight.contains(addr) {
@@ -259,34 +250,39 @@ fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::So
         }
         in_flight.insert(addr.to_string());
     }
+    // Taken before the thread exists, so the count can never describe fewer threads than are out.
+    if !claim_slot(&RESOLVER_THREADS, MAX_RESOLVER_THREADS) {
+        RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+        return Err(ClientError::Transport(
+            "too many host names are stuck being resolved; this machine's resolver is not answering"
+                .into(),
+        ));
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = addr.to_string();
-    let settled = Arc::new(AtomicBool::new(false));
-    let settled_by_thread = settled.clone();
     // `Builder`, not `thread::spawn`: spawn panics when a thread cannot be created, and a client
     // that cannot resolve a name has to report that, not take the desktop down with it.
     let spawned = std::thread::Builder::new().name(format!("resolve {addr}")).spawn(move || {
         let resolved = owned.to_socket_addrs().map(|a| a.collect::<Vec<_>>());
         // Released here rather than by the waiter, which may have given up long ago — until the
         // resolver returns there is still a thread out for this address, and that is precisely
-        // what a second attempt must not add to.
+        // what a second attempt, and the ceiling, must keep counting.
         RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(&owned);
-        settle_resolve(&settled_by_thread, false);
+        RESOLVER_THREADS.fetch_sub(1, SeqCst);
         let _ = tx.send(resolved);
     });
     if let Err(e) = spawned {
         RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+        RESOLVER_THREADS.fetch_sub(1, SeqCst);
         return Err(ClientError::Transport(format!("could not resolve `{addr}`: {e}")));
     }
 
     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(ClientError::Transport(e.to_string())),
-        Err(_) => {
-            settle_resolve(&settled, true);
-            Err(ClientError::Transport(format!("`{addr}` could not be resolved in time")))
-        }
+        // The thread keeps its slot from here: it is still out, and the count is about threads.
+        Err(_) => Err(ClientError::Transport(format!("`{addr}` could not be resolved in time"))),
     }
 }
 
@@ -658,52 +654,54 @@ mod tests {
     /// corner of one.
     #[test]
     fn an_address_that_is_already_an_address_is_not_resolved_at_all() {
-        use std::sync::atomic::Ordering::SeqCst;
+        // A deadline already in the past, which every path through the resolver would fail on:
+        // answering anyway is only possible without one. That is the assertion, and it needs no
+        // global state — an earlier version of this test pinned the shared ceiling to prove the
+        // same thing and starved every test running beside it of a slot.
+        let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now())
+            .expect("a literal address must not depend on the resolver at all");
+        assert_eq!(resolved, vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]);
 
-        // The ceiling held against it, which would refuse any name. Added and subtracted rather
-        // than saved and restored: these tests run in parallel and share this counter, so writing
-        // an old value back would discard whatever another test did meanwhile.
-        ABANDONED_RESOLVES.fetch_add(MAX_ABANDONED_RESOLVES, SeqCst);
-        let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now());
-        let claimed = RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).contains("192.168.1.50:7878");
-        ABANDONED_RESOLVES.fetch_sub(MAX_ABANDONED_RESOLVES, SeqCst);
-
-        assert_eq!(
-            resolved.expect("a literal address must not be refused by the resolver's ceiling"),
-            vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]
+        // And it takes nothing that another attempt would then be refused for. This address
+        // specifically, not the whole set, which other tests legitimately hold entries in.
+        assert!(
+            !RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).contains("192.168.1.50:7878"),
+            "a literal address must not occupy the resolver's dedup either"
         );
-        // This address specifically, not the whole set: another test resolving a real name holds
-        // an entry of its own for as long as its resolver takes, and asserting the set was empty
-        // made this pass or fail on which test happened to be running alongside it.
-        assert!(!claimed, "a literal address must not occupy the resolver's dedup either");
     }
 
-    /// The accounting the ceiling rests on. Both orders end at zero, and the one that must: a
-    /// resolver answering at the instant its caller gives up is counted abandoned by neither side
-    /// twice nor by both — drift upwards there would eventually refuse every name for the life of
-    /// the process, which is the failure a ceiling is supposed to prevent, not cause.
+    /// A slot is taken in one step, so simultaneous callers cannot all find the last one free.
+    /// Checking and then taking let a burst of distinct names pass the check together and leave
+    /// more threads out than the limit allows — a ceiling that a rush walks straight through is
+    /// not a ceiling.
     #[test]
-    fn a_resolve_is_accounted_for_once_whichever_side_finishes_first() {
-        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-        let before = ABANDONED_RESOLVES.load(SeqCst);
+    fn resolver_slots_cannot_be_taken_twice_by_callers_that_looked_at_once() {
+        use std::sync::atomic::AtomicUsize;
 
-        // The resolver answered in time: nothing was ever abandoned.
-        let in_time = AtomicBool::new(false);
-        settle_resolve(&in_time, false);
-        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before);
+        // A counter of this test's own, one slot short of its limit, and far more callers than
+        // that reaching for it together.
+        let counter = AtomicUsize::new(7);
+        let taken: usize = std::thread::scope(|s| {
+            let racers: Vec<_> =
+                (0..16).map(|_| s.spawn(|| usize::from(claim_slot(&counter, 8)))).collect();
+            racers.into_iter().map(|r| r.join().unwrap()).sum()
+        });
 
-        // The waiter gave up, and the thread came back later.
-        let gave_up = AtomicBool::new(false);
-        settle_resolve(&gave_up, true);
-        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before + 1, "a leaked thread is counted");
-        settle_resolve(&gave_up, false);
-        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before, "and uncounted when it returns");
+        assert_eq!(taken, 1, "{taken} callers were all handed the last slot");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 8, "the limit was passed");
+    }
 
-        // The race: the thread finished first, and the waiter timed out anyway.
-        let photo_finish = AtomicBool::new(false);
-        settle_resolve(&photo_finish, false);
-        settle_resolve(&photo_finish, true);
-        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before, "a thread already home is not a leak");
+    /// A slot comes back when the resolve returns, so a working machine cannot exhaust the
+    /// ceiling by using it. Asserted by using it far more times than the ceiling allows rather
+    /// than by reading the shared count, which every other test in this file also moves.
+    ///
+    /// `localhost` resolves from the hosts file, so none of these waits on a network.
+    #[test]
+    fn resolves_that_answer_give_their_slots_back() {
+        for attempt in 0..MAX_RESOLVER_THREADS + 20 {
+            resolve_by_deadline("localhost:7878", Instant::now() + Duration::from_secs(5))
+                .unwrap_or_else(|e| panic!("attempt {attempt} was refused a slot: {e}"));
+        }
     }
 
     /// A name that cannot be resolved must fail, and must leave nothing behind that stops the next

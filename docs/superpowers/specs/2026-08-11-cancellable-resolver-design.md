@@ -124,9 +124,14 @@ are accepted and recorded here so nobody re-files them as regressions:
   so a unicast name reachable solely through a scoped resolver stops resolving. Work around by
   address, or by the host's `.local` name — mDNS consults no DNS configuration at all.
   (Surfaced by the whole-change review, recorded here for the same reason as the other two.)
+- **Hosts-file pins of `.local` names**: `route` sends every `.local` name to multicast, so an
+  `/etc/hosts` entry for one — the classic operator workaround on exactly the flaky-mDNS
+  networks this change is about — is no longer consulted. `getaddrinfo` read the hosts file
+  first; the cancellable stack never hands a `.local` name to anything that reads it. Pin by
+  pairing with the IP instead, which skips every resolver.
 
-Hosts-file names, router-DNS names (`pi.lan`), and search-domain names keep working through
-hickory's system configuration support.
+Hosts-file names other than `.local` ones, router-DNS names (`pi.lan`), and search-domain
+names keep working through hickory's system configuration support.
 
 ## Testing
 

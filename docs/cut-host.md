@@ -197,7 +197,8 @@ discovery service is involved and none is needed. Address a host as `name.local:
 DNS with the desktop's search domains, not over mDNS, so it only works where the router
 registers DHCP names. On a VPN whose names come from split-DNS scoped resolvers, use the
 address or the `.local` name — the desktop resolves unicast names from the system's
-resolv.conf view only.
+resolv.conf view only. A `.local` name pinned in the hosts file is not consulted either —
+`.local` goes to multicast alone, so pin by pairing with the IP instead.
 
 ## Binding to every interface
 

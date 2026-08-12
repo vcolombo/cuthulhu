@@ -47,9 +47,13 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
+// Only the test seam takes a caller-supplied configuration; real callers reach hickory
+// through the system configuration in `resolve_dns`, so these ride the same cfg as the seam.
+#[cfg(test)]
+use hickory_resolver::config::ResolverConfig;
+#[cfg(test)]
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use mdns_sd::{HostnameResolutionEvent, ServiceDaemon};
 
@@ -162,7 +166,9 @@ pub(crate) fn resolve_dns(
 
 /// Same lookup against a caller-supplied configuration. The seam exists so a test can point
 /// resolution at a nameserver of its own choosing — a black hole — and hold the deadline to
-/// its promise; nothing outside tests should reach for it.
+/// its promise; the cfg makes "nothing outside tests reaches for it" the compiler's promise
+/// rather than this comment's.
+#[cfg(test)]
 fn resolve_dns_with(
     config: ResolverConfig,
     host: &str,
@@ -196,6 +202,27 @@ fn lookup(
             Err(ClientError::Transport(format!("`{host}` could not be resolved in time")))
         }
     }
+}
+
+/// `addr`'s socket addresses by whichever resolver its shape calls for, ordered for the
+/// connect loop, or a failure once `deadline` passes. The one entry point `client.rs` dials
+/// through; the contract — never block past the deadline — is what #126 bought.
+pub(crate) fn resolve_by_deadline(
+    addr: &str,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    match route(addr)? {
+        Route::Literal(literal) => Ok(vec![literal]),
+        Route::Mdns { host, port } => Ok(order_for_connect(resolve_mdns(&host, port, deadline)?)),
+        Route::Dns { host, port } => Ok(order_for_connect(resolve_dns(&host, port, deadline)?)),
+    }
+}
+
+/// v4 before v6 — see the ordering test for why. Stable, so a responder's own order
+/// survives within each family.
+fn order_for_connect(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.sort_by_key(|a| a.is_ipv6());
+    addrs
 }
 
 #[cfg(test)]
@@ -347,5 +374,40 @@ mod tests {
             addrs.iter().any(|a| a.ip().is_loopback()),
             "expected the registered loopback address: {addrs:?}"
         );
+    }
+
+    /// mDNS commonly answers with an IPv6 link-local first, and on a network where IPv6 is
+    /// dead that is the one address that cannot work. Ordering v4 first removes that failure
+    /// mode; the old code only budgeted around it. Stable sort, so within a family the
+    /// responder's order survives.
+    #[test]
+    fn addresses_are_ordered_v4_before_v6_for_the_connect_loop() {
+        let mixed: Vec<SocketAddr> = vec![
+            "[fe80::1]:7878".parse().unwrap(),
+            "192.168.1.50:7878".parse().unwrap(),
+            "[fe80::2]:7878".parse().unwrap(),
+            "192.168.1.51:7878".parse().unwrap(),
+        ];
+        let ordered = order_for_connect(mixed);
+        assert_eq!(
+            ordered,
+            vec![
+                "192.168.1.50:7878".parse::<SocketAddr>().unwrap(),
+                "192.168.1.51:7878".parse().unwrap(),
+                "[fe80::1]:7878".parse().unwrap(),
+                "[fe80::2]:7878".parse().unwrap(),
+            ]
+        );
+    }
+
+    /// The literal fast path, end to end through the public entry point: a deadline already
+    /// in the past, which every resolving route would fail on — answering anyway is only
+    /// possible by not resolving. (Moved from `client.rs`, minus its assertion about the
+    /// `RESOLVING` dedup set, which no longer exists to assert on.)
+    #[test]
+    fn an_address_that_is_already_an_address_is_not_resolved_at_all() {
+        let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now())
+            .expect("a literal address must not depend on any resolver");
+        assert_eq!(resolved, vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]);
     }
 }

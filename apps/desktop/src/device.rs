@@ -186,17 +186,23 @@ pub struct DeviceManagerHandle {
     /// the request goes out and cleared by any answer, so a Job still listed here is one whose
     /// fate is genuinely unknown, and the next dispatch of it reuses the same id.
     ///
-    /// An entry outlives the press of Cut that made it, and deliberately: it is cleared by an
-    /// *answer*, never by the clock. Ageing it out was the wrong fix for a dispatch nobody
-    /// revisits — time cannot show that the operator loaded fresh material, so a retry arriving
-    /// after the entry expired mints a new id and the host, which still remembers the old one,
-    /// cuts the same design a second time. What makes an abandoned entry harmless instead is that
-    /// the next Cut is *told* it was read as a retry (`CutStarted::duplicate`) and that the
-    /// answer clears the entry, so pressing Cut again really does cut (#121).
+    /// An entry is cleared by an *answer*, and otherwise only once the host itself can no longer
+    /// recognise the id. An earlier version aged them out after fifteen minutes, which was the
+    /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
+    /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
+    /// still remembers under the old one and cuts the design twice. What makes an entry nobody
+    /// revisits harmless is that the next Cut is *told* it was read as a retry
+    /// (`CutStarted::duplicate`), and that the answer clears the entry, so pressing Cut again
+    /// really does cut (#121).
+    ///
+    /// The one honest expiry is the host's own `ID_RETENTION`: past it the id means nothing to
+    /// anyone, so holding it only pretends to a protection that has already lapsed. Nothing on
+    /// either side can prevent a re-cut past that point — which is the true limit of deduplicating
+    /// by memory, not something a client-side rule can close.
     ///
     /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
     /// while holding it.
-    in_doubt: Mutex<HashMap<JobKey, cut_host::protocol::DispatchId>>,
+    in_doubt: Mutex<HashMap<JobKey, (cut_host::protocol::DispatchId, std::time::Instant)>>,
     /// The last status each remote cutter actually reported, so something can be said about one
     /// without dialling it.
     last_remote_status: Mutex<HashMap<(HostId, String), CutStatus>>,
@@ -216,6 +222,13 @@ pub struct DeviceManagerHandle {
     dispatch_epoch: std::sync::atomic::AtomicU64,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
+
+/// How many Jobs may be held in doubt at once.
+///
+/// A backstop against a session that dispatches thousands of distinct designs to hosts that never
+/// answer, not a policy anyone should reach: entries clear on any answer, and expire with the
+/// host's own memory. The oldest is evicted, which is the one a retry is least likely to name.
+const MAX_JOBS_IN_DOUBT: usize = 256;
 
 /// One dispatchable Job as this desktop identifies it: which cutter, on which host, carrying
 /// what. Two presses of Cut that agree on all three are the same Job — which is what makes the
@@ -924,11 +937,18 @@ impl DeviceManagerHandle {
                 // each: if the first reached the host and lost its reply, the second's entry
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
-                let (dispatch_id, reserved_here) = self.reserve_dispatch_id(&key);
+                // `first_attempt` is information, not ownership: it says whether an *earlier*
+                // dispatch of this Job is still unanswered, which changes what a failure here
+                // means. It is deliberately not used to decide whether to undo the reservation.
+                let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
                 // whose reply is lost is exactly the case the window-close guard must still warn
                 // about, and by then there is nothing to write it from.
                 self.remote_dispatched.lock().unwrap().insert((id.clone(), device.clone()));
+                // Bumped either side of the call, not just before it. A poll that begins after the
+                // mark but before the host has the Job sees a cutter that would still take one,
+                // and clearing on that reading throws away the mark the dispatch just made. Only a
+                // poll that ran entirely after the dispatch finished sees an unchanged count.
                 self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let reached_the_host = std::sync::atomic::AtomicBool::new(false);
@@ -948,15 +968,18 @@ impl DeviceManagerHandle {
                     }
                     sent
                 });
+                self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 if !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) {
-                    // No connection was ever made, so nothing is in doubt and nothing was started.
-                    // Only the reservation this call made is dropped: an earlier unanswered
-                    // dispatch's entry is what a later retry still needs.
-                    if reserved_here {
-                        self.in_doubt.lock().unwrap().remove(&key);
-                    }
+                    // Nothing was started, so nothing holds the window.
                     self.remote_dispatched.lock().unwrap().remove(&(id.clone(), device.clone()));
+                    // The reservation stays. Removing it needed this call to know it owned the
+                    // entry, and it cannot: a concurrent press of Cut on the same Job is *using*
+                    // that id, so undoing "its own" reservation could delete the record the other
+                    // one still needs and let a later retry go out under a name the host has never
+                    // seen. Leaving it costs nothing — a dispatch that never reached a host is one
+                    // the host cannot have seen either, so the next Cut reusing this id is cut
+                    // normally rather than deduplicated away.
                 }
 
                 match sent {
@@ -972,10 +995,16 @@ impl DeviceManagerHandle {
                         job_id: 0,
                         duplicate: admitted == cut_host::protocol::Admitted::AlreadyAccepted,
                     }),
-                    // Never reached the host at all (no connection), so nothing can be in doubt —
-                    // the reservation above has already been dropped and this stays the plain
-                    // error it is.
-                    Err(e) if !self.in_doubt.lock().unwrap().contains_key(&key) => Err(e),
+                    // Never reached the host, and nothing of this Job was outstanding before it:
+                    // there is nothing in doubt, so this stays the plain error it is. Both halves
+                    // matter — a first press against an offline Pi must not claim the Job may be
+                    // cutting, and a press made while an earlier dispatch is unanswered must.
+                    Err(e)
+                        if first_attempt
+                            && !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        Err(e)
+                    }
                     Err(e) => Err(IpcError::new(
                         "dispatch_unconfirmed",
                         format!(
@@ -1003,16 +1032,46 @@ impl DeviceManagerHandle {
     /// process while the host remembers ids for an hour — a second session would mint ids the host
     /// already knows and have its cuts silently deduplicated away.
     fn reserve_dispatch_id(&self, key: &JobKey) -> (cut_host::protocol::DispatchId, bool) {
+        let now = std::time::Instant::now();
         let mut in_doubt = self.in_doubt.lock().unwrap();
-        if let Some(id) = in_doubt.get(key) {
+
+        // Entries the host can no longer recognise are not retries any more, whatever they once
+        // were: past `ID_RETENTION` it has forgotten the id, so reusing it protects nothing and
+        // only hides that fact. This is *not* the fifteen-minute expiry that was removed — that
+        // one discarded protection while it still existed. Aligned to the host's own constant so
+        // the two sides cannot drift apart about when the window closes.
+        in_doubt.retain(|_, (_, written)| {
+            now.saturating_duration_since(*written) < cut_host::host::ID_RETENTION
+        });
+        // Looked up before anything is evicted, so the cap can never discard the very entry this
+        // call is here to reuse.
+        if let Some((id, _)) = in_doubt.get(key) {
             return (id.clone(), false);
+        }
+
+        // A backstop, not a policy: entries are per Job, so a long session cutting many different
+        // designs is what grows this, and the oldest is the one a retry is least likely to name.
+        // Room is made *before* the insert, so the map settles at the cap rather than one past it.
+        while in_doubt.len() >= MAX_JOBS_IN_DOUBT {
+            let Some(oldest) =
+                in_doubt.iter().min_by_key(|(_, (_, written))| *written).map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            in_doubt.remove(&oldest);
         }
         // The counter is what makes two attempts in the same clock tick distinct; the clock is
         // what keeps this run's ids clear of the previous run's. Neither alone is enough.
         static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // The cutter's id is truncated because it is the one part with no length of its own: a
+        // serial port enumerated by path can be most of a `/dev/serial/by-id/...` string, and the
+        // host refuses an id longer than it will remember — which would have refused *every*
+        // dispatch to that cutter. The digest already identifies the Job exactly; the text is for
+        // whoever is reading a log.
+        let device: String = key.device.chars().take(32).collect();
         let id = cut_host::protocol::DispatchId(format!(
             "{}-{:016x}-{}-{}",
-            key.device,
+            device,
             key.digest,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1020,7 +1079,7 @@ impl DeviceManagerHandle {
                 .unwrap_or(0),
             ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        in_doubt.insert(key.clone(), id.clone());
+        in_doubt.insert(key.clone(), (id.clone(), now));
         (id, true)
     }
 
@@ -2289,6 +2348,73 @@ mod tests {
         assert_ne!(dev.reserve_dispatch_id(&key).0, first, "a re-cut must not be swallowed");
     }
 
+    /// A cutter enumerated by path can be most of a `/dev/serial/by-id/...` string, and the host
+    /// refuses a dispatch id longer than it will remember — which would have refused *every*
+    /// dispatch to that cutter, permanently, for a reason nothing in the message points at.
+    #[test]
+    fn a_dispatch_id_fits_what_a_host_will_accept_even_for_a_long_cutter_id() {
+        let dev = test_device_setup();
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: "serial:at:/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A50285BI-if00-port0".into(),
+            digest: job_digest("puma", &a_square(10.0)),
+        };
+        let (id, _) = dev.reserve_dispatch_id(&key);
+        assert!(
+            id.0.len() <= 128,
+            "the host refuses ids over 128 characters; this one is {}: {}",
+            id.0.len(),
+            id.0
+        );
+        // Still distinguishing two Jobs on that cutter — the truncation drops the part the digest
+        // already covers, not the part that tells Jobs apart.
+        let other = JobKey { digest: job_digest("puma", &a_square(20.0)), ..key.clone() };
+        assert_ne!(dev.reserve_dispatch_id(&other).0, id);
+    }
+
+    /// Entries clear on any answer and expire with the host's memory, so this is a backstop rather
+    /// than a policy — but without it a session dispatching thousands of distinct designs at hosts
+    /// that never answer grows a map nothing ever prunes.
+    #[test]
+    fn jobs_held_in_doubt_are_bounded() {
+        let dev = test_device_setup();
+        for n in 0..MAX_JOBS_IN_DOUBT + 20 {
+            dev.reserve_dispatch_id(&JobKey {
+                host: HostId("host-1".into()),
+                device: cut_host::host::testing::CAMEO.into(),
+                digest: n as u64,
+            });
+        }
+        assert!(
+            dev.in_doubt.lock().unwrap().len() <= MAX_JOBS_IN_DOUBT,
+            "in doubt: {}",
+            dev.in_doubt.lock().unwrap().len()
+        );
+    }
+
+    /// A press that never reached a host keeps its reservation. Undoing it would need this call to
+    /// know it owns the entry, and it cannot — a concurrent press of Cut on the same Job is using
+    /// that same id. Keeping it costs nothing: a dispatch no host received is one no host can
+    /// deduplicate, so the next Cut under that id is cut normally.
+    #[test]
+    fn a_press_that_never_reached_a_host_keeps_its_id_for_the_next_one() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("nothing answers this host");
+        // A first press against an offline Pi must not claim the Job may be cutting there.
+        assert_eq!(err.code, "host_unreachable", "got {err:?}");
+
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+        assert!(!dev.reserve_dispatch_id(&key).1, "the next press joins the id already reserved");
+    }
+
     /// An abandoned entry is deliberately *kept*, not aged out. Time cannot show that the operator
     /// loaded fresh material, so expiring an unanswered dispatch mints a new id for a Job the host
     /// still remembers under the old one — and cuts the material a second time. What makes it
@@ -2329,8 +2455,8 @@ mod tests {
         // dispatch of this Job was never answered, so it may be cutting there right now.
         assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
         assert_eq!(
-            dev.in_doubt.lock().unwrap().get(&key),
-            Some(&earlier),
+            dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone()),
+            Some(earlier),
             "a call that never reached the host discarded a previous dispatch's id"
         );
     }

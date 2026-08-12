@@ -26,7 +26,12 @@ use crate::protocol::{Admitted, DeviceSnapshot, DispatchId, Event, Refusal};
 /// forever made a Job silently a no-op because the daemon had seen its id in January, which no
 /// client could know or work around (#119). Forgetting too soon is the opposite failure: a retry
 /// that arrives past this cuts the material a second time.
-const ID_RETENTION: Duration = Duration::from_secs(60 * 60);
+///
+/// Public because it is the *client's* business too: past this window a retry cannot be
+/// recognised, so a client holding an unanswered dispatch is holding something that has stopped
+/// meaning anything. Reading it from here is what keeps the two sides' idea of the window from
+/// drifting apart — the alternative is a number written down twice.
+pub const ID_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 /// The longest dispatch id this host will accept.
 ///
@@ -314,7 +319,6 @@ impl Host {
             if admission.accepted.insert(dispatch_id.clone(), Instant::now()).is_some() {
                 return Ok(Admitted::AlreadyAccepted);
             }
-            admission.forget_oldest_beyond_cap();
             // What is legal now is `actions`' answer, not ours to infer — plus the
             // one thing `actions` cannot yet know, an already-admitted dispatch on
             // its way to the manager. A cutter that never connected is kept so its
@@ -324,6 +328,10 @@ impl Host {
                 admission.accepted.remove(&dispatch_id);
                 return Err(Refusal::Device(DeviceError::Busy));
             }
+            // Only once this dispatch is keeping its place. Capping between the insert and the
+            // refusal above spent an old id to make room for one that was then handed straight
+            // back — a request that started nothing, costing the dedupe history of one that did.
+            admission.forget_oldest_beyond_cap();
             admission.starting = true;
         }
 
@@ -771,6 +779,41 @@ mod tests {
             admission.accepted.contains_key(&DispatchId(format!("d-{}", MAX_REMEMBERED_IDS + 49))),
             "the newest id — the one a retry would actually name — was evicted"
         );
+    }
+
+    /// A dispatch that is refused must not spend another Job's place in the dedupe history. The
+    /// cap used to run between the insert and the refusal, so a request that started nothing —
+    /// aimed at a busy cutter, say — evicted the oldest id to make room for one handed straight
+    /// back, and a retry naming that evicted id would then have been cut a second time.
+    #[test]
+    fn a_refused_dispatch_does_not_evict_an_id_to_make_room_for_itself() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        // Fill to the cap with ids of known ages, oldest first.
+        {
+            let slot = host.slot(CAMEO).unwrap();
+            let mut admission = slot.admission.lock().unwrap();
+            let base = Instant::now();
+            for n in 0..MAX_REMEMBERED_IDS {
+                admission
+                    .accepted
+                    .insert(DispatchId(format!("d-{n}")), base + Duration::from_millis(n as u64));
+            }
+        }
+        // A busy cutter, so the next dispatch is refused rather than admitted.
+        host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+
+        assert!(matches!(
+            host.dispatch(DispatchId("d-refused".into()), CAMEO, "cameo5", vec![square_pass()]),
+            Err(Refusal::Device(DeviceError::Busy))
+        ));
+
+        let admission = host.slot(CAMEO).unwrap().admission.lock().unwrap();
+        assert!(
+            admission.accepted.contains_key(&DispatchId("d-0".into())),
+            "a refused dispatch evicted the oldest id on its way to being refused"
+        );
+        assert!(!admission.accepted.contains_key(&DispatchId("d-refused".into())));
+        assert_eq!(admission.accepted.len(), MAX_REMEMBERED_IDS);
     }
 
     /// An id is remembered for a stated length of time, not forever. Kept forever, a daemon up for

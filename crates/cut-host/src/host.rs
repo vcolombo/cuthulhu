@@ -563,6 +563,83 @@ pub mod testing {
         }
     }
 
+    /// Holds every Transport write until the test opens it. This is what makes "dispatch
+    /// does not wait for the cut" falsifiable at all: `DeviceManager::cut` returns once
+    /// the Job reaches its first pause point (`manager.rs:153-156`), and `TestDriver`
+    /// parks for confirmation right after one Pass — so against the fixtures above even
+    /// a dispatch that called `cut` synchronously would reply promptly. A shut gate
+    /// wedges the worker *inside* `cut`'s transmit, where only a dispatch that truly
+    /// did not wait can answer.
+    #[derive(Clone, Default)]
+    pub struct WriteGate(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl WriteGate {
+        pub fn open(&self) {
+            let (open, cvar) = &*self.0;
+            *open.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        fn wait_open(&self) {
+            let (open, cvar) = &*self.0;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = cvar.wait(open).unwrap();
+            }
+        }
+    }
+
+    struct GatedTransport(WriteGate);
+
+    impl Transport for GatedTransport {
+        fn write(&mut self, b: &[u8]) -> Result<usize, TransportError> {
+            self.0.wait_open();
+            Ok(b.len())
+        }
+        fn read(&mut self, _buf: &mut [u8], _t: std::time::Duration) -> Result<usize, TransportError> {
+            Err(TransportError::Timeout)
+        }
+    }
+
+    /// One Cameo behind a [`WriteGate`]. `candidate: false`, deliberately: connecting a
+    /// candidate probes the machine — a write — and `Host::start` connects every cutter
+    /// before returning, so a probe would park startup itself at the gate.
+    #[derive(Default)]
+    pub struct GatedCutterFactory {
+        gate: WriteGate,
+    }
+
+    pub const GATED: &str = "usb:1:7";
+
+    impl GatedCutterFactory {
+        pub fn gate(&self) -> WriteGate {
+            self.gate.clone()
+        }
+    }
+
+    impl DeviceBackendFactory for GatedCutterFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> {
+            vec![DeviceInfo {
+                instance_id: GATED.into(),
+                machine_id: "cameo5".into(),
+                transport: TransportKind::Usb { locator: "1:7".into() },
+                candidate: false,
+                host: None,
+            }]
+        }
+        fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            if machine_id != "cameo5" {
+                return None;
+            }
+            Some(Box::new(TestDriver {
+                profile: MachineProfile { id: "cameo5".into(), name: "Cameo".into(), width_mm: 300.0, height_mm: 200.0 },
+                caps: MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: true },
+            }))
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Ok(Box::new(GatedTransport(self.gate.clone())))
+        }
+    }
+
     /// One cutter that never connects. `candidate: false` so `DeviceManager::connect`
     /// needs no probe reply before failing — unlike `TwoCutterFactory`'s Puma, there
     /// is no successful open to script a read for.
@@ -723,24 +800,28 @@ mod tests {
         assert!(matches!(refusal, Refusal::Device(driver_core::manager::DeviceError::Busy)));
     }
 
-    /// `dispatch` must return without waiting for the cut. The test Driver parks at
-    /// `AwaitingConfirmation` and stays there until something confirms, so a
-    /// `dispatch` that waited for `DeviceManager::cut` would sit that wait out in
-    /// full — any reply arriving at all is a reply that beat the cut. Proven over a
-    /// channel rather than a wall-time bound, which also measures the scheduler: a
-    /// runner that deschedules the test thread fails the clock with no code change
-    /// (#132, same class as #129).
+    /// `dispatch` must return without waiting for the cut. While the gate is shut the
+    /// worker is wedged inside `DeviceManager::cut`'s transmit, so the cut categorically
+    /// has not finished — a reply arriving then is a reply that beat it, and a dispatch
+    /// that regressed to calling `cut` synchronously sits at the gate and fails the
+    /// receive loudly. Nothing here measures time except the bound on a hang: a
+    /// wall-clock assertion also measured the scheduler (#132), and the ungated fixtures
+    /// cannot falsify the property at all, since `cut` returns at the Job's first pause
+    /// point and `TestDriver` pauses immediately (see `WriteGate`).
     #[test]
     fn a_dispatch_returns_before_the_cut_finishes() {
-        let host = Host::start(Arc::new(TwoCutterFactory));
+        let factory = GatedCutterFactory::default();
+        let gate = factory.gate();
+        let host = Host::start(Arc::new(factory));
+
         let (tx, rx) = mpsc::channel();
         let dispatching = host.clone();
-        // `let _`: if this test panics on the timeout below, `rx` is gone and this
-        // send fails on a thread nobody joins — that must not panic over the real one.
-        thread::spawn(move || {
+        // `let _`: on the timeout path below `rx` is gone before the helper sends, and
+        // that send failing must not panic over the verdict that matters.
+        let helper = thread::spawn(move || {
             let _ = tx.send(dispatching.dispatch(
                 DispatchId("d-1".into()),
-                CAMEO,
+                GATED,
                 "cameo5",
                 vec![square_pass()],
             ));
@@ -750,12 +831,21 @@ mod tests {
         // Disconnected is the helper dying (a panic inside `dispatch`) before replying.
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(admitted) => admitted.unwrap(),
-            Err(mpsc::RecvTimeoutError::Timeout) => panic!("dispatch waited for the cut"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Un-wedge the worker and the helper before failing: the rest of the
+                // test run shares this process.
+                gate.open();
+                panic!("dispatch waited for the cut");
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("the dispatch thread died before replying")
             }
         };
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        helper.join().expect("the dispatch helper panicked after replying");
+
+        // Only now may the cut proceed; it parks for confirmation as usual.
+        gate.open();
+        wait_for(&host, GATED, driver_core::Phase::AwaitingConfirmation);
     }
 
     /// The guard against cutting the same material twice after a dropped reply.

@@ -593,6 +593,28 @@ pub mod testing {
             Err(TransportError::NotFound)
         }
     }
+
+    /// Waits for a dispatch to land its Job on the slot, and returns that Job's id.
+    ///
+    /// Watching the phase is not enough for a test that reads `job_id` or `starting`, or that
+    /// needs the cutter released: the worker publishes the pause phase *before* `manager.cut`
+    /// replies, and the slot's `job_id` write and the `StartingClaim` drop happen after that
+    /// reply, on the dispatch thread. A test that read them at first sight of the phase had to
+    /// win a scheduling race to pass, and lost it on a loaded runner (#129).
+    pub fn wait_for_job(host: &super::Host, device: &str) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let slot = host.slot(device).expect("known cutter");
+            // `job_id` is written before the claim drops, so once `starting` clears the id is there.
+            if !slot.admission.lock().unwrap().starting {
+                if let Some(job_id) = *slot.job_id.lock().unwrap() {
+                    return job_id;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "{device}'s dispatch never landed a Job");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -719,8 +741,7 @@ mod tests {
     fn a_repeated_dispatch_id_starts_nothing_further() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
-        let job_after_first = *host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+        let job_after_first = wait_for_job(&host, CAMEO);
 
         // A retry arrives. The cutter is mid-Job, so a second cut would be refused
         // Busy anyway — the assertion that matters is that it is accepted as a
@@ -729,7 +750,7 @@ mod tests {
             .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
             .unwrap();
         assert_eq!(again, Admitted::AlreadyAccepted, "a no-op must say it was one");
-        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job_after_first);
+        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), Some(job_after_first));
     }
 
     /// An id is remembered for an hour, so its length is a cost this host carries rather than one
@@ -850,7 +871,9 @@ mod tests {
     fn a_forgotten_id_can_start_a_job_again() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: the second dispatch below needs the first one's
+        // `starting` claim gone, or it is refused Busy rather than answered about its id.
+        wait_for_job(&host, CAMEO);
         host.confirm_pass_done(CAMEO).unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::Idle);
 
@@ -921,8 +944,7 @@ mod tests {
     fn two_dispatches_of_one_id_to_a_busy_cutter_promise_no_job() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-first".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
-        let job = *host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+        let job = wait_for_job(&host, CAMEO);
 
         // Free-running rather than paired at a barrier: the window a split claim
         // leaves is only the few instructions between releasing the dedupe lock and
@@ -952,7 +974,7 @@ mod tests {
 
         assert!(answers.is_empty(), "a busy cutter promised {answers:?}");
         assert!(!holds_dispatch_id(&host, CAMEO, "d-retry"), "an id kept for a Job that never was");
-        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job, "the Job never changed");
+        assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), Some(job), "the Job never changed");
     }
 
     /// Two different ids at an idle cutter. Exactly one may be accepted: the cut
@@ -974,6 +996,7 @@ mod tests {
 
             let first = wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
             assert!(first.actions.confirm);
+            assert_eq!(wait_for_job(&host, CAMEO), 1, "round {round}: the winner's Job landed");
             host.confirm_pass_done(CAMEO).unwrap();
             let done = wait_for(&host, CAMEO, driver_core::Phase::Idle);
             assert_eq!(done.ended, Some(driver_core::Ended::Completed));
@@ -990,7 +1013,7 @@ mod tests {
     fn a_dispatch_records_the_job_a_reattaching_client_would_ask_about() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        wait_for_job(&host, CAMEO);
 
         let snap = host.snapshots().into_iter().find(|s| s.info.instance_id == CAMEO).unwrap();
         assert!(snap.job_id.is_some(), "a dispatched cutter reports which Job is on it");
@@ -1160,7 +1183,9 @@ mod tests {
     fn a_reconnect_is_the_way_back_from_a_cancel_that_could_not_confirm_the_stop() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), PUMA, "puma", vec![square_pass()]).unwrap();
-        wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: `reconnect` below must be refused for the cancel's
+        // unconfirmed stop, not for a `starting` claim this dispatch has yet to drop.
+        wait_for_job(&host, PUMA);
 
         host.cancel(PUMA).unwrap();
         let stuck = wait_for_ended(&host, PUMA, driver_core::Ended::Cancelled);
@@ -1227,13 +1252,13 @@ mod tests {
     fn a_job_in_flight_is_named_by_the_same_predicate_that_holds_the_daemon() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        let job = wait_for_job(&host, CAMEO);
 
         let claims = host.claims();
         assert_eq!(host.is_any_cut_active(), !claims.is_empty());
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].phase, driver_core::Phase::AwaitingConfirmation);
-        assert!(claims[0].job_id.is_some());
+        assert_eq!(claims[0].job_id, Some(job));
         assert!(!claims[0].starting);
     }
 

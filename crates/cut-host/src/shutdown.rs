@@ -130,7 +130,7 @@ fn report(host: &Host) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::testing::{TwoCutterFactory, CAMEO};
+    use crate::host::testing::{wait_for_job, TwoCutterFactory, CAMEO};
     use crate::protocol::DispatchId;
     use driver_core::manager::CutPass;
     use driver_core::{Job, Settings};
@@ -198,7 +198,9 @@ mod tests {
     fn a_refused_signal_becomes_an_exit_once_the_cut_ends() {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
-        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: the exit below needs the dispatch's `starting` claim
+        // gone, or the guard is still — correctly — holding for it once the Job ends.
+        wait_for_job(&host, CAMEO);
         assert!(!may_exit(&host, 1));
 
         host.confirm_pass_done(CAMEO).unwrap();

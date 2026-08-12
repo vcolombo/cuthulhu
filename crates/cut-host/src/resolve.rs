@@ -52,6 +52,11 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
     if host.split('.').any(|label| label.is_empty()) {
         return Err(malformed());
     }
+    // DNS caps a name at 253 bytes, and mdns-sd would refuse a longer one only after a
+    // daemon exists to refuse with — refusing here keeps garbage from starting machinery.
+    if host.len() > 253 {
+        return Err(malformed());
+    }
     if host.ends_with(".local") {
         Ok(Route::Mdns { host, port })
     } else {
@@ -71,7 +76,7 @@ use hickory_resolver::config::ResolverConfig;
 #[cfg(test)]
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
-use mdns_sd::{HostnameResolutionEvent, ServiceDaemon};
+use mdns_sd::{DaemonEvent, HostnameResolutionEvent, ServiceDaemon};
 
 /// One daemon for the process once one exists: it owns the multicast sockets and watches
 /// interface changes itself, and a query against it is a subscription that can be stopped —
@@ -79,11 +84,28 @@ use mdns_sd::{HostnameResolutionEvent, ServiceDaemon};
 /// *failed* construction is retried on the next call, because a transient blip (fd
 /// exhaustion, a thread that would not spawn) must not disable `.local` resolution for the
 /// rest of a desktop's multi-day run. Handles are Clone by design and share the one daemon.
-static DAEMON: Mutex<Option<ServiceDaemon>> = Mutex::new(None);
+static DAEMON: Mutex<Option<(ServiceDaemon, mdns_sd::Receiver<DaemonEvent>)>> = Mutex::new(None);
 
 fn daemon() -> Result<ServiceDaemon, ClientError> {
-    if let Some(daemon) = &*DAEMON.lock().unwrap_or_else(|e| e.into_inner()) {
-        return Ok(daemon.clone());
+    {
+        let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((daemon, health)) = &*slot {
+            // `ServiceDaemon::new` answers Ok before its sockets are bound, so a daemon that
+            // never joined multicast looks healthy from the handle and would eat every
+            // deadline from the cache. Its failures arrive on this monitor channel instead —
+            // drain it, and rebuild on any reported error.
+            // ponytail: any error rebuilds, including per-interface noise on a flaky NIC;
+            // refine to fatal-only if rebuild churn ever shows up.
+            let sick = std::iter::from_fn(|| health.try_recv().ok())
+                .any(|event| matches!(event, DaemonEvent::Error(_)));
+            if !sick {
+                return Ok(daemon.clone());
+            }
+            if let Some((dead, _)) = slot.take() {
+                // Its thread holds its own channel sender, so a bare drop leaks it running.
+                let _ = dead.shutdown();
+            }
+        }
     }
     // Built OUTSIDE the lock: construction enumerates interfaces, binds sockets and spawns a
     // thread, and a caller resolving a different name must not queue behind any of that.
@@ -93,12 +115,18 @@ fn daemon() -> Result<ServiceDaemon, ClientError> {
     let created = ServiceDaemon::new().map_err(|e| {
         ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
     })?;
+    let health = created.monitor().map_err(|e| {
+        ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
+    })?;
     let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(raced) = &*slot {
-        // Another caller built one first — theirs is the shared daemon, this one drops.
-        return Ok(raced.clone());
+    if let Some((raced, _)) = &*slot {
+        // Another caller built one first — theirs is the shared daemon, and this one's
+        // thread must be told to exit; it outlives a bare drop of the handle.
+        let raced = raced.clone();
+        let _ = created.shutdown();
+        return Ok(raced);
     }
-    *slot = Some(created.clone());
+    *slot = Some((created.clone(), health));
     Ok(created)
 }
 
@@ -161,6 +189,15 @@ pub(crate) fn resolve_mdns(
         )));
     }
     let daemon = daemon()?;
+    // Budget re-measured after the daemon exists: a cold first construction is charged to
+    // this caller's deadline, not granted on top of it. Distinct message again — the network
+    // was never asked; the next poll gets the cached daemon and a full budget.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ClientError::Transport(format!(
+            "`{host}` could not be queried before time ran out"
+        )));
+    }
     let events = match daemon
         .resolve_hostname(&fqdn, Some(remaining.as_millis().try_into().unwrap_or(u64::MAX)))
     {
@@ -169,8 +206,11 @@ pub(crate) fn resolve_mdns(
             // A handle whose daemon thread has died fails every query from here on — drop the
             // cached daemon so the next caller builds a fresh one, rather than wedging
             // `.local` resolution for the rest of a multi-day run. A well-formed query
-            // erroring at all is the daemon telling us something is wrong with *it*.
-            DAEMON.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // erroring at all is the daemon telling us something is wrong with *it* — and the
+            // thread is told to exit, since it outlives a bare drop of its handle.
+            if let Some((dead, _)) = DAEMON.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = dead.shutdown();
+            }
             return Err(ClientError::Transport(format!(
                 "could not query `{host}` over mDNS ({e})"
             )));
@@ -248,24 +288,23 @@ pub(crate) fn resolve_mdns(
 static RUNTIME: Mutex<Option<Arc<tokio::runtime::Runtime>>> = Mutex::new(None);
 
 fn runtime() -> Result<Arc<tokio::runtime::Runtime>, ClientError> {
-    if let Some(runtime) = &*RUNTIME.lock().unwrap_or_else(|e| e.into_inner()) {
+    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(runtime) = &*slot {
         return Ok(runtime.clone());
     }
-    // Built outside the lock, same as `daemon()`: a runtime build spawns a thread, and an
-    // unrelated caller must not wait on it.
-    let built = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("cut-host resolve")
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            ClientError::Transport(format!("name resolution has no runtime to run on ({e})"))
-        })?;
-    let built = Arc::new(built);
-    let mut slot = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(raced) = &*slot {
-        return Ok(raced.clone());
-    }
+    // Built UNDER the lock, unlike the daemon: a runtime build is one thread spawn, and a
+    // racing loser would have to drop its freshly built runtime — a drop that panics inside
+    // an async context, which is exactly where the desktop dials from.
+    let built = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("cut-host resolve")
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                ClientError::Transport(format!("name resolution has no runtime to run on ({e})"))
+            })?,
+    );
     *slot = Some(built.clone());
     Ok(built)
 }
@@ -324,6 +363,9 @@ fn lookup(
     port: u16,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, ClientError> {
+    let runtime = runtime()?;
+    // Budget measured after the runtime exists, so a cold first build is charged to the
+    // caller's deadline rather than silently granted on top of it.
     let remaining = deadline.saturating_duration_since(Instant::now());
     // A spent budget returns before anything is spawned: the channel margin below exists to
     // absorb runtime scheduling, not to grant an already-expired caller a fresh quarter second.
@@ -336,7 +378,7 @@ fn lookup(
     // listening abandons a lookup that tokio still cancels at the deadline.
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = host.to_string();
-    runtime()?.spawn(async move {
+    runtime.spawn(async move {
         let _ = tx.send(tokio::time::timeout(remaining, resolver.lookup_ip(owned.as_str())).await);
     });
     // The channel waits a beat longer than tokio's own timeout: the timeout inside the future
@@ -445,6 +487,11 @@ mod tests {
             let err = route(broken).expect_err(broken).to_string();
             assert!(err.contains(broken), "error should name `{broken}`: {err}");
         }
+        // Oversized separately — DNS caps names at 253 bytes, and a literal this long in the
+        // array above would drown the list.
+        let oversized = format!("{}.local:7878", "x".repeat(300));
+        let err = route(&oversized).expect_err("oversized name").to_string();
+        assert!(err.contains("is not a host:port"), "oversized should be malformed: {err}");
     }
 
     use std::time::{Duration, Instant};

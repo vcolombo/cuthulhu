@@ -41,8 +41,11 @@ network is the ordinary way a resolver wedges" — #109, and the comment above
 ## Routing
 
 A new module, `crates/cut-host/src/resolve.rs`, takes `resolve_by_deadline(addr, deadline)`
-with its current signature and current contract (a `Vec<SocketAddr>` or a `ClientError`, never
-blocking past the deadline). `client.rs` is at 744 lines and the resolver was already its most
+with its current signature and this contract: a `Vec<SocketAddr>` or a `ClientError`, returned
+within a whisker of the deadline, and no lookup ever parked on a thread that cannot be told to
+stop. The whisker is named, not implied — a 250ms answer-channel margin on unicast lookups,
+and, once per process, the first lookup's runtime or daemon construction (charged to that
+caller's budget, but itself unbounded). `client.rs` is at 744 lines and the resolver was already its most
 self-contained region; it moves rather than grows in place. Routing is by shape of the string:
 
 1. **Literal address** (`192.168.1.50:7878`, `[fe80::1]:7878`) → parsed and returned. No

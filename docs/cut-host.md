@@ -10,10 +10,14 @@ your network. It owns the cut: once a Job starts, closing the laptop that sent i
 Build on the Pi, or cross-compile:
 
 ```sh
-cross build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd
+cross build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd --no-default-features
 ```
 
 Copy the binary to `/usr/local/bin/cuthulhu-cutd`.
+
+`--no-default-features` drops the desktop client's resolver stack (tokio, hickory, mdns-sd) —
+the daemon never resolves a name, and without the flag those three cross-compile for nothing.
+The build works either way; the flag is what CI checks and what keeps it small.
 
 `cross` needs Docker running, and takes the rest from the repository: `Cross.toml` installs the
 target's `libudev` into the build image, and `.cargo/config.toml` tells `pkg-config` to look there.
@@ -32,7 +36,7 @@ docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
     dpkg --add-architecture arm64 && apt-get update &&
     apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross libudev-dev:arm64 pkg-config &&
     rustup target add aarch64-unknown-linux-gnu &&
-    cargo build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd'
+    cargo build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd --no-default-features'
 ```
 
 The binary lands in `target/cross/aarch64-unknown-linux-gnu/release/cuthulhu-cutd`. Its own target

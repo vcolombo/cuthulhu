@@ -53,8 +53,11 @@ jobs:
       # No environment set here on purpose: the target's libudev is installed into the image by
       # `Cross.toml`, and where pkg-config looks for it comes from `.cargo/config.toml`. Anything
       # that lived only in this file would make the documented command fail for everyone else.
+      # --no-default-features drops the desktop client and its resolver stack (tokio,
+      # hickory, mdns-sd): the daemon never resolves a name, and the Pi build should not
+      # have to cross-compile what it cannot call.
       - name: Cross build the daemon for the Pi
-        run: cross build --release --locked --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd
+        run: cross build --release --locked --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd --no-default-features
 
   ui:
     runs-on: ubuntu-latest

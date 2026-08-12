@@ -113,9 +113,9 @@ pub fn reconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), Ip
 
 // async: non-blocking for a local device — the status is published rather than asked of the
 // worker (see DeviceManagerHandle::status) — but for a remote one this polls the host over the
-// network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) plus an
-// unbounded DNS/mDNS resolve ahead of both, and it is called after every connect/cancel/resume/
-// confirm, so it must not run on the main thread.
+// network, bounded by roughly 2x STATUS_POLL_TIMEOUT (reconnect leg, then body-read leg) with
+// the DNS/mDNS resolve bounded inside the first leg's deadline, and it is called after every
+// connect/cancel/resume/confirm, so it must not run on the main thread.
 #[tauri::command(async)]
 pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {
     Ok(dev.status())
@@ -217,9 +217,9 @@ pub fn existing_pairing(
 /// Prove a host without saving it. The pairing dialog calls this before `pair_host`, so an
 /// entry that has never worked is never written.
 ///
-/// async: `pair_check` dials the host over the network (5s connect timeout, 30s body timeout,
-/// plus an unbounded DNS/mDNS resolve) — on the main thread a mistyped address would freeze the
-/// window for the length of that wait.
+/// async: `pair_check` dials the host over the network (5s connect timeout with the DNS/mDNS
+/// resolve bounded inside it, 30s body timeout) — on the main thread a mistyped address would
+/// freeze the window for the length of that wait.
 #[tauri::command(async)]
 pub fn test_host(address: String, token: String, fingerprint: String) -> Result<Vec<DeviceInfo>, IpcError> {
     cut_host::client::HostClient::pair_check(&address, &token, &fingerprint)

@@ -25,6 +25,16 @@ rustls-pemfile = "2"
 sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 toml = "0.8"
+# The desktop's client half only. The daemon never resolves a name — it binds — so the
+# resolver stack (tokio + hickory + mdns-sd) is feature-gated out of the Pi cross build,
+# which passes --no-default-features. Default-on so `cargo test --workspace` needs no flag.
+hickory-resolver = { version = "0.26", features = ["tokio", "system-config"], optional = true }
+mdns-sd = { version = "0.21", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+
+[features]
+default = ["client"]
+client = ["dep:tokio", "dep:hickory-resolver", "dep:mdns-sd"]
 
 [dev-dependencies]
 tempfile = "3"

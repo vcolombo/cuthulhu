@@ -7,7 +7,12 @@
 //! exists rather than a Transport that forwards bytes to a desktop still driving.
 
 pub mod check;
+// The desktop's half of the crate. Feature-gated so the Pi daemon builds without the
+// resolver stack it cannot call — see Cargo.toml's `client` feature.
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
+mod resolve;
 pub mod config;
 pub mod frame;
 pub mod host;

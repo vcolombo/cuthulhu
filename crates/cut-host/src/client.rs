@@ -169,11 +169,12 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 /// The first of `addr`'s resolved addresses that answers before `deadline`.
 ///
 /// A single deadline covers the resolve and every resolved address, not a fresh budget per
-/// address: mDNS commonly returns an IPv6 link-local first, and on a network where IPv6 is dead
-/// that is the one address that cannot work — trying it with the whole budget and only
-/// then trying the IPv4 that would have worked turns "first contact" into a timeout.
+/// address: one slow address must not spend what its siblings needed. The v6-first trap this
+/// budget used to be the only defense against is now removed at the source — `resolve` orders
+/// IPv4 ahead of IPv6 before this loop ever sees the list.
 fn connect_by_deadline(addr: &str, deadline: Instant) -> Result<TcpStream, ClientError> {
     let addrs = crate::resolve::resolve_by_deadline(addr, deadline)?;
+    let resolved_any = !addrs.is_empty();
     let mut last_err = None;
     for sock_addr in addrs {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -190,6 +191,12 @@ fn connect_by_deadline(addr: &str, deadline: Instant) -> Result<TcpStream, Clien
     }
     Err(match last_err {
         Some((sock_addr, e)) => ClientError::Transport(format!("{sock_addr}: {e}")),
+        // Distinct from "no address": the resolve answered and the budget ran out before a
+        // single connect was tried — blaming the name here sends the operator to debug the
+        // wrong layer.
+        None if resolved_any => {
+            ClientError::Transport(format!("no time was left to try `{addr}`'s addresses"))
+        }
         None => ClientError::Transport(format!("`{addr}` resolved to no address")),
     })
 }

@@ -44,8 +44,9 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
     }
 }
 
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use hickory_resolver::Resolver;
 // Only the test seam takes a caller-supplied configuration; real callers reach hickory
@@ -71,6 +72,14 @@ fn daemon() -> Result<&'static ServiceDaemon, ClientError> {
         })
 }
 
+/// One live query per name — not to bound anything, but because mdns-sd keeps a single
+/// listener per hostname: a second `resolve_hostname` for the same name overwrites the first
+/// caller's channel, and either caller's `stop_resolve_hostname` tears down the other's query.
+/// Serializing per name lets both callers answer, where the old machinery refused one.
+/// ponytail: entries are never pruned — a few bytes per distinct name ever dialled, bounded by
+/// paired hosts and pairing-dialog typos; prune on last-caller-out if that ever matters.
+static LOCAL_QUERIES: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+
 /// `host`'s addresses over mDNS, or a failure once `deadline` passes. Never blocks past the
 /// deadline: the query is unsubscribed on every exit, so a wedged network costs the wait and
 /// nothing else — no thread, no slot, no ceiling.
@@ -82,7 +91,22 @@ pub(crate) fn resolve_mdns(
     let daemon = daemon()?;
     // mdns-sd wants the fully-qualified spelling; `route` stripped the trailing dot off.
     let fqdn = format!("{host}.");
+    let gate = LOCAL_QUERIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(fqdn.clone())
+        .or_default()
+        .clone();
+    // Waiting a turn spends this caller's own budget — everything below recomputes what is
+    // left — so a queue behind a slow same-name query still returns by this caller's deadline.
+    let _one_query_per_name = gate.lock().unwrap_or_else(|e| e.into_inner());
+
     let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ClientError::Transport(format!(
+            "`{host}` was not answered over mDNS in time"
+        )));
+    }
     let events = daemon
         .resolve_hostname(&fqdn, Some(remaining.as_millis().try_into().unwrap_or(u64::MAX)))
         .map_err(|e| ClientError::Transport(format!("could not query `{host}` over mDNS ({e})")))?;
@@ -193,12 +217,22 @@ fn lookup(
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, ClientError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let looked_up = runtime()?
-        .block_on(async { tokio::time::timeout(remaining, resolver.lookup_ip(host)).await });
-    match looked_up {
-        Ok(Ok(found)) => Ok(found.iter().map(|ip| SocketAddr::new(ip, port)).collect()),
-        Ok(Err(e)) => Err(ClientError::Transport(format!("could not resolve `{host}`: {e}"))),
-        Err(_elapsed) => {
+    // Spawned onto this module's own runtime and answered over a channel — never `block_on`:
+    // the desktop dials from inside Tauri's tokio workers, and blocking a worker thread on a
+    // runtime panics by design. The future carries its own timeout, so a caller that stops
+    // listening abandons a lookup that tokio still cancels at the deadline.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = host.to_string();
+    runtime()?.spawn(async move {
+        let _ = tx.send(tokio::time::timeout(remaining, resolver.lookup_ip(owned.as_str())).await);
+    });
+    // The channel waits a beat longer than tokio's own timeout: the timeout inside the future
+    // is the real clock, and the margin keeps a busy runtime from converting "answered right
+    // at the wire" into a spurious refusal.
+    match rx.recv_timeout(remaining + Duration::from_millis(250)) {
+        Ok(Ok(Ok(found))) => Ok(found.iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+        Ok(Ok(Err(e))) => Err(ClientError::Transport(format!("could not resolve `{host}`: {e}"))),
+        Ok(Err(_)) | Err(_) => {
             Err(ClientError::Transport(format!("`{host}` could not be resolved in time")))
         }
     }
@@ -409,5 +443,57 @@ mod tests {
         let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now())
             .expect("a literal address must not depend on any resolver");
         assert_eq!(resolved, vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]);
+    }
+
+    /// The desktop dials from inside Tauri's tokio workers, where blocking on a runtime
+    /// panics by design ("cannot block the current thread from within a runtime") — a context
+    /// the other tests never enter, which is how a `block_on` here first shipped as a panic
+    /// on every unicast-name dial. Reproduce the context: a foreign runtime drives an async
+    /// task that calls the sync resolver.
+    #[test]
+    fn dns_resolution_works_from_inside_a_foreign_tokio_runtime() {
+        let foreign = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let addrs = foreign
+            .block_on(async {
+                resolve_dns("localhost", 7878, Instant::now() + Duration::from_secs(5))
+            })
+            .expect("resolving from inside a runtime must not panic");
+        assert!(
+            addrs.iter().any(|a| a.ip().is_loopback()),
+            "localhost should include a loopback address: {addrs:?}"
+        );
+    }
+
+    /// Two callers after the same name at once: mdns-sd keeps one listener per hostname, so
+    /// unserialized concurrent queries tear each other's subscription down — the second
+    /// `resolve_hostname` overwrites the first caller's channel, and either caller's stop
+    /// kills the other's query. Serialized, both come back by their own deadlines; the
+    /// second spends part of its budget waiting its turn.
+    #[test]
+    fn concurrent_resolves_of_the_same_name_are_both_answered_by_their_deadlines() {
+        let host = format!("cuthulhu-shared-{}.local", std::process::id());
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let host = host.clone();
+                    s.spawn(move || {
+                        resolve_mdns(&host, 7878, Instant::now() + Duration::from_secs(2))
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("no panic").expect_err("nobody owns this name");
+            }
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "each caller must be bounded by its own deadline, took {:?}",
+            start.elapsed()
+        );
     }
 }

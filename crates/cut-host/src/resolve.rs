@@ -93,8 +93,10 @@ pub(crate) fn resolve_mdns(
                 found.extend(addrs.iter().map(|scoped| SocketAddr::new(scoped.to_ip_addr(), port)));
             }
             Ok(HostnameResolutionEvent::SearchTimeout(_)) => break,
-            // SearchStarted, AddressesRemoved, SearchStopped, and whatever the non_exhaustive
-            // enum grows later: none of them is an answer, keep waiting for one.
+            Ok(HostnameResolutionEvent::SearchStopped(_)) => break,
+            // SearchStarted, AddressesRemoved, and whatever the non_exhaustive enum grows
+            // later: none of them is an answer, so keep waiting. SearchStopped breaks above
+            // because a stopped query is gone; waiting can only spend the deadline it cannot answer.
             Ok(_) => continue,
             Err(_) => break,
         }

@@ -11,6 +11,8 @@ pub mod check;
 // resolver stack it cannot call — see Cargo.toml's `client` feature.
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "client")]
+mod resolve;
 pub mod config;
 pub mod frame;
 pub mod host;

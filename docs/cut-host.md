@@ -192,7 +192,10 @@ completes on its own.
 ## Reaching it
 
 Raspberry Pi OS advertises its hostname over mDNS, so the host is at `<hostname>.local:7878`. No
-discovery service is involved and none is needed.
+discovery service is involved and none is needed. Address a host as `name.local:port` or
+`ip:port`, spelled out: a bare single-label name (`cuthulhu-pi:7878`) is looked up over unicast
+DNS with the desktop's search domains, not over mDNS, so it only works where the router
+registers DHCP names.
 
 ## Binding to every interface
 

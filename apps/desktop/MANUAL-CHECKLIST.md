@@ -68,6 +68,17 @@ before SP6 leans on device connection and mid-job disconnect detection.
 Driving note: WebKit range inputs ignore both synthetic `click at` positioning and AX `set value`. The
 reliable way to move a slider is AX `set focused to true` on it, then arrow-key key codes.
 
+## Cut Host resolver (#126, unverified)
+
+The `.local` path now resolves over mdns-sd rather than the OS resolver; only a real Pi on a
+real network can confirm the swap end to end.
+
+- [ ] Pair a Cut Host by `cuthulhu-pi.local` and list its cutters — the lookup succeeds and the
+      paired host cuts.
+- [ ] Wedge the network (drop the Pi's Wi-Fi mid-poll) — the desktop's connect attempt fails
+      within ~5s, no `resolve …` threads accumulate in Activity Monitor, and the host is
+      reachable again once the network returns.
+
 ## CLI plain cut path (architecture review candidate 3)
 
 - [ ] `cuthulhu cut fill-only.svg --device cameo5 --dry-run` — a fill-only SVG still produces bytes (one pass).

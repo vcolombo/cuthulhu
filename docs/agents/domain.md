@@ -20,10 +20,8 @@ decision lands.
 ```
 /
 ├── CONTEXT.md
-├── docs/adr/
-│   ├── 0001-event-sourced-orders.md
-│   └── 0002-postgres-for-write-model.md
-└── src/
+├── docs/adr/          ← lazily created; absent until the first recorded decision
+└── crates/, apps/     ← the workspace this repo actually has, not a `src/`
 ```
 
 ## Use the glossary's vocabulary

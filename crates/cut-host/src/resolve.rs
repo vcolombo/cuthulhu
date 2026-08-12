@@ -65,7 +65,7 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
 }
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use hickory_resolver::Resolver;
@@ -84,50 +84,119 @@ use mdns_sd::{DaemonEvent, HostnameResolutionEvent, ServiceDaemon};
 /// *failed* construction is retried on the next call, because a transient blip (fd
 /// exhaustion, a thread that would not spawn) must not disable `.local` resolution for the
 /// rest of a desktop's multi-day run. Handles are Clone by design and share the one daemon.
-static DAEMON: Mutex<Option<(ServiceDaemon, mdns_sd::Receiver<DaemonEvent>)>> = Mutex::new(None);
+/// How the shared daemon comes to exist. `Building` is what makes construction
+/// deadline-enforceable: the caller that arrives first hands the work to a builder thread
+/// and then waits bounded like everyone else, so nobody's budget is ever spent inside
+/// `ServiceDaemon::new`. `Failed` carries a construction error to exactly one waiter, and
+/// the slot re-opens so a later call can try again.
+/// ponytail: a failed build is re-attempted per arriving caller with no backoff — the
+/// redial paths arrive about once a second, which is the backoff.
+enum DaemonSlot {
+    Empty,
+    Building,
+    Failed(String),
+    Ready(ServiceDaemon, mdns_sd::Receiver<DaemonEvent>),
+}
 
-fn daemon() -> Result<ServiceDaemon, ClientError> {
-    {
+static DAEMON: Mutex<DaemonSlot> = Mutex::new(DaemonSlot::Empty);
+static DAEMON_CHANGED: Condvar = Condvar::new();
+
+/// Un-wedges the slot if the builder thread panics: `Building` with no builder alive would
+/// strand every future caller in bounded waits for a build that is not coming. Success and
+/// failure both write their own state before this drops, making it a no-op there.
+struct BuildReset;
+impl Drop for BuildReset {
+    fn drop(&mut self) {
         let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((daemon, health)) = &*slot {
-            // `ServiceDaemon::new` answers Ok before its sockets are bound, so a daemon that
-            // never joined multicast looks healthy from the handle and would eat every
-            // deadline from the cache. Its failures arrive on this monitor channel instead —
-            // drain it, and rebuild on any reported error.
-            // ponytail: any error rebuilds, including per-interface noise on a flaky NIC;
-            // refine to fatal-only if rebuild churn ever shows up.
-            let sick = std::iter::from_fn(|| health.try_recv().ok())
-                .any(|event| matches!(event, DaemonEvent::Error(_)));
-            if !sick {
-                return Ok(daemon.clone());
+        if matches!(*slot, DaemonSlot::Building) {
+            *slot = DaemonSlot::Empty;
+            DAEMON_CHANGED.notify_all();
+        }
+    }
+}
+
+fn daemon(deadline: Instant) -> Result<ServiceDaemon, ClientError> {
+    let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        match &*slot {
+            DaemonSlot::Ready(daemon, health) => {
+                // `ServiceDaemon::new` answers Ok before its sockets are bound, so a daemon
+                // that never joined multicast looks healthy from the handle and would eat
+                // every deadline from the cache. Its failures arrive on this monitor channel
+                // instead — drain it, and rebuild on any reported error.
+                // ponytail: any error rebuilds, including per-interface noise on a flaky
+                // NIC; refine to fatal-only if rebuild churn ever shows up.
+                let sick = std::iter::from_fn(|| health.try_recv().ok())
+                    .any(|event| matches!(event, DaemonEvent::Error(_)));
+                if !sick {
+                    return Ok(daemon.clone());
+                }
+                if let DaemonSlot::Ready(dead, _) =
+                    std::mem::replace(&mut *slot, DaemonSlot::Empty)
+                {
+                    // Its thread holds its own channel sender, so a bare drop leaks it.
+                    let _ = dead.shutdown();
+                }
             }
-            if let Some((dead, _)) = slot.take() {
-                // Its thread holds its own channel sender, so a bare drop leaks it running.
-                let _ = dead.shutdown();
+            DaemonSlot::Failed(_) => {
+                let DaemonSlot::Failed(why) = std::mem::replace(&mut *slot, DaemonSlot::Empty)
+                else {
+                    unreachable!("matched Failed above");
+                };
+                return Err(ClientError::Transport(format!(
+                    "multicast DNS is unavailable on this machine ({why})"
+                )));
+            }
+            DaemonSlot::Building => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ClientError::Transport(
+                        "multicast DNS was still starting when time ran out".into(),
+                    ));
+                }
+                let (guard, _timed_out) = DAEMON_CHANGED
+                    .wait_timeout(slot, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                slot = guard;
+            }
+            DaemonSlot::Empty => {
+                if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                    return Err(ClientError::Transport(
+                        "multicast DNS was still starting when time ran out".into(),
+                    ));
+                }
+                *slot = DaemonSlot::Building;
+                drop(slot);
+                // The build runs on a thread of its own so even the caller that arrived
+                // first is bounded like every other. The thread stores its result and exits:
+                // this is construction — interface walks, socket binds — not a parked OS
+                // call, and it finishes on its own whether or not anyone is still waiting.
+                let spawned = std::thread::Builder::new()
+                    .name("cut-host mdns build".into())
+                    .spawn(|| {
+                        let _reset_on_panic = BuildReset;
+                        let outcome =
+                            ServiceDaemon::new().and_then(|d| d.monitor().map(|h| (d, h)));
+                        let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+                        *slot = match outcome {
+                            Ok((daemon, health)) => DaemonSlot::Ready(daemon, health),
+                            Err(e) => DaemonSlot::Failed(e.to_string()),
+                        };
+                        DAEMON_CHANGED.notify_all();
+                    });
+                slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = spawned {
+                    if matches!(*slot, DaemonSlot::Building) {
+                        *slot = DaemonSlot::Empty;
+                        DAEMON_CHANGED.notify_all();
+                    }
+                    return Err(ClientError::Transport(format!(
+                        "multicast DNS is unavailable on this machine ({e})"
+                    )));
+                }
             }
         }
     }
-    // Built OUTSIDE the lock: construction enumerates interfaces, binds sockets and spawns a
-    // thread, and a caller resolving a different name must not queue behind any of that.
-    // ponytail: a failed build is re-attempted by every caller with no backoff — the redial
-    // paths arrive about once a second, which is the backoff; add a retry-after stamp if a
-    // multicast-less machine ever shows the churn.
-    let created = ServiceDaemon::new().map_err(|e| {
-        ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
-    })?;
-    let health = created.monitor().map_err(|e| {
-        ClientError::Transport(format!("multicast DNS is unavailable on this machine ({e})"))
-    })?;
-    let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((raced, _)) = &*slot {
-        // Another caller built one first — theirs is the shared daemon, and this one's
-        // thread must be told to exit; it outlives a bare drop of the handle.
-        let raced = raced.clone();
-        let _ = created.shutdown();
-        return Ok(raced);
-    }
-    *slot = Some((created.clone(), health));
-    Ok(created)
 }
 
 /// One live query per name — not to bound anything, but because mdns-sd keeps a single
@@ -139,10 +208,10 @@ fn daemon() -> Result<ServiceDaemon, ClientError> {
 static LOCAL_QUERIES: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
 
 /// `host`'s addresses over mDNS, or a failure once `deadline` passes — give or take the
-/// overshoots named on `resolve_by_deadline`, of which this path owns one: the process's
-/// first `.local` lookup constructs the shared daemon (interface enumeration, socket binds),
-/// paid once and not deadline-bounded. Past that, the query is unsubscribed on every exit,
-/// so a wedged network costs the wait and nothing else — no thread, no slot, no ceiling.
+/// overshoots named on `resolve_by_deadline`. Daemon construction happens on a builder
+/// thread behind a bounded wait, so even the process's first `.local` lookup is released by
+/// its own deadline; the query is unsubscribed on every exit, so a wedged network costs the
+/// wait and nothing else — no thread parked, no slot, no ceiling.
 pub(crate) fn resolve_mdns(
     host: &str,
     port: u16,
@@ -188,10 +257,10 @@ pub(crate) fn resolve_mdns(
             "`{host}` was still being resolved by an earlier attempt when time ran out"
         )));
     }
-    let daemon = daemon()?;
-    // Budget re-measured after the daemon exists: a cold first construction is charged to
-    // this caller's deadline, not granted on top of it. Distinct message again — the network
-    // was never asked; the next poll gets the cached daemon and a full budget.
+    let daemon = daemon(deadline)?;
+    // Budget re-measured after the daemon exists: the bounded wait above is charged to this
+    // caller's deadline, not granted on top of it. Distinct message again — the network was
+    // never asked; the next poll gets the cached daemon and a full budget.
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(ClientError::Transport(format!(
@@ -208,8 +277,16 @@ pub(crate) fn resolve_mdns(
             // `.local` resolution for the rest of a multi-day run. A well-formed query
             // erroring at all is the daemon telling us something is wrong with *it* — and the
             // thread is told to exit, since it outlives a bare drop of its handle.
-            if let Some((dead, _)) = DAEMON.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                let _ = dead.shutdown();
+            {
+                let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+                if matches!(*slot, DaemonSlot::Ready(..)) {
+                    if let DaemonSlot::Ready(dead, _) =
+                        std::mem::replace(&mut *slot, DaemonSlot::Empty)
+                    {
+                        let _ = dead.shutdown();
+                    }
+                    DAEMON_CHANGED.notify_all();
+                }
             }
             return Err(ClientError::Transport(format!(
                 "could not query `{host}` over mDNS ({e})"
@@ -398,7 +475,8 @@ fn lookup(
 /// through; the contract #126 bought is "returns within a whisker of `deadline`" — no lookup
 /// is ever parked on a thread that cannot be told to stop. The whisker is named, not implied:
 /// a 250ms answer-channel margin on unicast lookups, and — once per process — the first
-/// `.local` lookup's daemon construction. Callers needing a hard bound budget for those.
+/// unicast lookup's runtime build, one thread spawn held under its lock. mDNS daemon
+/// construction is NOT a whisker: it runs on a builder thread behind a deadline-bounded wait.
 pub(crate) fn resolve_by_deadline(
     addr: &str,
     deadline: Instant,
@@ -566,7 +644,8 @@ mod tests {
     #[test]
     #[ignore = "needs working multicast loopback; run by hand: cargo test -p cut-host -- --ignored"]
     fn a_registered_local_name_resolves_over_multicast() {
-        let daemon = daemon().expect("multicast daemon");
+        let daemon =
+            daemon(Instant::now() + Duration::from_secs(5)).expect("multicast daemon");
         let service = mdns_sd::ServiceInfo::new(
             "_cuthulhu-test._udp.local.",
             "resolver-plan-test",
@@ -707,6 +786,45 @@ mod tests {
         assert!(
             err.to_string().contains("earlier attempt"),
             "queue exhaustion must not read as a network failure: {err}"
+        );
+    }
+
+    /// A caller that arrives while the daemon is still being built must be released by its
+    /// own deadline — construction runs on a builder thread precisely so no caller's budget
+    /// is spent inside `ServiceDaemon::new`. The building state is forced directly and the
+    /// previous state restored after; parallel tests that need a daemon wait a bounded beat
+    /// at worst, inside budgets far larger than this test's 300ms hold.
+    #[test]
+    fn a_caller_arriving_during_daemon_construction_is_bounded_by_its_own_deadline() {
+        let previous = {
+            let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *slot, DaemonSlot::Building)
+        };
+
+        let host = format!("cuthulhu-building-{}.local", std::process::id());
+        let start = Instant::now();
+        let result = resolve_mdns(&host, 7878, start + Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        // Restore before asserting, so a failing assertion cannot strand the shared slot.
+        {
+            let mut slot = DAEMON.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = previous;
+            DAEMON_CHANGED.notify_all();
+        }
+
+        let err = result.expect_err("a build in progress cannot have answered");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "returned in {elapsed:?} — it never actually waited on the build"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "not bounded by its own deadline: {elapsed:?}, {err}"
+        );
+        assert!(
+            err.to_string().contains("starting"),
+            "startup exhaustion must not read as a network failure: {err}"
         );
     }
 }

@@ -44,8 +44,9 @@ A new module, `crates/cut-host/src/resolve.rs`, takes `resolve_by_deadline(addr,
 with its current signature and this contract: a `Vec<SocketAddr>` or a `ClientError`, returned
 within a whisker of the deadline, and no lookup ever parked on a thread that cannot be told to
 stop. The whisker is named, not implied — a 250ms answer-channel margin on unicast lookups,
-and, once per process, the first lookup's runtime or daemon construction (charged to that
-caller's budget, but itself unbounded). `client.rs` is at 744 lines and the resolver was already its most
+and, once per process, the first unicast lookup's runtime build (one thread spawn). mDNS
+daemon construction runs on a builder thread behind a deadline-bounded wait, so even the
+process's first `.local` lookup is released by its own deadline. `client.rs` is at 744 lines and the resolver was already its most
 self-contained region; it moves rather than grows in place. Routing is by shape of the string:
 
 1. **Literal address** (`192.168.1.50:7878`, `[fe80::1]:7878`) → parsed and returned. No

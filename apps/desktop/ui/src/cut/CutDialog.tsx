@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, staleSection } from "../hosts/deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
@@ -108,6 +108,13 @@ export function CutDialog({
   const [skippedNoStroke, setSkippedNoStroke] = useState(0);
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
+  /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
+   *  started. Cleared by the next press of Cut, which is the thing that makes it untrue. */
+  const [alreadyAccepted, setAlreadyAccepted] = useState(false);
+  /** A cut request is out. The backend reserves one dispatch id per Job, so a second click is
+   *  safe — it joins the first rather than starting a second Job — but it would come back
+   *  "already accepted", which is a confusing thing to say about a double-click. */
+  const [cutInFlight, setCutInFlight] = useState(false);
 
   // The whole device list in one request rather than one per host: `list_devices` already
   // re-reads every paired host in a single call, and `list_hosts` carries why any of them cannot
@@ -288,11 +295,20 @@ export function CutDialog({
   const startCut = () => {
     if (!connected || planRevision === null) return;
     const request = toCutRequest(connected.instance_id, planRevision, rows);
-    ipc.cut(request).catch((e) => {
-      const code = ipc.ipcErrorCode(e);
-      if (code === "stale_plan") setStalePlan(true);
-      onError(ipc.ipcErrorMessage(e));
-    });
+    setAlreadyAccepted(false);
+    setCutInFlight(true);
+    ipc
+      .cut(request)
+      // Not an error, and not a success worth saying nothing about: the host recognised this
+      // dispatch and started nothing. Told apart, because a cutter that is not moving looks the
+      // same either way and only the host knows which happened.
+      .then((started) => setAlreadyAccepted(started.duplicate))
+      .catch((e) => {
+        const code = ipc.ipcErrorCode(e);
+        if (code === "stale_plan") setStalePlan(true);
+        onError(ipc.ipcErrorMessage(e));
+      })
+      .finally(() => setCutInFlight(false));
   };
 
   const resume = () => {
@@ -397,12 +413,15 @@ export function CutDialog({
               ) : null}
               {section.devices.map((d) => {
                 // Only the aimed-at cutter has a status; the rest have not been asked, and
-                // `null` is what says so rather than something that reads as ready.
-                const aimed = connected?.instance_id === d.instance_id ? status : null;
+                // `null` is what says so rather than something that reads as ready. Matched on the
+                // id *and* the host: two hosts wired alike hand out the same fallback id, and
+                // giving one host's status to the other's row hands Cancel to the wrong machine.
+                const isAimed = sameCutter(connected, d);
+                const aimed = isAimed ? status : null;
                 const badge = deviceBadge(aimed);
                 const control = connectedControl(aimed, d.host !== null);
                 return (
-                <div key={d.instance_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                <div key={`${d.host ?? "local"}:${d.instance_id}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <span>
                     {d.machine_id}
                     {d.candidate ? " (unverified serial device)" : ""}
@@ -410,7 +429,7 @@ export function CutDialog({
                   <span data-testid="device-badge" data-tone={badge.tone} style={{ color: TONE_COLOR[badge.tone] }}>
                     {badge.label}
                   </span>
-                  {connected?.instance_id === d.instance_id ? (
+                  {isAimed ? (
                     <>
                       <span style={{ color: "var(--ready)" }}>connected</span>
                       {/* The only way back from a stop nothing confirmed: `driver-core` refuses
@@ -449,6 +468,14 @@ export function CutDialog({
             <button style={btn} onClick={() => onConvertMachine(connected.machine_id)}>
               Convert to {connected.machine_id}
             </button>
+          </div>
+        ) : null}
+
+        {alreadyAccepted ? (
+          <div role="alert" style={{ color: "var(--cut)", fontSize: 12 }}>
+            This Cut Host had already accepted this cut, so nothing new was started — this was read
+            as a retry of a dispatch whose answer was lost. If the cutter is idle and you meant a
+            fresh sheet, press Cut again.
           </div>
         ) : null}
 
@@ -577,7 +604,7 @@ export function CutDialog({
           <button
             aria-label="Start Cut"
             style={btn}
-            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0}
+            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0 || cutInFlight}
             onClick={startCut}
           >
             Start Cut

@@ -53,7 +53,7 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
   async function start() {
     const done = await runPairing(
       { address: address.trim(), token, name: name.trim() || undefined },
-      { probe: ipc.probeHost, test: ipc.testHost, save: ipc.pairHost },
+      { probe: ipc.probeHost, test: ipc.testHost, save: ipc.pairHost, existing: ipc.existingPairing },
       {
         confirmFingerprint: () => new Promise<boolean>(resolve => { decide.current = resolve; }),
         onState: setState,
@@ -93,6 +93,24 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
 
         {state.kind === "confirm" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {/* Said before the fingerprint, not after: a changed certificate is the reason the
+                existing pairing stopped working, and it is what the operator is here to fix. The
+                second row this will create is unavoidable — pairing cannot overwrite another
+                host's pinned fingerprint — so what is owed is an explanation, not a refusal. */}
+            {state.existing && !state.existing.sameFingerprint && (
+              <p role="alert" style={{ margin: 0, color: "var(--cut)" }}>
+                “{state.existing.name}” is already paired at this address, and the certificate
+                pinned for it is not the one just presented. Either the Cut Host was reinstalled,
+                or something else is answering at this address. Pairing again adds a second entry;
+                the old one will never connect again, and is yours to forget.
+              </p>
+            )}
+            {state.existing && state.existing.sameFingerprint && (
+              <p style={{ margin: 0, color: "var(--muted)" }}>
+                “{state.existing.name}” is already paired at this address, with this same
+                certificate. Pairing again adds a second entry rather than replacing it.
+              </p>
+            )}
             {/* The token has not been sent yet, and will not be unless this is confirmed. */}
             <p style={{ margin: 0 }}>The host presented this fingerprint. Check that it matches the
               one shown on the Cut Host's own console before continuing.</p>

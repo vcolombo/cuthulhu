@@ -15,6 +15,32 @@ cross build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthu
 
 Copy the binary to `/usr/local/bin/cuthulhu-cutd`.
 
+`cross` needs Docker running, and takes the rest from the repository: `Cross.toml` installs the
+target's `libudev` into the build image, and `.cargo/config.toml` tells `pkg-config` to look there.
+Both are needed because `serialport` links a C library, and a cross build must find the *Pi's*
+copy of it rather than the build machine's.
+
+Not on an Apple Silicon Mac, though: `cross` 0.2.5 wants an `x86_64` Linux toolchain that `rustup`
+refuses to install on an ARM host, and it stops before it reaches Docker at all. Build on the Pi,
+cross-compile from an `x86_64` machine, or do it in a container:
+
+```sh
+docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work \
+  -e CARGO_TARGET_DIR=/work/target/cross \
+  -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  rust:1-bookworm bash -c '
+    dpkg --add-architecture arm64 && apt-get update &&
+    apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross libudev-dev:arm64 pkg-config &&
+    rustup target add aarch64-unknown-linux-gnu &&
+    cargo build --release --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd'
+```
+
+The binary lands in `target/cross/aarch64-unknown-linux-gnu/release/cuthulhu-cutd`. Its own target
+directory, because the container's build scripts are Linux binaries and would otherwise be written
+over the macOS ones in `target/release/build`. `libc6-dev-arm64-cross` is the easy one to leave
+out and the confusing one to debug: without it the aarch64 compiler is present but has no headers,
+and the first C dependency fails on a missing `bits/libc-header-start.h`.
+
 ## Create the daemon's user
 
 `cuthulhu-cutd` runs as an unprivileged system account, never as root:
@@ -132,8 +158,16 @@ the daemon refuses to end a Job on one. It logs which cutter is still busy and w
 itself the moment the last cut finishes — a stop issued mid-Job is deferred, not rejected, so you
 can leave the command running and it completes when the material does.
 
+**A Pass waiting for you counts as a cut in progress.** A Puma cannot be polled, so between
+colours it parks and waits for somebody to swap the material — and the daemon treats that as
+active, because the alternative is abandoning a Job somebody fully intends to finish. It will wait
+there as long as the Pass does. Upgrade a package at 6pm with a Puma parked mid-Job and nobody in
+the room, and `systemctl stop` sits for the whole of `TimeoutStopSec` on a machine that is not
+cutting and will not resume until someone walks over to it. The log line names it —
+`waiting for an operator` beside the cutter — and the second signal below is how you stop anyway.
+
 That waiting is only as long as systemd allows. **`TimeoutStopSec` must exceed your longest
-realistic cut.** systemd sends SIGKILL when it expires, and SIGKILL cannot be refused by anything —
+realistic cut**, including any time a Pass may sit waiting for a person. systemd sends SIGKILL when it expires, and SIGKILL cannot be refused by anything —
 leave it at the default (90 seconds on most systems) and a stop during a half-hour Job abandons the
 cut exactly as before, while the daemon's refusal in the log makes it look like it did not.
 `TimeoutStopSec=infinity` waits forever, at the cost of a genuinely wedged daemon being able to

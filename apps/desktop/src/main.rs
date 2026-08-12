@@ -15,7 +15,12 @@ use desktop::state::AppState;
 
 /// Cancels + shuts down the device manager and exits the process. Used by the
 /// UI after the user confirms they want to quit with a cut in progress.
-#[tauri::command]
+///
+/// async, like every other command here that can touch the network: aimed at a Cut Host, `cancel`
+/// waits for that host's connection lock, may reconnect, and then waits out a reply — on the main
+/// thread that is the escape hatch from the close guard hanging harder than the guard it escapes
+/// (#116).
+#[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     dev.cancel().ok();
     dev.shutdown();
@@ -72,6 +77,7 @@ fn main() {
             ipc::delete_preset,
             ipc::list_hosts,
             ipc::probe_host,
+            ipc::existing_pairing,
             ipc::test_host,
             ipc::pair_host,
             ipc::forget_host,
@@ -84,12 +90,17 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                // Non-blocking for a local device: the worker publishes status rather than being
-                // asked for it. Aimed at a host, this is a synchronous network round trip on the
-                // UI thread — bounded (roughly 2x STATUS_POLL_TIMEOUT, see DeviceManagerHandle::
-                // status) but not instant, and DNS ahead of it is unbounded with std. A closing
-                // window can briefly stall on a wedged Pi; it will not hang forever.
-                if dev.status().is_active() {
+                // Never blocking, local or remote. This callback is synchronous and runs on the
+                // main thread, and `status()` aimed at a host dials: its 2s budget starts only
+                // once that host's connection lock is in hand, and `list_devices` holds the same
+                // lock across a 30s call — so a close arriving during a device-list poll froze
+                // the window for the listing plus the poll plus an unbounded resolve (#115).
+                // What this asks is whether to warn, which a status alone cannot answer: a
+                // dispatch accepted a second ago has not been polled yet, so the newest status
+                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts a
+                // dispatch this desktop sent and has not seen finish; a warning about a Job that
+                // has since ended costs a dialog the operator dismisses.
+                if dev.a_cut_may_be_running() {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();
                 }

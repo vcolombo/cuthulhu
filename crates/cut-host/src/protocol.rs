@@ -54,6 +54,21 @@ pub enum Request {
     Reconnect { device: String },
 }
 
+/// What an accepted dispatch actually did.
+///
+/// "Your Job has started" and "this host had already accepted that id" are different facts, and a
+/// bare `Ok` said only the first while sometimes meaning the second — so an operator whose retry
+/// was answered as a duplicate watched a cutter that was never going to move (#121). The client
+/// cannot work it out: a retry and a second sheet of the same design are byte-identical, and only
+/// the host knows which ids it has seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Admitted {
+    /// A Job was registered and its worker started.
+    Started,
+    /// This dispatch id had already been accepted for this cutter; nothing new was started.
+    AlreadyAccepted,
+}
+
 /// `Accepted` carries no `job_id`: `DeviceManager::cut` does not return one until
 /// the Job reaches its first pause point or finishes (`manager.rs:648-668`), which
 /// for a pollable machine is the end of the cut. The client reads `job_id` off the
@@ -62,9 +77,13 @@ pub enum Request {
 pub enum Response {
     Devices(Vec<DeviceInfo>),
     Snapshots(Vec<DeviceSnapshot>),
-    Accepted { dispatch_id: DispatchId },
+    Accepted { dispatch_id: DispatchId, admitted: Admitted },
     Ok,
     Refused(Refusal),
+    /// The token presented matched no client. Sent instead of closing the connection, because a
+    /// silent close is indistinguishable from an unreachable host and the two need opposite
+    /// responses from the operator (#112).
+    Unauthorized,
 }
 
 /// `Preflight` carries `PassFault` itself, not its rendered sentence: the sentence
@@ -78,6 +97,10 @@ pub enum Refusal {
     MachineMismatch { dispatched: String, attached: String },
     Preflight(PassFault),
     Device(DeviceError),
+    /// The id was longer than a host will remember. Refused rather than truncated, because a
+    /// truncated id is a *different* id and the whole point of one is that a retry arrives under
+    /// the name its first attempt used.
+    DispatchIdTooLong { max: usize },
 }
 
 /// `driver-core`'s own event, plus which cutter it came from. One client

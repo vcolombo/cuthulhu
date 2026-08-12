@@ -8,15 +8,46 @@
 //! `CutStatus`, so a failure on one cutter cannot reach another — that isolation is
 //! structural, not implemented.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use driver_core::manager::{CutPass, DeviceError, DeviceManager};
-use driver_core::{DeviceBackendFactory, DeviceInfo};
+use driver_core::{DeviceBackendFactory, DeviceInfo, Phase};
 
 use crate::check::{check_passes, PassFault};
-use crate::protocol::{DeviceSnapshot, DispatchId, Event, Refusal};
+use crate::protocol::{Admitted, DeviceSnapshot, DispatchId, Event, Refusal};
+
+/// How long a Cut Host remembers a dispatch id it has accepted.
+///
+/// Long enough to cover any retry an operator would recognise as one — a dropped reply, a Wi-Fi
+/// gap, a laptop lid — and short enough that the daemon can say how long it is. Remembering
+/// forever made a Job silently a no-op because the daemon had seen its id in January, which no
+/// client could know or work around (#119). Forgetting too soon is the opposite failure: a retry
+/// that arrives past this cuts the material a second time.
+///
+/// Public because it is the *client's* business too: past this window a retry cannot be
+/// recognised, so a client holding an unanswered dispatch is holding something that has stopped
+/// meaning anything. Reading it from here is what keeps the two sides' idea of the window from
+/// drifting apart — the alternative is a number written down twice.
+pub const ID_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+/// The longest dispatch id this host will accept.
+///
+/// A client's own name for one dispatch; the desktop's is about sixty characters. The cap is not
+/// about that client — it is that an id is *remembered*, so without a bound an authenticated
+/// client could hand a Pi with a gigabyte of RAM a megabyte of id per dispatch and have the daemon
+/// hold every one of them for an hour.
+const MAX_DISPATCH_ID: usize = 128;
+
+/// How many accepted ids one cutter remembers at once, oldest evicted first.
+///
+/// The hour alone is not a bound: nothing prunes until the next dispatch arrives, so a daemon left
+/// idle keeps whatever the last burst put there. This is what makes the memory a fixed cost rather
+/// than a function of how fast a client can dispatch. It only weakens the dedupe after this many
+/// *distinct* Jobs on one cutter inside an hour, by which point the oldest is long finished.
+const MAX_REMEMBERED_IDS: usize = 512;
 
 pub(crate) struct DeviceSlot {
     pub info: DeviceInfo,
@@ -50,17 +81,81 @@ impl DeviceSlot {
 /// that never existed. They live together so no lock ordering can get that wrong.
 #[derive(Default)]
 pub(crate) struct Admission {
-    /// Dispatch ids already accepted for this cutter. A repeat starts nothing.
-    accepted: HashSet<DispatchId>,
+    /// Dispatch ids already accepted for this cutter, and when each was last seen. A repeat
+    /// starts nothing, until it ages past `ID_RETENTION`.
+    accepted: HashMap<DispatchId, Instant>,
     /// Set from admitting a dispatch until its worker's `manager.cut` returns.
     /// `actions.cut` cannot cover that window on its own: the cut runs on a thread
     /// of its own, so until it has told the `DeviceManager` anything, the cutter
     /// still publishes itself as free and a second dispatch would be admitted too.
-    //
-    // ponytail: a panic inside `manager.cut` would leave this set and the cutter
-    // unclaimable until the daemon restarts. `cut` is a channel round-trip that
-    // does not unwrap; give this an RAII guard if that ever stops being true.
+    ///
+    /// Cleared by `StartingClaim`'s `Drop`, never by hand: a path that leaves it set makes the
+    /// cutter permanently unclaimable, and the ways to leave it set are exactly the ones an
+    /// explicit assignment cannot reach — a panic inside `manager.cut`, or a worker thread that
+    /// could not be spawned at all (#120).
     starting: bool,
+}
+
+impl Admission {
+    /// Drop every accepted id older than `ID_RETENTION` as of `now`.
+    ///
+    /// Takes the moment rather than reading the clock so a test can look at this from a point in
+    /// the future — `Instant` is monotonic from an unspecified epoch, so stepping *backwards* from
+    /// `now` is what a freshly booted machine cannot do.
+    fn forget_expired(&mut self, now: Instant) {
+        self.accepted.retain(|_, seen| now.saturating_duration_since(*seen) < ID_RETENTION);
+    }
+
+    /// Drop the oldest ids until at most `MAX_REMEMBERED_IDS` remain.
+    ///
+    /// The age rule cannot do this on its own: it only runs when a dispatch arrives, so a burst
+    /// followed by silence leaves every id of that burst held. Evicting by age keeps the ids a
+    /// retry could plausibly still name and drops the ones a retry never will.
+    fn forget_oldest_beyond_cap(&mut self) {
+        while self.accepted.len() > MAX_REMEMBERED_IDS {
+            let Some(oldest) =
+                self.accepted.iter().min_by_key(|(_, seen)| **seen).map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            self.accepted.remove(&oldest);
+        }
+    }
+}
+
+/// Holds `Admission::starting` for as long as a dispatch is on its way to `manager.cut`, and
+/// clears it however that ends — normally, by a panic unwinding through the worker, or by the
+/// worker never running because the thread could not be spawned (the closure, and this with it,
+/// is dropped there).
+///
+/// The flag is half of `is_claimed`, so leaking it set claims the cutter for a Job that will never
+/// run: `reconnect` refuses, every later dispatch refuses, and the shutdown guard holds — leaving
+/// a restart of `cuthulhu-cutd` as the only way back, which is the outcome `Reconnect` exists to
+/// avoid.
+struct StartingClaim {
+    host: Arc<Host>,
+    device: String,
+}
+
+impl Drop for StartingClaim {
+    fn drop(&mut self) {
+        let Some(slot) = self.host.slot(&self.device) else { return };
+        // Poison is recovered from rather than propagated: this runs during unwind if the worker
+        // panicked, and a panic in a `Drop` while unwinding aborts the process — so the one path
+        // that most needs the flag cleared would instead take the daemon down.
+        let mut admission = slot.admission.lock().unwrap_or_else(|e| e.into_inner());
+        admission.starting = false;
+    }
+}
+
+/// One cutter a Cut Host is holding, for whoever has to say why it will not exit yet.
+pub struct Claim {
+    pub device: String,
+    pub phase: Phase,
+    pub job_id: Option<u64>,
+    /// A dispatch admitted and not yet inside `manager.cut`: claimed, with nothing for the phase
+    /// or the Job id to describe yet.
+    pub starting: bool,
 }
 
 pub struct Host {
@@ -171,7 +266,13 @@ impl Host {
         device: &str,
         machine_id: &str,
         passes: Vec<CutPass>,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Admitted, Refusal> {
+        // Before the cutter is even looked up: an id this host would have to remember for an hour
+        // is the one part of a dispatch whose cost outlives the request carrying it.
+        if dispatch_id.0.len() > MAX_DISPATCH_ID {
+            return Err(Refusal::DispatchIdTooLong { max: MAX_DISPATCH_ID });
+        }
+
         let slot = self.slot(device).ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
 
         if slot.info.machine_id != machine_id {
@@ -204,14 +305,19 @@ impl Host {
         // under this lock, only asked what it last said.
         {
             let mut admission = slot.admission.lock().unwrap();
+            admission.forget_expired(Instant::now());
             // `insert` reports whether the id was already there, so a duplicate
             // cannot slip through the gap a separate `contains` would leave. That
             // gap is where a client's retry after a dropped reply would become a
             // second cut of the same material. Checked before the cutter so a retry
             // of a Job already mid-cut stays the no-op it always was, rather than
             // being told Busy by the very state its own first dispatch caused.
-            if !admission.accepted.insert(dispatch_id.clone()) {
-                return Ok(());
+            //
+            // Answered as `AlreadyAccepted` rather than as a plain success: a no-op and a started
+            // Job are different facts, and the operator standing at a cutter that is not moving is
+            // the one who needs to be told which happened.
+            if admission.accepted.insert(dispatch_id.clone(), Instant::now()).is_some() {
+                return Ok(Admitted::AlreadyAccepted);
             }
             // What is legal now is `actions`' answer, not ours to infer — plus the
             // one thing `actions` cannot yet know, an already-admitted dispatch on
@@ -222,31 +328,47 @@ impl Host {
                 admission.accepted.remove(&dispatch_id);
                 return Err(Refusal::Device(DeviceError::Busy));
             }
+            // Only once this dispatch is keeping its place. Capping between the insert and the
+            // refusal above spent an old id to make room for one that was then handed straight
+            // back — a request that started nothing, costing the dedupe history of one that did.
+            admission.forget_oldest_beyond_cap();
             admission.starting = true;
         }
 
-        let host = self.clone();
         let device = device.to_string();
-        thread::spawn(move || {
-            let Some(slot) = host.slot(&device) else { return };
+        let claim = StartingClaim { host: self.clone(), device: device.clone() };
+        let id = dispatch_id.clone();
+        // `Builder`, not `thread::spawn`: spawn *panics* when a thread cannot be created, and this
+        // is a daemon that must survive the day it runs out of threads. On the error path the
+        // closure — and the claim inside it — is dropped, which is what puts the cutter back.
+        let started = thread::Builder::new().name(format!("dispatch {device}")).spawn(move || {
+            let claim = claim;
+            let Some(slot) = claim.host.slot(&claim.device) else { return };
             // Only now is the claim the manager's to publish: `cut` returns once the
             // Job has reached its first pause point or finished, so from here
             // `actions` describes this Job rather than the cutter it found free.
-            let outcome = slot.manager.cut(passes);
-            let mut admission = slot.admission.lock().unwrap();
-            admission.starting = false;
-            match outcome {
+            match slot.manager.cut(passes) {
                 Ok(job_id) => *slot.job_id.lock().unwrap() = Some(job_id),
                 Err(e) => {
                     // A refusal before any motion emits no event and moves no state,
                     // so nothing else will tell anyone. Give the id back: a retry
                     // after a Job that never started must be able to run.
-                    admission.accepted.remove(&dispatch_id);
-                    eprintln!("cut host: {device} refused the job: {e:?}");
+                    slot.admission.lock().unwrap().accepted.remove(&id);
+                    eprintln!("cut host: {} refused the job: {e:?}", claim.device);
                 }
             }
+            // `claim` drops here, clearing `starting` — after the id has been handed back, so no
+            // window shows a free cutter still holding the id of a Job that never ran.
         });
-        Ok(())
+
+        if let Err(e) = started {
+            eprintln!("cut host: {device} could not start a worker for the dispatch: {e}");
+            if let Some(slot) = self.slot(&device) {
+                slot.admission.lock().unwrap().accepted.remove(&dispatch_id);
+            }
+            return Err(Refusal::Device(DeviceError::Io(e.to_string())));
+        }
+        Ok(Admitted::Started)
     }
 
     /// What the daemon's shutdown guard asks (`crate::shutdown` is the caller). Built on
@@ -256,6 +378,26 @@ impl Host {
     /// told `Accepted` — see `DeviceSlot::is_claimed`.
     pub fn is_any_cut_active(&self) -> bool {
         self.slots.values().any(|s| s.is_claimed())
+    }
+
+    /// Every cutter this host is holding, and what it is holding it for.
+    ///
+    /// The same predicate `is_any_cut_active` decides on, so a daemon that says it is waiting can
+    /// always name what for. Filtering on `is_active` instead let the shutdown guard announce a
+    /// cut and then print nothing, in exactly the window `starting` exists to cover — an empty
+    /// list under "a cut is still running" reads as a confused guard worth forcing past (#124).
+    pub fn claims(&self) -> Vec<Claim> {
+        self.order
+            .iter()
+            .filter_map(|id| self.slots.get(id))
+            .filter(|s| s.is_claimed())
+            .map(|s| Claim {
+                device: s.info.instance_id.clone(),
+                phase: s.manager.status().phase,
+                job_id: *s.job_id.lock().unwrap(),
+                starting: s.admission.lock().unwrap().starting,
+            })
+            .collect()
     }
 
     /// Cancel, resume and confirm take no client identity on purpose. One token is
@@ -583,8 +725,164 @@ mod tests {
         // A retry arrives. The cutter is mid-Job, so a second cut would be refused
         // Busy anyway — the assertion that matters is that it is accepted as a
         // no-op rather than surfacing an error to a client that did nothing wrong.
-        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        let again = host
+            .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
+            .unwrap();
+        assert_eq!(again, Admitted::AlreadyAccepted, "a no-op must say it was one");
         assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job_after_first);
+    }
+
+    /// An id is remembered for an hour, so its length is a cost this host carries rather than one
+    /// the request carrying it pays. Refused before the cutter is even looked up, and refused
+    /// rather than truncated — a truncated id is a different id, and a retry arriving under a
+    /// different name is a second cut.
+    #[test]
+    fn a_dispatch_id_longer_than_a_host_will_remember_is_refused() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let huge = DispatchId("d".repeat(MAX_DISPATCH_ID + 1));
+        match host.dispatch(huge.clone(), CAMEO, "cameo5", vec![square_pass()]) {
+            Err(Refusal::DispatchIdTooLong { max }) => assert_eq!(max, MAX_DISPATCH_ID),
+            other => panic!("expected DispatchIdTooLong, got {other:?}"),
+        }
+        assert!(!holds_dispatch_id(&host, CAMEO, &huge.0), "a refused id must not be remembered");
+        assert_eq!(host.slot(CAMEO).unwrap().manager.status().phase, driver_core::Phase::Idle);
+
+        // The merely long is still fine: the cap refuses abuse, not the desktop's own ids, which
+        // run to about sixty characters.
+        host.dispatch(DispatchId("d".repeat(MAX_DISPATCH_ID)), CAMEO, "cameo5", vec![square_pass()])
+            .expect("an id at the limit is acceptable");
+    }
+
+    /// The hour is not a bound on its own: nothing prunes until the next dispatch arrives, so a
+    /// daemon left idle after a burst keeps every id of that burst. The cap is what makes the
+    /// memory a fixed cost rather than a function of how fast a client can dispatch.
+    #[test]
+    fn a_cutter_remembers_only_so_many_ids_at_once() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let slot = host.slot(CAMEO).unwrap();
+        let mut admission = slot.admission.lock().unwrap();
+        // Ages a millisecond apart, so "oldest" is well defined rather than a tie.
+        let base = Instant::now();
+        for n in 0..MAX_REMEMBERED_IDS + 50 {
+            admission
+                .accepted
+                .insert(DispatchId(format!("d-{n}")), base + Duration::from_millis(n as u64));
+        }
+        admission.forget_oldest_beyond_cap();
+
+        assert_eq!(admission.accepted.len(), MAX_REMEMBERED_IDS);
+        assert!(
+            !admission.accepted.contains_key(&DispatchId("d-0".into())),
+            "the oldest id survived the cap"
+        );
+        assert!(
+            admission.accepted.contains_key(&DispatchId(format!("d-{}", MAX_REMEMBERED_IDS + 49))),
+            "the newest id — the one a retry would actually name — was evicted"
+        );
+    }
+
+    /// A dispatch that is refused must not spend another Job's place in the dedupe history. The
+    /// cap used to run between the insert and the refusal, so a request that started nothing —
+    /// aimed at a busy cutter, say — evicted the oldest id to make room for one handed straight
+    /// back, and a retry naming that evicted id would then have been cut a second time.
+    #[test]
+    fn a_refused_dispatch_does_not_evict_an_id_to_make_room_for_itself() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        // Fill to the cap with ids of known ages, oldest first.
+        {
+            let slot = host.slot(CAMEO).unwrap();
+            let mut admission = slot.admission.lock().unwrap();
+            let base = Instant::now();
+            for n in 0..MAX_REMEMBERED_IDS {
+                admission
+                    .accepted
+                    .insert(DispatchId(format!("d-{n}")), base + Duration::from_millis(n as u64));
+            }
+        }
+        // A busy cutter, so the next dispatch is refused rather than admitted.
+        host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+
+        assert!(matches!(
+            host.dispatch(DispatchId("d-refused".into()), CAMEO, "cameo5", vec![square_pass()]),
+            Err(Refusal::Device(DeviceError::Busy))
+        ));
+
+        let admission = host.slot(CAMEO).unwrap().admission.lock().unwrap();
+        assert!(
+            admission.accepted.contains_key(&DispatchId("d-0".into())),
+            "a refused dispatch evicted the oldest id on its way to being refused"
+        );
+        assert!(!admission.accepted.contains_key(&DispatchId("d-refused".into())));
+        assert_eq!(admission.accepted.len(), MAX_REMEMBERED_IDS);
+    }
+
+    /// An id is remembered for a stated length of time, not forever. Kept forever, a daemon up for
+    /// months answered `Ok` to a dispatch carrying an id it had seen in January and cut nothing —
+    /// and no client could know that, because nothing on the wire said how long ids last (#119).
+    #[test]
+    fn an_accepted_id_is_forgotten_once_it_is_older_than_the_retention() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        assert!(holds_dispatch_id(&host, CAMEO, "d-1"));
+
+        // Looked at from a point past the retention rather than by ageing the entry: `Instant` is
+        // monotonic from an unspecified epoch, so a machine booted minutes ago cannot subtract an
+        // hour from `now` at all.
+        {
+            let slot = host.slot(CAMEO).unwrap();
+            let mut admission = slot.admission.lock().unwrap();
+            admission.forget_expired(Instant::now() + ID_RETENTION + Duration::from_secs(1));
+        }
+        assert!(!holds_dispatch_id(&host, CAMEO, "d-1"), "an id past its retention is still held");
+
+        // And a fresh one is not swept up with it.
+        let slot = host.slot(CAMEO).unwrap();
+        let mut admission = slot.admission.lock().unwrap();
+        admission.accepted.insert(DispatchId("d-fresh".into()), Instant::now());
+        admission.forget_expired(Instant::now());
+        assert!(admission.accepted.contains_key(&DispatchId("d-fresh".into())));
+    }
+
+    /// A dispatch id forgotten by the host is dispatchable again — the property the retention is
+    /// for. Without it the operator's press of Cut is answered `AlreadyAccepted` and nothing moves.
+    #[test]
+    fn a_forgotten_id_can_start_a_job_again() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        host.confirm_pass_done(CAMEO).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::Idle);
+
+        host.slot(CAMEO)
+            .unwrap()
+            .admission
+            .lock()
+            .unwrap()
+            .forget_expired(Instant::now() + ID_RETENTION + Duration::from_secs(1));
+
+        let admitted = host
+            .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
+            .expect("an id the host no longer remembers is a new Job");
+        assert_eq!(admitted, Admitted::Started);
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+    }
+
+    /// The claim comes off however the dispatch's worker ends. The two ways it used not to — a
+    /// panic unwinding out of `manager.cut`, and a thread that could never be spawned — are both
+    /// outside any explicit assignment, and either one left the cutter claimed by a Job that would
+    /// never run: `reconnect` refused, every dispatch refused, the shutdown guard held, and a
+    /// restart of the daemon was the only exit (#120).
+    #[test]
+    fn a_dropped_starting_claim_releases_the_cutter() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+        assert!(host.slot(CAMEO).unwrap().is_claimed(), "the fixture has to actually claim it");
+
+        drop(StartingClaim { host: host.clone(), device: CAMEO.into() });
+
+        assert!(!host.slot(CAMEO).unwrap().is_claimed(), "the cutter is still claimed by nothing");
+        assert!(host.reconnect(CAMEO).is_ok(), "and still unreachable through the way back");
     }
 
     /// Runs `dispatch` on two threads released together, so both are inside it at
@@ -595,7 +893,7 @@ mod tests {
         host: &Arc<Host>,
         device: &str,
         ids: [&str; 2],
-    ) -> [Result<(), Refusal>; 2] {
+    ) -> [Result<Admitted, Refusal>; 2] {
         let gate = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
             let one = s.spawn(|| {
@@ -611,7 +909,7 @@ mod tests {
 
     fn holds_dispatch_id(host: &Host, device: &str, id: &str) -> bool {
         let admission = host.slot(device).unwrap().admission.lock().unwrap();
-        admission.accepted.contains(&DispatchId(id.into()))
+        admission.accepted.contains_key(&DispatchId(id.into()))
     }
 
     /// The retry and its own original, arriving together at a cutter that is busy.
@@ -912,6 +1210,37 @@ mod tests {
 
         assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
         assert!(host.is_any_cut_active(), "and the daemon must not exit past it either");
+
+        // What the shutdown guard prints has to agree with what it decided. Reading `is_active`
+        // there instead announced "a cut is still running" and then listed nothing, in exactly
+        // this window — an empty list under that sentence reads as a guard worth forcing past.
+        let claims = host.claims();
+        assert_eq!(claims.len(), 1, "a held daemon must be able to name what holds it");
+        assert_eq!(claims[0].device, CAMEO);
+        assert!(claims[0].starting, "and say that it is a dispatch rather than a Job in flight");
+        assert_eq!(claims[0].job_id, None);
+    }
+
+    /// The other half of the same agreement: a Job actually in flight is named too, so one
+    /// predicate really does serve both readings.
+    #[test]
+    fn a_job_in_flight_is_named_by_the_same_predicate_that_holds_the_daemon() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+        wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+
+        let claims = host.claims();
+        assert_eq!(host.is_any_cut_active(), !claims.is_empty());
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].phase, driver_core::Phase::AwaitingConfirmation);
+        assert!(claims[0].job_id.is_some());
+        assert!(!claims[0].starting);
+    }
+
+    #[test]
+    fn an_idle_host_holds_nothing_and_names_nothing() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        assert!(host.claims().is_empty());
     }
 
     fn wait_for_ended(host: &Arc<Host>, device: &str, want: driver_core::Ended) -> driver_core::CutStatus {

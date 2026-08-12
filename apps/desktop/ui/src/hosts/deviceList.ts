@@ -1,6 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { ipcErrorCode, ipcErrorMessage, type CutStatus, type DeviceInfo, type PairedHostView } from "../ipc";
 
+/**
+ * Whether these are the same cutter — the id *and* the host, never the id alone.
+ *
+ * Instance ids are not unique across hosts. `driver-registry` assigns a fallback id from *where* a
+ * device was found when it reports no serial number (`usb:at:1:4`, `serial:at:/dev/ttyUSB0`), so
+ * two Pis with cutters wired the same way hand out the same string for two different machines.
+ * That is deliberate: `at:` promises only the same socket, which is why it is spelled differently
+ * from `sn:`.
+ *
+ * Comparing ids alone gave the polled status to every row that matched, so a cutter mid-cut on one
+ * host lost its controls to an idle namesake on another — and Cancel, the one control that stops a
+ * blade, aimed at the wrong machine (#114). `apps/desktop/src/device.rs`'s dispatch guard has
+ * always compared the pair; this is the UI catching up.
+ */
+export function sameCutter(
+  a: { instance_id: string; host: string | null } | null | undefined,
+  b: { instance_id: string; host: string | null } | null | undefined,
+): boolean {
+  return !!a && !!b && a.instance_id === b.instance_id && a.host === b.host;
+}
+
 export type DeviceSection = {
   /** null for cutters attached to this computer. */
   hostId: string | null;

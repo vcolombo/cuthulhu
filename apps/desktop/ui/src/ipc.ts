@@ -199,7 +199,12 @@ export async function planCut(): Promise<PlanCutResponse> {
   return invoke("plan_cut", {});
 }
 
-export async function cut(request: Args): Promise<number> {
+/** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this
+ *  dispatch and started nothing — the one fact the desktop cannot work out for itself, and the
+ *  difference between a cutter about to move and one that never will. */
+export type CutStarted = { job_id: number; duplicate: boolean };
+
+export async function cut(request: Args): Promise<CutStarted> {
   return invoke("cut", { request });
 }
 
@@ -227,6 +232,15 @@ export async function probeHost(address: string): Promise<string> {
 
 export async function testHost(address: string, token: string, fingerprint: string): Promise<DeviceInfo[]> {
   return invoke("test_host", { address, token, fingerprint });
+}
+
+/** A Cut Host already paired at this address, if there is one. `sameFingerprint: false` means the
+ *  host's certificate changed since it was paired — a reinstall, or something worth worrying
+ *  about, and the operator is the only one who knows which. */
+export type ExistingPairing = { id: string; name: string; sameFingerprint: boolean };
+
+export async function existingPairing(address: string, fingerprint: string): Promise<ExistingPairing | null> {
+  return invoke("existing_pairing", { address, fingerprint });
 }
 
 export async function pairHost(name: string, address: string, token: string, fingerprint: string): Promise<PairedHostView> {

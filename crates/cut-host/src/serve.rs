@@ -65,6 +65,14 @@ fn enable_keepalive(stream: &TcpStream, peer: &str) {
 /// anything beyond this is a bug or an attempt to exhaust it.
 pub const MAX_CLIENTS: usize = 8;
 
+/// How long an unauthenticated peer has to present its token, from the connection being accepted.
+///
+/// Short on purpose, and much shorter than `DEFAULT_BODY_TIMEOUT`: a peer that has proved nothing
+/// has earned less patience than a paired desktop mid-dispatch, and until it has, it is holding
+/// one of `MAX_CLIENTS` slots. Spent at most twice — once waiting for the frame to begin, once for
+/// the rest of it — so the worst an unauthenticated peer can squat is roughly `2x` this (#118).
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The name of the token that matched, or `None`. Every candidate is compared in full, so the
 /// time taken says nothing about how much of a token was right — and comparing all of them,
 /// rather than stopping at the first match, keeps that true as clients are added.
@@ -93,7 +101,7 @@ pub fn handle_request(host: &Arc<Host>, request: Request) -> Response {
         Request::Snapshot => Response::Snapshots(host.snapshots()),
         Request::Dispatch { dispatch_id, device, machine_id, passes } => {
             match host.dispatch(dispatch_id.clone(), &device, &machine_id, passes) {
-                Ok(()) => Response::Accepted { dispatch_id },
+                Ok(admitted) => Response::Accepted { dispatch_id, admitted },
                 Err(refusal) => Response::Refused(refusal),
             }
         }
@@ -228,6 +236,13 @@ fn serve_client(
     stream
         .set_read_timeout(Some(SOCKET_POLL_INTERVAL))
         .map_err(|e| io::Error::other(format!("could not set a read timeout: {e}")))?;
+    // The same, for the direction this worker writes in. Without it a client that authenticates
+    // and then stops reading pins this thread — and its `MAX_CLIENTS` slot — in `write_frame` as
+    // soon as the queued events outgrow the socket buffer. Keepalive does not reach that peer
+    // either: it is alive and acknowledging, it has just stopped draining.
+    stream
+        .set_write_timeout(Some(SOCKET_POLL_INTERVAL))
+        .map_err(|e| io::Error::other(format!("could not set a write timeout: {e}")))?;
 
     let conn = rustls::ServerConnection::new(tls).map_err(io::Error::other)?;
     let mut tls_stream = rustls::StreamOwned::new(conn, stream);
@@ -235,15 +250,20 @@ fn serve_client(
     // The token before anything else: an unauthenticated frame must never reach a
     // device, and a failed attempt is slowed so the port cannot be worked through.
     let presented: String =
-        read_frame(&mut tls_stream, 1024, Some(DEFAULT_BODY_TIMEOUT), DEFAULT_BODY_TIMEOUT)
+        read_frame(&mut tls_stream, 1024, Some(PRE_AUTH_TIMEOUT), PRE_AUTH_TIMEOUT)
             .map_err(io::Error::other)?;
     let Some(client) = match_token(&presented, tokens) else {
         eprintln!("cut host: {peer} presented a token matching no client");
         thread::sleep(std::time::Duration::from_secs(2));
+        // Said out loud rather than closed silently. A dropped connection reaches the operator as
+        // "the host could not be reached", which is what an asleep Pi looks like too — and the two
+        // call for opposite actions: re-pair with the token from `cutd.toml`, versus wait (#112).
+        // After the delay, so naming the failure does not also make it quicker to work through.
+        let _ = write_frame(&mut tls_stream, &Response::Unauthorized, PRE_AUTH_TIMEOUT);
         return Err(io::Error::other("bad token"));
     };
     eprintln!("cut host: {peer} authenticated as `{client}`");
-    write_frame(&mut tls_stream, &Response::Ok)?;
+    write_frame(&mut tls_stream, &Response::Ok, DEFAULT_BODY_TIMEOUT).map_err(io::Error::other)?;
 
     // Events for every cutter go out on this connection; requests come back on it.
     // ponytail: they are written just before each reply rather than pushed the
@@ -255,7 +275,7 @@ fn serve_client(
     loop {
         // Drain whatever the cutters have said before waiting on the client again.
         while let Ok(event) = events.try_recv() {
-            write_frame(&mut tls_stream, &event)?;
+            write_frame(&mut tls_stream, &event, DEFAULT_BODY_TIMEOUT).map_err(io::Error::other)?;
         }
         // `None` buys the client an unbounded wait for its next request to *begin*, and nothing
         // more: it is idle between polls, not stalled mid-frame, and must not be dropped for
@@ -269,7 +289,8 @@ fn serve_client(
                     eprintln!("cut host: `{client}` dispatched to {device}");
                 }
                 let response = handle_request(host, request);
-                write_frame(&mut tls_stream, &response)?;
+                write_frame(&mut tls_stream, &response, DEFAULT_BODY_TIMEOUT)
+                    .map_err(io::Error::other)?;
             }
             Err(FrameError::Eof) => return Ok(()),
             Err(e) => return Err(io::Error::other(e.to_string())),

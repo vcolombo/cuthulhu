@@ -96,17 +96,30 @@ fn watch(host: &Host) -> ! {
 /// refused a stop needs to know which cutter, on which Job, and how long is left.
 fn report(host: &Host) {
     eprintln!("cut host: not exiting yet, a cut is still running:");
-    for snapshot in host.snapshots().iter().filter(|s| s.status.is_active()) {
+    // `claims` is the predicate the decision above was made on, rendered — not a second reading
+    // that can disagree with it. Filtering on `is_active` here left the daemon announcing a cut
+    // and then printing nothing whenever the only thing holding it was a dispatch still on its way
+    // to the manager, which is the one case `is_claimed` exists to cover.
+    for claim in host.claims() {
+        // A Pass parked for a human is not the same call to action as a blade that is moving, and
+        // whoever is deciding whether to signal a second time is the person that distinction is
+        // for.
+        let doing = if claim.starting {
+            "starting a dispatch".to_string()
+        } else if claim.phase == driver_core::Phase::AwaitingConfirmation
+            || claim.phase == driver_core::Phase::AwaitingColorSwap
+        {
+            format!("{:?} — waiting for an operator", claim.phase)
+        } else {
+            format!("{:?}", claim.phase)
+        };
         // `None` is the window between a dispatch being admitted and its worker
         // recording the id, not a Job without one.
-        let job = match snapshot.job_id {
+        let job = match claim.job_id {
             Some(id) => format!("job {id}"),
             None => "job starting".to_string(),
         };
-        eprintln!(
-            "cut host:   {} is {:?} ({job})",
-            snapshot.info.instance_id, snapshot.status.phase
-        );
+        eprintln!("cut host:   {} is {doing} ({job})", claim.device);
     }
     eprintln!(
         "cut host: it will exit when the cut ends. Follow it with \

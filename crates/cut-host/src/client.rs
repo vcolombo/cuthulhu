@@ -178,13 +178,44 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 static RESOLVING: Mutex<std::collections::BTreeSet<String>> =
     Mutex::new(std::collections::BTreeSet::new());
 
-/// How many resolves may be out at once across every address.
+/// Resolves whose caller gave up and whose thread has not come back — the leak this file is
+/// honest about, counted so it can be bounded.
 ///
-/// Per-address dedup bounds the threads one wedged name can leak, and bounds nothing about how
-/// many names there are: a desktop with several paired hosts, or an operator retyping an address
-/// in the pairing dialog, produces a distinct string each time. This is the process-wide ceiling —
-/// generous next to a handful of Cut Hosts, and far below anything that could exhaust the process.
-const MAX_RESOLVES_IN_FLIGHT: usize = 8;
+/// *Abandoned*, not in-flight. Counting resolves in progress made a healthy host pay for wedged
+/// ones: eight stalled lookups held every slot, and the next name — reachable, resolvable, nothing
+/// wrong with it — was refused before it began. A resolve someone is still waiting on is costing a
+/// thread that is about to be reclaimed either way, so it is not what needs a ceiling.
+static ABANDONED_RESOLVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many abandoned resolver threads this process tolerates before refusing to start another.
+///
+/// Reaching this takes that many *distinct* names each wedging their own OS resolver, since a
+/// repeat of one name is already refused by `RESOLVING` — so a desktop with a handful of paired
+/// hosts, polling every second, cannot approach it. It is the backstop for a resolver that has
+/// stopped answering entirely, at which point refusing is the honest answer and it self-clears as
+/// the threads return.
+const MAX_ABANDONED_RESOLVES: usize = 64;
+
+/// Whether the waiter or the resolver got there first, so exactly one of them accounts for the
+/// thread. Racing them without this drifts the count upwards — a resolve that finished the instant
+/// its caller gave up would be counted abandoned forever, and enough of those would refuse every
+/// name for the life of the process.
+fn settle_resolve(settled: &std::sync::atomic::AtomicBool, by_the_waiter: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let already = settled.swap(true, SeqCst);
+    match (by_the_waiter, already) {
+        // The waiter gave up first: from here the thread is out on its own.
+        (true, false) => {
+            ABANDONED_RESOLVES.fetch_add(1, SeqCst);
+        }
+        // The resolver came back to a caller that had already left.
+        (false, true) => {
+            ABANDONED_RESOLVES.fetch_sub(1, SeqCst);
+        }
+        // The resolver answered in time, or the waiter is tidying up after it. Nothing was leaked.
+        _ => {}
+    }
+}
 
 /// ponytail: on a genuine timeout the thread stays blocked in the resolver and leaks, exactly as
 /// `driver-silhouette`'s `usb.rs` read does and for the same reason — the OS resolver takes no
@@ -199,8 +230,17 @@ const MAX_RESOLVES_IN_FLIGHT: usize = 8;
 ///
 /// Per-address is not a ceiling on its own — the number of addresses is not fixed, since an
 /// operator retyping one in the pairing dialog produces a fresh string each time — so
-/// `MAX_RESOLVES_IN_FLIGHT` bounds the total as well.
+/// `MAX_ABANDONED_RESOLVES` bounds the total. It counts only the threads nobody is waiting on any
+/// more: a healthy name must not be refused because other names are stalled.
 fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    if ABANDONED_RESOLVES.load(SeqCst) >= MAX_ABANDONED_RESOLVES {
+        return Err(ClientError::Transport(
+            "too many host names are stuck being resolved; this machine's resolver is not answering"
+                .into(),
+        ));
+    }
     {
         let mut in_flight = RESOLVING.lock().unwrap_or_else(|e| e.into_inner());
         if in_flight.contains(addr) {
@@ -208,16 +248,13 @@ fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::So
                 "`{addr}` is still being resolved from an earlier attempt"
             )));
         }
-        if in_flight.len() >= MAX_RESOLVES_IN_FLIGHT {
-            return Err(ClientError::Transport(
-                "too many host names are already being resolved; try again in a moment".into(),
-            ));
-        }
         in_flight.insert(addr.to_string());
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let owned = addr.to_string();
+    let settled = Arc::new(AtomicBool::new(false));
+    let settled_by_thread = settled.clone();
     // `Builder`, not `thread::spawn`: spawn panics when a thread cannot be created, and a client
     // that cannot resolve a name has to report that, not take the desktop down with it.
     let spawned = std::thread::Builder::new().name(format!("resolve {addr}")).spawn(move || {
@@ -226,6 +263,7 @@ fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::So
         // resolver returns there is still a thread out for this address, and that is precisely
         // what a second attempt must not add to.
         RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).remove(&owned);
+        settle_resolve(&settled_by_thread, false);
         let _ = tx.send(resolved);
     });
     if let Err(e) = spawned {
@@ -236,7 +274,10 @@ fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::So
     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(ClientError::Transport(e.to_string())),
-        Err(_) => Err(ClientError::Transport(format!("`{addr}` could not be resolved in time"))),
+        Err(_) => {
+            settle_resolve(&settled, true);
+            Err(ClientError::Transport(format!("`{addr}` could not be resolved in time")))
+        }
     }
 }
 
@@ -600,6 +641,34 @@ mod tests {
             "took {:?}, longer than the timeout allows for: {err}",
             start.elapsed()
         );
+    }
+
+    /// The accounting the ceiling rests on. Both orders end at zero, and the one that must: a
+    /// resolver answering at the instant its caller gives up is counted abandoned by neither side
+    /// twice nor by both — drift upwards there would eventually refuse every name for the life of
+    /// the process, which is the failure a ceiling is supposed to prevent, not cause.
+    #[test]
+    fn a_resolve_is_accounted_for_once_whichever_side_finishes_first() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let before = ABANDONED_RESOLVES.load(SeqCst);
+
+        // The resolver answered in time: nothing was ever abandoned.
+        let in_time = AtomicBool::new(false);
+        settle_resolve(&in_time, false);
+        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before);
+
+        // The waiter gave up, and the thread came back later.
+        let gave_up = AtomicBool::new(false);
+        settle_resolve(&gave_up, true);
+        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before + 1, "a leaked thread is counted");
+        settle_resolve(&gave_up, false);
+        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before, "and uncounted when it returns");
+
+        // The race: the thread finished first, and the waiter timed out anyway.
+        let photo_finish = AtomicBool::new(false);
+        settle_resolve(&photo_finish, false);
+        settle_resolve(&photo_finish, true);
+        assert_eq!(ABANDONED_RESOLVES.load(SeqCst), before, "a thread already home is not a leak");
     }
 
     /// A name that cannot be resolved must fail, and must leave nothing behind that stops the next

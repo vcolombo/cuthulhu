@@ -235,6 +235,15 @@ fn settle_resolve(settled: &std::sync::atomic::AtomicBool, by_the_waiter: bool) 
 fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
+    // An address that is already an address needs no resolver, no thread and no ceiling.
+    // `to_socket_addrs` would answer this from the string itself too, but only after being handed
+    // to a worker and counted against the machinery above — so a Cut Host paired by IP, which is
+    // what `docs/cut-host.md` has the operator put in `bind`, stays reachable however badly this
+    // machine's name resolution is behaving.
+    if let Ok(literal) = addr.parse::<std::net::SocketAddr>() {
+        return Ok(vec![literal]);
+    }
+
     if ABANDONED_RESOLVES.load(SeqCst) >= MAX_ABANDONED_RESOLVES {
         return Err(ClientError::Transport(
             "too many host names are stuck being resolved; this machine's resolver is not answering"
@@ -640,6 +649,29 @@ mod tests {
             start.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
             "took {:?}, longer than the timeout allows for: {err}",
             start.elapsed()
+        );
+    }
+
+    /// A host paired by IP never touches the resolver, so nothing about the machine's name
+    /// resolution — wedged, slow, or at the ceiling — can make it unreachable. The documented
+    /// `bind` in `docs/cut-host.md` is a literal address, so this is the ordinary case, not a
+    /// corner of one.
+    #[test]
+    fn an_address_that_is_already_an_address_is_not_resolved_at_all() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // The ceiling held against it, which would refuse any name.
+        let before = ABANDONED_RESOLVES.fetch_add(MAX_ABANDONED_RESOLVES, SeqCst);
+        let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now());
+        ABANDONED_RESOLVES.store(before, SeqCst);
+
+        assert_eq!(
+            resolved.expect("a literal address must not be refused by the resolver's ceiling"),
+            vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]
+        );
+        assert!(
+            RESOLVING.lock().unwrap().is_empty(),
+            "a literal address must not occupy the resolver's dedup either"
         );
     }
 

@@ -44,9 +44,103 @@ pub(crate) fn route(addr: &str) -> Result<Route, ClientError> {
     }
 }
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::Resolver;
+
+/// One worker thread for every lookup this process will ever make, alive for the process —
+/// where the old machinery held up to 128 parked threads. Multi-thread flavour on purpose:
+/// `block_on` against a `current_thread` runtime serializes callers, and a second host must
+/// not queue behind a first one that is timing out.
+static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+fn runtime() -> Result<&'static tokio::runtime::Runtime, ClientError> {
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("cut-host resolve")
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| {
+            ClientError::Transport(format!("name resolution has no runtime to run on ({e})"))
+        })
+}
+
+/// `host`'s addresses over unicast DNS, by the system's own configuration, or a failure once
+/// `deadline` passes. The timeout drops the lookup future — sockets closed, nothing left
+/// running — which is the whole reason hickory is here instead of `to_socket_addrs`.
+pub(crate) fn resolve_dns(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    // Rebuilt per call: building parses resolv.conf (cheap), and a desktop runs for days
+    // across VPN connects that rewrite it — a cached resolver keeps dead nameservers until
+    // restart. The redial path runs once a second only while a host is unreachable.
+    // ponytail: cache keyed on the config file's mtime, if this parse ever shows in a profile.
+    let builder = Resolver::builder_tokio().map_err(|e| {
+        ClientError::Transport(format!("could not read this machine's resolver configuration ({e})"))
+    })?;
+    lookup(
+        // Deviation from the brief's literal listing: `ResolverBuilder::build` returns
+        // `Result` in hickory-resolver 0.26.1 (confirmed against the vendored source), so
+        // the brief's own pre-specified one-line fix applies here.
+        builder.build().map_err(|e| ClientError::Transport(e.to_string()))?,
+        host,
+        port,
+        deadline,
+    )
+}
+
+/// Same lookup against a caller-supplied configuration. The seam exists so a test can point
+/// resolution at a nameserver of its own choosing — a black hole — and hold the deadline to
+/// its promise; nothing outside tests should reach for it.
+fn resolve_dns_with(
+    config: ResolverConfig,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    lookup(
+        // Same version-sensitive fix as `resolve_dns`: `build()` is fallible here too.
+        Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .build()
+            .map_err(|e| ClientError::Transport(e.to_string()))?,
+        host,
+        port,
+        deadline,
+    )
+}
+
+fn lookup(
+    resolver: hickory_resolver::TokioResolver,
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let looked_up = runtime()?
+        .block_on(async { tokio::time::timeout(remaining, resolver.lookup_ip(host)).await });
+    match looked_up {
+        Ok(Ok(found)) => Ok(found.iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+        Ok(Err(e)) => Err(ClientError::Transport(format!("could not resolve `{host}`: {e}"))),
+        Err(_elapsed) => {
+            Err(ClientError::Transport(format!("`{host}` could not be resolved in time")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 
     /// A literal address must route without a lookup, whatever this machine's name
     /// resolution is doing — a host paired by IP stays reachable. Both families, since the
@@ -100,5 +194,51 @@ mod tests {
             let err = route(broken).expect_err(broken).to_string();
             assert!(err.contains(broken), "error should name `{broken}`: {err}");
         }
+    }
+
+    use std::time::{Duration, Instant};
+
+    /// The hosts file is part of "unicast DNS" as an operator understands it — `localhost`
+    /// and hand-pinned names must keep resolving now that `getaddrinfo` is out of the loop.
+    #[test]
+    fn dns_resolution_still_reads_the_hosts_file() {
+        let addrs = resolve_dns("localhost", 7878, Instant::now() + Duration::from_secs(5))
+            .expect("localhost must resolve");
+        assert!(
+            addrs.iter().any(|a| a.ip().is_loopback()),
+            "localhost should include a loopback address: {addrs:?}"
+        );
+    }
+
+    /// The property #126 exists to buy: a nameserver that never answers costs the caller its
+    /// deadline and nothing more. The deaf nameserver is a socket this test binds and never
+    /// reads: queries land in its buffer and no reply ever comes — silence that no network
+    /// topology can spoil. (The conventional black-holed 10.255.255.1 turned out to answer
+    /// fast on some networks, via ICMP, which converts the timeout under test into an
+    /// ordinary error.) Built from parts — not `ResolverConfig::default()`, which carries
+    /// real public nameservers that would answer and pass this vacuously.
+    #[test]
+    fn a_nameserver_that_never_answers_costs_only_the_deadline() {
+        let deaf = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the deaf nameserver");
+        let mut ns = NameServerConfig::udp(deaf.local_addr().unwrap().ip());
+        ns.connections[0].port = deaf.local_addr().unwrap().port();
+        let silent = ResolverConfig::from_parts(None, vec![], vec![ns]);
+
+        let start = Instant::now();
+        let err = resolve_dns_with(
+            silent,
+            "cuthulhu-blackhole-test.example",
+            7878,
+            start + Duration::from_secs(1),
+        )
+        .expect_err("a nameserver that never answers must not produce one");
+        // `deaf` lives to here, so the port cannot be reassigned to something that answers.
+        drop(deaf);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "gave up after {:?}, not by the deadline: {err}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("in time"), "should read as a timeout: {err}");
     }
 }

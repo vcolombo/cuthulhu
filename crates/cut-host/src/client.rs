@@ -660,19 +660,22 @@ mod tests {
     fn an_address_that_is_already_an_address_is_not_resolved_at_all() {
         use std::sync::atomic::Ordering::SeqCst;
 
-        // The ceiling held against it, which would refuse any name.
-        let before = ABANDONED_RESOLVES.fetch_add(MAX_ABANDONED_RESOLVES, SeqCst);
+        // The ceiling held against it, which would refuse any name. Added and subtracted rather
+        // than saved and restored: these tests run in parallel and share this counter, so writing
+        // an old value back would discard whatever another test did meanwhile.
+        ABANDONED_RESOLVES.fetch_add(MAX_ABANDONED_RESOLVES, SeqCst);
         let resolved = resolve_by_deadline("192.168.1.50:7878", Instant::now());
-        ABANDONED_RESOLVES.store(before, SeqCst);
+        let claimed = RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).contains("192.168.1.50:7878");
+        ABANDONED_RESOLVES.fetch_sub(MAX_ABANDONED_RESOLVES, SeqCst);
 
         assert_eq!(
             resolved.expect("a literal address must not be refused by the resolver's ceiling"),
             vec!["192.168.1.50:7878".parse::<std::net::SocketAddr>().unwrap()]
         );
-        assert!(
-            RESOLVING.lock().unwrap().is_empty(),
-            "a literal address must not occupy the resolver's dedup either"
-        );
+        // This address specifically, not the whole set: another test resolving a real name holds
+        // an entry of its own for as long as its resolver takes, and asserting the set was empty
+        // made this pass or fail on which test happened to be running alongside it.
+        assert!(!claimed, "a literal address must not occupy the resolver's dedup either");
     }
 
     /// The accounting the ceiling rests on. Both orders end at zero, and the one that must: a

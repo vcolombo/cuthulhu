@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// The daemon is exercised through a real client, so this file needs the `client` feature;
+// the daemon-only shape (`--no-default-features`, the Pi cross build) skips it.
+#![cfg(feature = "client")]
 //! The three behaviours that only exist once there is a real socket: two clients at once, the
 //! client cap, and the refusal to bind somewhere the whole internet can reach.
 //!

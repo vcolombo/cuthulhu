@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// The daemon is exercised through a real client, so this file needs the `client` feature;
+// the daemon-only shape (`--no-default-features`, the Pi cross build) skips it.
+#![cfg(feature = "client")]
 //! A whole cut, from a client through TLS to a Cut Host and back, with no
 //! hardware. This is the test that says the phase works.
 

@@ -95,10 +95,12 @@ fn main() {
                 // once that host's connection lock is in hand, and `list_devices` holds the same
                 // lock across a 30s call — so a close arriving during a device-list poll froze
                 // the window for the listing plus the poll plus an unbounded resolve (#115).
-                // What this asks is whether to warn, and the last status actually heard answers
-                // that; a warning about a Job that has since finished costs a dialog the operator
-                // can dismiss.
-                if dev.status_without_dialling().is_active() {
+                // What this asks is whether to warn, which a status alone cannot answer: a
+                // dispatch accepted a second ago has not been polled yet, so the newest status
+                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts a
+                // dispatch this desktop sent and has not seen finish; a warning about a Job that
+                // has since ended costs a dialog the operator dismisses.
+                if dev.a_cut_may_be_running() {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();
                 }

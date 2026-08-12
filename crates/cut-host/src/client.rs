@@ -36,6 +36,8 @@ impl std::fmt::Display for ClientError {
                 write!(f, "the cut was planned for a `{dispatched}`, but a `{attached}` is attached"),
             ClientError::Refused(Refusal::Preflight(fault)) => write!(f, "{fault}"),
             ClientError::Refused(Refusal::Device(e)) => write!(f, "the cutter refused: {e:?}"),
+            ClientError::Refused(Refusal::DispatchIdTooLong { max }) =>
+                write!(f, "this host will not accept a dispatch id longer than {max} characters"),
             ClientError::Fingerprint { expected, found } =>
                 write!(f, "this host presented a different certificate than the one paired \
                            (expected {expected}, found {found})"),
@@ -176,6 +178,14 @@ type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 static RESOLVING: Mutex<std::collections::BTreeSet<String>> =
     Mutex::new(std::collections::BTreeSet::new());
 
+/// How many resolves may be out at once across every address.
+///
+/// Per-address dedup bounds the threads one wedged name can leak, and bounds nothing about how
+/// many names there are: a desktop with several paired hosts, or an operator retyping an address
+/// in the pairing dialog, produces a distinct string each time. This is the process-wide ceiling —
+/// generous next to a handful of Cut Hosts, and far below anything that could exhaust the process.
+const MAX_RESOLVES_IN_FLIGHT: usize = 8;
+
 /// ponytail: on a genuine timeout the thread stays blocked in the resolver and leaks, exactly as
 /// `driver-silhouette`'s `usb.rs` read does and for the same reason — the OS resolver takes no
 /// cancellation. The upgrade is an async resolver crate, at the cost of a dependency.
@@ -186,11 +196,24 @@ static RESOLVING: Mutex<std::collections::BTreeSet<String>> =
 /// thread every second until the process ran out. Refusing a second attempt while the first is
 /// still out bounds it at one thread per address, and the thread clears its own claim whenever the
 /// resolver finally answers, so a name that resolves slowly once is not blacklisted afterwards.
+///
+/// Per-address is not a ceiling on its own — the number of addresses is not fixed, since an
+/// operator retyping one in the pairing dialog produces a fresh string each time — so
+/// `MAX_RESOLVES_IN_FLIGHT` bounds the total as well.
 fn resolve_by_deadline(addr: &str, deadline: Instant) -> Result<Vec<std::net::SocketAddr>, ClientError> {
-    if !RESOLVING.lock().unwrap_or_else(|e| e.into_inner()).insert(addr.to_string()) {
-        return Err(ClientError::Transport(format!(
-            "`{addr}` is still being resolved from an earlier attempt"
-        )));
+    {
+        let mut in_flight = RESOLVING.lock().unwrap_or_else(|e| e.into_inner());
+        if in_flight.contains(addr) {
+            return Err(ClientError::Transport(format!(
+                "`{addr}` is still being resolved from an earlier attempt"
+            )));
+        }
+        if in_flight.len() >= MAX_RESOLVES_IN_FLIGHT {
+            return Err(ClientError::Transport(
+                "too many host names are already being resolved; try again in a moment".into(),
+            ));
+        }
+        in_flight.insert(addr.to_string());
     }
 
     let (tx, rx) = std::sync::mpsc::channel();

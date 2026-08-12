@@ -28,6 +28,22 @@ use crate::protocol::{Admitted, DeviceSnapshot, DispatchId, Event, Refusal};
 /// that arrives past this cuts the material a second time.
 const ID_RETENTION: Duration = Duration::from_secs(60 * 60);
 
+/// The longest dispatch id this host will accept.
+///
+/// A client's own name for one dispatch; the desktop's is about sixty characters. The cap is not
+/// about that client — it is that an id is *remembered*, so without a bound an authenticated
+/// client could hand a Pi with a gigabyte of RAM a megabyte of id per dispatch and have the daemon
+/// hold every one of them for an hour.
+const MAX_DISPATCH_ID: usize = 128;
+
+/// How many accepted ids one cutter remembers at once, oldest evicted first.
+///
+/// The hour alone is not a bound: nothing prunes until the next dispatch arrives, so a daemon left
+/// idle keeps whatever the last burst put there. This is what makes the memory a fixed cost rather
+/// than a function of how fast a client can dispatch. It only weakens the dedupe after this many
+/// *distinct* Jobs on one cutter inside an hour, by which point the oldest is long finished.
+const MAX_REMEMBERED_IDS: usize = 512;
+
 pub(crate) struct DeviceSlot {
     pub info: DeviceInfo,
     pub manager: Arc<DeviceManager>,
@@ -83,6 +99,22 @@ impl Admission {
     /// `now` is what a freshly booted machine cannot do.
     fn forget_expired(&mut self, now: Instant) {
         self.accepted.retain(|_, seen| now.saturating_duration_since(*seen) < ID_RETENTION);
+    }
+
+    /// Drop the oldest ids until at most `MAX_REMEMBERED_IDS` remain.
+    ///
+    /// The age rule cannot do this on its own: it only runs when a dispatch arrives, so a burst
+    /// followed by silence leaves every id of that burst held. Evicting by age keeps the ids a
+    /// retry could plausibly still name and drops the ones a retry never will.
+    fn forget_oldest_beyond_cap(&mut self) {
+        while self.accepted.len() > MAX_REMEMBERED_IDS {
+            let Some(oldest) =
+                self.accepted.iter().min_by_key(|(_, seen)| **seen).map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            self.accepted.remove(&oldest);
+        }
     }
 }
 
@@ -230,6 +262,12 @@ impl Host {
         machine_id: &str,
         passes: Vec<CutPass>,
     ) -> Result<Admitted, Refusal> {
+        // Before the cutter is even looked up: an id this host would have to remember for an hour
+        // is the one part of a dispatch whose cost outlives the request carrying it.
+        if dispatch_id.0.len() > MAX_DISPATCH_ID {
+            return Err(Refusal::DispatchIdTooLong { max: MAX_DISPATCH_ID });
+        }
+
         let slot = self.slot(device).ok_or_else(|| Refusal::UnknownDevice(device.to_string()))?;
 
         if slot.info.machine_id != machine_id {
@@ -276,6 +314,7 @@ impl Host {
             if admission.accepted.insert(dispatch_id.clone(), Instant::now()).is_some() {
                 return Ok(Admitted::AlreadyAccepted);
             }
+            admission.forget_oldest_beyond_cap();
             // What is legal now is `actions`' answer, not ours to infer — plus the
             // one thing `actions` cannot yet know, an already-admitted dispatch on
             // its way to the manager. A cutter that never connected is kept so its
@@ -683,6 +722,55 @@ mod tests {
             .unwrap();
         assert_eq!(again, Admitted::AlreadyAccepted, "a no-op must say it was one");
         assert_eq!(*host.slot(CAMEO).unwrap().job_id.lock().unwrap(), job_after_first);
+    }
+
+    /// An id is remembered for an hour, so its length is a cost this host carries rather than one
+    /// the request carrying it pays. Refused before the cutter is even looked up, and refused
+    /// rather than truncated — a truncated id is a different id, and a retry arriving under a
+    /// different name is a second cut.
+    #[test]
+    fn a_dispatch_id_longer_than_a_host_will_remember_is_refused() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let huge = DispatchId("d".repeat(MAX_DISPATCH_ID + 1));
+        match host.dispatch(huge.clone(), CAMEO, "cameo5", vec![square_pass()]) {
+            Err(Refusal::DispatchIdTooLong { max }) => assert_eq!(max, MAX_DISPATCH_ID),
+            other => panic!("expected DispatchIdTooLong, got {other:?}"),
+        }
+        assert!(!holds_dispatch_id(&host, CAMEO, &huge.0), "a refused id must not be remembered");
+        assert_eq!(host.slot(CAMEO).unwrap().manager.status().phase, driver_core::Phase::Idle);
+
+        // The merely long is still fine: the cap refuses abuse, not the desktop's own ids, which
+        // run to about sixty characters.
+        host.dispatch(DispatchId("d".repeat(MAX_DISPATCH_ID)), CAMEO, "cameo5", vec![square_pass()])
+            .expect("an id at the limit is acceptable");
+    }
+
+    /// The hour is not a bound on its own: nothing prunes until the next dispatch arrives, so a
+    /// daemon left idle after a burst keeps every id of that burst. The cap is what makes the
+    /// memory a fixed cost rather than a function of how fast a client can dispatch.
+    #[test]
+    fn a_cutter_remembers_only_so_many_ids_at_once() {
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let slot = host.slot(CAMEO).unwrap();
+        let mut admission = slot.admission.lock().unwrap();
+        // Ages a millisecond apart, so "oldest" is well defined rather than a tie.
+        let base = Instant::now();
+        for n in 0..MAX_REMEMBERED_IDS + 50 {
+            admission
+                .accepted
+                .insert(DispatchId(format!("d-{n}")), base + Duration::from_millis(n as u64));
+        }
+        admission.forget_oldest_beyond_cap();
+
+        assert_eq!(admission.accepted.len(), MAX_REMEMBERED_IDS);
+        assert!(
+            !admission.accepted.contains_key(&DispatchId("d-0".into())),
+            "the oldest id survived the cap"
+        );
+        assert!(
+            admission.accepted.contains_key(&DispatchId(format!("d-{}", MAX_REMEMBERED_IDS + 49))),
+            "the newest id — the one a retry would actually name — was evicted"
+        );
     }
 
     /// An id is remembered for a stated length of time, not forever. Kept forever, a daemon up for

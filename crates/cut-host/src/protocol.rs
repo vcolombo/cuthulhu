@@ -97,6 +97,10 @@ pub enum Refusal {
     MachineMismatch { dispatched: String, attached: String },
     Preflight(PassFault),
     Device(DeviceError),
+    /// The id was longer than a host will remember. Refused rather than truncated, because a
+    /// truncated id is a *different* id and the whole point of one is that a retry arrives under
+    /// the name its first attempt used.
+    DispatchIdTooLong { max: usize },
 }
 
 /// `driver-core`'s own event, plus which cutter it came from. One client

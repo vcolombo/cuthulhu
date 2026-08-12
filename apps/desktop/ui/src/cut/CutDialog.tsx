@@ -111,6 +111,10 @@ export function CutDialog({
   /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
    *  started. Cleared by the next press of Cut, which is the thing that makes it untrue. */
   const [alreadyAccepted, setAlreadyAccepted] = useState(false);
+  /** A cut request is out. The backend reserves one dispatch id per Job, so a second click is
+   *  safe — it joins the first rather than starting a second Job — but it would come back
+   *  "already accepted", which is a confusing thing to say about a double-click. */
+  const [cutInFlight, setCutInFlight] = useState(false);
 
   // The whole device list in one request rather than one per host: `list_devices` already
   // re-reads every paired host in a single call, and `list_hosts` carries why any of them cannot
@@ -292,6 +296,7 @@ export function CutDialog({
     if (!connected || planRevision === null) return;
     const request = toCutRequest(connected.instance_id, planRevision, rows);
     setAlreadyAccepted(false);
+    setCutInFlight(true);
     ipc
       .cut(request)
       // Not an error, and not a success worth saying nothing about: the host recognised this
@@ -302,7 +307,8 @@ export function CutDialog({
         const code = ipc.ipcErrorCode(e);
         if (code === "stale_plan") setStalePlan(true);
         onError(ipc.ipcErrorMessage(e));
-      });
+      })
+      .finally(() => setCutInFlight(false));
   };
 
   const resume = () => {
@@ -598,7 +604,7 @@ export function CutDialog({
           <button
             aria-label="Start Cut"
             style={btn}
-            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0}
+            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0 || cutInFlight}
             onClick={startCut}
           >
             Start Cut

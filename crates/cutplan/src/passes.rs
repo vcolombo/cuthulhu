@@ -152,6 +152,10 @@ mod tests {
                 "shape #5: a font was found, but its file could not be read",
             ),
             (
+                PlanError::BadShape(NodeId(6), geometry::GeomError::NoGlyphs.to_string()),
+                "shape #6: the chosen font cannot draw any of this text",
+            ),
+            (
                 PlanError::MissingNode(NodeId(4)),
                 "shape #4 is referenced by the document but missing from it",
             ),

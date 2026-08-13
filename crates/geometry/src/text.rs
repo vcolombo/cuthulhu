@@ -103,12 +103,19 @@ fn outline_with_face(data: &[u8], face_index: u32, size_mm: f64, text: &str) -> 
         let adv = face.glyph_hor_advance(gid).unwrap_or(0) as f64;
         x += adv * scale;
     }
+    // A face that drew nothing for text that asked for something (a symbol font and
+    // Latin letters, a bitmap-only face) would otherwise persist as an invisible empty
+    // node that plans as an empty job. Whitespace-only text legitimately has no outlines.
+    if segs.is_empty() && text.chars().any(|c| !c.is_whitespace()) {
+        return Err(GeomError::NoGlyphs);
+    }
     Ok(Path { segs })
 }
 
 /// Glyph outlines for `text` set in `family` at `size_mm` (font units-per-em -> size_mm).
 /// A family with no installed match silently substitutes via `resolve_face`; only a
-/// system with zero faces is `NoFont`, and a matched face that won't parse is `BadFont`.
+/// system with zero faces is `NoFont`, a matched face that won't parse is `BadFont`,
+/// and a face that draws nothing for non-whitespace text is `NoGlyphs`.
 /// Simple per-character glyph lookup + horizontal advance, no kerning/shaping (ponytail:
 /// good enough for laser-cut labels; add rustybuzz shaping if ligatures/kerning matter later).
 pub fn text_to_path(family: &str, size_mm: f64, text: &str) -> Result<Path, GeomError> {
@@ -171,6 +178,29 @@ mod tests {
     #[test]
     fn garbage_face_data_is_bad_font_not_no_font() {
         assert_eq!(outline_with_face(b"not a font", 0, 10.0, "x"), Err(GeomError::BadFont));
+    }
+
+    #[test]
+    fn whitespace_only_text_is_an_empty_path_not_an_error() {
+        if any_available_family().is_some() {
+            let p = text_to_path("Whatever", 10.0, "   ").expect("whitespace has no outlines by design");
+            assert!(p.segs.is_empty());
+        }
+    }
+
+    #[test]
+    fn text_no_face_can_draw_is_no_glyphs_not_an_invisible_node() {
+        // Unicode noncharacters: permanently unassigned, so no ordinary font maps them.
+        // macOS's LastResort face maps *every* codepoint (cmap format 13), so skip
+        // families that would defeat the premise rather than hardcode a platform list.
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let family = db.faces()
+            .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            .find(|name| !name.contains("LastResort"));
+        if let Some(family) = family {
+            assert_eq!(text_to_path(&family, 10.0, "\u{FDD0}\u{FDD1}"), Err(GeomError::NoGlyphs));
+        }
     }
 
     #[test]

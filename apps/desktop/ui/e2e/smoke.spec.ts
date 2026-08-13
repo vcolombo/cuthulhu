@@ -78,6 +78,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return {};
     },
     add_text: (a) => {
+      // The real command rejects on the backend's terms; the fake can at least refuse a
+      // caller that stopped forwarding the arguments, so the picker test proves the
+      // selected family actually crosses the IPC boundary.
+      if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
+      if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
       const id = nextId++;
       doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
       doc.nodes[a.parent as number].children.push(id);

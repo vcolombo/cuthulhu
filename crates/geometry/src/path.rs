@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 use crate::affine::{Point, Polyline, Rect, Affine};
 
 #[derive(Debug, PartialEq)]
-pub enum GeomError { Parse(String), Degenerate, NoFont, BadFont }
+pub enum GeomError { Parse(String), Degenerate, NoFont, BadFont, NoGlyphs }
 impl std::fmt::Display for GeomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -16,6 +16,7 @@ impl std::fmt::Display for GeomError {
             // mean the system has none at all — a missing *family* is not an error.
             GeomError::NoFont => write!(f, "no fonts are installed on this system"),
             GeomError::BadFont => write!(f, "a font was found, but its file could not be read"),
+            GeomError::NoGlyphs => write!(f, "the chosen font cannot draw any of this text"),
         }
     }
 }

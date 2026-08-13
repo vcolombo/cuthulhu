@@ -1156,6 +1156,9 @@ mod tests {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: `is_any_cut_active` is also satisfied by the dispatch's
+        // transient `starting` claim, and this test is about the Job-in-flight branch.
+        wait_for_job(&host, CAMEO);
         assert!(host.is_any_cut_active(), "a Host with a cut in flight must report itself active");
     }
 
@@ -1323,6 +1326,9 @@ mod tests {
 
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: a `starting` claim also refuses a reconnect, and the busy
+        // half of this test is about the Job in flight.
+        wait_for_job(&host, CAMEO);
         assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
         // And the parked Job is still there to be answered, not silently dropped.
         assert!(host.slot(CAMEO).unwrap().manager.status().actions.confirm);

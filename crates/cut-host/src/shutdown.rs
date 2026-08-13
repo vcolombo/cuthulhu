@@ -177,6 +177,9 @@ mod tests {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
         wait_for(&host, CAMEO, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: a `starting` claim also holds the guard, and this test
+        // names the Job in flight.
+        wait_for_job(&host, CAMEO);
 
         assert!(!may_exit(&host, 1), "a signal must not end a Job the daemon is running");
     }
@@ -216,6 +219,9 @@ mod tests {
         let host = Host::start(Arc::new(TwoCutterFactory));
         host.dispatch(DispatchId("d-1".into()), PUMA, "puma", vec![square_pass()]).unwrap();
         wait_for(&host, PUMA, driver_core::Phase::AwaitingConfirmation);
+        // Landed, not merely parked: a `starting` claim also holds the guard, and this test
+        // names the Job in flight.
+        wait_for_job(&host, PUMA);
 
         assert_eq!(host.slot(CAMEO).unwrap().manager.status().phase, driver_core::Phase::Idle);
         assert!(!may_exit(&host, 1), "an idle cutter alongside a busy one is not permission to exit");

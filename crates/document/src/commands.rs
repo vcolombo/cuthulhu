@@ -17,9 +17,15 @@ pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result
 /// holds under transformed ancestors.
 pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    let selected: HashSet<NodeId> = ids.iter().copied().collect();
     let mut ops = vec![];
+    let mut seen = HashSet::new();
     for &id in ids {
-        let before = doc.get(id).ok_or(CmdError::NotFound)?.clone();
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        // A selected ancestor already carries this node along; updating it too
+        // would move its world position by `m` twice.
+        if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
+        let before = node.clone();
         // Convert the world-space matrix into this node's parent space so that
         // new_world = old_world.then(m) holds under transformed ancestors:
         // new_local = old_local.then(pw).then(m).then(pw⁻¹)
@@ -39,14 +45,6 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
 pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let selected: HashSet<NodeId> = ids.iter().copied().collect();
-    let has_selected_ancestor = |id: NodeId| {
-        let mut cur = id;
-        while let Some(pid) = parent_of(doc, cur) {
-            if selected.contains(&pid) { return true; }
-            cur = pid;
-        }
-        false
-    };
     // Emit a subtree's Removes children-first so each Remove still has its parent
     // in the map, and the inverse delta (reversed Adds) restores parents first.
     fn push_subtree(doc: &Document, id: NodeId, parent: NodeId, ops: &mut Vec<NodeOp>)
@@ -61,7 +59,7 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     let mut ops = vec![];
     let mut seen = HashSet::new();
     for &id in ids {
-        if !seen.insert(id) || has_selected_ancestor(id) { continue; }
+        if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
         let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
         push_subtree(doc, id, parent, &mut ops)?;
     }
@@ -79,6 +77,18 @@ pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, Cm
 
 fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
     doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
+}
+
+/// True when any ancestor of `id` is also in `selected`. Commands that act on a
+/// selection per-subtree (transform, delete) skip such nodes so that exactly one
+/// operation applies per selected subtree — the ancestor carries them along.
+fn has_selected_ancestor(doc: &Document, selected: &HashSet<NodeId>, id: NodeId) -> bool {
+    let mut cur = id;
+    while let Some(pid) = parent_of(doc, cur) {
+        if selected.contains(&pid) { return true; }
+        cur = pid;
+    }
+    false
 }
 
 /// World transform of `id`: its local transform composed through every ancestor
@@ -415,6 +425,59 @@ mod tests {
         let after_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
         // world moved exactly 10mm — NOT 20mm (the double-application bug this fixes)
         assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0));
+    }
+
+    #[test]
+    fn transform_applies_once_per_selected_subtree() {
+        let mut ed = Editor::new();
+        let gid = ed.doc.ids.next();
+        let mut group = Node::container(gid, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let cid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: gid,
+            node: Node::shape(cid, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+
+        let before_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        // group AND child selected — the child must ride along, not transform again
+        ed.commit(transform_nodes(&ed.doc, &[gid, cid], Affine::translate(10.0, 0.0)).unwrap());
+        let after_world = world_transform(&ed.doc, cid).unwrap().apply(0.0, 0.0);
+        assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0),
+            "child world position must move by the gesture exactly once");
+    }
+
+    #[test]
+    fn transform_skips_transitively_selected_ancestors() {
+        let mut ed = Editor::new();
+        // root → outer(selected) → mid(NOT selected) → leaf(selected)
+        let outer = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::container(outer, NodeKind::Group), index: 0 }]));
+        let mid = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer,
+            node: Node::container(mid, NodeKind::Group), index: 0 }]));
+        let leaf = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: mid,
+            node: Node::shape(leaf, ShapeKind::Rect { w: 1.0, h: 1.0 }), index: 0 }]));
+
+        let before_world = world_transform(&ed.doc, leaf).unwrap().apply(0.0, 0.0);
+        ed.commit(transform_nodes(&ed.doc, &[outer, leaf], Affine::translate(10.0, 0.0)).unwrap());
+        let after_world = world_transform(&ed.doc, leaf).unwrap().apply(0.0, 0.0);
+        assert_eq!((after_world.0 - before_world.0, after_world.1 - before_world.1), (10.0, 0.0),
+            "selected ancestor anywhere up the chain must suppress the leaf's own update");
+    }
+
+    #[test]
+    fn transform_nodes_dedupes_ids() {
+        let mut ed = Editor::new();
+        let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+            ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let id = *ed.doc.get(ed.doc.root).unwrap().children.first().unwrap();
+        let d = transform_nodes(&ed.doc, &[id, id], Affine::translate(5.0, 0.0)).unwrap();
+        assert_eq!(d.0.len(), 1, "duplicate ids must collapse to one Update");
+        ed.commit(d);
+        assert_eq!(ed.doc.get(id).unwrap().transform.apply(0.0, 0.0), (5.0, 0.0));
     }
 
     #[test]

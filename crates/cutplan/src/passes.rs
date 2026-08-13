@@ -145,7 +145,15 @@ mod tests {
         let cases: Vec<(PlanError, &str)> = vec![
             (
                 PlanError::BadShape(NodeId(3), geometry::GeomError::NoFont.to_string()),
-                "shape #3: no font on this system matches the requested family",
+                "shape #3: no fonts are installed on this system",
+            ),
+            (
+                PlanError::BadShape(NodeId(5), geometry::GeomError::BadFont.to_string()),
+                "shape #5: a font was found, but its file could not be read",
+            ),
+            (
+                PlanError::BadShape(NodeId(6), geometry::GeomError::NoGlyphs.to_string()),
+                "shape #6: the chosen font cannot draw any of this text",
             ),
             (
                 PlanError::MissingNode(NodeId(4)),
@@ -218,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn text_plans_as_glyph_outlines_or_typed_error() {
+    fn text_with_unknown_family_falls_back_or_reports_no_fonts() {
         let mut ed = Editor::new();
         let root = ed.doc.root;
 
@@ -231,15 +239,23 @@ mod tests {
             assert!(!planned.passes[0].shapes[0].polylines.is_empty());
         }
 
-        // bogus family is a typed error regardless of what's installed
+        // A bogus family substitutes an installed font (a project from another machine
+        // still plans); only a system with zero faces refuses, and says so.
         let bad_id = ed.doc.ids.next();
         let node = Node::shape(bad_id, ShapeKind::Text {
             family: "Definitely Not A Real Font Family 12345".into(), size_mm: 10.0, text: "Hi".into(),
         });
         let mut bad_doc = ed.doc.clone();
         bad_doc.apply(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
-        assert_eq!(plan_passes(&bad_doc),
-            Err(PlanError::BadShape(bad_id, geometry::GeomError::NoFont.to_string())));
+        match any_available_family() {
+            Some(_) => {
+                let planned = plan_passes(&bad_doc).expect("fallback should have substituted a font");
+                let pass = planned.passes.last().unwrap();
+                assert!(!pass.shapes.last().unwrap().polylines.is_empty());
+            }
+            None => assert_eq!(plan_passes(&bad_doc),
+                Err(PlanError::BadShape(bad_id, geometry::GeomError::NoFont.to_string()))),
+        }
     }
 
     #[test]

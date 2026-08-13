@@ -13,6 +13,7 @@ import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
 import { TraceDialog } from "./trace/TraceDialog";
+import { TextDialog } from "./text/TextDialog";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -150,6 +151,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
+  const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
   const [status, setStatus] = useState<ipc.CutStatus>(ipc.DISCONNECTED_STATUS);
 
@@ -434,7 +436,7 @@ export function App() {
         onSelectTool={setTool}
         onAddRect={() => run(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }))}
         onAddEllipse={() => run(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }))}
-        onAddText={() => run(() => ipc.addText({ parent: root, family: "Arial", sizeMm: 10, text: "Text" }))}
+        onAddText={() => setTextOpen(true)}
         onBoolean={onBooleanOp}
         onDelete={deleteSelected}
       />
@@ -478,6 +480,17 @@ export function App() {
       ) : null}
       {tracePath !== null ? (
         <TraceDialog path={tracePath} onInsert={onTraceInsert} onClose={() => setTracePath(null)} />
+      ) : null}
+      {textOpen ? (
+        <TextDialog
+          onInsert={(family) => {
+            setTextOpen(false);
+            // ponytail: content and size are fixed until #33 grows this dialog into real
+            // text editing; the family is the only choice the backend can act on today.
+            run(() => ipc.addText({ parent: root, family, sizeMm: 10, text: "Text" }));
+          }}
+          onClose={() => setTextOpen(false)}
+        />
       ) : null}
     </div>
   );

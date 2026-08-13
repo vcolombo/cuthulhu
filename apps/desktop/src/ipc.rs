@@ -313,6 +313,14 @@ pub fn trace_controls() -> Result<trace::TraceControlSpecs, IpcError> {
     Ok(trace::control_specs())
 }
 
+// async: load_system_fonts walks the system font directories on disk — keep the scan off the
+// main thread, same reasoning as the trace commands. An empty list is honest data (a box with
+// no fonts), not an error; the dialog renders it as a state.
+#[tauri::command(async)]
+pub fn list_fonts() -> Result<Vec<String>, IpcError> {
+    Ok(geometry::list_font_families())
+}
+
 #[tauri::command(async)]
 pub fn trace_image(
     auth: tauri::State<AuthorizedImages>,

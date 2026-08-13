@@ -4989,6 +4989,7 @@ dependencies = [
  "fileio",
  "image 0.25.10",
  "serde",
+ "serde_json",
  "tempfile",
  "vtracer",
 ]

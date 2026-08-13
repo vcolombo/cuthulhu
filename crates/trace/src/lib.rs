@@ -72,6 +72,28 @@ pub fn read_image(path: &std::path::Path) -> Result<Vec<u8>, TraceError> {
 #[serde(rename_all = "lowercase")]
 pub enum TraceMode { Binary, Color }
 
+// The CLI's `--mode` flag prints its default through `Display` and reads the flag back through
+// `FromStr`, so the default mode stays stated once, in `TraceControls::default()`. The spellings
+// are the serde ones above: `--mode color` and the dialog's `defaultMode: "color"` are the same
+// word arriving by different transports.
+impl std::fmt::Display for TraceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { TraceMode::Binary => "binary", TraceMode::Color => "color" })
+    }
+}
+
+impl std::str::FromStr for TraceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "binary" => Ok(TraceMode::Binary),
+            "color" => Ok(TraceMode::Color),
+            // clap echoes the offending value itself, so the message only states what is legal.
+            _ => Err("must be binary or color".into()),
+        }
+    }
+}
+
 /// One user-facing trace control: what it is called, what it accepts, and where it starts.
 ///
 /// The single statement of these numbers. `validate` builds its refusals from them, the CLI takes
@@ -169,13 +191,13 @@ fn length_threshold(detail: f64) -> f64 {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum TraceError { Input(String), InvalidOption(String), Decode(String), Trace(String), EmptyResult }
+pub enum TraceError { Input(String), InvalidControl(String), Decode(String), Trace(String), EmptyResult }
 impl std::fmt::Display for TraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Input's messages are already whole sentences naming the file, so a prefix would read twice.
             TraceError::Input(m) => write!(f, "{m}"),
-            TraceError::InvalidOption(m) => write!(f, "invalid option: {m}"),
+            TraceError::InvalidControl(m) => write!(f, "invalid control: {m}"),
             TraceError::Decode(m) => write!(f, "could not read image: {m}"),
             TraceError::Trace(m) => write!(f, "trace failed: {m}"),
             TraceError::EmptyResult =>
@@ -192,7 +214,7 @@ impl TraceError {
     pub fn code(&self) -> &'static str {
         match self {
             TraceError::Input(_) => "input",
-            TraceError::InvalidOption(_) => "invalid_option",
+            TraceError::InvalidControl(_) => "invalid_control",
             TraceError::Decode(_) => "decode",
             TraceError::Trace(_) => "trace",
             TraceError::EmptyResult => "empty",
@@ -221,7 +243,7 @@ pub(crate) fn validate(c: &TraceControls) -> Result<(), TraceError> {
         // A NaN fails `contains` too, which is the answer we want and the reason this is not
         // written as a pair of comparisons.
         if !(spec.min..=spec.max).contains(&value) {
-            return Err(TraceError::InvalidOption(format!(
+            return Err(TraceError::InvalidControl(format!(
                 "{} must be {}–{}", spec.name, spec.min, spec.max
             )));
         }
@@ -497,15 +519,15 @@ mod tests {
         let d = TraceControls::default();
 
         let bad = TraceControls { speckle: SPECKLE.max as u8 + 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("speckle")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("speckle")));
         let bad = TraceControls { smoothing: SMOOTHING.max as u8 + 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("smoothing")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("smoothing")));
         let bad = TraceControls { detail: DETAIL.max + DETAIL.step, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("detail")));
         let bad = TraceControls { detail: DETAIL.min - DETAIL.step, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("detail")));
         let bad = TraceControls { colors: COLORS.min as u8 - 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("colors")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("colors")));
 
         assert!(validate(&d).is_ok());
 
@@ -564,11 +586,44 @@ mod tests {
     #[test]
     fn every_error_carries_a_code() {
         assert_eq!(TraceError::Input(String::new()).code(), "input");
-        assert_eq!(TraceError::InvalidOption(String::new()).code(), "invalid_option");
+        assert_eq!(TraceError::InvalidControl(String::new()).code(), "invalid_control");
         assert_eq!(TraceError::Decode(String::new()).code(), "decode");
         assert_eq!(TraceError::Trace(String::new()).code(), "trace");
         assert_eq!(TraceError::EmptyResult.code(), "empty");
     }
+
+    /// CONTEXT.md puts "options" on TraceControls' _Avoid_ list; the error a bad control raises
+    /// has to follow the vocabulary or it reintroduces the word at the exact moment it matters.
+    #[test]
+    fn rejected_control_speaks_of_controls_not_options() {
+        assert_eq!(TraceError::InvalidControl("x".into()).to_string(), "invalid control: x");
+    }
+
+    /// The CLI states its `--mode` default as `TraceControls::default().mode`, printed through
+    /// `Display` and read back through `FromStr` — the pair must round-trip or clap rejects its
+    /// own default at startup. Serde is held to the same words, not trusted to match by
+    /// coincidence: `--mode color` and the dialog's `defaultMode: "color"` are one vocabulary
+    /// crossing two transports.
+    #[test]
+    fn trace_mode_display_round_trips_through_from_str() {
+        assert_eq!(TraceMode::Binary.to_string(), "binary");
+        assert_eq!(TraceMode::Color.to_string(), "color");
+        for mode in [TraceMode::Binary, TraceMode::Color] {
+            assert_eq!(mode.to_string().parse::<TraceMode>().unwrap(), mode);
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{mode}\""));
+        }
+        assert!("neither".parse::<TraceMode>().is_err());
+    }
+
+    /// The dialog reads a fresh trace's mode from `defaultMode` — a field name and spelling that
+    /// `ui/src/ipc.ts` types by hand, so the wire shape is pinned here where it is produced.
+    #[test]
+    fn control_specs_send_the_default_mode_under_its_wire_name() {
+        let json = serde_json::to_string(&control_specs()).unwrap();
+        let expected = format!(r#""defaultMode":"{}""#, TraceControls::default().mode);
+        assert!(json.contains(&expected), "{json}");
+    }
+
 
     /// One sentence, printed verbatim by both entry points. Before this, the CLI said "lower
     /// --detail" and the dialog said "raise detail" for the same failure, and both were right.
@@ -650,9 +705,9 @@ mod tests {
     }
 
     #[test]
-    fn trace_rejects_invalid_options_before_decoding() {
+    fn trace_rejects_invalid_controls_before_decoding() {
         let bad = TraceControls { speckle: 17, ..TraceControls::default() };
-        assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
+        assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidControl(_))));
     }
 
     /// A 256×256 one-pixel checkerboard at speckle 0 makes vtracer emit tens of thousands of

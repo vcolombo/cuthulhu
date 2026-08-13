@@ -64,8 +64,8 @@ enum Command {
         #[arg(short, long)]
         output: std::path::PathBuf,
         /// binary (single-color silhouette) or color (one path per color cluster)
-        #[arg(long, default_value = "binary")]
-        mode: String,
+        #[arg(long, default_value_t = trace::TraceControls::default().mode)]
+        mode: trace::TraceMode,
         #[arg(long, help = trace::SPECKLE.help, default_value_t = trace::SPECKLE.default as u8)]
         speckle: u8,
         #[arg(long, help = trace::SMOOTHING.help, default_value_t = trace::SMOOTHING.default as u8)]
@@ -136,11 +136,6 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Command::Trace { file, output, mode, speckle, smoothing, detail, colors } => {
-            let mode = match mode.as_str() {
-                "binary" => trace::TraceMode::Binary,
-                "color" => trace::TraceMode::Color,
-                other => return Err(format!("--mode must be binary or color, got {other}")),
-            };
             let controls = trace::TraceControls { mode, speckle, smoothing, detail, colors };
             let bytes = trace::read_image(&file).map_err(|e| e.to_string())?;
             let result = trace::trace(&bytes, &controls).map_err(|e| e.to_string())?;
@@ -197,5 +192,33 @@ fn print_hex_ascii(bytes: &[u8]) {
             .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
             .collect();
         println!("{:<48} {ascii}", hex.join(" "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_trace(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec!["cuthulhu", "trace", "in.png", "-o", "out.svg"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args)
+    }
+
+    /// A mode neither entry point knows must die in the parser, where clap names the flag and the
+    /// legal values, rather than surviving as a `String` for `run` to reject later.
+    #[test]
+    fn mode_flag_rejects_unknown_values_at_parse_time() {
+        assert!(parse_trace(&["--mode", "neither"]).is_err());
+    }
+
+    /// Issue #84: the dialog starts a fresh trace in `TraceControls::default().mode`; the CLI must
+    /// start in the same mode, whatever its clap attribute claims. Guards the attribute against
+    /// being rewritten as a literal that can drift from the crate's default.
+    #[test]
+    fn mode_flag_default_agrees_with_the_dialogs() {
+        let cli = parse_trace(&[]).expect("defaults must parse");
+        let Command::Trace { mode, .. } = cli.command else { panic!("parsed a different subcommand") };
+        assert_eq!(mode, trace::TraceControls::default().mode);
     }
 }

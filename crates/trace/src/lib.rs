@@ -72,6 +72,28 @@ pub fn read_image(path: &std::path::Path) -> Result<Vec<u8>, TraceError> {
 #[serde(rename_all = "lowercase")]
 pub enum TraceMode { Binary, Color }
 
+// The CLI's `--mode` flag prints its default through `Display` and reads the flag back through
+// `FromStr`, so the default mode stays stated once, in `TraceControls::default()`. The spellings
+// are the serde ones above: `--mode color` and the dialog's `defaultMode: "color"` are the same
+// word arriving by different transports.
+impl std::fmt::Display for TraceMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self { TraceMode::Binary => "binary", TraceMode::Color => "color" })
+    }
+}
+
+impl std::str::FromStr for TraceMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "binary" => Ok(TraceMode::Binary),
+            "color" => Ok(TraceMode::Color),
+            // clap echoes the offending value itself, so the message only states what is legal.
+            _ => Err("must be binary or color".into()),
+        }
+    }
+}
+
 /// One user-facing trace control: what it is called, what it accepts, and where it starts.
 ///
 /// The single statement of these numbers. `validate` builds its refusals from them, the CLI takes
@@ -575,6 +597,20 @@ mod tests {
     #[test]
     fn rejected_control_speaks_of_controls_not_options() {
         assert_eq!(TraceError::InvalidControl("x".into()).to_string(), "invalid control: x");
+    }
+
+    /// The CLI states its `--mode` default as `TraceControls::default().mode`, printed through
+    /// `Display` and read back through `FromStr` — the pair must round-trip or clap rejects its
+    /// own default at startup. The spellings are pinned because they are the same words serde
+    /// sends the dialog as `defaultMode`, and `--mode color` must stay that word.
+    #[test]
+    fn trace_mode_display_round_trips_through_from_str() {
+        assert_eq!(TraceMode::Binary.to_string(), "binary");
+        assert_eq!(TraceMode::Color.to_string(), "color");
+        for mode in [TraceMode::Binary, TraceMode::Color] {
+            assert_eq!(mode.to_string().parse::<TraceMode>().unwrap(), mode);
+        }
+        assert!("neither".parse::<TraceMode>().is_err());
     }
 
 

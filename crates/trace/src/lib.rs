@@ -601,16 +601,27 @@ mod tests {
 
     /// The CLI states its `--mode` default as `TraceControls::default().mode`, printed through
     /// `Display` and read back through `FromStr` — the pair must round-trip or clap rejects its
-    /// own default at startup. The spellings are pinned because they are the same words serde
-    /// sends the dialog as `defaultMode`, and `--mode color` must stay that word.
+    /// own default at startup. Serde is held to the same words, not trusted to match by
+    /// coincidence: `--mode color` and the dialog's `defaultMode: "color"` are one vocabulary
+    /// crossing two transports.
     #[test]
     fn trace_mode_display_round_trips_through_from_str() {
         assert_eq!(TraceMode::Binary.to_string(), "binary");
         assert_eq!(TraceMode::Color.to_string(), "color");
         for mode in [TraceMode::Binary, TraceMode::Color] {
             assert_eq!(mode.to_string().parse::<TraceMode>().unwrap(), mode);
+            assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{mode}\""));
         }
         assert!("neither".parse::<TraceMode>().is_err());
+    }
+
+    /// The dialog reads a fresh trace's mode from `defaultMode` — a field name and spelling that
+    /// `ui/src/ipc.ts` types by hand, so the wire shape is pinned here where it is produced.
+    #[test]
+    fn control_specs_send_the_default_mode_under_its_wire_name() {
+        let json = serde_json::to_string(&control_specs()).unwrap();
+        let expected = format!(r#""defaultMode":"{}""#, TraceControls::default().mode);
+        assert!(json.contains(&expected), "{json}");
     }
 
 

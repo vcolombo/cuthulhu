@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
   type Doc = {
@@ -131,6 +131,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     list_machines: () => machines,
+    // A fixture, not a claim: the real list comes from geometry::list_font_families and is
+    // whatever the OS has installed. This exists only so the dialog has options to render.
+    list_fonts: () => (opts?.noFonts ? [] : ["Arial", "Comic Sans MS", "Times New Roman"]),
     trace_image: () => ({
       svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
       pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
@@ -1090,6 +1093,30 @@ test("trace dialog: a control table missing a control reports it instead of hang
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(/detail/)).toBeVisible();
   // Nothing traceable was ever configured, so Insert must not offer geometry.
+  await expect(page.getByRole("button", { name: "Insert" })).toBeDisabled();
+});
+
+test("text dialog: picking a family and Insert adds a shape", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Text" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add text" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Font family").selectOption("Times New Roman");
+  await page.getByRole("button", { name: "Insert" }).click();
+  await expect(dialog).not.toBeVisible();
+  // add_text mock was invoked — it adds a node to doc, same observable-effect assertion
+  // the trace-insert test above uses.
+  await expect(page.getByTestId("layer-row")).toHaveCount(1);
+});
+
+test("text dialog: an empty font list says so and disables Insert", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { noFonts: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Text" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add text" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("No fonts were found on this system")).toBeVisible();
   await expect(page.getByRole("button", { name: "Insert" })).toBeDisabled();
 });
 

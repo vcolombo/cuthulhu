@@ -54,34 +54,69 @@ impl OutlineBuilder for GlyphOutline<'_> {
     }
 }
 
+/// Sorted, deduped primary family names of every installed face. Fresh scan per
+/// call — a picker enumerates once per dialog open, and the scan is a directory
+/// walk, not something worth caching against font installs mid-session.
+pub fn list_font_families() -> Vec<String> {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    // Primary name only: localized aliases would show as duplicates in a picker,
+    // and the query below matches any alias, so a primary name always round-trips.
+    let mut names: Vec<String> =
+        db.faces().filter_map(|f| f.families.first().map(|(name, _)| name.clone())).collect();
+    names.sort_unstable(); // ponytail: locale-aware collation if anyone ever cares
+    names.dedup();
+    names
+}
+
+/// Exact family first, then the generic sans-serif alias (fontconfig may remap it),
+/// then any installed face at all. The last step is what guarantees text renders on
+/// systems without the requested family: substituting a font the operator can see
+/// beats refusing, and preview and cut plan resolve through this same function, so
+/// what gets cut is what was shown.
+fn resolve_face(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
+    db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family), fontdb::Family::SansSerif],
+        ..Default::default()
+    })
+    .or_else(|| db.faces().next().map(|f| f.id))
+}
+
+/// Split out of `text_to_path`'s closure so the BadFont branch is testable: fontdb
+/// parses files on insert and refuses corrupt ones, so garbage face data can only be
+/// fed in through this seam.
+fn outline_with_face(data: &[u8], face_index: u32, size_mm: f64, text: &str) -> Result<Path, GeomError> {
+    let face = Face::parse(data, face_index).map_err(|_| GeomError::BadFont)?;
+    let scale = size_mm / face.units_per_em() as f64;
+    let mut segs = vec![];
+    let mut x = 0.0f64;
+    for ch in text.chars() {
+        let gid = match face.glyph_index(ch) {
+            Some(g) if g != GlyphId(0) => g,
+            _ => { x += size_mm * 0.3; continue; } // missing glyph: skip outline, advance a fallback space
+        };
+        let mut builder = GlyphOutline {
+            segs: &mut segs, origin_x: x, scale,
+            cur: Point { x: 0.0, y: 0.0 }, start: Point { x: 0.0, y: 0.0 },
+        };
+        face.outline_glyph(gid, &mut builder);
+        let adv = face.glyph_hor_advance(gid).unwrap_or(0) as f64;
+        x += adv * scale;
+    }
+    Ok(Path { segs })
+}
+
 /// Glyph outlines for `text` set in `family` at `size_mm` (font units-per-em -> size_mm).
+/// A family with no installed match silently substitutes via `resolve_face`; only a
+/// system with zero faces is `NoFont`, and a matched face that won't parse is `BadFont`.
 /// Simple per-character glyph lookup + horizontal advance, no kerning/shaping (ponytail:
 /// good enough for laser-cut labels; add rustybuzz shaping if ligatures/kerning matter later).
 pub fn text_to_path(family: &str, size_mm: f64, text: &str) -> Result<Path, GeomError> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
-    let query = fontdb::Query { families: &[fontdb::Family::Name(family)], ..Default::default() };
-    let id = db.query(&query).ok_or(GeomError::NoFont)?;
-    db.with_face_data(id, |data, face_index| -> Result<Path, GeomError> {
-        let face = Face::parse(data, face_index).map_err(|_| GeomError::NoFont)?;
-        let scale = size_mm / face.units_per_em() as f64;
-        let mut segs = vec![];
-        let mut x = 0.0f64;
-        for ch in text.chars() {
-            let gid = match face.glyph_index(ch) {
-                Some(g) if g != GlyphId(0) => g,
-                _ => { x += size_mm * 0.3; continue; } // missing glyph: skip outline, advance a fallback space
-            };
-            let mut builder = GlyphOutline {
-                segs: &mut segs, origin_x: x, scale,
-                cur: Point { x: 0.0, y: 0.0 }, start: Point { x: 0.0, y: 0.0 },
-            };
-            face.outline_glyph(gid, &mut builder);
-            let adv = face.glyph_hor_advance(gid).unwrap_or(0) as f64;
-            x += adv * scale;
-        }
-        Ok(Path { segs })
-    }).ok_or(GeomError::NoFont)?
+    let id = resolve_face(&db, family).ok_or(GeomError::NoFont)?;
+    db.with_face_data(id, |data, face_index| outline_with_face(data, face_index, size_mm, text))
+        .ok_or(GeomError::BadFont)?
 }
 
 #[cfg(test)]
@@ -115,7 +150,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_family_is_no_font_error() {
-        assert_eq!(text_to_path("Definitely Not A Real Font Family 12345", 10.0, "x"), Err(GeomError::NoFont));
+    fn unknown_family_falls_back_to_an_installed_font() {
+        match any_available_family() {
+            Some(_) => match text_to_path("Definitely Not A Real Font Family 12345", 10.0, "Ab") {
+                Ok(p) => {
+                    assert!(!p.segs.is_empty());
+                    let b = p.bounds();
+                    assert!(b.w > 0.0, "width was {}", b.w);
+                    assert!(b.h > 0.0, "height was {}", b.h);
+                }
+                Err(e) => panic!("fallback should have substituted a font: {e:?}"),
+            },
+            None => assert_eq!(
+                text_to_path("Definitely Not A Real Font Family 12345", 10.0, "Ab"),
+                Err(GeomError::NoFont)
+            ),
+        }
+    }
+
+    #[test]
+    fn garbage_face_data_is_bad_font_not_no_font() {
+        assert_eq!(outline_with_face(b"not a font", 0, 10.0, "x"), Err(GeomError::BadFont));
+    }
+
+    #[test]
+    fn list_font_families_is_sorted_deduped_and_nonempty_with_fonts() {
+        let families = list_font_families();
+        assert!(families.windows(2).all(|w| w[0] <= w[1]), "not sorted: {families:?}");
+        let mut deduped = families.clone();
+        deduped.dedup();
+        assert_eq!(families, deduped, "contains duplicates");
+        assert_eq!(families.is_empty(), any_available_family().is_none());
     }
 }

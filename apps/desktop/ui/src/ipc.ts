@@ -311,6 +311,10 @@ export type TraceResultDto = { svg: string; pathCount: number; widthPx: number; 
 export async function traceControls(): Promise<TraceControlSpecsDto> {
   return invoke("trace_controls", {});
 }
+// Sorted installed family names; empty on a system with no fonts (a state, not an error).
+export async function listFonts(): Promise<string[]> {
+  return invoke("list_fonts", {});
+}
 export async function traceImage(args: { path: string; controls: TraceControlsDto }): Promise<TraceResultDto> {
   return invoke("trace_image", args);
 }

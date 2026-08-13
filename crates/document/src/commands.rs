@@ -157,7 +157,8 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
 /// `NodeId(u64::MAX)` as a placeholder — `Editor::add_text` overwrites it before commit.
 pub fn add_text(doc: &Document, parent: NodeId, family: &str, size_mm: f64, text: &str) -> Result<Delta, CmdError> {
     doc.get(parent).ok_or(CmdError::NotFound)?;
-    let path = text_to_path(family, size_mm, text).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
+    // `to_string`, not `{e:?}`: same operator-facing contract as `shape_outline` (#91).
+    let path = text_to_path(family, size_mm, text).map_err(|e| CmdError::Geometry(e.to_string()))?;
     let node = Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: path.to_svg() });
     Ok(Delta(vec![NodeOp::Add { parent, node, index: usize::MAX }]))
 }
@@ -386,6 +387,22 @@ mod tests {
             },
             // headless CI with zero system fonts: assert the real Geometry(NoFont) path instead.
             None => assert_eq!(ed.add_text(parent, "Whatever", 10.0, "Hi"),
+                Err(CmdError::Geometry(geometry::GeomError::NoFont.to_string()))),
+        }
+    }
+
+    #[test]
+    fn add_text_with_unknown_family_falls_back() {
+        let mut ed = Editor::new();
+        let parent = ed.doc.root;
+        let result = ed.add_text(parent, "Definitely Not A Real Font Family 12345", 10.0, "Hi");
+        match any_available_family() {
+            Some(_) => {
+                result.expect("fallback should have substituted a font");
+                let kids = &ed.doc.get(parent).unwrap().children;
+                assert_eq!(kids.len(), 1);
+            }
+            None => assert_eq!(result,
                 Err(CmdError::Geometry(geometry::GeomError::NoFont.to_string()))),
         }
     }

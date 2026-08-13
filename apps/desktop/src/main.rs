@@ -83,6 +83,7 @@ fn main() {
             ipc::forget_host,
             ipc::trace_image,
             ipc::trace_controls,
+            ipc::list_fonts,
             ipc::load_image_preview,
             ipc::pick_image,
             force_quit,

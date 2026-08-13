@@ -169,13 +169,13 @@ fn length_threshold(detail: f64) -> f64 {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum TraceError { Input(String), InvalidOption(String), Decode(String), Trace(String), EmptyResult }
+pub enum TraceError { Input(String), InvalidControl(String), Decode(String), Trace(String), EmptyResult }
 impl std::fmt::Display for TraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Input's messages are already whole sentences naming the file, so a prefix would read twice.
             TraceError::Input(m) => write!(f, "{m}"),
-            TraceError::InvalidOption(m) => write!(f, "invalid option: {m}"),
+            TraceError::InvalidControl(m) => write!(f, "invalid control: {m}"),
             TraceError::Decode(m) => write!(f, "could not read image: {m}"),
             TraceError::Trace(m) => write!(f, "trace failed: {m}"),
             TraceError::EmptyResult =>
@@ -192,7 +192,7 @@ impl TraceError {
     pub fn code(&self) -> &'static str {
         match self {
             TraceError::Input(_) => "input",
-            TraceError::InvalidOption(_) => "invalid_option",
+            TraceError::InvalidControl(_) => "invalid_control",
             TraceError::Decode(_) => "decode",
             TraceError::Trace(_) => "trace",
             TraceError::EmptyResult => "empty",
@@ -221,7 +221,7 @@ pub(crate) fn validate(c: &TraceControls) -> Result<(), TraceError> {
         // A NaN fails `contains` too, which is the answer we want and the reason this is not
         // written as a pair of comparisons.
         if !(spec.min..=spec.max).contains(&value) {
-            return Err(TraceError::InvalidOption(format!(
+            return Err(TraceError::InvalidControl(format!(
                 "{} must be {}–{}", spec.name, spec.min, spec.max
             )));
         }
@@ -497,15 +497,15 @@ mod tests {
         let d = TraceControls::default();
 
         let bad = TraceControls { speckle: SPECKLE.max as u8 + 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("speckle")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("speckle")));
         let bad = TraceControls { smoothing: SMOOTHING.max as u8 + 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("smoothing")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("smoothing")));
         let bad = TraceControls { detail: DETAIL.max + DETAIL.step, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("detail")));
         let bad = TraceControls { detail: DETAIL.min - DETAIL.step, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("detail")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("detail")));
         let bad = TraceControls { colors: COLORS.min as u8 - 1, ..d.clone() };
-        assert!(matches!(over(&bad), TraceError::InvalidOption(m) if m.contains("colors")));
+        assert!(matches!(over(&bad), TraceError::InvalidControl(m) if m.contains("colors")));
 
         assert!(validate(&d).is_ok());
 
@@ -564,11 +564,19 @@ mod tests {
     #[test]
     fn every_error_carries_a_code() {
         assert_eq!(TraceError::Input(String::new()).code(), "input");
-        assert_eq!(TraceError::InvalidOption(String::new()).code(), "invalid_option");
+        assert_eq!(TraceError::InvalidControl(String::new()).code(), "invalid_control");
         assert_eq!(TraceError::Decode(String::new()).code(), "decode");
         assert_eq!(TraceError::Trace(String::new()).code(), "trace");
         assert_eq!(TraceError::EmptyResult.code(), "empty");
     }
+
+    /// CONTEXT.md puts "options" on TraceControls' _Avoid_ list; the error a bad control raises
+    /// has to follow the vocabulary or it reintroduces the word at the exact moment it matters.
+    #[test]
+    fn rejected_control_speaks_of_controls_not_options() {
+        assert_eq!(TraceError::InvalidControl("x".into()).to_string(), "invalid control: x");
+    }
+
 
     /// One sentence, printed verbatim by both entry points. Before this, the CLI said "lower
     /// --detail" and the dialog said "raise detail" for the same failure, and both were right.
@@ -650,9 +658,9 @@ mod tests {
     }
 
     #[test]
-    fn trace_rejects_invalid_options_before_decoding() {
+    fn trace_rejects_invalid_controls_before_decoding() {
         let bad = TraceControls { speckle: 17, ..TraceControls::default() };
-        assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidOption(_))));
+        assert!(matches!(trace(b"irrelevant", &bad), Err(TraceError::InvalidControl(_))));
     }
 
     /// A 256×256 one-pixel checkerboard at speckle 0 makes vtracer emit tens of thousands of

@@ -106,6 +106,7 @@ describe("clippedEdges", () => {
 import {
   reorderPass,
   reorderForReplan,
+  toTravelPasses,
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
@@ -206,23 +207,43 @@ describe("reorderPass", () => {
 
 describe("reorderForReplan", () => {
   const rows = [
-    { color: 0xff0000ff, label: "red" },
-    { color: 0x00ff00ff, label: "green" },
-    { color: null, label: "uncolored" },
+    { color: 0xff0000ff, label: "red", enabled: true },
+    { color: 0x00ff00ff, label: "green", enabled: true },
+    { color: null, label: "uncolored", enabled: true },
   ];
 
-  it("returns the swapped rows and the matching color order for the backend", () => {
+  it("returns the swapped rows", () => {
     const moved = reorderForReplan(rows, 0, 1);
     expect(moved).not.toBeNull();
-    expect(moved!.rows.map((r) => r.label)).toEqual(["green", "red", "uncolored"]);
-    // The order is read from the swapped rows, not the originals — a mismatch here
-    // replans travel for an order the dialog no longer shows.
-    expect(moved!.order).toEqual([0x00ff00ff, 0xff0000ff, null]);
+    expect(moved!.map((r) => r.label)).toEqual(["green", "red", "uncolored"]);
   });
 
   it("is null at a boundary, so a clamped move costs no replan", () => {
     expect(reorderForReplan(rows, 0, -1)).toBeNull();
     expect(reorderForReplan(rows, 2, 1)).toBeNull();
+  });
+
+  it("sends the swapped order to the planner, not the original", () => {
+    // Read from the swapped rows: taking the order off the originals replans travel
+    // for a list the dialog no longer shows.
+    expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.color)).toEqual([
+      0x00ff00ff, 0xff0000ff, null,
+    ]);
+  });
+});
+
+describe("toTravelPasses", () => {
+  it("names every pass, disabled ones included, carrying whether each is cut", () => {
+    // Dropping the disabled pass here would leave the backend unable to tell a pass the
+    // operator switched off from one a frontend bug lost.
+    const rows = [
+      { color: 0xff0000ff, enabled: false },
+      { color: 0x00ff00ff, enabled: true },
+    ];
+    expect(toTravelPasses(rows)).toEqual([
+      { color: 0xff0000ff, enabled: false },
+      { color: 0x00ff00ff, enabled: true },
+    ]);
   });
 });
 

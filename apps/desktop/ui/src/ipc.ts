@@ -206,13 +206,18 @@ export async function planCut(): Promise<PlanCutResponse> {
   return invoke("plan_cut", {});
 }
 
-/** Travel replanned by the backend for the dialog's current pass order. Rejects with
- *  code "stale_plan" when the document has changed since `docRevision` was planned. */
+/** A pass as the dialog has it configured: where it sits in the order, and whether it is cut. */
+export type TravelPass = { color: number | null; enabled: boolean };
+
+/** Travel replanned by the backend for the dialog's current pass list. Every planned pass
+ *  must be named (disabled ones included — they are dropped from the travel, not from the
+ *  list). Rejects with code "stale_plan" when the document has changed since `docRevision`
+ *  was planned. */
 export async function travelForOrder(
   docRevision: string,
-  order: (number | null)[],
+  passes: TravelPass[],
 ): Promise<[number, number, number, number][]> {
-  return invoke("travel_for_order", { docRevision, order });
+  return invoke("travel_for_order", { docRevision, passes });
 }
 
 /** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this

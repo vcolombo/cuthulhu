@@ -7,6 +7,7 @@ import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
 import {
   reorderForReplan,
+  toTravelPasses,
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
@@ -354,29 +355,42 @@ export function CutDialog({
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   };
 
-  // Rapid Up/Up fires two replans, and nothing orders their replies — an older
-  // response landing last would redraw travel for an order the rows no longer show.
-  // Only the latest request's reply (or failure) is allowed to touch state, and
-  // `replan` bumps the sequence too, so a full replan orphans them all.
-  const movePass = (i: number, dir: -1 | 1) => {
-    const moved = reorderForReplan(rows, i, dir);
-    if (!moved) return;
-    setRows(moved.rows);
+  // Travel is the planner's answer about the configured list — reorder and enable both
+  // change it, so both come through here. Rapid clicks fire several replans and nothing
+  // orders their replies: an older response landing last would redraw travel for a list
+  // the rows no longer show. Only the latest request's reply (or failure) may touch
+  // state, and `replan` bumps the sequence too, so a fresh plan orphans them all.
+  const refreshTravel = (next: PassRow[]) => {
     // No plan means no travel on screen to go stale (the initial plan itself failed).
     if (planRevision === null) return;
     const seq = ++travelSeq.current;
     ipc
-      .travelForOrder(planRevision, moved.order)
+      .travelForOrder(planRevision, toTravelPasses(next))
       .then((t) => {
         if (seq === travelSeq.current) setTravel(t);
       })
       .catch((e) => {
         if (seq !== travelSeq.current) return;
         // The same refusal Start Cut gets, surfaced the same way: the banner's Replan
-        // is the way back, and the reordered rows keep the operator's arrangement.
+        // is the way back, and the rows keep the operator's arrangement.
         if (ipc.ipcErrorCode(e) === "stale_plan") setStalePlan(true);
         else onError(ipc.ipcErrorMessage(e));
       });
+  };
+
+  const movePass = (i: number, dir: -1 | 1) => {
+    const next = reorderForReplan(rows, i, dir);
+    if (!next) return;
+    setRows(next);
+    refreshTravel(next);
+  };
+
+  // The head never travels to a pass that will not be cut, so enabling is as much a
+  // travel edit as reordering is.
+  const setPassEnabled = (i: number, enabled: boolean) => {
+    const next = rows.map((r, idx) => (idx === i ? { ...r, enabled } : r));
+    setRows(next);
+    refreshTravel(next);
   };
 
   return (
@@ -552,7 +566,7 @@ export function CutDialog({
                 />
                 <span>{row.shapeCount} shape(s)</span>
                 <label>
-                  <input type="checkbox" checked={row.enabled} onChange={(e) => updateRow(i, { enabled: e.target.checked })} />
+                  <input type="checkbox" checked={row.enabled} onChange={(e) => setPassEnabled(i, e.target.checked)} />
                   Enabled
                 </label>
                 <select

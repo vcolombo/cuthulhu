@@ -1141,16 +1141,25 @@ pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, Ip
     })
 }
 
-/// Travel for the pass order the cut dialog currently shows, replanned against the live
-/// document. Reordering is a UI-side list edit — the plan itself is not resent — so this
-/// re-asks the planner rather than letting the frontend recompute travel from geometry
-/// it does not have. The revision check keeps the stale-plan rule: travel for an order
-/// the operator arranged against a document that has since changed is refused, exactly
-/// as the cut itself would be.
+/// The dialog's pass list as it stands: the order, plus which passes are enabled. The same
+/// two facts `cut` is sent, in the same shape, so the preview and the cut cannot disagree
+/// about what "configured" means.
+#[derive(Debug, Deserialize)]
+pub struct TravelPassDto {
+    pub color: Option<u32>,
+    pub enabled: bool,
+}
+
+/// Travel for the configured pass list the cut dialog currently shows, replanned against
+/// the live document. Reorder and enable are UI-side list edits — the plan itself is not
+/// resent — so this re-asks the planner rather than letting the frontend recompute travel
+/// from geometry it does not have. The revision check keeps the stale-plan rule: travel for
+/// a list the operator arranged against a document that has since changed is refused,
+/// exactly as the cut itself would be.
 pub fn travel_for_order(
     doc: &document::Document,
     doc_revision: &str,
-    order: &[Option<u32>],
+    configured: &[TravelPassDto],
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Same rule as `prepare_cut`: a revision string that isn't a u64 was never
     // issued by `doc_revision`, so it cannot be the current plan.
@@ -1161,26 +1170,34 @@ pub fn travel_for_order(
     if planned.doc_revision != expected {
         return Err(map_cut_error(CutError::StalePlan { expected, actual: planned.doc_revision }));
     }
-    // With the revision equal, the plan is the one the dialog's rows came from, so the
-    // order must name each planned pass exactly once — anything else is a caller bug,
-    // and travel for a subset would silently misdraw the machine's motion.
+    // With the revision equal, the plan is the one the dialog's rows came from, so the list
+    // must name each planned pass exactly once — anything else is a caller bug, and a pass
+    // quietly missing from the list would misdraw the machine's motion as surely as a wrong
+    // order would. Disabled passes are named too, which is what keeps that check available:
+    // they are dropped here rather than by omitting them.
     let mut remaining: Vec<&ColorPass> = planned.passes.iter().collect();
-    let mut refs: Vec<&ColorPass> = Vec::with_capacity(order.len());
-    for color in order {
-        let Some(i) = remaining.iter().position(|p| p.color == *color) else {
-            // A color planned but already consumed is a duplicate in the order — a
+    let mut refs: Vec<&ColorPass> = Vec::with_capacity(configured.len());
+    for pass in configured {
+        let Some(i) = remaining.iter().position(|p| p.color == pass.color) else {
+            // A color planned but already consumed is a duplicate in the list — a
             // mismatch, not an unknown color; "no planned pass has color X" would be
             // a lie about a pass that exists.
-            return Err(if planned.passes.iter().any(|p| p.color == *color) {
-                IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass exactly once")
+            return Err(if planned.passes.iter().any(|p| p.color == pass.color) {
+                IpcError::new("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
             } else {
-                map_cut_error(CutError::UnknownPassColor(*color))
+                map_cut_error(CutError::UnknownPassColor(pass.color))
             });
         };
-        refs.push(remaining.remove(i));
+        let planned_pass = remaining.remove(i);
+        // The head never travels to a pass that will not be cut — `prepare_cut` filters the
+        // same way, and travel drawn through skipped geometry is motion the machine will
+        // not make (docs/superpowers/specs/2026-07-24-cut-workflow-design.md).
+        if pass.enabled {
+            refs.push(planned_pass);
+        }
     }
     if !remaining.is_empty() {
-        return Err(IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass exactly once"));
+        return Err(IpcError::new("plan_mismatch", "the requested pass list does not name every planned pass exactly once"));
     }
     Ok(cutplan::travel_moves(&refs).into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect())
 }
@@ -1343,48 +1360,67 @@ mod tests {
         (app, revision)
     }
 
+    fn on(color: u32) -> TravelPassDto { TravelPassDto { color: Some(color), enabled: true } }
+    fn off(color: u32) -> TravelPassDto { TravelPassDto { color: Some(color), enabled: false } }
+
     #[test]
     fn travel_for_order_follows_the_requested_order() {
         let (app, revision) = two_color_doc();
 
         // The plan's own first-seen order reproduces exactly what plan_cut_response sent.
-        let planned = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(BLUE)]).unwrap();
+        let planned = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(BLUE)]).unwrap();
         assert_eq!(planned, plan_cut_response(&app.editor.doc).unwrap().travel);
         assert_eq!(planned.len(), 1);
         assert!(planned[0][2] >= 100.0, "red first: travel lands on the blue rect at x=100, got {planned:?}");
 
-        let reversed = travel_for_order(&app.editor.doc, &revision, &[Some(BLUE), Some(RED)]).unwrap();
+        let reversed = travel_for_order(&app.editor.doc, &revision, &[on(BLUE), on(RED)]).unwrap();
         assert_eq!(reversed.len(), 1);
         assert!(reversed[0][0] >= 100.0 && reversed[0][2] <= 10.0,
             "blue first: travel leaves x=100 for the red rect at the origin, got {reversed:?}");
+    }
+
+    /// The head does not travel to a pass that will not be cut. A disabled pass is still
+    /// named, so the completeness check below survives.
+    #[test]
+    fn travel_for_order_skips_a_disabled_pass() {
+        let (app, revision) = two_color_doc();
+        let travel = travel_for_order(&app.editor.doc, &revision, &[on(RED), off(BLUE)]).unwrap();
+        assert!(travel.is_empty(), "nothing to travel to with only one pass cut, got {travel:?}");
+
+        // And with everything off there is no motion at all.
+        let none = travel_for_order(&app.editor.doc, &revision, &[off(RED), off(BLUE)]).unwrap();
+        assert!(none.is_empty(), "no pass is cut, so the head does not move: {none:?}");
     }
 
     #[test]
     fn travel_for_order_with_a_stale_revision_is_refused() {
         let (mut app, revision) = two_color_doc();
         app.add_rect(5.0, 5.0);
-        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(BLUE)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(BLUE)]).unwrap_err();
         assert_eq!(err.code, "stale_plan");
     }
 
     #[test]
     fn travel_for_order_with_an_unknown_color_is_refused() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(0xDEADBEEF)]).unwrap_err();
+        let unknown = TravelPassDto { color: Some(0xDEADBEEF), enabled: true };
+        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), unknown]).unwrap_err();
         assert_eq!(err.code, "unknown_pass_color");
     }
 
+    /// Disabling a pass drops it from the travel, never from the list — a pass genuinely
+    /// missing is a frontend bug, and silently drawing travel around it would hide it.
     #[test]
     fn travel_for_order_missing_a_planned_pass_is_refused() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED)]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 
     #[test]
     fn travel_for_order_naming_a_pass_twice_is_a_mismatch_not_an_unknown_color() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(RED)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(RED)]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 

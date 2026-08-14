@@ -149,18 +149,24 @@ export function reorderPass<T>(
 }
 
 /**
- * A reorder the dialog should act on: the swapped rows plus the color order to ask the
- * backend to replan travel for. Null when the move clamps at a boundary — no row moved,
- * so there is nothing to redraw and no reason to spend an IPC round trip.
+ * The swapped rows, or null when the move clamps at a boundary — no row moved, so there is
+ * nothing to redraw and no reason to spend an IPC round trip.
  */
-export function reorderForReplan<T extends { color: number | null }>(
-  rows: T[],
-  index: number,
-  dir: -1 | 1,
-): { rows: T[]; order: (number | null)[] } | null {
+export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] | null {
   const next = reorderPass(rows, index, dir);
-  if (next === rows) return null;
-  return { rows: next, order: next.map((r) => r.color) };
+  return next === rows ? null : next;
+}
+
+/**
+ * The pass list to ask the planner for travel in: every planned pass, in dialog order,
+ * carrying whether it is cut. Disabled passes are named rather than dropped — the backend
+ * skips them when routing the head but still checks that no pass went missing, which a
+ * filtered list would make impossible to tell from a frontend bug.
+ */
+export function toTravelPasses<T extends { color: number | null; enabled: boolean }>(
+  rows: T[],
+): { color: number | null; enabled: boolean }[] {
+  return rows.map((r) => ({ color: r.color, enabled: r.enabled }));
 }
 
 /**

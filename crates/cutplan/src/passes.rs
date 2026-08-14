@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use document::{shape_outline, Document, NodeId};
+use document::{shape_outline, Document, NodeId, NodeKind};
 use geometry::{Affine, Point, Polyline};
 use serde::{Deserialize, Serialize};
 
@@ -76,18 +76,34 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
         let node = doc.get(id).ok_or(PlanError::MissingNode(id))?;
         let world = node.transform.then(&parent_world);
 
-        match shape_outline(node).map_err(|e| PlanError::BadShape(id, e))? {
-            None => {
-                // Container: descend, pushing in reverse so preorder visits children left-to-right.
+        // Descend on the node's own kind, not on `shape_outline` returning `None`. The two
+        // agree, but reading it from `NodeKind` is what lets the outline stay unresolved
+        // until the shape is known to be cut — resolving first meant a font or path-data
+        // failure on a shape nobody would cut refused the whole plan (#139).
+        match &node.kind {
+            NodeKind::Group | NodeKind::Layer => {
+                // Push in reverse so preorder visits children left-to-right.
                 for &child in node.children.iter().rev() {
                     stack.push((child, world));
                 }
             }
-            Some(path) => {
+            NodeKind::Shape(_) => {
                 // 0-alpha counts as "no stroke" — nothing to cut, same as None.
                 match node.style.stroke.filter(|c| c & 0xFF != 0) {
                     None => skipped_no_stroke += 1,
                     Some(color) => {
+                        // `None` here is `shape_outline`'s container signal, which `NodeKind`
+                        // has already ruled out, so no `ShapeKind` reaches this today. A new
+                        // one added without its own arm there would fall into its catch-all
+                        // and land here — refuse rather than skip, because this branch is
+                        // past the cut filter: the shape *is* being cut, and quietly dropping
+                        // it would send a partial plan to the blade. Same reason a shape whose
+                        // outline fails to parse refuses instead of being skipped.
+                        let Some(path) = shape_outline(node).map_err(|e| PlanError::BadShape(id, e))?
+                        else {
+                            return Err(PlanError::BadShape(
+                                id, "this kind of shape cannot be resolved to an outline".into()));
+                        };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
                         match passes.iter_mut().find(|p| p.color == Some(color)) {
@@ -174,6 +190,35 @@ mod tests {
         node
     }
 
+    /// Unicode noncharacters. Permanently unassigned, so a face drawing them is the
+    /// exception rather than the rule — see `family_that_cannot_draw` for the exception.
+    const UNDRAWABLE: &str = "\u{FDD0}\u{FDD1}";
+
+    /// A family installed here that cannot draw `text`, or `None` if every face can.
+    ///
+    /// Searched rather than picked, because picking makes the caller's premise depend on
+    /// font enumeration order: this box carries 2966 faces of which exactly one, macOS's
+    /// `.LastResort`, maps essentially every codepoint. Taking the first face happens to
+    /// avoid it here and would not elsewhere, failing the test for a reason that has
+    /// nothing to do with planning. The search short-circuits on the first face that
+    /// cannot draw, so it costs one resolution in practice, not 2966.
+    fn family_that_cannot_draw(text: &str) -> Option<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        // Zero faces: every name resolves to NoFont, so any name gives an unresolvable
+        // text. Returning None here instead would skip the regression on exactly the
+        // machines where fonts are least predictable.
+        if db.faces().next().is_none() {
+            return Some("Any Family".into());
+        }
+        // Bound before returning: as a tail expression the iterator's borrow of `db`
+        // outlives `db` itself.
+        let found = db.faces()
+            .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            .find(|name| geometry::text_to_path(name, 10.0, text).is_err());
+        found
+    }
+
     /// Picks whatever font family is actually installed, instead of hardcoding one
     /// (macOS-only). Returns None on a headless CI box with zero system faces.
     fn any_available_family() -> Option<String> {
@@ -255,6 +300,93 @@ mod tests {
             }
             None => assert_eq!(plan_passes(&bad_doc),
                 Err(PlanError::BadShape(bad_id, geometry::GeomError::NoFont.to_string()))),
+        }
+    }
+
+    /// A node the plan excludes must not be able to refuse the plan. `shape_outline`
+    /// used to run before the stroke filter, so a font failure on a shape that would
+    /// never be cut took unrelated valid geometry down with it (#139).
+    #[test]
+    fn a_skipped_text_that_cannot_resolve_does_not_refuse_the_plan() {
+        let Some(family) = family_that_cannot_draw(UNDRAWABLE) else { return };
+        let unresolvable = ShapeKind::Text {
+            family, size_mm: 10.0, text: UNDRAWABLE.into(),
+        };
+
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+        let rect = ed.doc.ids.next();
+        let node = with_stroke(Node::shape(rect, ShapeKind::Rect { w: 5.0, h: 5.0 }), Some(0xFF0000FF));
+        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+
+        // Establish the premise rather than assuming it: stroked, this text must refuse the
+        // plan. If some face did draw those noncharacters the strokeless half below would
+        // pass against the unfixed traversal too, pinning nothing — so assert it here, where
+        // a face that resolves fails the test loudly instead of hollowing it out.
+        let stroked = ed.doc.ids.next();
+        let mut premise = ed.doc.clone();
+        premise.apply(Delta(vec![NodeOp::Add {
+            parent: root, index: usize::MAX,
+            node: with_stroke(Node::shape(stroked, unresolvable.clone()), Some(0x0000FFFF)),
+        }]));
+        assert!(
+            matches!(plan_passes(&premise), Err(PlanError::BadShape(id, _)) if id == stroked),
+            "premise void: this text resolves on the picked face, so the case below pins nothing",
+        );
+
+        // The contract: the same text, strokeless, is skipped instead of fatal.
+        let text = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add {
+            parent: root, index: usize::MAX,
+            node: with_stroke(Node::shape(text, unresolvable), None),
+        }]));
+
+        let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
+        assert_eq!(planned.passes.len(), 1, "the rect still plans");
+        assert_eq!(planned.passes[0].shapes.len(), 1);
+        assert_eq!(planned.skipped_no_stroke, 1, "the text is skipped, not fatal");
+    }
+
+    /// Same ordering bug, reached through a different `shape_outline` branch — the defect
+    /// is in when the outline is resolved, not in text.
+    #[test]
+    fn a_skipped_path_with_unreadable_data_does_not_refuse_the_plan() {
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+
+        let rect = ed.doc.ids.next();
+        let node = with_stroke(Node::shape(rect, ShapeKind::Rect { w: 5.0, h: 5.0 }), Some(0xFF0000FF));
+        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+
+        let bad = ed.doc.ids.next();
+        let node = with_stroke(
+            Node::shape(bad, ShapeKind::Path { d: "totally not path data".into() }), None);
+        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
+        assert_eq!(planned.passes.len(), 1);
+        assert_eq!(planned.skipped_no_stroke, 1);
+    }
+
+    /// The other half of the contract: deferring resolution must not swallow a failure on
+    /// a shape the plan *does* include. That one still refuses, with the same sentence.
+    #[test]
+    fn a_cut_shape_with_unreadable_data_still_refuses_the_plan() {
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+        let bad = ed.doc.ids.next();
+        let node = with_stroke(
+            Node::shape(bad, ShapeKind::Path { d: "totally not path data".into() }),
+            Some(0xFF0000FF),
+        );
+        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+
+        match plan_passes(&ed.doc) {
+            Err(PlanError::BadShape(id, message)) => {
+                assert_eq!(id, bad);
+                assert!(message.contains("path data"), "unexpected message: {message}");
+            }
+            other => panic!("expected BadShape for a shape that would be cut, got {other:?}"),
         }
     }
 

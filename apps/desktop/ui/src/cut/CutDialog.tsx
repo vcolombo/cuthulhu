@@ -160,15 +160,22 @@ export function CutDialog({
 
   /** Serial number of the newest travel-affecting request; see movePass and replan. */
   const travelSeq = useRef(0);
+  /** Serial number of the newest Replan, so two in flight cannot install out of order. */
+  const planSeq = useRef(0);
 
   const replan = () => {
-    // A fresh plan orphans every in-flight reorder request: bumping the sequence here
-    // keeps a slow reply planned against the old revision from overwriting the new
-    // travel — or re-raising the stale banner the fresh plan just cleared.
+    const seq = ++planSeq.current;
+    // A fresh plan orphans every reorder request: once when it is asked for (a reply
+    // landing during the fetch would redraw travel the incoming plan replaces) and
+    // again when it installs (a move made while the fetch was out carries the old
+    // revision, and its late stale_plan rejection would re-raise the banner this
+    // plan just cleared — Greptile drove exactly that interleaving on PR #142).
     travelSeq.current++;
     ipc
       .planCut()
       .then((plan) => {
+        if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
+        travelSeq.current++;
         setRows(
           plan.passes.map((p) => ({
             color: p.color,
@@ -187,7 +194,10 @@ export function CutDialog({
         setPlanRevision(plan.doc_revision);
         setStalePlan(false);
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => {
+        if (seq !== planSeq.current) return; // superseded: its failure is no longer news
+        onError(ipc.ipcErrorMessage(e));
+      });
   };
 
   useEffect(() => {

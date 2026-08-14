@@ -248,6 +248,25 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let planPasses: { color: number | null; enabled: boolean }[] = [];
   let failNextResume = false;
   let failNextCut = false;
+  // Parked responses for the reorder/replan race, released from the test in the order it
+  // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
+  // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
+  // Armed by the test rather than by a call count — StrictMode plans twice on mount, so
+  // "hold from the second call" holds the dialog's own opening plan and it never gets rows.
+  let holding = false;
+  const heldPlans: (() => void)[] = [];
+  const heldTravel: (() => void)[] = [];
+  const release = (queue: (() => void)[]) => {
+    queue.splice(0).forEach((f) => f());
+    // One macrotask, so the settled promises' handlers have run by the time the test's
+    // `evaluate` resolves and it can assert on what they did (or did not) change.
+    return new Promise((r) => setTimeout(r, 0));
+  };
+  Object.assign(window, {
+    __armHold: () => { holding = true; },
+    __releasePlans: () => release(heldPlans),
+    __releaseTravel: () => release(heldTravel),
+  });
 
   function ipcError(code: string, message: string) {
     return { code, message };
@@ -275,7 +294,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       for (const c of n.children) walk(c);
     };
     walk(doc.root);
-    const passes = [...byColor.values()].map((p) => ({ color: p.color, shape_count: p.node_ids.length, node_ids: p.node_ids }));
+    // starts is all-null on purpose: the fake carries no geometry to flatten, and null
+    // is the real backend's no-outline case — so e2e renders exercise the preview's
+    // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
+    const passes = [...byColor.values()].map((p) => ({
+      color: p.color,
+      shape_count: p.node_ids.length,
+      node_ids: p.node_ids,
+      starts: p.node_ids.map(() => null),
+    }));
     // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
     // bumped per command diverges on that, and silently goes stale-blind for any
@@ -399,7 +426,38 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return status;
     },
     get_connected_device: () => connected,
-    plan_cut: () => planFromDoc(),
+    plan_cut: () => {
+      // Answered from the document as it is *now*, like the real command, then parked if
+      // the test has armed the hold: which of a replan and an older reorder settles first
+      // is the whole subject of the race test, and a timing race cannot state it.
+      const plan = planFromDoc();
+      if (!holding) return plan;
+      return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
+    },
+    // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
+    // refusal, then synthetic segments (one per adjacent pair, x encoding the position in
+    // the order). Received orders are recorded on `window.__travelOrders` so a test can
+    // assert what the dialog asked for — travel itself lands on a canvas Playwright
+    // cannot read.
+    travel_for_order: (a) => {
+      const passes = a.passes as { color: number | null; enabled: boolean }[];
+      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests ??= [];
+      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests.push(passes);
+      // Decided against the document at call time, like the real command — a request
+      // issued before a replan is stale even if it settles after one.
+      const stale = planFromDoc().doc_revision !== a.docRevision;
+      const settle = () => {
+        if (stale) throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+        // One segment between each pair of *cut* passes, mirroring the real command
+        // skipping the head-travel to a pass that will not be cut.
+        const cut = passes.filter((p) => p.enabled);
+        return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+      };
+      if (!holding) return settle();
+      return new Promise((resolve, reject) => heldTravel.push(() => {
+        try { resolve(settle()); } catch (e) { reject(e); }
+      }));
+    },
     cut: (a) => {
       const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
       if (!connected) throw ipcError("not_connected", "no device connected");
@@ -662,6 +720,102 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await page.getByRole("button", { name: "Replan" }).click();
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
+});
+
+test("reordering passes asks the backend for travel in the new order", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  // Seeded first-seen order is red (0xff0000ff) then green (0x00ff00ff).
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+
+  await page.getByRole("button", { name: "Down" }).first().click();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+
+  // The wire is the contract under test: the replan request names the swapped order.
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+  );
+  expect(requests).toEqual([[
+    { color: 0x00ff00ff, enabled: true },
+    { color: 0xff0000ff, enabled: true },
+  ]]);
+});
+
+// The head does not travel to a pass that will not be cut, so switching one off is a travel
+// edit too — a preview that kept routing through it would draw motion the machine won't make.
+test("disabling a pass replans travel without it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
+
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+  );
+  // Both passes still named — the disabled one is dropped from the travel by the planner,
+  // not from the list, so a pass going missing stays distinguishable from a frontend bug.
+  expect(requests).toEqual([[
+    { color: 0xff0000ff, enabled: false },
+    { color: 0x00ff00ff, enabled: true },
+  ]]);
+});
+
+test("reordering after a doc edit surfaces the stale plan instead of stale travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  // Same off-screen edit as the stale-cut test above: the dialog covers the canvas.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+
+  await page.getByRole("button", { name: "Down" }).first().click();
+  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+});
+
+// The order these two settle in is the whole defect: a reorder issued before Replan carries
+// the old revision, so it is refused — and that refusal arriving *after* the fresh plan
+// installed used to re-raise the banner the replan had just cleared, telling the operator a
+// document they had only now replanned was stale again.
+test("a reorder refused for the old revision does not re-mark a freshly replanned document", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+  const banner = page.getByText("Document changed since this plan was made.");
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(banner).toBeVisible();
+
+  // Replan is in flight (held) when the pass moves, so the move is sent with the revision
+  // the fresh plan is about to replace.
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByRole("button", { name: "Replan" }).click();
+  await page.getByRole("button", { name: "Down" }).first().click();
+
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<unknown> }).__releasePlans());
+  await expect(banner).toHaveCount(0);
+
+  await page.evaluate(() => (window as unknown as { __releaseTravel: () => Promise<unknown> }).__releaseTravel());
+  await expect(banner).toHaveCount(0);
 });
 
 // The one test that drives the Cut Host surface end to end. It is here rather than in a unit

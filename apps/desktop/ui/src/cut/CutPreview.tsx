@@ -16,7 +16,13 @@ export function cssColor(rgba: number): string {
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 }
 
-export type PreviewPass = { color: number | null; nodeIds: number[]; enabled: boolean };
+export type PreviewPass = {
+  color: number | null;
+  nodeIds: number[];
+  /** Each shape's first world-space point from the plan, parallel to nodeIds. */
+  starts: ([number, number] | null)[];
+  enabled: boolean;
+};
 
 type Props = {
   scene: Scene;
@@ -111,14 +117,16 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     // fit is exactly the illegibility this viewport exists to remove.
     passes.forEach((pass, passIndex) => {
       const color = pass.color !== null ? cssColor(pass.color) : text;
-      for (const nodeId of pass.nodeIds) {
+      pass.nodeIds.forEach((nodeId, shapeIndex) => {
         const node = nodesById.get(nodeId);
-        if (!node) continue;
-        // Order badge at the shape's world-bounds corner — inside the fitted region by
-        // construction. The world-transform origin is not: a path whose `d` starts away
-        // from (0,0) can be fully visible while its origin sits far off-canvas.
-        const bx = node.bounds.x * vp.scale + vp.tx;
-        const by = node.bounds.y * vp.scale + vp.ty;
+        if (!node) return;
+        // Order badge at the shape's first planned point — where the blade actually
+        // lands (PR #141 wanted this; the plan now carries it). A shape whose outline
+        // flattened to nothing falls back to the world-bounds corner, which is inside
+        // the fitted region by construction.
+        const start = pass.starts[shapeIndex];
+        const bx = (start ? start[0] : node.bounds.x) * vp.scale + vp.tx;
+        const by = (start ? start[1] : node.bounds.y) * vp.scale + vp.ty;
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(bx, by, 6, 0, Math.PI * 2);
@@ -128,7 +136,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
         ctx.fillText(String(passIndex + 1), bx, by);
-      }
+      });
     });
 
     // Where the fitted view cuts the artboard off, a dashed line along the canvas

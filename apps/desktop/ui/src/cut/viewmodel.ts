@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
+// callers keep their import path without a second structurally-identical type drifting.
+import type { Bounds } from "../render/hittest";
+export type { Bounds };
+
 // View model types (UI representation)
 export type PassVm = {
   color: number | null;
@@ -44,8 +49,6 @@ export type Preset = {
   };
   builtin: boolean;
 };
-
-export type Bounds = { x: number; y: number; w: number; h: number };
 
 /** World-mm → canvas-px mapping for the cut preview: screen = world * scale + t. */
 export type Viewport = { scale: number; tx: number; ty: number };
@@ -143,6 +146,27 @@ export function reorderPass<T>(
   [result[index], result[newIndex]] = [result[newIndex], result[index]];
 
   return result;
+}
+
+/**
+ * The swapped rows, or null when the move clamps at a boundary — no row moved, so there is
+ * nothing to redraw and no reason to spend an IPC round trip.
+ */
+export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] | null {
+  const next = reorderPass(rows, index, dir);
+  return next === rows ? null : next;
+}
+
+/**
+ * The pass list to ask the planner for travel in: every planned pass, in dialog order,
+ * carrying whether it is cut. Disabled passes are named rather than dropped — the backend
+ * skips them when routing the head but still checks that no pass went missing, which a
+ * filtered list would make impossible to tell from a frontend bug.
+ */
+export function toTravelPasses<T extends { color: number | null; enabled: boolean }>(
+  rows: T[],
+): { color: number | null; enabled: boolean }[] {
+  return rows.map((r) => ({ color: r.color, enabled: r.enabled }));
 }
 
 /**

@@ -141,7 +141,14 @@ export type DeviceEventKind =
 
 export type DeviceEvent = { job_id: number; kind: DeviceEventKind; status: CutStatus };
 
-export type PlanCutPassSummary = { color: number | null; shape_count: number; node_ids: number[] };
+export type PlanCutPassSummary = {
+  color: number | null;
+  shape_count: number;
+  node_ids: number[];
+  /** Each shape's first world-space point, parallel to node_ids — where the blade lands.
+   *  null is a shape whose outline flattened to nothing. */
+  starts: ([number, number] | null)[];
+};
 
 export type PlanCutResponse = {
   passes: PlanCutPassSummary[];
@@ -197,6 +204,20 @@ export async function forceQuit(): Promise<void> {
 
 export async function planCut(): Promise<PlanCutResponse> {
   return invoke("plan_cut", {});
+}
+
+/** A pass as the dialog has it configured: where it sits in the order, and whether it is cut. */
+export type TravelPass = { color: number | null; enabled: boolean };
+
+/** Travel replanned by the backend for the dialog's current pass list. Every planned pass
+ *  must be named (disabled ones included — they are dropped from the travel, not from the
+ *  list). Rejects with code "stale_plan" when the document has changed since `docRevision`
+ *  was planned. */
+export async function travelForOrder(
+  docRevision: string,
+  passes: TravelPass[],
+): Promise<[number, number, number, number][]> {
+  return invoke("travel_for_order", { docRevision, passes });
 }
 
 /** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this

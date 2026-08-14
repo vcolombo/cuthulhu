@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
 import {
-  reorderPass,
+  reorderForReplan,
+  toTravelPasses,
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
@@ -20,7 +21,7 @@ import {
 // machine does not support, so an optimistic default here cannot mis-send anything.
 const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
-type PassRow = PassVm & { nodeIds: number[] };
+type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[] };
 
 type Props = {
   scene: Scene;
@@ -158,15 +159,30 @@ export function CutDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Serial number of the newest travel-affecting request; see movePass and replan. */
+  const travelSeq = useRef(0);
+  /** Serial number of the newest Replan, so two in flight cannot install out of order. */
+  const planSeq = useRef(0);
+
   const replan = () => {
+    const seq = ++planSeq.current;
+    // A fresh plan orphans every reorder request: once when it is asked for (a reply
+    // landing during the fetch would redraw travel the incoming plan replaces) and
+    // again when it installs (a move made while the fetch was out carries the old
+    // revision, and its late stale_plan rejection would re-raise the banner this
+    // plan just cleared — Greptile drove exactly that interleaving on PR #142).
+    travelSeq.current++;
     ipc
       .planCut()
       .then((plan) => {
+        if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
+        travelSeq.current++;
         setRows(
           plan.passes.map((p) => ({
             color: p.color,
             shapeCount: p.shape_count,
             nodeIds: p.node_ids,
+            starts: p.starts,
             enabled: true,
             presetId: null,
             speed: null,
@@ -179,7 +195,10 @@ export function CutDialog({
         setPlanRevision(plan.doc_revision);
         setStalePlan(false);
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => {
+        if (seq !== planSeq.current) return; // superseded: its failure is no longer news
+        onError(ipc.ipcErrorMessage(e));
+      });
   };
 
   useEffect(() => {
@@ -334,6 +353,44 @@ export function CutDialog({
 
   const updateRow = (i: number, patch: Partial<PassRow>) => {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  };
+
+  // Travel is the planner's answer about the configured list — reorder and enable both
+  // change it, so both come through here. Rapid clicks fire several replans and nothing
+  // orders their replies: an older response landing last would redraw travel for a list
+  // the rows no longer show. Only the latest request's reply (or failure) may touch
+  // state, and `replan` bumps the sequence too, so a fresh plan orphans them all.
+  const refreshTravel = (next: PassRow[]) => {
+    // No plan means no travel on screen to go stale (the initial plan itself failed).
+    if (planRevision === null) return;
+    const seq = ++travelSeq.current;
+    ipc
+      .travelForOrder(planRevision, toTravelPasses(next))
+      .then((t) => {
+        if (seq === travelSeq.current) setTravel(t);
+      })
+      .catch((e) => {
+        if (seq !== travelSeq.current) return;
+        // The same refusal Start Cut gets, surfaced the same way: the banner's Replan
+        // is the way back, and the rows keep the operator's arrangement.
+        if (ipc.ipcErrorCode(e) === "stale_plan") setStalePlan(true);
+        else onError(ipc.ipcErrorMessage(e));
+      });
+  };
+
+  const movePass = (i: number, dir: -1 | 1) => {
+    const next = reorderForReplan(rows, i, dir);
+    if (!next) return;
+    setRows(next);
+    refreshTravel(next);
+  };
+
+  // The head never travels to a pass that will not be cut, so enabling is as much a
+  // travel edit as reordering is.
+  const setPassEnabled = (i: number, enabled: boolean) => {
+    const next = rows.map((r, idx) => (idx === i ? { ...r, enabled } : r));
+    setRows(next);
+    refreshTravel(next);
   };
 
   return (
@@ -509,7 +566,7 @@ export function CutDialog({
                 />
                 <span>{row.shapeCount} shape(s)</span>
                 <label>
-                  <input type="checkbox" checked={row.enabled} onChange={(e) => updateRow(i, { enabled: e.target.checked })} />
+                  <input type="checkbox" checked={row.enabled} onChange={(e) => setPassEnabled(i, e.target.checked)} />
                   Enabled
                 </label>
                 <select
@@ -552,10 +609,10 @@ export function CutDialog({
                   style={{ width: 50 }}
                 />
                 {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, -1))} disabled={i === 0}>
+                <button style={btn} onClick={() => movePass(i, -1)} disabled={i === 0}>
                   Up
                 </button>
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, 1))} disabled={i === rows.length - 1}>
+                <button style={btn} onClick={() => movePass(i, 1)} disabled={i === rows.length - 1}>
                   Down
                 </button>
               </div>

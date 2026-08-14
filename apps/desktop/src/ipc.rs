@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use document::{Delta, MachineProfile, NodeId, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
-use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse};
+use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse, TravelPassDto};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 
@@ -131,6 +131,11 @@ pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Op
 #[tauri::command]
 pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, IpcError> {
     plan_cut_response(&state.lock().unwrap().editor.doc)
+}
+
+#[tauri::command]
+pub fn travel_for_order(state: tauri::State<AppStateHandle>, doc_revision: String, passes: Vec<TravelPassDto>) -> Result<Vec<[f64; 4]>, IpcError> {
+    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, &passes)
 }
 
 // async: prepare_cut briefly locks the document (plan + preflight), then the

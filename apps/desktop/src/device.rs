@@ -1168,12 +1168,19 @@ pub fn travel_for_order(
     let mut refs: Vec<&ColorPass> = Vec::with_capacity(order.len());
     for color in order {
         let Some(i) = remaining.iter().position(|p| p.color == *color) else {
-            return Err(map_cut_error(CutError::UnknownPassColor(*color)));
+            // A color planned but already consumed is a duplicate in the order — a
+            // mismatch, not an unknown color; "no planned pass has color X" would be
+            // a lie about a pass that exists.
+            return Err(if planned.passes.iter().any(|p| p.color == *color) {
+                IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass exactly once")
+            } else {
+                map_cut_error(CutError::UnknownPassColor(*color))
+            });
         };
         refs.push(remaining.remove(i));
     }
     if !remaining.is_empty() {
-        return Err(IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass"));
+        return Err(IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass exactly once"));
     }
     Ok(cutplan::travel_moves(&refs).into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect())
 }
@@ -1371,6 +1378,13 @@ mod tests {
     fn travel_for_order_missing_a_planned_pass_is_refused() {
         let (app, revision) = two_color_doc();
         let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED)]).unwrap_err();
+        assert_eq!(err.code, "plan_mismatch");
+    }
+
+    #[test]
+    fn travel_for_order_naming_a_pass_twice_is_a_mismatch_not_an_unknown_color() {
+        let (app, revision) = two_color_doc();
+        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(RED)]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 

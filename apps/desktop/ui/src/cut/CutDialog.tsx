@@ -158,7 +158,14 @@ export function CutDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Serial number of the newest travel-affecting request; see movePass and replan. */
+  const travelSeq = useRef(0);
+
   const replan = () => {
+    // A fresh plan orphans every in-flight reorder request: bumping the sequence here
+    // keeps a slow reply planned against the old revision from overwriting the new
+    // travel — or re-raising the stale banner the fresh plan just cleared.
+    travelSeq.current++;
     ipc
       .planCut()
       .then((plan) => {
@@ -339,8 +346,8 @@ export function CutDialog({
 
   // Rapid Up/Up fires two replans, and nothing orders their replies — an older
   // response landing last would redraw travel for an order the rows no longer show.
-  // Only the latest request's reply (or failure) is allowed to touch state.
-  const travelSeq = useRef(0);
+  // Only the latest request's reply (or failure) is allowed to touch state, and
+  // `replan` bumps the sequence too, so a full replan orphans them all.
   const movePass = (i: number, dir: -1 | 1) => {
     const moved = reorderForReplan(rows, i, dir);
     if (!moved) return;

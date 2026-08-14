@@ -93,9 +93,15 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                     None => skipped_no_stroke += 1,
                     Some(color) => {
                         // `None` here is `shape_outline`'s container signal, which `NodeKind`
-                        // has already ruled out; every `ShapeKind` yields a path.
+                        // has already ruled out; every `ShapeKind` yields a path. A new
+                        // `ShapeKind` added without its own arm there would land in its
+                        // catch-all and reach this branch, cutting nothing — loudly in a test
+                        // build rather than silently, since the release fallback is a skip.
                         let Some(path) = shape_outline(node).map_err(|e| PlanError::BadShape(id, e))?
-                        else { continue };
+                        else {
+                            debug_assert!(false, "shape #{} resolved to no outline", id.0);
+                            continue;
+                        };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
                         match passes.iter_mut().find(|p| p.color == Some(color)) {
@@ -273,22 +279,38 @@ mod tests {
     fn a_skipped_text_that_cannot_resolve_does_not_refuse_the_plan() {
         // Needs a real face to reach NoGlyphs: a zero-font box fails earlier, at NoFont.
         let Some(family) = any_available_family() else { return };
+        // Noncharacters, which no face is expected to draw.
+        let unresolvable = ShapeKind::Text {
+            family, size_mm: 10.0, text: "\u{FDD0}\u{FDD1}".into(),
+        };
+
         let mut ed = Editor::new();
         let root = ed.doc.root;
-
         let rect = ed.doc.ids.next();
         let node = with_stroke(Node::shape(rect, ShapeKind::Rect { w: 5.0, h: 5.0 }), Some(0xFF0000FF));
         ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
 
-        // Noncharacters: no face draws them, so this is NoGlyphs rather than a substitution.
-        let text = ed.doc.ids.next();
-        let node = with_stroke(
-            Node::shape(text, ShapeKind::Text {
-                family, size_mm: 10.0, text: "\u{FDD0}\u{FDD1}".into(),
-            }),
-            None,
+        // Establish the premise rather than assuming it: stroked, this text must refuse the
+        // plan. If some face did draw those noncharacters the strokeless half below would
+        // pass against the unfixed traversal too, pinning nothing — so assert it here, where
+        // a face that resolves fails the test loudly instead of hollowing it out.
+        let stroked = ed.doc.ids.next();
+        let mut premise = ed.doc.clone();
+        premise.apply(Delta(vec![NodeOp::Add {
+            parent: root, index: usize::MAX,
+            node: with_stroke(Node::shape(stroked, unresolvable.clone()), Some(0x0000FFFF)),
+        }]));
+        assert!(
+            matches!(plan_passes(&premise), Err(PlanError::BadShape(id, _)) if id == stroked),
+            "premise void: this text resolves on the picked face, so the case below pins nothing",
         );
-        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+
+        // The contract: the same text, strokeless, is skipped instead of fatal.
+        let text = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add {
+            parent: root, index: usize::MAX,
+            node: with_stroke(Node::shape(text, unresolvable), None),
+        }]));
 
         let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
         assert_eq!(planned.passes.len(), 1, "the rect still plans");

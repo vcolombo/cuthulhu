@@ -61,6 +61,12 @@ describe("fitViewport", () => {
     expect(center.y).toBeCloseTo(CANVAS.h / 2);
   });
 
+  it("keeps scale positive and finite when the margin swallows the canvas", () => {
+    const vp = fitViewport({ x: 0, y: 0, w: 10, h: 10 }, ARTBOARD, { w: 20, h: 20 }, 50);
+    expect(Number.isFinite(vp.scale)).toBe(true);
+    expect(vp.scale).toBeGreaterThan(0);
+  });
+
   it("widens degenerate content instead of fitting at Infinity", () => {
     const vp = fitViewport({ x: 50, y: 50, w: 0, h: 0 }, ARTBOARD, CANVAS, MARGIN);
     expect(Number.isFinite(vp.scale)).toBe(true);

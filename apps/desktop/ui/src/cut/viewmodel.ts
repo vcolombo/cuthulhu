@@ -92,7 +92,11 @@ export function fitViewport(
   // Widening keeps the original box centered, so re-center the target too.
   const cx = target.x + target.w / 2;
   const cy = target.y + target.h / 2;
-  const scale = Math.min((canvas.w - 2 * marginPx) / w, (canvas.h - 2 * marginPx) / h);
+  // A margin that swallows the canvas would flip the scale negative and invert the
+  // render; clamp the drawable area so scale stays positive and finite for any input.
+  const availW = Math.max(canvas.w - 2 * marginPx, 1);
+  const availH = Math.max(canvas.h - 2 * marginPx, 1);
+  const scale = Math.min(availW / w, availH / h);
   return { scale, tx: canvas.w / 2 - cx * scale, ty: canvas.h / 2 - cy * scale };
 }
 

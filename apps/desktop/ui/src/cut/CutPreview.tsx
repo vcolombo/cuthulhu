@@ -104,11 +104,11 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
       for (const nodeId of pass.nodeIds) {
         const node = nodesById.get(nodeId);
         if (!node) continue;
-        // Order badge at the shape's start point (its world-space origin).
-        const ox = node.world ? node.world[4] : node.bounds.x;
-        const oy = node.world ? node.world[5] : node.bounds.y;
-        const bx = ox * vp.scale + vp.tx;
-        const by = oy * vp.scale + vp.ty;
+        // Order badge at the shape's world-bounds corner — inside the fitted region by
+        // construction. The world-transform origin is not: a path whose `d` starts away
+        // from (0,0) can be fully visible while its origin sits far off-canvas.
+        const bx = node.bounds.x * vp.scale + vp.tx;
+        const by = node.bounds.y * vp.scale + vp.ty;
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(bx, by, 6, 0, Math.PI * 2);

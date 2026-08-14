@@ -1,5 +1,108 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
+import { clippedEdges, contentBounds, fitViewport, type Bounds, type Viewport } from "./viewmodel";
+
+const CANVAS = { w: 400, h: 300 };
+const MARGIN = 16;
+const ARTBOARD: Bounds = { x: 0, y: 0, w: 330, h: 3000 };
+
+const toScreen = (vp: Viewport, x: number, y: number) => ({
+  x: x * vp.scale + vp.tx,
+  y: y * vp.scale + vp.ty,
+});
+
+describe("contentBounds", () => {
+  it("is null for an empty plan", () => {
+    expect(contentBounds([], [])).toBeNull();
+  });
+
+  it("unions shape bounds with travel endpoints", () => {
+    // Both travel endpoints sit outside the shape box, so an implementation that
+    // ignores either endpoint produces a smaller union and fails.
+    const b = contentBounds([{ x: 10, y: 10, w: 5, h: 5 }], [[0, 0, 30, 40]]);
+    expect(b).toEqual({ x: 0, y: 0, w: 30, h: 40 });
+  });
+});
+
+describe("fitViewport", () => {
+  it("fits the artboard when the plan is empty", () => {
+    const vp = fitViewport(null, ARTBOARD, CANVAS, MARGIN);
+    const top = toScreen(vp, ARTBOARD.x, ARTBOARD.y);
+    const bottom = toScreen(vp, ARTBOARD.x + ARTBOARD.w, ARTBOARD.y + ARTBOARD.h);
+    expect(vp.scale).toBeGreaterThan(0);
+    expect(top.y).toBeCloseTo(MARGIN);
+    expect(bottom.y).toBeCloseTo(CANVAS.h - MARGIN);
+  });
+
+  it("makes tiny content occupy most of the canvas", () => {
+    // A 10×10mm sticker on the Cameo artboard — the case the fixed 1px=1mm
+    // mapping rendered as a 10px speck in the corner.
+    const vp = fitViewport({ x: 5, y: 5, w: 10, h: 10 }, ARTBOARD, CANVAS, MARGIN);
+    const tl = toScreen(vp, 5, 5);
+    const br = toScreen(vp, 15, 15);
+    expect(br.x - tl.x).toBeCloseTo(CANVAS.h - 2 * MARGIN); // height-limited uniform scale
+    expect(tl.x).toBeGreaterThanOrEqual(0);
+    expect(br.y).toBeLessThanOrEqual(CANVAS.h);
+  });
+
+  it("shrinks content larger than the canvas until fully visible", () => {
+    const vp = fitViewport({ x: 0, y: 0, w: 2000, h: 500 }, ARTBOARD, CANVAS, MARGIN);
+    expect(vp.scale).toBeLessThan(1);
+    const tl = toScreen(vp, 0, 0);
+    const br = toScreen(vp, 2000, 500);
+    expect(tl.x).toBeCloseTo(MARGIN);
+    expect(br.x).toBeCloseTo(CANVAS.w - MARGIN);
+    expect(tl.y).toBeGreaterThanOrEqual(0);
+    expect(br.y).toBeLessThanOrEqual(CANVAS.h);
+  });
+
+  it("centers content offset far from the origin", () => {
+    const vp = fitViewport({ x: 300, y: 2900, w: 20, h: 20 }, ARTBOARD, CANVAS, MARGIN);
+    const center = toScreen(vp, 310, 2910);
+    expect(center.x).toBeCloseTo(CANVAS.w / 2);
+    expect(center.y).toBeCloseTo(CANVAS.h / 2);
+  });
+
+  it("keeps scale positive and finite when the margin swallows the canvas", () => {
+    const vp = fitViewport({ x: 0, y: 0, w: 10, h: 10 }, ARTBOARD, { w: 20, h: 20 }, 50);
+    expect(Number.isFinite(vp.scale)).toBe(true);
+    expect(vp.scale).toBeGreaterThan(0);
+  });
+
+  it("widens degenerate content instead of fitting at Infinity", () => {
+    const vp = fitViewport({ x: 50, y: 50, w: 0, h: 0 }, ARTBOARD, CANVAS, MARGIN);
+    expect(Number.isFinite(vp.scale)).toBe(true);
+    const dot = toScreen(vp, 50, 50);
+    expect(dot.x).toBeCloseTo(CANVAS.w / 2);
+    expect(dot.y).toBeCloseTo(CANVAS.h / 2);
+  });
+});
+
+describe("clippedEdges", () => {
+  it("reports no clipping when the whole artboard fits", () => {
+    const vp = fitViewport(null, ARTBOARD, CANVAS, MARGIN);
+    expect(clippedEdges(vp, ARTBOARD, CANVAS)).toEqual({
+      left: false, right: false, top: false, bottom: false,
+    });
+  });
+
+  it("reports the edges a content-fitted view cuts off", () => {
+    // Content hugging the artboard's top-left corner (within the fit margin):
+    // zooming in keeps the sheet's top-left visible while its right and bottom
+    // edges run past the canvas.
+    const vp = fitViewport({ x: 0.2, y: 0.2, w: 10, h: 10 }, ARTBOARD, CANVAS, MARGIN);
+    expect(clippedEdges(vp, ARTBOARD, CANVAS)).toEqual({
+      left: false, right: true, top: false, bottom: true,
+    });
+  });
+
+  it("reports all edges clipped when content sits mid-sheet", () => {
+    const vp = fitViewport({ x: 150, y: 1500, w: 10, h: 10 }, ARTBOARD, CANVAS, MARGIN);
+    expect(clippedEdges(vp, ARTBOARD, CANVAS)).toEqual({
+      left: true, right: true, top: true, bottom: true,
+    });
+  });
+});
 import {
   reorderPass,
   effectiveSettings,

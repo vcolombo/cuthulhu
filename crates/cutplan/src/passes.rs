@@ -93,14 +93,16 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                     None => skipped_no_stroke += 1,
                     Some(color) => {
                         // `None` here is `shape_outline`'s container signal, which `NodeKind`
-                        // has already ruled out; every `ShapeKind` yields a path. A new
-                        // `ShapeKind` added without its own arm there would land in its
-                        // catch-all and reach this branch, cutting nothing — loudly in a test
-                        // build rather than silently, since the release fallback is a skip.
+                        // has already ruled out, so no `ShapeKind` reaches this today. A new
+                        // one added without its own arm there would fall into its catch-all
+                        // and land here — refuse rather than skip, because this branch is
+                        // past the cut filter: the shape *is* being cut, and quietly dropping
+                        // it would send a partial plan to the blade. Same reason a shape whose
+                        // outline fails to parse refuses instead of being skipped.
                         let Some(path) = shape_outline(node).map_err(|e| PlanError::BadShape(id, e))?
                         else {
-                            debug_assert!(false, "shape #{} resolved to no outline", id.0);
-                            continue;
+                            return Err(PlanError::BadShape(
+                                id, "this kind of shape cannot be resolved to an outline".into()));
                         };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
@@ -277,9 +279,12 @@ mod tests {
     /// never be cut took unrelated valid geometry down with it (#139).
     #[test]
     fn a_skipped_text_that_cannot_resolve_does_not_refuse_the_plan() {
-        // Needs a real face to reach NoGlyphs: a zero-font box fails earlier, at NoFont.
-        let Some(family) = any_available_family() else { return };
-        // Noncharacters, which no face is expected to draw.
+        // Deliberately no early return on a zero-font box. With faces installed these
+        // noncharacters resolve to NoGlyphs; with none, any family resolves to NoFont.
+        // Either way the text will not resolve, which is the only property under test —
+        // skipping the case there would leave the regression unexercised exactly where
+        // fonts are least predictable.
+        let family = any_available_family().unwrap_or_else(|| "Any Family".into());
         let unresolvable = ShapeKind::Text {
             family, size_mm: 10.0, text: "\u{FDD0}\u{FDD1}".into(),
         };

@@ -190,6 +190,35 @@ mod tests {
         node
     }
 
+    /// Unicode noncharacters. Permanently unassigned, so a face drawing them is the
+    /// exception rather than the rule — see `family_that_cannot_draw` for the exception.
+    const UNDRAWABLE: &str = "\u{FDD0}\u{FDD1}";
+
+    /// A family installed here that cannot draw `text`, or `None` if every face can.
+    ///
+    /// Searched rather than picked, because picking makes the caller's premise depend on
+    /// font enumeration order: this box carries 2966 faces of which exactly one, macOS's
+    /// `.LastResort`, maps essentially every codepoint. Taking the first face happens to
+    /// avoid it here and would not elsewhere, failing the test for a reason that has
+    /// nothing to do with planning. The search short-circuits on the first face that
+    /// cannot draw, so it costs one resolution in practice, not 2966.
+    fn family_that_cannot_draw(text: &str) -> Option<String> {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        // Zero faces: every name resolves to NoFont, so any name gives an unresolvable
+        // text. Returning None here instead would skip the regression on exactly the
+        // machines where fonts are least predictable.
+        if db.faces().next().is_none() {
+            return Some("Any Family".into());
+        }
+        // Bound before returning: as a tail expression the iterator's borrow of `db`
+        // outlives `db` itself.
+        let found = db.faces()
+            .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+            .find(|name| geometry::text_to_path(name, 10.0, text).is_err());
+        found
+    }
+
     /// Picks whatever font family is actually installed, instead of hardcoding one
     /// (macOS-only). Returns None on a headless CI box with zero system faces.
     fn any_available_family() -> Option<String> {
@@ -279,14 +308,9 @@ mod tests {
     /// never be cut took unrelated valid geometry down with it (#139).
     #[test]
     fn a_skipped_text_that_cannot_resolve_does_not_refuse_the_plan() {
-        // Deliberately no early return on a zero-font box. With faces installed these
-        // noncharacters resolve to NoGlyphs; with none, any family resolves to NoFont.
-        // Either way the text will not resolve, which is the only property under test —
-        // skipping the case there would leave the regression unexercised exactly where
-        // fonts are least predictable.
-        let family = any_available_family().unwrap_or_else(|| "Any Family".into());
+        let Some(family) = family_that_cannot_draw(UNDRAWABLE) else { return };
         let unresolvable = ShapeKind::Text {
-            family, size_mm: 10.0, text: "\u{FDD0}\u{FDD1}".into(),
+            family, size_mm: 10.0, text: UNDRAWABLE.into(),
         };
 
         let mut ed = Editor::new();

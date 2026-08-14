@@ -45,6 +45,74 @@ export type Preset = {
   builtin: boolean;
 };
 
+export type Bounds = { x: number; y: number; w: number; h: number };
+
+/** World-mm → canvas-px mapping for the cut preview: screen = world * scale + t. */
+export type Viewport = { scale: number; tx: number; ty: number };
+
+/**
+ * Union of the geometry the preview will actually draw: pass-member shape bounds
+ * plus travel endpoints. Travel counts because the park/origin moves routinely
+ * leave the content box, and a fit that crops them defeats the dashed lines'
+ * purpose. Returns null when there is nothing to draw (the empty-plan case).
+ */
+export function contentBounds(
+  shapeBounds: Bounds[],
+  travel: [number, number, number, number][]
+): Bounds | null {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const b of shapeBounds) {
+    minX = Math.min(minX, b.x); minY = Math.min(minY, b.y);
+    maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h);
+  }
+  for (const [x1, y1, x2, y2] of travel) {
+    minX = Math.min(minX, x1, x2); minY = Math.min(minY, y1, y2);
+    maxX = Math.max(maxX, x1, x2); maxY = Math.max(maxY, y1, y2);
+  }
+  if (minX === Infinity) return null;
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/**
+ * Fit `content` (falling back to the artboard for an empty plan) into the canvas
+ * with a uniform scale and a symmetric pixel margin, centered on both axes.
+ * Degenerate extents are widened to 1mm so a single dot fits at a finite scale
+ * instead of an Infinity that blanks the canvas.
+ */
+export function fitViewport(
+  content: Bounds | null,
+  artboard: Bounds,
+  canvas: { w: number; h: number },
+  marginPx: number
+): Viewport {
+  const target = content ?? artboard;
+  const minMm = 1;
+  const w = Math.max(target.w, minMm);
+  const h = Math.max(target.h, minMm);
+  // Widening keeps the original box centered, so re-center the target too.
+  const cx = target.x + target.w / 2;
+  const cy = target.y + target.h / 2;
+  const scale = Math.min((canvas.w - 2 * marginPx) / w, (canvas.h - 2 * marginPx) / h);
+  return { scale, tx: canvas.w / 2 - cx * scale, ty: canvas.h / 2 - cy * scale };
+}
+
+/**
+ * Which canvas edges cut the artboard off. The artboard rect itself is drawn
+ * clipped for free by the canvas; these flags drive the explicit "it continues
+ * past here" treatment so a missing border edge reads as clipped, not absent.
+ */
+export function clippedEdges(
+  vp: Viewport,
+  artboard: Bounds,
+  canvas: { w: number; h: number }
+): { left: boolean; right: boolean; top: boolean; bottom: boolean } {
+  const x1 = artboard.x * vp.scale + vp.tx;
+  const y1 = artboard.y * vp.scale + vp.ty;
+  const x2 = (artboard.x + artboard.w) * vp.scale + vp.tx;
+  const y2 = (artboard.y + artboard.h) * vp.scale + vp.ty;
+  return { left: x1 < 0, right: x2 > canvas.w, top: y1 < 0, bottom: y2 > canvas.h };
+}
+
 /**
  * Reorder a pass within the list by swapping it with an adjacent element.
  * Clamps at the start and end bounds.

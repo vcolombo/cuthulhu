@@ -17,8 +17,10 @@ describe("contentBounds", () => {
   });
 
   it("unions shape bounds with travel endpoints", () => {
-    const b = contentBounds([{ x: 10, y: 10, w: 5, h: 5 }], [[0, 0, 10, 10]]);
-    expect(b).toEqual({ x: 0, y: 0, w: 15, h: 15 });
+    // Both travel endpoints sit outside the shape box, so an implementation that
+    // ignores either endpoint produces a smaller union and fails.
+    const b = contentBounds([{ x: 10, y: 10, w: 5, h: 5 }], [[0, 0, 30, 40]]);
+    expect(b).toEqual({ x: 0, y: 0, w: 30, h: 40 });
   });
 });
 

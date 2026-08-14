@@ -110,11 +110,14 @@ export function clippedEdges(
   artboard: Bounds,
   canvas: { w: number; h: number }
 ): { left: boolean; right: boolean; top: boolean; bottom: boolean } {
+  // Half-pixel tolerance: an artboard that mathematically lands on the canvas edge
+  // can overhang by float residue (~1e-14), and a sub-pixel overhang is not clipped.
+  const eps = 0.5;
   const x1 = artboard.x * vp.scale + vp.tx;
   const y1 = artboard.y * vp.scale + vp.ty;
   const x2 = (artboard.x + artboard.w) * vp.scale + vp.tx;
   const y2 = (artboard.y + artboard.h) * vp.scale + vp.ty;
-  return { left: x1 < 0, right: x2 > canvas.w, top: y1 < 0, bottom: y2 > canvas.h };
+  return { left: x1 < -eps, right: x2 > canvas.w + eps, top: y1 < -eps, bottom: y2 > canvas.h + eps };
 }
 
 /**

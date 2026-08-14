@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
+// callers keep their import path without a second structurally-identical type drifting.
+import type { Bounds } from "../render/hittest";
+export type { Bounds };
+
 // View model types (UI representation)
 export type PassVm = {
   color: number | null;
@@ -44,8 +49,6 @@ export type Preset = {
   };
   builtin: boolean;
 };
-
-export type Bounds = { x: number; y: number; w: number; h: number };
 
 /** World-mm → canvas-px mapping for the cut preview: screen = world * scale + t. */
 export type Viewport = { scale: number; tx: number; ty: number };
@@ -143,6 +146,21 @@ export function reorderPass<T>(
   [result[index], result[newIndex]] = [result[newIndex], result[index]];
 
   return result;
+}
+
+/**
+ * A reorder the dialog should act on: the swapped rows plus the color order to ask the
+ * backend to replan travel for. Null when the move clamps at a boundary — no row moved,
+ * so there is nothing to redraw and no reason to spend an IPC round trip.
+ */
+export function reorderForReplan<T extends { color: number | null }>(
+  rows: T[],
+  index: number,
+  dir: -1 | 1,
+): { rows: T[]; order: (number | null)[] } | null {
+  const next = reorderPass(rows, index, dir);
+  if (next === rows) return null;
+  return { rows: next, order: next.map((r) => r.color) };
 }
 
 /**

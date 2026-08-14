@@ -105,6 +105,7 @@ describe("clippedEdges", () => {
 });
 import {
   reorderPass,
+  reorderForReplan,
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
@@ -200,6 +201,28 @@ describe("reorderPass", () => {
 
     const result = reorderPass(passes, 1, 1);
     expect(result).toEqual(passes);
+  });
+});
+
+describe("reorderForReplan", () => {
+  const rows = [
+    { color: 0xff0000ff, label: "red" },
+    { color: 0x00ff00ff, label: "green" },
+    { color: null, label: "uncolored" },
+  ];
+
+  it("returns the swapped rows and the matching color order for the backend", () => {
+    const moved = reorderForReplan(rows, 0, 1);
+    expect(moved).not.toBeNull();
+    expect(moved!.rows.map((r) => r.label)).toEqual(["green", "red", "uncolored"]);
+    // The order is read from the swapped rows, not the originals — a mismatch here
+    // replans travel for an order the dialog no longer shows.
+    expect(moved!.order).toEqual([0x00ff00ff, 0xff0000ff, null]);
+  });
+
+  it("is null at a boundary, so a clamped move costs no replan", () => {
+    expect(reorderForReplan(rows, 0, -1)).toBeNull();
+    expect(reorderForReplan(rows, 2, 1)).toBeNull();
   });
 });
 

@@ -275,7 +275,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       for (const c of n.children) walk(c);
     };
     walk(doc.root);
-    const passes = [...byColor.values()].map((p) => ({ color: p.color, shape_count: p.node_ids.length, node_ids: p.node_ids }));
+    // starts is all-null on purpose: the fake carries no geometry to flatten, and null
+    // is the real backend's no-outline case — so e2e renders exercise the preview's
+    // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
+    const passes = [...byColor.values()].map((p) => ({
+      color: p.color,
+      shape_count: p.node_ids.length,
+      node_ids: p.node_ids,
+      starts: p.node_ids.map(() => null),
+    }));
     // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
     // bumped per command diverges on that, and silently goes stale-blind for any
@@ -400,6 +408,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     get_connected_device: () => connected,
     plan_cut: () => planFromDoc(),
+    // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
+    // refusal, then synthetic segments (one per adjacent pair, x encoding the position in
+    // the order). Received orders are recorded on `window.__travelOrders` so a test can
+    // assert what the dialog asked for — travel itself lands on a canvas Playwright
+    // cannot read.
+    travel_for_order: (a) => {
+      const order = a.order as (number | null)[];
+      if (planFromDoc().doc_revision !== a.docRevision) {
+        throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+      }
+      (window as unknown as { __travelOrders: (number | null)[][] }).__travelOrders ??= [];
+      (window as unknown as { __travelOrders: (number | null)[][] }).__travelOrders.push(order);
+      return order.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+    },
     cut: (a) => {
       const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
       if (!connected) throw ipcError("not_connected", "no device connected");
@@ -662,6 +684,44 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await page.getByRole("button", { name: "Replan" }).click();
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
+});
+
+test("reordering passes asks the backend for travel in the new order", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  // Seeded first-seen order is red (0xff0000ff) then green (0x00ff00ff).
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+
+  await page.getByRole("button", { name: "Down" }).first().click();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+
+  // The wire is the contract under test: the replan request names the swapped order.
+  const orders = await page.evaluate(
+    () => (window as unknown as { __travelOrders?: (number | null)[][] }).__travelOrders,
+  );
+  expect(orders).toEqual([[0x00ff00ff, 0xff0000ff]]);
+});
+
+test("reordering after a doc edit surfaces the stale plan instead of stale travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  // Same off-screen edit as the stale-cut test above: the dialog covers the canvas.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+
+  await page.getByRole("button", { name: "Down" }).first().click();
+  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
 });
 
 // The one test that drives the Cut Host surface end to end. It is here rather than in a unit

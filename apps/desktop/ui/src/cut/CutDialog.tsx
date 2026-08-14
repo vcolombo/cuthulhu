@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useCallback, useEffect, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import * as ipc from "../ipc";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
 import {
-  reorderPass,
+  reorderForReplan,
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
@@ -20,7 +20,7 @@ import {
 // machine does not support, so an optimistic default here cannot mis-send anything.
 const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
-type PassRow = PassVm & { nodeIds: number[] };
+type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[] };
 
 type Props = {
   scene: Scene;
@@ -167,6 +167,7 @@ export function CutDialog({
             color: p.color,
             shapeCount: p.shape_count,
             nodeIds: p.node_ids,
+            starts: p.starts,
             enabled: true,
             presetId: null,
             speed: null,
@@ -334,6 +335,31 @@ export function CutDialog({
 
   const updateRow = (i: number, patch: Partial<PassRow>) => {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  };
+
+  // Rapid Up/Up fires two replans, and nothing orders their replies — an older
+  // response landing last would redraw travel for an order the rows no longer show.
+  // Only the latest request's reply (or failure) is allowed to touch state.
+  const travelSeq = useRef(0);
+  const movePass = (i: number, dir: -1 | 1) => {
+    const moved = reorderForReplan(rows, i, dir);
+    if (!moved) return;
+    setRows(moved.rows);
+    // No plan means no travel on screen to go stale (the initial plan itself failed).
+    if (planRevision === null) return;
+    const seq = ++travelSeq.current;
+    ipc
+      .travelForOrder(planRevision, moved.order)
+      .then((t) => {
+        if (seq === travelSeq.current) setTravel(t);
+      })
+      .catch((e) => {
+        if (seq !== travelSeq.current) return;
+        // The same refusal Start Cut gets, surfaced the same way: the banner's Replan
+        // is the way back, and the reordered rows keep the operator's arrangement.
+        if (ipc.ipcErrorCode(e) === "stale_plan") setStalePlan(true);
+        else onError(ipc.ipcErrorMessage(e));
+      });
   };
 
   return (
@@ -552,10 +578,10 @@ export function CutDialog({
                   style={{ width: 50 }}
                 />
                 {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, -1))} disabled={i === 0}>
+                <button style={btn} onClick={() => movePass(i, -1)} disabled={i === 0}>
                   Up
                 </button>
-                <button style={btn} onClick={() => setRows(reorderPass(rows, i, 1))} disabled={i === rows.length - 1}>
+                <button style={btn} onClick={() => movePass(i, 1)} disabled={i === rows.length - 1}>
                   Down
                 </button>
               </div>

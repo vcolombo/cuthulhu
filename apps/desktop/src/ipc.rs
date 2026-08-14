@@ -133,6 +133,11 @@ pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, 
     plan_cut_response(&state.lock().unwrap().editor.doc)
 }
 
+#[tauri::command]
+pub fn travel_for_order(state: tauri::State<AppStateHandle>, doc_revision: String, order: Vec<Option<u32>>) -> Result<Vec<[f64; 4]>, IpcError> {
+    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, &order)
+}
+
 // async: prepare_cut briefly locks the document (plan + preflight), then the
 // lock is dropped before execute_cut's blocking call into the device worker
 // so `cut` never holds the doc mutex while blocked, and running off the main

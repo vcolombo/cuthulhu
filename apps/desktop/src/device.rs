@@ -1113,6 +1113,11 @@ pub struct PlanCutPassSummary {
     pub color: Option<u32>,
     pub shape_count: usize,
     pub node_ids: Vec<document::NodeId>,
+    /// Each shape's first world-space point, parallel to `node_ids` — where the blade
+    /// actually lands. The preview's order badges anchor here; the UI cannot derive it
+    /// from `travel`, which has no move to the first shape and none for a single-shape
+    /// plan. `None` is a shape whose outline flattened to nothing.
+    pub starts: Vec<Option<[f64; 2]>>,
 }
 
 /// Summarizes `plan_passes` output for the UI — not the raw `DocumentPasses`
@@ -1126,11 +1131,51 @@ pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, Ip
             color: p.color,
             shape_count: p.shapes.len(),
             node_ids: p.shapes.iter().map(|s| s.node_id).collect(),
+            starts: p.shapes.iter().map(|s| {
+                s.polylines.first().and_then(|p| p.first()).map(|pt| [pt.x, pt.y])
+            }).collect(),
         }).collect(),
         skipped_no_stroke: planned.skipped_no_stroke,
         doc_revision: planned.doc_revision.to_string(),
         travel: travel.into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect(),
     })
+}
+
+/// Travel for the pass order the cut dialog currently shows, replanned against the live
+/// document. Reordering is a UI-side list edit — the plan itself is not resent — so this
+/// re-asks the planner rather than letting the frontend recompute travel from geometry
+/// it does not have. The revision check keeps the stale-plan rule: travel for an order
+/// the operator arranged against a document that has since changed is refused, exactly
+/// as the cut itself would be.
+pub fn travel_for_order(
+    doc: &document::Document,
+    doc_revision: &str,
+    order: &[Option<u32>],
+) -> Result<Vec<[f64; 4]>, IpcError> {
+    // Same rule as `prepare_cut`: a revision string that isn't a u64 was never
+    // issued by `doc_revision`, so it cannot be the current plan.
+    let Ok(expected) = doc_revision.parse::<u64>() else {
+        return Err(IpcError::new("stale_plan", "travel request carries an unrecognized plan revision"));
+    };
+    let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", e.to_string()))?;
+    if planned.doc_revision != expected {
+        return Err(map_cut_error(CutError::StalePlan { expected, actual: planned.doc_revision }));
+    }
+    // With the revision equal, the plan is the one the dialog's rows came from, so the
+    // order must name each planned pass exactly once — anything else is a caller bug,
+    // and travel for a subset would silently misdraw the machine's motion.
+    let mut remaining: Vec<&ColorPass> = planned.passes.iter().collect();
+    let mut refs: Vec<&ColorPass> = Vec::with_capacity(order.len());
+    for color in order {
+        let Some(i) = remaining.iter().position(|p| p.color == *color) else {
+            return Err(map_cut_error(CutError::UnknownPassColor(*color)));
+        };
+        refs.push(remaining.remove(i));
+    }
+    if !remaining.is_empty() {
+        return Err(IpcError::new("plan_mismatch", "the requested pass order does not name every planned pass"));
+    }
+    Ok(cutplan::travel_moves(&refs).into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect())
 }
 
 /// Re-derives the on-disk *user-only* preset list (builtins always shadow-load
@@ -1268,6 +1313,79 @@ mod tests {
         request.passes[0].color = Some(0xDEADBEEF); // doesn't match any planned pass
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "unknown_pass_color");
+    }
+
+    const RED: u32 = 0xFF0000FF;
+    const BLUE: u32 = 0x0000FFFF;
+
+    /// A stroked rect offset along x, so travel direction between shapes is assertable.
+    fn add_stroked_rect(app: &mut AppState, stroke: u32, x: f64) {
+        use document::{Delta, Node, NodeOp, ShapeKind, Style};
+        let id = app.editor.doc.ids.next();
+        let mut node = Node::shape(id, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: Some(stroke), fill: None };
+        node.transform = geometry::Affine::translate(x, 0.0);
+        app.editor.commit(Delta(vec![NodeOp::Add { parent: app.editor.doc.root, node, index: usize::MAX }]));
+    }
+
+    fn two_color_doc() -> (AppState, String) {
+        let mut app = AppState::new();
+        add_stroked_rect(&mut app, RED, 0.0);
+        add_stroked_rect(&mut app, BLUE, 100.0);
+        let revision = cutplan::doc_revision(&app.editor.doc).to_string();
+        (app, revision)
+    }
+
+    #[test]
+    fn travel_for_order_follows_the_requested_order() {
+        let (app, revision) = two_color_doc();
+
+        // The plan's own first-seen order reproduces exactly what plan_cut_response sent.
+        let planned = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(BLUE)]).unwrap();
+        assert_eq!(planned, plan_cut_response(&app.editor.doc).unwrap().travel);
+        assert_eq!(planned.len(), 1);
+        assert!(planned[0][2] >= 100.0, "red first: travel lands on the blue rect at x=100, got {planned:?}");
+
+        let reversed = travel_for_order(&app.editor.doc, &revision, &[Some(BLUE), Some(RED)]).unwrap();
+        assert_eq!(reversed.len(), 1);
+        assert!(reversed[0][0] >= 100.0 && reversed[0][2] <= 10.0,
+            "blue first: travel leaves x=100 for the red rect at the origin, got {reversed:?}");
+    }
+
+    #[test]
+    fn travel_for_order_with_a_stale_revision_is_refused() {
+        let (mut app, revision) = two_color_doc();
+        app.add_rect(5.0, 5.0);
+        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(BLUE)]).unwrap_err();
+        assert_eq!(err.code, "stale_plan");
+    }
+
+    #[test]
+    fn travel_for_order_with_an_unknown_color_is_refused() {
+        let (app, revision) = two_color_doc();
+        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED), Some(0xDEADBEEF)]).unwrap_err();
+        assert_eq!(err.code, "unknown_pass_color");
+    }
+
+    #[test]
+    fn travel_for_order_missing_a_planned_pass_is_refused() {
+        let (app, revision) = two_color_doc();
+        let err = travel_for_order(&app.editor.doc, &revision, &[Some(RED)]).unwrap_err();
+        assert_eq!(err.code, "plan_mismatch");
+    }
+
+    #[test]
+    fn plan_cut_response_carries_each_shapes_first_world_point() {
+        let (app, _) = two_color_doc();
+        let response = plan_cut_response(&app.editor.doc).unwrap();
+        for pass in &response.passes {
+            assert_eq!(pass.starts.len(), pass.node_ids.len(), "starts is parallel to node_ids");
+        }
+        // The blue rect's translate must show in its start — a local-space point here
+        // would put the badge at the origin instead of on the shape.
+        let blue = response.passes.iter().find(|p| p.color == Some(BLUE)).unwrap();
+        let start = blue.starts[0].unwrap();
+        assert!(start[0] >= 100.0, "world-space start, got {start:?}");
     }
 
     /// The bridge used to synthesize `Transmitting` from `Progress` because the

@@ -26,11 +26,38 @@ fn walk_svg(doc: &Document, id: NodeId, parent_xf: &Affine, out: &mut String) {
     let xf = node.transform.then(parent_xf);
     match &node.kind {
         NodeKind::Shape(shape) => match shape_path(shape) {
-            Some(p) => out.push_str(&format!("<path d=\"{}\"/>", p.transformed(&xf).to_svg())),
+            Some(p) => out.push_str(&format!(
+                "<path d=\"{}\"{}{}/>",
+                p.transformed(&xf).to_svg(),
+                paint_attrs("stroke", node.style.stroke),
+                paint_attrs("fill", node.style.fill),
+            )),
             None => out.push_str(&format!("<!-- skipped {} -->", shape_kind_name(shape))),
         },
         NodeKind::Group | NodeKind::Layer => {
             for child in &node.children { walk_svg(doc, *child, &xf, out); }
+        }
+    }
+}
+
+/// One paint as SVG attributes: explicit `stroke="none"`/`fill="none"` for absent paint —
+/// SVG's own defaults (black fill, no stroke) are the exact inverse of the editor's, which
+/// is how bare paths rendered as filled black blobs externally. Alpha rides in a separate
+/// `-opacity` attribute because `#RRGGBBAA` hex is SVG 2 and usvg's own import folds
+/// paint-opacity back into the RGBA hint, closing the round-trip.
+fn paint_attrs(name: &str, paint: Option<u32>) -> String {
+    match paint {
+        None => format!(" {name}=\"none\""),
+        Some(rgba) => {
+            let a = rgba & 0xFF;
+            let rgb = format!(" {name}=\"#{:06x}\"", rgba >> 8);
+            if a == 0xFF {
+                rgb
+            } else {
+                // 4 decimals: worst-case round-trip error is 5e-5 * 255 ≈ 0.013, well
+                // under the 0.5 that would round back to a different alpha byte.
+                format!("{rgb} {name}-opacity=\"{:.4}\"", a as f64 / 255.0)
+            }
         }
     }
 }
@@ -213,6 +240,64 @@ mod tests {
         assert!(svg.contains("M12,0"), "expected composed point M12,0: {svg}");
         assert!(!svg.contains("M22,0"), "order looks swapped (parent applied before child): {svg}");
     }
+    fn shape_with_style(doc: &mut Document, kind: ShapeKind, stroke: Option<u32>, fill: Option<u32>) {
+        let id = doc.ids.next();
+        let mut node = document::Node::shape(id, kind);
+        node.style = document::Style { stroke, fill };
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: doc.root, index: usize::MAX, node }]));
+    }
+
+    #[test]
+    fn doc_to_svg_default_style_is_black_stroke_no_fill() {
+        // SVG's own defaults are the inverse (black fill, no stroke), so both
+        // attributes must be explicit or external renderers invert the design.
+        let mut doc = Document::new();
+        let id = doc.ids.next();
+        doc.apply(document::Delta(vec![document::NodeOp::Add {
+            parent: doc.root, index: 0,
+            node: document::Node::shape(id, ShapeKind::Rect { w: 5.0, h: 5.0 }) }]));
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains(r##"stroke="#000000""##), "missing black stroke: {svg}");
+        assert!(svg.contains(r#"fill="none""#), "missing explicit no-fill: {svg}");
+        assert!(!svg.contains("stroke-opacity"), "opaque paint needs no opacity attr: {svg}");
+    }
+
+    #[test]
+    fn doc_to_svg_translucent_paint_emits_opacity() {
+        let mut doc = Document::new();
+        shape_with_style(&mut doc, ShapeKind::Rect { w: 5.0, h: 5.0 }, Some(0x0000FF80), Some(0x00FF0040));
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains(r##"stroke="#0000ff" stroke-opacity="0.5020""##), "stroke alpha: {svg}");
+        assert!(svg.contains(r##"fill="#00ff00" fill-opacity="0.2510""##), "fill alpha: {svg}");
+    }
+
+    #[test]
+    fn write_then_import_round_trips_stroke_and_fill() {
+        let mut doc = Document::new();
+        shape_with_style(&mut doc, ShapeKind::Rect { w: 5.0, h: 5.0 }, Some(0xFF0000FF), None);
+        shape_with_style(&mut doc, ShapeKind::Rect { w: 5.0, h: 5.0 }, None, Some(0x00FF00FF));
+        shape_with_style(&mut doc, ShapeKind::Rect { w: 5.0, h: 5.0 }, Some(0x0000FF80), None);
+        let svg = doc_to_svg(&doc);
+        let imp = svg_to_paths(svg.as_bytes()).unwrap();
+        let hints: Vec<(Option<u32>, Option<u32>)> =
+            imp.paths.iter().map(|(_, h)| (h.stroke, h.fill)).collect();
+        assert!(hints.contains(&(Some(0xFF0000FF), None)), "opaque stroke: {hints:?}");
+        assert!(hints.contains(&(None, Some(0x00FF00FF))), "fill-only: {hints:?}");
+        assert!(hints.contains(&(Some(0x0000FF80), None)), "alpha survives the opacity attr: {hints:?}");
+    }
+
+    #[test]
+    fn doc_to_svg_still_skips_text_with_a_comment() {
+        let mut doc = Document::new();
+        shape_with_style(&mut doc,
+            ShapeKind::Text { family: "X".into(), size_mm: 10.0, text: "hi".into() },
+            Some(0xFF0000FF), None);
+        let svg = doc_to_svg(&doc);
+        assert!(svg.contains("<!-- skipped text -->"), "comment emission changed: {svg}");
+        assert!(!svg.contains("<path"), "text must not emit a styled path: {svg}");
+    }
+
     #[test]
     fn import_preserves_stroke_colors_and_none() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="10">

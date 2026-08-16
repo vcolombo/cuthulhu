@@ -33,9 +33,10 @@ off `Style` is the substance of the decision, not a detail of it:
 pub enum CutLineType { Cut, NoCut }
 ```
 
-Two members ship. The others are named here so nobody invents a parallel enum: `CutEdge` is
-#56's, and its geometry semantics are the substantial part of that issue; `Draw`, `Score`,
-`PrintCutCut`, `PrintCutPrint` and `ColorLayerAlignment` are #45's, alongside the grouping modes.
+Two members ship. The others are named here so nobody invents a parallel enum: `CutEdge` belongs
+to #56, and its geometry semantics are the substantial part of that issue; `Draw`, `Score`,
+`PrintCutCut`, `PrintCutPrint` and `ColorLayerAlignment` belong to #45, alongside the grouping
+modes.
 Adding a variant later is a one-line change here and a match arm wherever it is consumed, which
 is the point of an enum over a bool.
 

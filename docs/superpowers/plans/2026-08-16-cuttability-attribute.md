@@ -615,11 +615,15 @@ The e2e fake's `planFromDoc` (`smoke.spec.ts:276-311`) is a second implementatio
 - `:285-287`: replace the stroke read and skip test with `if (n.cut_line_type === "NoCut") { skipped++; continue; }`.
 - `:289-291`: key the grouping map on stroke-else-fill with alpha-0 counting as absent, mirroring `pass_key`.
 
-The fake's Node literals do not carry `cut_line_type` yet; that is Task 8, which owns the fake's document shape. Until then `n.cut_line_type` is `undefined` for every fake node, which is `!== "NoCut"` — so every fake shape is cut, matching the default. State that in the comment so the sequencing is not mistaken for an oversight:
+The fake's Node *literals* do not carry `cut_line_type` until Task 8, which owns the fake's
+document shape — but `planFromDoc` cannot read a property the fake's `Node` type does not declare,
+so the declaration comes here, optional, and Task 8 makes it required once every literal stamps
+it. Add to `smoke.spec.ts:10`:
 
 ```ts
-  // A fake Node without the attribute reads as cut, which is the import default — Task 8
-  // stamps it explicitly on the literals.
+// Optional only until Task 8 stamps it on every literal: an absent value reads as cut, which
+// is the import default.
+type Node = { …; cut_line_type?: "Cut" | "NoCut"; … };
 ```
 
 - [ ] **Step 2: Verify no occurrence survives**
@@ -708,9 +712,14 @@ fn plain_cut_plans_one_pass_without_touching_paint() {
     assert_eq!(planned.passes.len(), 1);
     assert_eq!(planned.passes[0].color, None);
     assert_eq!(planned.passes[0].shapes.len(), 2);
-    for node in doc.nodes.values() {
-        assert_ne!(node.style.stroke, Some(0x000000FF),
-            "a plain cut no longer stamps a stroke on anything");
+    // Shapes only: the document's root is a container built by `Node::container`, whose
+    // `Style::default()` is the same opaque black this asserts the absence of. Walking every
+    // node would fail on the root while the imported paint was perfectly intact.
+    let shapes = doc.nodes.values().filter(|n| matches!(n.kind, document::NodeKind::Shape(_)));
+    for node in shapes {
+        assert_eq!(node.style.stroke, None,
+            "a plain cut no longer stamps a stroke on an imported path");
+        assert!(node.style.fill.is_some(), "and the fill it really had survives");
     }
 }
 ```
@@ -825,6 +834,7 @@ a planning input now, which is the direction #45 already prescribes."
 - Modify: `crates/trace/src/lib.rs` — delete `mirror_fill_onto_stroke` (`:322-350`) and `attr_value` (`:315-320`), and the call at `:304`
 - Modify: `crates/trace/src/lib.rs:737` — delete `traced_paths_are_stroked_so_they_can_be_cut`, replace with its opposite
 - Modify: `crates/trace/tests/roundtrip.rs:18-45` — the stroke assertions become fill assertions
+- Modify: `crates/trace/src/lib.rs:366-373` (`flatten_onto_white`'s doc comment) and the comments on `a_fully_transparent_image_traces_to_nothing` (`:760-765`) and `a_transparent_background_is_not_a_path_in_color_mode` (`:780-783`) — three places that explain a real danger with the mirror as its mechanism
 
 **Interfaces:**
 - Consumes: Task 3 (fill-only geometry plans passes) and Task 1 (import defaults to `Cut`). Deleting this before either is in place makes every trace uncuttable.
@@ -892,6 +902,23 @@ Delete `mirror_fill_onto_stroke` and `attr_value` from `crates/trace/src/lib.rs`
 ```
 
 Nothing else in the crate calls either function. `strip_empty_paths`' own doc comment must lose any claim about stroking; check it before committing.
+
+Three comments elsewhere in the crate reach a correct conclusion through the mirror, and must
+keep the conclusion while losing the mechanism — the danger they document is real and survives
+this change, which is exactly why they cannot be left saying something false:
+
+- `flatten_onto_white`'s doc comment (`crates/trace/src/lib.rs:366-373`) ends "Because every
+  emitted path is stroked, that rectangle is a cut line, so an invisible image would put a
+  rectangle through the material." Replace the causal clause: a traced path is cut because
+  import defaults its `CutLineType` to `Cut`, not because anything stroked it.
+- `a_fully_transparent_image_traces_to_nothing` (`:760-765`) says "Since every traced path is now
+  stroked, that phantom shape is cut geometry" and closes on "a stroked, cuttable canvas
+  rectangle". Same edit: still cuttable, no longer stroked.
+- `a_transparent_background_is_not_a_path_in_color_mode` (`:780-783`) says the flattened
+  background "comes back as a stroked path, which the cut planner then reports as a pass". It
+  comes back as a filled path, and the planner reports a pass keyed on that fill.
+
+Neither test's assertions change; both are about `path_count` and emitted colours.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1250,7 +1277,7 @@ Say why in the cut dialog (`CutDialog.tsx:623`) — spec scoping decision 2 asks
 
 Then the e2e fake. It mirrors `Document::snapshot_json()`, so every fabricated Node gains the field:
 
-- `:10` — add `cut_line_type: "Cut" | "NoCut"` to the fake's `Node` type.
+- `:10` — make `cut_line_type` required on the fake's `Node` type by dropping the `?` Task 4 added, so a literal that forgets it fails to compile rather than silently reading as cut.
 - `:23-25` — `DEFAULT_STYLE`'s comment currently claims a black stroke is what makes a shape "cuttable by default". Move that clause to the new field: paint no longer decides.
 - `:31`, `:49`, `:57`, `:88`, `:117` — every Node literal gets `cut_line_type: "Cut"`, including the root Layer (inert, and matching `Node::container`).
 - `:73-78` — `add_primitive`'s fake already accepts a test-only `a.stroke` override; add a `a.cut_line_type` override the same way, so a test can seed a `NoCut` node.

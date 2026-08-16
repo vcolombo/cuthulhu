@@ -24,8 +24,9 @@ swatches (`apps/desktop/ui/src/cut/CutDialog.tsx:181-198,554-618`) → the previ
 the CLI's `--skip-color` and `--order` (`crates/cli/src/main.rs:45-54`).
 
 So this cannot be added as a planner flag. Pass identity stops being a colour, once, and the four
-modes arrive on top of it. That is the whole of this slice; #45's other criteria are listed under
-*Out of scope* with the issues that own them.
+modes arrive on top of it. **#148 tracks this slice**; #45 stays open as the parity umbrella, and
+its remaining criteria are #149 (one continuous job versus separate confirmed jobs) and #150
+(colour-layer alignment marks), both listed under *Out of scope* below.
 
 ## What the reference applications do
 
@@ -254,12 +255,13 @@ that can change between plan and cut with nothing to detect it.
 
 ## Out of scope
 
-Each needs its own issue; none is blocked by anything here.
+The first two are filed; the rest are named so nobody builds half of one here. None is blocked by
+anything in this slice.
 
-- **One continuous job versus separate confirmed jobs** (#45). The per-pass completion policy
+- **One continuous job versus separate confirmed jobs** (#149). The per-pass completion policy
   already exists in `DeviceManager`; making it a per-plan choice is a `driver-core` question, not a
   grouping one.
-- **Colour-layer alignment marks in every enabled pass** (#45). Needs registration marks, which
+- **Colour-layer alignment marks in every enabled pass** (#150). Needs registration marks, which
   #25 owns.
 - **`CutEdge`** (#56), and `Draw`/`Score`/`PrintCutCut`/`PrintCutPrint`/`ColorLayerAlignment`
   members — each needs a driver answer for the tool it implies.

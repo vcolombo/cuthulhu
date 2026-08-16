@@ -22,9 +22,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
 
   // Mirrors document::Style::default() — a freshly-added shape has an opaque black stroke.
   const DEFAULT_STYLE: Style = { stroke: 0x000000ff, fill: null };
-  // Every Node below carries `cut_line_type: "Cut"`, mirroring document::CutLineType::default():
-  // that, not the paint, is what makes a shape cuttable by default (crates/cutplan/src/passes.rs).
-  // Containers carry it too, inertly, matching Node::container.
+  // Every Node below carries `cut_line_type: "Cut"`, the import default. It comes from the two
+  // constructors, `Node::shape` and `Node::container` (crates/document/src/node.rs) — there is no
+  // `CutLineType::default()` to mirror, and the planner reads the attribute rather than defaulting
+  // it. That attribute, not the paint, is what makes a shape cuttable. Containers carry it inertly.
 
   let nextId = 1;
   const freshDoc = (): Doc => {

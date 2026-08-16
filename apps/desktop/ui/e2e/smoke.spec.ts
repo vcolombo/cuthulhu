@@ -7,9 +7,7 @@ import { test, expect } from "@playwright/test";
 // which is what actually parses this on the JS side.
 function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
-  // cut_line_type is optional only until Task 8 stamps it on every literal: an absent value
-  // reads as cut, which is the import default.
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type?: "Cut" | "NoCut" };
+  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut" };
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -22,15 +20,17 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     { id: "puma", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
   ];
 
-  // Mirrors document::Style::default() — a freshly-added shape has an opaque black
-  // stroke and is cuttable by default.
+  // Mirrors document::Style::default() — a freshly-added shape has an opaque black stroke.
   const DEFAULT_STYLE: Style = { stroke: 0x000000ff, fill: null };
+  // Every Node below carries `cut_line_type: "Cut"`, mirroring document::CutLineType::default():
+  // that, not the paint, is what makes a shape cuttable by default (crates/cutplan/src/passes.rs).
+  // Containers carry it too, inertly, matching Node::container.
 
   let nextId = 1;
   const freshDoc = (): Doc => {
     const rootId = nextId++;
     return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [] } },
+      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut" } },
       root: rootId,
       artboard: { x: 0, y: 0, w: 330, h: 3000 },
       machine: null,
@@ -50,6 +50,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       transform: [1, 0, 0, 1, 0, 0],
       style: { stroke: 0xff0000ff, fill: null },
       children: [],
+      cut_line_type: "Cut",
     };
     const greenId = nextId++;
     doc.nodes[greenId] = {
@@ -58,6 +59,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       transform: [1, 0, 0, 1, 0, 0],
       style: { stroke: 0x00ff00ff, fill: null },
       children: [],
+      cut_line_type: "Cut",
     };
     doc.nodes[doc.root].children.push(redId, greenId);
   }
@@ -75,7 +77,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     add_primitive: (a) => {
       const id = nextId++;
       const style = a.stroke !== undefined ? { stroke: a.stroke as number | null, fill: null } : DEFAULT_STYLE;
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [] };
+      // Same test-only override as `a.stroke`: no UI control sets cuttability at creation, so
+      // this is the only way to seed a NoCut shape without going through set_cut_line_type.
+      const cutLineType = a.cut_line_type !== undefined ? (a.cut_line_type as "Cut" | "NoCut") : "Cut";
+      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -86,7 +91,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
       if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -108,6 +113,25 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }
       return {};
     },
+    // Mirrors commands::set_cut_line_type: descends into containers, because the attribute is
+    // read only on the shape that carries it — setting it on a Group alone would do nothing.
+    set_cut_line_type: (a) => {
+      const value = a.value as "Cut" | "NoCut";
+      const ids = a.ids as number[];
+      if (ids.length === 0) throw new Error("set_cut_line_type: EmptySelection");
+      const seen = new Set<number>();
+      const stack = [...ids];
+      while (stack.length > 0) {
+        const id = stack.pop()!;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const n = doc.nodes[id];
+        if (!n) throw new Error("set_cut_line_type: NotFound");
+        if (typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object)) n.cut_line_type = value;
+        else stack.push(...n.children);
+      }
+      return {};
+    },
     // Four commands the fake has never performed. They used to answer "ok" while leaving
     // `doc` untouched, which is the false green this file exists to avoid: each one edits
     // the document in the real backend, so a plan made before it goes stale and `plan_cut`
@@ -118,7 +142,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     boolean_op: () => unimplemented("boolean_op"),
     import_svg: (a) => {
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [] };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
       doc.nodes[a.parent as number].children.push(id);
       return [{}, []];
     },
@@ -698,6 +722,34 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
 
   await page.getByRole("button", { name: "Close" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+// The whole operator-facing round trip: the properties panel's control, the real
+// set_cut_line_type command, and the plan that then leaves the shape out. Nothing else in this
+// suite reads the dialog's not-cut line, so a readout wired to a renamed field would render an
+// `undefined` and every other test would still pass — hence the assertion on its full text,
+// count and reason both. It is also the only exercise of planFromDoc's NoCut branch.
+test("marking a shape No Cut drops its pass, and the dialog says why", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+
+  await page.getByTestId("layer-row").first().click();
+  const cuttable = page.getByRole("checkbox", { name: "Cut this shape" });
+  await expect(cuttable).toBeChecked();
+  await cuttable.uncheck();
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByText("Not cut: 1 shapes marked No Cut")).toBeVisible();
+
+  // Discriminating step: a command that ignored `value` and only ever wrote NoCut would pass
+  // everything above. Marking it back has to restore the pass and empty the readout.
+  await page.getByRole("button", { name: "Close" }).click();
+  await cuttable.check();
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
 });
 
 // The plan is made from the document, so an edit after planning must refuse the cut —

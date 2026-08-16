@@ -16,5 +16,8 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  // e2e is included so `npm run build` typechecks the fake backend too: it mirrors
+  // Document::snapshot_json(), and a Node literal that drops a required field there would
+  // otherwise reach Playwright's transpile-only run unchecked and read as a silent default.
+  "include": ["src", "e2e"]
 }

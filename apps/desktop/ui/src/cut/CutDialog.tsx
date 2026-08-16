@@ -620,7 +620,9 @@ export function CutDialog({
           })}
         </div>
 
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>Not cut: {skippedNotCut} shapes</div>
+        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+          Not cut: {skippedNotCut} shapes marked No Cut
+        </div>
 
         <CutPreview scene={scene} artboard={artboard} passes={rows} travel={travel} />
 

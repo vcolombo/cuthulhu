@@ -38,6 +38,10 @@ export async function reorder(args: Args) {
   return invoke("reorder", args);
 }
 
+export async function setCutLineType(args: Args) {
+  return invoke("set_cut_line_type", args);
+}
+
 export async function undo() {
   return invoke("undo", {});
 }

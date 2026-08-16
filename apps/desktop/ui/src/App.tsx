@@ -10,6 +10,7 @@ import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
+import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
 import { TraceDialog } from "./trace/TraceDialog";
@@ -39,6 +40,7 @@ export type DocNode = {
   id: number;
   kind: NodeKindJson;
   transform: Affine6;
+  cut_line_type: CutLineTypeJson;
   children: number[];
 };
 
@@ -345,6 +347,13 @@ export function App() {
     run(() => ipc.commitTransform({ ids: selected, m }));
   };
 
+  const cutLineType = doc ? selectionCutLineType(doc.nodes, selected) : null;
+
+  const setCutLineType = (value: CutLineTypeJson) => {
+    if (selected.length === 0) return;
+    run(() => ipc.setCutLineType({ ids: selected, value }));
+  };
+
   // A successful boolean op removes the source nodes and adds a result node — selecting
   // the removed ids would error the next transform with NotFound, so read the result id
   // straight out of the returned Delta's Add op and select that instead (or clear
@@ -461,6 +470,8 @@ export function App() {
           onChangeY={(v) => commitAxis("y", v)}
           onChangeW={(v) => commitScale("w", v)}
           onChangeH={(v) => commitScale("h", v)}
+          cutLineType={cutLineType}
+          onChangeCutLineType={setCutLineType}
         />
       </div>
       <div style={{ gridColumn: "1 / -1" }}>

@@ -73,12 +73,28 @@ fn pass_key(style: &Style) -> Option<u32> {
     style.stroke.filter(|c| c & 0xFF != 0).or(style.fill.filter(|c| c & 0xFF != 0))
 }
 
+/// How `plan_passes` splits cut shapes into passes.
+///
+/// `ByColor` is what every caller wants and stays the default. `Single` is one pass in
+/// document order, which is what `cuthulhu cut` without `--by-color` has always meant — it
+/// used to say it by giving every path the same stroke, which also destroyed the document's
+/// real colours for no other purpose.
+///
+/// #45 extends this with fill, layer-preset and line-type modes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Grouping { ByColor, Single }
+
 /// Walk the document in preorder from `doc.root`, group the shapes whose `CutLineType` is
 /// `Cut` by the colour `pass_key` gives them, and flatten each shape's outline under its
 /// accumulated world transform. A `NoCut` shape is counted, not cut. Iterative (explicit
 /// stack) so depth is not bounded by the Rust call stack; a `visited` set catches cycles in
 /// malformed docs.
 pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
+    plan_passes_with(doc, Grouping::ByColor)
+}
+
+/// `plan_passes` with the grouping named explicitly. See `Grouping`.
+pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPasses, PlanError> {
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut stack: Vec<(NodeId, Affine)> = vec![(doc.root, Affine::identity())];
     let mut passes: Vec<ColorPass> = vec![];
@@ -124,7 +140,13 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                         };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
-                        let color = pass_key(&node.style);
+                        let color = match grouping {
+                            Grouping::ByColor => pass_key(&node.style),
+                            // One bucket: `None` because a pass of mixed paint has no colour
+                            // to name, and the caller asked for one pass rather than for a
+                            // colour's pass.
+                            Grouping::Single => None,
+                        };
                         match passes.iter_mut().find(|p| p.color == color) {
                             Some(pass) => pass.shapes.push(shape),
                             None => passes.push(ColorPass { color, shapes: vec![shape] }),
@@ -511,5 +533,30 @@ mod tests {
         let planned = plan_passes(&doc).unwrap();
         assert_eq!(planned.passes.len(), 1);
         assert_eq!(planned.passes[0].color, None, "both paints are invisible, so neither keys the pass");
+    }
+
+    /// `Single` exists so the plain CLI cut can stop overwriting the document's colours to
+    /// get one pass. Document order is the substance of it: merging colour-grouped passes
+    /// afterwards would have concatenated colour by colour and quietly reordered the cut
+    /// (see the spec's rejected alternative), so the order is asserted, not just the count.
+    #[test]
+    fn single_grouping_yields_one_pass_in_document_order() {
+        let mut doc = Document::new();
+        let mut ids = vec![];
+        for fill in [0xFF0000FF, 0x00FF00FF, 0xFF0000FF] {
+            let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+            node.style = Style { stroke: None, fill: Some(fill) };
+            ids.push(node.id);
+            doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+        }
+
+        let by_color = plan_passes_with(&doc, Grouping::ByColor).unwrap();
+        assert_eq!(by_color.passes.len(), 2, "premise: two fills, so colour grouping splits");
+
+        let single = plan_passes_with(&doc, Grouping::Single).unwrap();
+        assert_eq!(single.passes.len(), 1);
+        assert_eq!(single.passes[0].color, None, "one pass of mixed paint has no colour to name");
+        let planned: Vec<_> = single.passes[0].shapes.iter().map(|s| s.node_id).collect();
+        assert_eq!(planned, ids, "document order, not colour-grouped order");
     }
 }

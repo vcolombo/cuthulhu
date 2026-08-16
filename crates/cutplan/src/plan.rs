@@ -12,8 +12,9 @@ use driver_core::{Job, MachineCaps, MachineProfile, Settings};
 use crate::passes::DocumentPasses;
 use crate::preflight::{preflight, ConfiguredPass, PreflightError};
 
-/// One pass the caller wants cut, keyed by the stroke colour `plan_passes`
-/// grouped on. Order within `PlanOptions::passes` is the order they are cut.
+/// One pass the caller wants cut, keyed on the colour `plan_passes` gave it — its shapes'
+/// visible stroke, else their visible fill, else nothing at all. Order within
+/// `PlanOptions::passes` is the order they are cut.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PassSelection {
     pub color: Option<u32>,
@@ -73,8 +74,9 @@ impl std::fmt::Display for CutError {
                 write!(f, "the document changed since this cut was planned"),
             CutError::UnknownPassColor(Some(color)) =>
                 write!(f, "no planned pass has color #{color:08X}"),
-            // `plan_passes` only ever builds `Some(color)` passes, so this is a caller
-            // asking for a pass that cannot exist rather than one that went missing.
+            // A `None` selection names the colourless pass — the one holding shapes with no
+            // visible paint, or the single pass a `Grouping::Single` plan contains. This is
+            // reached when no such pass was planned at all.
             CutError::UnknownPassColor(None) =>
                 write!(f, "no planned pass without a color"),
             CutError::Preflight(e) => write!(f, "{e}"),

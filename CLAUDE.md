@@ -87,12 +87,14 @@ can refuse a cut lives behind it: the stale-plan check (`doc_revision`), colour�
 meant for the connected machine, output size). A caller hands over `DocumentPasses` plus a
 `PlanOptions` and gets a `CutPlan` or a `CutError`. Do not add a way around it; extend it.
 
-A plain `cuthulhu cut` (no `--by-color`) reaches it by giving every imported path a uniform stroke
-(`pipeline::doc_from_svg_all_cuttable`), so `plan_passes` sees all the geometry and groups it into
-exactly one `ColorPass`. That is the plain path saying explicitly what it always meant — everything
-in the file, one pass — rather than arriving there by skipping the planner. It deliberately does
-not change `plan_passes`' stroke rule; whether cuttability should follow the path or the stroke is
-still open in issue #68.
+A plain `cuthulhu cut` (no `--by-color`) reaches it by asking the planner for one pass:
+`plan_passes_with(&doc, Grouping::Single)` groups every cut shape into a single `ColorPass`, in
+document order, and the selection asks for that pass by its colour — `None`, because a pass of
+mixed paint has no colour to name. That is the plain path saying explicitly what it always meant
+— everything in the file, one pass — rather than arriving there by skipping the planner. It used
+to say it by stamping a uniform stroke on every imported path, which also made the geometry
+cuttable; #144 took that second job away and left the overwrite destroying the document's real
+colours for nothing.
 
 A pass is not "enabled/disabled": a colour nobody lists in `PlanOptions::passes` is not cut.
 

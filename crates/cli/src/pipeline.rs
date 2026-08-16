@@ -68,31 +68,6 @@ pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     Ok(doc)
 }
 
-/// The stroke a plain cut gives every imported path. Opaque black, matching
-/// `document::Style::default()`.
-pub const CUT_STROKE: u32 = 0x000000FF;
-
-/// Import `svg` for a plain (non-`--by-color`) cut: every path gets the same
-/// stroke, so `plan_passes` finds all of it and groups it into exactly one
-/// `ColorPass`.
-///
-/// This is what the plain path has always meant — cut everything in the file,
-/// in one pass — stated explicitly so the cut can go through `plan_cut` and be
-/// preflighted. It deliberately does not touch `plan_passes`' stroke rule; see
-/// issue #68 for whether that rule should change at all.
-pub fn doc_from_svg_all_cuttable(svg: &[u8]) -> Result<document::Document, String> {
-    let mut doc = document::Document::new();
-    let (mut delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
-        .map_err(|e| format!("SVG parse: {e:?}"))?;
-    for op in delta.0.iter_mut() {
-        if let document::NodeOp::Add { node, .. } = op {
-            node.style.stroke = Some(CUT_STROKE);
-        }
-    }
-    doc.apply(delta);
-    Ok(doc)
-}
-
 /// The colours to cut, in cut order: apply `--order` (listed colours to the
 /// front, in listed sequence; the rest keep their relative order) and then
 /// `--skip-color`, in that order per the brief.
@@ -158,22 +133,26 @@ pub fn plan_plain_cut(
     settings: &Settings,
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
-    let doc = doc_from_svg_all_cuttable(svg)?;
-    let planned = cutplan::plan_passes(&doc).map_err(|e| e.to_string())?;
-    // Checked here rather than left to `plan_cut`: with no passes at all, asking for
-    // CUT_STROKE is an unmatched colour, and "no pass matches color" describes the
+    let doc = doc_from_svg(svg)?;
+    // One pass, in document order, whatever each path is painted. Cuttability no longer
+    // rides on the stroke (#144), so there is nothing to overwrite to say "cut all of
+    // this" — the grouping mode says it, and the document keeps its real colours.
+    let planned = cutplan::plan_passes_with(&doc, cutplan::Grouping::Single)
+        .map_err(|e| e.to_string())?;
+    // Checked here rather than left to `plan_cut`: with no passes at all, asking for the
+    // colourless pass is an unmatched selection, and "no pass matches color" describes the
     // request instead of the file.
     if planned.passes.is_empty() {
         return Err("no cuttable paths in SVG".into());
     }
-    let passes = vec![cutplan::PassSelection { color: Some(CUT_STROKE), settings: settings.clone() }];
+    let passes = vec![cutplan::PassSelection { color: None, settings: settings.clone() }];
     let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
 
 /// `CutError` as something to print at a terminal. Two arms outlive the shared
 /// `Display`: `NothingToCut`, because only this caller knows an SVG was imported
-/// and that none of its paths were stroked; and out-of-bounds, because naming
+/// and that none of its paths were cut; and out-of-bounds, because naming
 /// `--allow-out-of-bounds` is the CLI's to do — the desktop hardcodes
 /// `allow_out_of_bounds: false` and offers the operator no such control.
 fn describe_cut_error(e: cutplan::CutError) -> String {
@@ -307,25 +286,38 @@ mod tests {
         assert!(parse_hex_color("nothex12").is_err());
     }
 
-    /// A fill-only SVG is what Illustrator, Inkscape and most clipart emit. The plain
-    /// cut path has always cut it, so routing that path through `plan_passes` — which
-    /// skips strokeless shapes — must not change what it cuts.
+    /// A plain cut means everything in the file in one pass, and since #144 it says so with a
+    /// grouping mode instead of by overwriting every path's stroke. The `--by-color` half is not
+    /// a witness to the overwrite being gone — nothing outside `plan_plain_cut` can see the
+    /// document it imports — it pins that a fill keys a pass at all, through the caller the CLI
+    /// actually uses.
     #[test]
-    fn fill_only_svg_plans_exactly_one_pass() {
-        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+    fn plain_cut_plans_one_pass_and_by_color_still_sees_both_fills() {
+        let two_fills = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
-        let doc = doc_from_svg_all_cuttable(svg).expect("import");
-        let planned = cutplan::plan_passes(&doc).expect("plan");
-        assert_eq!(planned.passes.len(), 1, "all geometry belongs to one pass");
-        assert_eq!(planned.passes[0].color, Some(CUT_STROKE));
+
+        let plain = plan_plain_cut(two_fills, cameo5().as_ref(), &Settings::default(), false).unwrap();
+        assert_eq!(plain.passes.len(), 1);
+        assert_eq!(plain.passes[0].color, None, "one pass by request names no colour");
+
+        let by_color =
+            plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap();
+        assert_eq!(by_color.passes.len(), 2, "the fixture's two fills survived the import");
+        assert!(by_color.passes.iter().all(|p| p.color != Some(0x000000FF)),
+            "keyed on the fills, not on the black stroke a plain cut used to stamp");
     }
 
+    /// The fill-only-clipart case, stated as behaviour rather than as a consequence: paint that
+    /// nobody can see still cuts, because cuttability is the attribute and import defaults it to
+    /// `Cut`. Before #144 this SVG planned nothing at all.
     #[test]
-    fn plain_cut_plans_one_pass() {
-        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
-            <rect width="5" height="5" fill="#ff0000"/></svg>"##;
-        let plan = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false).expect("plan");
+    fn plain_cut_plans_invisible_paint() {
+        let transparent_fill = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
+            <rect width="5" height="5" fill="#00ff00" fill-opacity="0"/></svg>"##;
+
+        let plan = plan_plain_cut(transparent_fill, cameo5().as_ref(), &Settings::default(), false).unwrap();
         assert_eq!(plan.passes.len(), 1);
+        assert_eq!(plan.passes[0].color, None);
     }
 
     /// The whole point of the change: the plain path is preflighted. A shape past the

@@ -44,10 +44,12 @@ enum Command {
         /// Cut each color as a separate pass, pausing between passes for a tool swap
         #[arg(long)]
         by_color: bool,
-        /// Skip cutting shapes of this color (RRGGBBAA); may be repeated
+        /// Skip cutting shapes of this color (RRGGBBAA); may be repeated. Cannot name the
+        /// colorless pass, which is where shapes with no visible paint are cut
         #[arg(long = "skip-color")]
         skip_color: Vec<String>,
-        /// Comma-separated color order (RRGGBBAA,...) for --by-color passes; like --skip-color, cannot name the colorless pass
+        /// Comma-separated color order (RRGGBBAA,...) for --by-color passes; like
+        /// --skip-color, cannot name the colorless pass
         #[arg(long)]
         order: Option<String>,
         /// Send geometry that falls outside the machine's cutting area

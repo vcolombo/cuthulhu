@@ -24,7 +24,9 @@ swatches (`apps/desktop/ui/src/cut/CutDialog.tsx:181-198,554-618`) → the previ
 the CLI's `--skip-color` and `--order` (`crates/cli/src/main.rs:45-54`).
 
 So this cannot be added as a planner flag. Pass identity stops being a colour, once, and the four
-modes arrive on top of it. **#148 tracks this slice**; #45 stays open as the parity umbrella, and
+keys #45 asks for join the two `Grouping` already has — today's stroke-else-fill default and the
+single pass — for six modes in total. **#148 tracks this slice**; #45 stays open as the parity
+umbrella, and
 its remaining criteria are #149 (one continuous job versus separate confirmed jobs) and #150
 (colour-layer alignment marks), both listed under *Out of scope* below.
 

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use document::{shape_outline, Document, NodeId, NodeKind};
+use document::{shape_outline, CutLineType, Document, NodeId, NodeKind, Style};
 use geometry::{Affine, Point, Polyline};
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct PlannedShape { pub node_id: NodeId, pub polylines: Vec<Polyline> }
 
-/// All shapes sharing one stroke color (0xRRGGBBAA), cut together as one pass.
+/// All shapes cut together as one pass, keyed on the colour they share (0xRRGGBBAA) —
+/// their stroke where they have a visible one, else their fill. `None` is a pass of shapes
+/// with no visible paint at all.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 
@@ -59,10 +61,23 @@ pub fn doc_revision(doc: &Document) -> u64 {
     hasher.finish()
 }
 
-/// Walk the document in preorder from `doc.root`, group shapes by full stroke RGBA
-/// (`None` or alpha-0 strokes are skipped, not cut), and flatten each shape's outline
-/// under its accumulated world transform. Iterative (explicit stack) so depth is not
-/// bounded by the Rust call stack; a `visited` set catches cycles in malformed docs.
+/// The colour a cut shape's pass is keyed on: its stroke if it has a visible one, else its
+/// fill. Alpha-0 counts as absent in both, exactly as a 0-alpha stroke did when the stroke
+/// decided cuttability.
+///
+/// A fallback is needed because a shape with no stroke can be cut since #144 — traced and
+/// fill-only art is the common case — and a pass with no colour at all is something an
+/// operator cannot recognise in a pass list. `None` remains possible for a shape with no
+/// visible paint whatsoever.
+fn pass_key(style: &Style) -> Option<u32> {
+    style.stroke.filter(|c| c & 0xFF != 0).or(style.fill.filter(|c| c & 0xFF != 0))
+}
+
+/// Walk the document in preorder from `doc.root`, group the shapes whose `CutLineType` is
+/// `Cut` by the colour `pass_key` gives them, and flatten each shape's outline under its
+/// accumulated world transform. A `NoCut` shape is counted, not cut. Iterative (explicit
+/// stack) so depth is not bounded by the Rust call stack; a `visited` set catches cycles in
+/// malformed docs.
 pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut stack: Vec<(NodeId, Affine)> = vec![(doc.root, Affine::identity())];
@@ -88,10 +103,13 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                 }
             }
             NodeKind::Shape(_) => {
-                // 0-alpha counts as "no stroke" — nothing to cut, same as None.
-                match node.style.stroke.filter(|c| c & 0xFF != 0) {
-                    None => skipped_no_stroke += 1,
-                    Some(color) => {
+                // The predicate #144 moved here off the stroke. The *ordering* is #139's and
+                // must not move with it: the outline stays unresolved until the shape is
+                // known to be cut, so a font or path-data failure on a shape nobody cuts
+                // cannot refuse the whole plan.
+                match node.cut_line_type {
+                    CutLineType::NoCut => skipped_no_stroke += 1,
+                    CutLineType::Cut => {
                         // `None` here is `shape_outline`'s container signal, which `NodeKind`
                         // has already ruled out, so no `ShapeKind` reaches this today. A new
                         // one added without its own arm there would fall into its catch-all
@@ -106,9 +124,10 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                         };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
-                        match passes.iter_mut().find(|p| p.color == Some(color)) {
+                        let color = pass_key(&node.style);
+                        match passes.iter_mut().find(|p| p.color == color) {
                             Some(pass) => pass.shapes.push(shape),
-                            None => passes.push(ColorPass { color: Some(color), shapes: vec![shape] }),
+                            None => passes.push(ColorPass { color, shapes: vec![shape] }),
                         }
                     }
                 }
@@ -150,7 +169,7 @@ pub fn travel_moves(configured: &[&ColorPass]) -> Vec<(Point, Point)> {
 mod tests {
     use super::*;
     use document::history::Editor;
-    use document::{Delta, Node, NodeKind, NodeOp, ShapeKind, Style};
+    use document::{CutLineType, Delta, Node, NodeKind, NodeOp, ShapeKind, Style};
 
     /// The whole table at once: a new variant fails to compile the match in `Display`,
     /// and a reworded one fails here. These strings are what an operator reads — all
@@ -187,6 +206,13 @@ mod tests {
 
     fn with_stroke(mut node: Node, stroke: Option<u32>) -> Node {
         node.style = Style { stroke, fill: None };
+        node
+    }
+
+    /// Mark a node not-cut. Since #144 a strokeless shape is cut by default, so a test that
+    /// wants a skipped shape has to say so rather than leaving the stroke off.
+    fn with_no_cut(mut node: document::Node) -> document::Node {
+        node.cut_line_type = CutLineType::NoCut;
         node
     }
 
@@ -254,13 +280,13 @@ mod tests {
         let node = with_stroke(Node::shape(ellipse, ShapeKind::Ellipse { rx: 3.0, ry: 3.0 }), Some(BLUE));
         ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
 
-        // stroke-None rect: excluded from every pass
-        let no_stroke = ed.doc.ids.next();
-        let node = with_stroke(Node::shape(no_stroke, ShapeKind::Rect { w: 5.0, h: 5.0 }), None);
+        // marked not-cut: excluded from every pass
+        let not_cut = ed.doc.ids.next();
+        let node = with_no_cut(Node::shape(not_cut, ShapeKind::Rect { w: 5.0, h: 5.0 }));
         ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
 
         let planned = plan_passes(&ed.doc).unwrap();
-        assert_eq!(planned.passes.len(), 2, "red + blue; None excluded");
+        assert_eq!(planned.passes.len(), 2, "red + blue; the not-cut rect excluded");
         assert_eq!(planned.skipped_no_stroke, 1);
         let red = &planned.passes[0]; // first-seen order
         assert_eq!(red.color, Some(RED));
@@ -334,11 +360,11 @@ mod tests {
             "premise void: this text resolves on the picked face, so the case below pins nothing",
         );
 
-        // The contract: the same text, strokeless, is skipped instead of fatal.
+        // The contract: the same text, marked not-cut, is skipped instead of fatal.
         let text = ed.doc.ids.next();
         ed.commit(Delta(vec![NodeOp::Add {
             parent: root, index: usize::MAX,
-            node: with_stroke(Node::shape(text, unresolvable), None),
+            node: with_no_cut(Node::shape(text, unresolvable)),
         }]));
 
         let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
@@ -359,8 +385,8 @@ mod tests {
         ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
 
         let bad = ed.doc.ids.next();
-        let node = with_stroke(
-            Node::shape(bad, ShapeKind::Path { d: "totally not path data".into() }), None);
+        let node = with_no_cut(
+            Node::shape(bad, ShapeKind::Path { d: "totally not path data".into() }));
         ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
 
         let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
@@ -426,5 +452,64 @@ mod tests {
             (pt(11.0, 0.0), pt(0.0, 0.0)), // end of pass_b's only shape -> start of pass_a's first shape
             (pt(1.0, 0.0), pt(2.0, 0.0)),  // end of pass_a's first shape -> start of pass_a's second shape
         ]);
+    }
+
+    /// The point of the whole change: geometry with no stroke is cut when it says it is,
+    /// and its pass is keyed on the fill so an operator can still tell passes apart.
+    #[test]
+    fn a_fill_only_shape_that_is_cut_plans_into_a_pass_keyed_on_its_fill() {
+        let mut doc = Document::new();
+        let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: None, fill: Some(0x00FF00FF) };
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&doc).unwrap();
+        assert_eq!(planned.skipped_no_stroke, 0);
+        assert_eq!(planned.passes.len(), 1);
+        assert_eq!(planned.passes[0].color, Some(0x00FF00FF));
+    }
+
+    /// The other direction, which the old rule could not express at all: a shape with a
+    /// perfectly good stroke that the operator has marked not to cut.
+    #[test]
+    fn a_stroked_shape_marked_no_cut_plans_into_nothing() {
+        let mut doc = Document::new();
+        let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: Some(0xFF0000FF), fill: None };
+        node.cut_line_type = CutLineType::NoCut;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&doc).unwrap();
+        assert!(planned.passes.is_empty());
+        assert_eq!(planned.skipped_no_stroke, 1);
+    }
+
+    /// Neither paint, and cut anyway. `ColorPass::color` has always been `Option<u32>`;
+    /// this is the first thing that can make it `None`, so every consumer that renders a
+    /// swatch or prints a header now has a case that reaches it.
+    #[test]
+    fn a_cut_shape_with_no_paint_lands_in_the_colorless_pass() {
+        let mut doc = Document::new();
+        let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: None, fill: None };
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&doc).unwrap();
+        assert_eq!(planned.passes.len(), 1);
+        assert_eq!(planned.passes[0].color, None);
+    }
+
+    /// Alpha-0 paint is not a colour to group by, in either channel — a fully transparent
+    /// stroke used to mean "not cut", and the fallback must not resurrect it as a key.
+    #[test]
+    fn transparent_paint_is_not_a_pass_key() {
+        let mut doc = Document::new();
+        let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: Some(0xFF000000), fill: Some(0x00FF0000) };
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&doc).unwrap();
+        assert_eq!(planned.passes.len(), 1);
+        assert_eq!(planned.passes[0].color, None, "both paints are invisible, so neither keys the pass");
     }
 }

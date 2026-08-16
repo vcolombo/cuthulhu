@@ -38,9 +38,15 @@ names
 ### Planning a cut
 
 **ColorPass**:
-Every shape in a Document sharing one stroke colour, grouped together because they are cut in a
-single run of the blade. A shape with no stroke belongs to no ColorPass and is not cut.
+Every shape in a Document cut in a single run of the blade, grouped by the colour they
+share — their stroke where they have one, otherwise their fill. Which shapes are cut at all
+is their CutLineType's business, not their paint's.
 _Avoid_: layer, colour group, batch
+
+**CutLineType**:
+Whether a Node is cut, and how — `Cut` or `NoCut` today. An explicit attribute of the Node
+rather than something read off its stroke, defaulted to `Cut` at import.
+_Avoid_: cut style, cuttable flag, cut attribute
 
 **DocumentPasses**:
 Every ColorPass a Document contains, in the order they were first encountered. An inventory of

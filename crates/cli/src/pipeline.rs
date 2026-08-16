@@ -276,13 +276,18 @@ mod tests {
         assert!(err.contains("speed"), "expected a settings-range refusal, got: {err}");
     }
 
+    /// A fill-only SVG used to be refused by name here, because `plan_passes` cut only stroked
+    /// shapes. Since #144 `--by-color` plans it, keyed on the fill, and the refusal it used to
+    /// produce belongs to an SVG with no geometry at all — which
+    /// `plain_cut_of_an_empty_svg_says_nothing_to_cut` covers.
     #[test]
-    fn an_svg_with_nothing_stroked_is_refused_by_name() {
+    fn a_fill_only_svg_is_planned_by_color_on_its_fill() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
             <rect width="5" height="5" fill="#ff0000"/>
         </svg>"##;
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap_err();
-        assert_eq!(err, "no cuttable paths in SVG");
+        let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap();
+        assert_eq!(plan.passes.len(), 1);
+        assert_eq!(plan.passes[0].color, Some(0xFF0000FF));
     }
 
     #[test]

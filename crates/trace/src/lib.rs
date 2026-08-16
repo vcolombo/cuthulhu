@@ -301,7 +301,7 @@ fn strip_empty_paths(svg: &str) -> (String, usize) {
                 continue;
             }
             kept += 1;
-            out.push_str(&mirror_fill_onto_stroke(line));
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -309,43 +309,6 @@ fn strip_empty_paths(svg: &str) -> (String, usize) {
         out.push('\n');
     }
     (out, kept)
-}
-
-/// Read the value of `name="..."` from one element's source line.
-fn attr_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!("{name}=\"");
-    let start = line.find(&key)? + key.len();
-    let rest = &line[start..];
-    Some(&rest[..rest.find('"')?])
-}
-
-/// Copy a path's `fill` onto a `stroke` of the same colour.
-///
-/// vtracer describes a region by the colour that fills it, which is the right model for an
-/// image and the wrong one for a cutter: a blade follows an outline. `cutplan::plan_cut` groups
-/// shapes by stroke and counts a strokeless shape into `skipped_no_stroke`, so fill-only trace
-/// output plans zero passes — every traced shape is reported as "not cut". Mirroring the colour
-/// onto the stroke is what makes a trace reach the machine, and it keeps the fill so the
-/// preview still reads as the picture the user traced.
-///
-/// Done here rather than in `import_svg` or `plan_cut` on purpose. "Filled but unstroked means
-/// do not cut" is a deliberate distinction downstream — it is how an imported SVG says which of
-/// its shapes are cut lines — so the colour has to be promoted at the point where it is known
-/// to describe cuttable geometry, not by weakening that rule for every document.
-fn mirror_fill_onto_stroke(line: &str) -> String {
-    // Leave a path that already carries a stroke alone: re-adding one would emit the attribute
-    // twice and make the SVG invalid.
-    if line.contains("stroke=\"") {
-        return line.to_string();
-    }
-    match attr_value(line, "fill") {
-        Some(fill) => line.replacen(
-            &format!("fill=\"{fill}\""),
-            &format!("fill=\"{fill}\" stroke=\"{fill}\""),
-            1,
-        ),
-        None => line.to_string(),
-    }
 }
 
 /// Decode an image, apply the same ceiling and downscale as tracing, and re-encode it as PNG.
@@ -369,9 +332,9 @@ pub fn preview_png(image_bytes: &[u8]) -> Result<Vec<u8>, TraceError> {
 /// vtracer's binary path is `to_binary_image(|x| x.r < 128)`: it thresholds on the red channel
 /// and never looks at alpha, and exporters write transparent regions as `(0,0,0,0)`. A
 /// transparent background is therefore indistinguishable from black artwork there — it merges
-/// into the shape and the whole canvas traces as one filled rectangle. Because every emitted
-/// path is stroked, that rectangle is a cut line, so an invisible image would put a rectangle
-/// through the material.
+/// into the shape and the whole canvas traces as one filled rectangle. Import defaults every
+/// path's `CutLineType` to `Cut`, so that rectangle is a cut line and an invisible image would
+/// put a rectangle through the material.
 fn flatten_onto_white(img: &mut image::RgbaImage) {
     for px in img.pixels_mut() {
         let a = px[3] as u32;
@@ -392,11 +355,11 @@ fn flatten_onto_white(img: &mut image::RgbaImage) {
 /// Colour mode only removes transparent regions when `should_key_image` says the frame has enough
 /// of them: it counts transparent pixels on five sampled scanlines and needs 20% of two widths.
 /// A small hole misses that bar, so its raw RGB survives as ordinary artwork — a `(0,0,0,0)`
-/// island traces to a black shape and, being stroked, cuts. One transparent row lands on the
-/// last sampled scanline and contributes a full width of transparent pixels, which clears the
-/// threshold for any image, and keying then applies to *every* transparent pixel including
-/// interior ones. The row itself is keyed away, so it contributes no geometry; only the emitted
-/// `height` has to be put back.
+/// island traces to a black shape that import defaults to `Cut`, so it cuts. One transparent
+/// row lands on the last sampled scanline and contributes a full width of transparent pixels,
+/// which clears the threshold for any image, and keying then applies to *every* transparent
+/// pixel including interior ones. The row itself is keyed away, so it contributes no geometry;
+/// only the emitted `height` has to be put back.
 fn pad_with_transparent_row(img: &image::RgbaImage) -> image::RgbaImage {
     let (w, h) = (img.width(), img.height());
     let mut padded = image::RgbaImage::from_pixel(w, h + 1, image::Rgba([0, 0, 0, 0]));
@@ -411,7 +374,7 @@ pub fn trace(image_bytes: &[u8], controls: &TraceControls) -> Result<TraceResult
     let (mut rgba, downscaled) = decode_and_downscale(image_bytes)?;
     // Nothing visible means nothing to cut. This has to be decided before flattening, which
     // erases the distinction by making every transparent pixel opaque white — and in colour mode
-    // vtracer then clusters that white into a path of its own, which `strip_empty_paths` strokes.
+    // vtracer then clusters that white into a path of its own, which import defaults to `Cut`.
     // The result would be a cut rectangle traced from an image that shows nothing at all.
     if rgba.pixels().all(|p| p[3] == 0) {
         return Err(TraceError::EmptyResult);
@@ -419,8 +382,8 @@ pub fn trace(image_bytes: &[u8], controls: &TraceControls) -> Result<TraceResult
     // Only binary mode needs this. Colour mode already keys transparency out — vtracer replaces
     // every fully transparent pixel with a colour absent from the image and has visioncortex drop
     // that colour, so the background produces no cluster. Flattening first would hide the alpha
-    // it looks for, and the manufactured white would come back as a stroked path the cut planner
-    // reports as a pass. Binary mode has no such handling and needs the composite.
+    // it looks for, and the manufactured white would come back as a filled path the cut planner
+    // keys a pass on. Binary mode has no such handling and needs the composite.
     if controls.mode == TraceMode::Binary {
         flatten_onto_white(&mut rgba);
     }
@@ -729,19 +692,13 @@ mod tests {
         }
     }
 
-    /// vtracer describes regions with `fill` alone, but a cutter follows outlines: `cutplan`
-    /// groups shapes by *stroke* and counts anything with no stroke as not cut. Fill-only trace
-    /// output therefore plans zero passes, so nothing traced can be cut at all. Every emitted
-    /// path has to carry a stroke matching its fill for the trace to reach the machine.
+    /// vtracer describes a region by the colour that fills it, and since #144 that is
+    /// enough: an imported path is cuttable because its `CutLineType` says so, and its pass
+    /// is keyed on the fill. The mirror that used to copy fill onto stroke was a workaround
+    /// for the old rule and double-applies under the new one, so a traced path must carry
+    /// no stroke at all — an invented one would key a pass on a colour the user never chose.
     #[test]
-    fn traced_paths_are_stroked_so_they_can_be_cut() {
-        fn attr<'a>(line: &'a str, name: &str) -> Option<&'a str> {
-            let key = format!("{name}=\"");
-            let start = line.find(&key)? + key.len();
-            let rest = &line[start..];
-            Some(&rest[..rest.find('"')?])
-        }
-
+    fn traced_paths_carry_a_fill_and_no_stroke() {
         for mode in [TraceMode::Binary, TraceMode::Color] {
             let opts = TraceControls { mode, speckle: 0, ..TraceControls::default() };
             let r = trace(&png_bytes(&quadrants()), &opts).unwrap();
@@ -749,20 +706,19 @@ mod tests {
                 r.svg.lines().filter(|l| l.trim_start().starts_with("<path")).collect();
             assert!(!paths.is_empty(), "{mode:?}: no paths emitted");
             for p in paths {
-                let fill = attr(p, "fill")
-                    .unwrap_or_else(|| panic!("{mode:?}: path carries no fill: {p}"));
-                assert_eq!(attr(p, "stroke"), Some(fill), "{mode:?}: stroke must match fill: {p}");
+                assert!(p.contains("fill=\""), "{mode:?}: path carries no fill: {p}");
+                assert!(!p.contains("stroke=\""), "{mode:?}: path still carries a stroke: {p}");
             }
         }
     }
 
     /// vtracer reads raw channel values and ignores alpha, so a fully transparent pixel
     /// (0,0,0,0) reaches it as solid black and an invisible image traces to a filled canvas.
-    /// Since every traced path is now stroked, that phantom shape is cut geometry: loading a
-    /// transparent PNG would put a rectangle through the material.
+    /// Import defaults every path's `CutLineType` to `Cut`, so that phantom shape is cut
+    /// geometry: loading a transparent PNG would put a rectangle through the material.
     /// Both modes, because the failure differs by mode and testing only one hides the other:
     /// binary reads transparent black as artwork, while color clusters the flattened background
-    /// into a white path. Either way the result is a stroked, cuttable canvas rectangle.
+    /// into a white path. Either way the result is a cuttable canvas rectangle.
     #[test]
     fn a_fully_transparent_image_traces_to_nothing() {
         let img = RgbaImage::from_pixel(64, 64, image::Rgba([0, 0, 0, 0]));
@@ -778,8 +734,8 @@ mod tests {
     /// Colour mode keys transparency out on its own: vtracer swaps every fully transparent pixel
     /// for an unused colour and tells visioncortex to drop it, so a transparent background yields
     /// no cluster at all. Flattening it to white first destroys that — the background arrives
-    /// opaque, is clustered like any other colour, and comes back as a stroked path, which the
-    /// cut planner then reports as a pass. The artwork alone must survive.
+    /// opaque, is clustered like any other colour, and comes back as a path the cut planner
+    /// reports as a pass, keyed on its fill. The artwork alone must survive.
     #[test]
     fn a_transparent_background_is_not_a_path_in_color_mode() {
         let img = RgbaImage::from_fn(128, 128, |x, y| {
@@ -801,7 +757,7 @@ mod tests {
 
     /// vtracer only keys transparency once enough of it shows up on the five scanlines
     /// `should_key_image` samples, so a small interior hole falls under the threshold and its raw
-    /// RGB is traced as artwork — a `(0,0,0,0)` island becomes a stroked black shape that cuts,
+    /// RGB is traced as artwork — a `(0,0,0,0)` island becomes a black shape that cuts,
     /// indistinguishable from an opaque one. Keying has to happen for any transparency at all,
     /// and the padding used to force it must not show up in the result.
     #[test]

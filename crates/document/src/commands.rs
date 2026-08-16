@@ -61,7 +61,10 @@ pub fn set_cut_line_type(doc: &Document, ids: &[NodeId], value: CutLineType)
     while let Some(id) = stack.pop() {
         let node = doc.get(id).ok_or(CmdError::NotFound)?;
         // Also the cycle guard: a malformed document whose nodes contain each other would
-        // otherwise spin here, the way `plan_passes` guards its own walk.
+        // otherwise spin here. Unlike `plan_passes_with`, which errors on a revisit because a
+        // preorder walk from the single root can only reach a node twice through a cycle, this
+        // walk starts from an arbitrary selection where a revisit is the ordinary overlapping
+        // case — a group and a shape inside it — so it must skip the node, not refuse the edit.
         if !seen.insert(id) { continue; }
         match &node.kind {
             NodeKind::Group | NodeKind::Layer => stack.extend(node.children.iter().rev().copied()),

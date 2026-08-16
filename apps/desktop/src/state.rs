@@ -157,4 +157,19 @@ mod tests {
         app.new_doc();
         assert!(app.undo().is_none());
     }
+
+    /// The panel dispatches on every click, including the one that re-picks the value the
+    /// selection already carries. Committing that empty delta would clear the redo stack and
+    /// leave an undo step that undoes nothing, so the method must decline to commit it.
+    #[test]
+    fn app_state_set_cut_line_type_no_op_keeps_redo_stack() {
+        let mut app = AppState::new();
+        let id = app.add_rect(1.0, 1.0);
+        app.add_rect(2.0, 2.0);
+        app.undo();
+
+        let d = app.set_cut_line_type(vec![id], CutLineType::Cut).unwrap();
+        assert!(d.0.is_empty(), "premise: the rect already cuts");
+        assert!(app.redo().is_some(), "a no-op must not throw away redoable work");
+    }
 }

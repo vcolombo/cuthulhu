@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::PathBuf;
 use std::sync::Mutex;
-use document::{Delta, MachineProfile, NodeId, ShapeKind};
+use document::{CutLineType, Delta, MachineProfile, NodeId, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
 use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse, TravelPassDto};
@@ -48,6 +48,12 @@ pub fn delete(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>) -> Result<D
 #[tauri::command]
 pub fn reorder(state: tauri::State<AppStateHandle>, id: NodeId, new_index: usize) -> Result<Delta, String> {
     state.lock().unwrap().reorder(id, new_index).map_err(|e| format!("{e:?}"))
+}
+
+#[tauri::command]
+pub fn set_cut_line_type(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: CutLineType)
+    -> Result<Delta, String> {
+    state.lock().unwrap().set_cut_line_type(ids, value).map_err(|e| format!("{e:?}"))
 }
 
 #[tauri::command]

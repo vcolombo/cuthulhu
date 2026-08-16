@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::Path;
-use document::{commands, CmdError, Delta, Editor, MachineProfile, NodeId, ShapeKind};
+use document::{commands, CmdError, CutLineType, Delta, Editor, MachineProfile, NodeId, ShapeKind};
 use fileio::IoError;
 use geometry::{Affine, BoolOp};
 
@@ -60,6 +60,15 @@ impl AppState {
 
     pub fn reorder(&mut self, id: NodeId, new_index: usize) -> Result<Delta, CmdError> {
         let d = commands::reorder(&self.editor.doc, id, new_index)?;
+        Ok(self.editor.commit(d))
+    }
+
+    pub fn set_cut_line_type(&mut self, ids: Vec<NodeId>, value: CutLineType)
+        -> Result<Delta, CmdError> {
+        let d = commands::set_cut_line_type(&self.editor.doc, &ids, value)?;
+        // An empty delta is a no-op the operator asked for; committing it would clear the
+        // redo stack and add an undo step that does nothing.
+        if d.0.is_empty() { return Ok(d); }
         Ok(self.editor.commit(d))
     }
 

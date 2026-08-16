@@ -538,6 +538,23 @@ mod tests {
         assert_eq!(planned.passes[0].color, None, "both paints are invisible, so neither keys the pass");
     }
 
+    /// The fill is a FALLBACK, not a co-equal key: a shape carrying both visible paints is
+    /// keyed on its stroke. Every other pass-key test gives a shape one visible paint or
+    /// none, so reversing `pass_key`'s two arms would leave all of them green while
+    /// silently regrouping every stroked-and-filled document into different passes — a
+    /// different set of colours for the operator to swap tools between.
+    #[test]
+    fn a_shape_with_both_paints_is_keyed_on_its_stroke() {
+        let mut doc = Document::new();
+        let mut node = document::Node::shape(doc.ids.next(), ShapeKind::Rect { w: 10.0, h: 10.0 });
+        node.style = Style { stroke: Some(0xFF0000FF), fill: Some(0x00FF00FF) };
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+
+        let planned = plan_passes(&doc).unwrap();
+        assert_eq!(planned.passes.len(), 1);
+        assert_eq!(planned.passes[0].color, Some(0xFF0000FF), "the stroke wins over the fill");
+    }
+
     /// `Single` exists so the plain CLI cut can stop overwriting the document's colours to
     /// get one pass. Document order is the substance of it: merging colour-grouped passes
     /// afterwards would have concatenated colour by colour and quietly reordered the cut

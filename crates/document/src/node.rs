@@ -68,6 +68,14 @@ impl Node {
 /// it cannot tell an absent field from an explicit `Cut`, and it cannot see the node's
 /// stroke, which is the only thing that says what an old document used to cut.
 ///
+/// An explicit `"cut_line_type": null` is treated as absence, which serde gives for free and
+/// which is deliberate rather than incidental. Nothing this workspace writes can produce it —
+/// `Serialize` is derived and always writes a concrete value — so it only ever arrives from a
+/// damaged or third-party file, and for such a file deriving from the stroke reproduces
+/// exactly the pre-#144 behaviour, which is the same answer absence gets. Refusing it instead
+/// would fail closed: `load_project` would refuse the whole document over one null field,
+/// turning a recoverable file into one the operator cannot open at all.
+///
 /// This sits on `Node` rather than in `fileio::load_project`, where the legacy-machine-id
 /// migration lives, because a `Node` is also deserialized through `Document::snapshot_json`
 /// and across IPC; confining it to project load would leave those paths to guess.
@@ -132,8 +140,11 @@ mod tests {
     }
 
     /// A document written before the attribute existed must cut exactly what it cut then.
-    /// The three cases are the whole of the old rule (`plan_passes`' stroke filter): a
-    /// stroke, no stroke, and a stroke nobody can see.
+    /// The cases are the whole of the old rule (`plan_passes`' stroke filter): a stroke, no
+    /// stroke, a stroke nobody can see, and a stroke barely anybody can see — the last
+    /// because the rule turns on alpha being non-zero, not on the stroke being opaque, and
+    /// without it a migration tightened to "fully opaque" would mark every partially
+    /// transparent legacy stroke `NoCut` with these tests still green.
     #[test]
     fn a_node_saved_without_the_attribute_derives_it_from_its_stroke() {
         let node = |stroke: &str| -> Node {
@@ -149,6 +160,9 @@ mod tests {
         assert_eq!(node("null").cut_line_type, CutLineType::NoCut);
         // 0xFF000000 — red at alpha 0, which `plan_passes` skipped exactly like `None`.
         assert_eq!(node("4278190080").cut_line_type, CutLineType::NoCut);
+        // 0xFF000001 — red at alpha 1. Invisible in practice, cut all the same, because the
+        // old predicate asked only whether the alpha byte was non-zero.
+        assert_eq!(node("4278190081").cut_line_type, CutLineType::Cut);
     }
 
     /// The value on the wire wins over the derivation, or a file saved after this change
@@ -162,5 +176,26 @@ mod tests {
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains(r#""cut_line_type":"NoCut""#), "{json}");
         assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
+    }
+
+    /// An explicit `null` is treated as absence, and that is a decision rather than an
+    /// accident of serde. Nothing here writes one — `Serialize` always emits a concrete
+    /// value — so it only arrives from a damaged or third-party file, where deriving from
+    /// the stroke reproduces the pre-#144 behaviour, which is the same answer absence gets.
+    /// Refusing it would fail closed and make `load_project` reject a whole document over
+    /// one null field. Pinned because nothing else states which way that goes.
+    #[test]
+    fn an_explicit_null_migrates_the_same_way_an_absent_field_does() {
+        let node = |field: &str| -> Node {
+            let json = format!(
+                r#"{{"id":7,"kind":{{"Shape":{{"Rect":{{"w":1.0,"h":1.0}}}}}},
+                     "transform":[1.0,0.0,0.0,1.0,0.0,0.0],
+                     "style":{{"stroke":255,"fill":null}},{field}"children":[]}}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        };
+        assert_eq!(node(r#""cut_line_type":null,"#).cut_line_type, node("").cut_line_type);
+        assert_eq!(node(r#""cut_line_type":null,"#).cut_line_type, CutLineType::Cut,
+            "derived from the stroke, exactly as the absent field is");
     }
 }

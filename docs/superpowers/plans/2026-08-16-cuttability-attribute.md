@@ -19,7 +19,7 @@
 - **`ui/dist` is committed.** Any task that edits `apps/desktop/ui/src` must end with `npm --prefix apps/desktop/ui run build` and commit `apps/desktop/ui/dist` in the same commit — CI rebuilds and fails on a stale bundle. Tasks 4 and 8 are the two that touch `ui/src`.
 - **`CONTEXT.md` is normative vocabulary**, and this change edits it. Terms in play: **Node** (not "element"/"object"), **ColorPass** (not "layer"/"colour group"), **Preflight** (not "validation"), **CutPlan**. The new term is **CutLineType**; the ColorPass entry's second sentence ("A shape with no stroke belongs to no ColorPass and is not cut") stops being true in Task 3 and must change there, not later.
 - **Comments explain why, not what.** Every comment specified below records a constraint, a trap, or a decision that was taken against an alternative. Do not add comments restating the code.
-- **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path. `NodeWire` gets one: it exists only for documents written before the attribute did.
+- **The `ponytail:` marker marks a deliberate simplification** with its ceiling and upgrade path. The marker is the word, not the comment form — the workspace carries it on both `//` lines (`crates/driver-core/src/manager.rs:174`) and `///` doc comments (`crates/cut-host/src/resolve.rs:92`, `:206`), and `grep -rn "ponytail:"` finds either. `NodeWire` gets one, on its doc comment, because it documents the type: it exists only for documents written before the attribute did.
 - **The import default and the migration default are deliberately different values.** `Cut` for a new import, derived-from-stroke for an old file. Anywhere the two look like duplicated logic that could be unified, they must not be — a saved project must cut exactly what it cut before, on real material.
 - **The e2e fake mirrors `Document::snapshot_json()`** (`CLAUDE.md:135-136`). `apps/desktop/ui/e2e/smoke.spec.ts` re-implements `plan_passes` at `:276-311`; when the predicate changes, so does the fake, or the suite lies.
 - **Out of scope, and must not creep in:** a configurable import default (#54 owns it — the default ships hardcoded), `CutEdge` geometry (#56), production roles and grouping-mode pickers (#45), print-and-cut (#25), and any change to the outline-resolution ordering #139 established. The predicate swaps; the sequence does not.
@@ -668,7 +668,7 @@ fake's own copy of plan_passes has to filter on the attribute too."
 - Modify: `crates/cutplan/src/plan.rs:74-79` (the comment that says a colourless pass cannot exist)
 - Modify: `crates/cli/src/pipeline.rs:71-94` (delete `CUT_STROKE` and `doc_from_svg_all_cuttable`), `:155-172` (`plan_plain_cut`), `:174-178` (`describe_cut_error`'s doc comment), and the tests at `:309-327`
 - Modify: `CLAUDE.md:90-95` (the paragraph describing how a plain cut reaches `plan_cut`)
-- Test: `crates/cutplan/src/passes.rs`, `crates/cli/src/pipeline.rs`, `crates/cli/tests/dry_run.rs`
+- Test: `crates/cutplan/src/passes.rs`, `crates/cli/src/pipeline.rs`, `crates/cli/src/cut.rs`
 
 **Interfaces:**
 - Consumes: Task 3's `pass_key`.
@@ -737,18 +737,37 @@ fn plain_cut_plans_one_pass_without_touching_paint() {
 
 Reuse the two-fill fixture and the `driver()`/`settings()` helpers the deleted tests already had rather than adding `TWO_FILLS`; it is the exact document this needs.
 
-One observable output change needs pinning where nothing pins it today. A plain `--dry-run` prints its pass header through `format_pass_color` (`crates/cli/src/main.rs:173`), which becomes `-- pass 1/1 (color none) --`; `crates/cli/tests/dry_run.rs` only ever asserts on a refusal and on framing. Add a successful plain dry-run case there asserting that header, so the change is a pinned decision rather than a silent one:
+One observable change needs pinning where nothing pins it today, and it is **not** the dry-run
+header: the plain branch (`crates/cli/src/main.rs:119-127`) prints encoded bytes and no header at
+all — `-- pass i/n (color …) --` (`:173`) belongs exclusively to `cut_by_color`. The only place a
+plain cut ever names its pass's colour is the operator prompt, `pause_prompt`
+(`crates/cli/src/cut.rs:88-97`), reached when the machine requires a per-pass confirmation. It
+becomes `(color none)` where it used to read `(color #000000)`.
+
+`pause_prompt` returns its wording precisely so it can be asserted (`:85-87`), and
+`a_prompt_takes_both_halves_of_the_position_from_the_status` (`:282`) already builds plans through
+a `plan(&[…])` helper that accepts a `None` colour (`:283`). Add a case beside it:
 
 ```rust
-/// A plain cut's pass has no colour to name since #144 — it is one pass by request, not one
-/// colour's worth of shapes. The old header printed `#000000`, which was the invented stroke
-/// the plain path used to stamp; nothing pinned it, so nothing caught it changing.
-#[test]
-fn plain_dry_run_names_a_colourless_pass() {
-    // Mirror `plain_dry_run_refuses_geometry_off_the_bed`'s setup, with in-bounds geometry.
-    // Assert on stdout: `-- pass 1/1 (color none) --`.
-}
+    /// A plain cut's pass has no colour to name since #144 — it is one pass by request, not one
+    /// colour's worth of shapes. The prompt used to read `#000000`, which was the invented stroke
+    /// the plain path stamped on every path; nothing pinned it, so nothing would catch it
+    /// changing.
+    #[test]
+    fn a_colourless_pass_is_named_none_in_the_prompt() {
+        let plan = plan(&[None]);
+        let parked = status(
+            Actions { cancel: true, confirm: true, ..Actions::default() },
+            Phase::AwaitingConfirmation,
+            Some(PassPosition { index: 0, total: 1 }),
+        );
+        let confirm = pause_prompt(Pause::Confirm, &plan, &parked);
+        assert!(confirm.contains("(color none)"), "{confirm}");
+    }
 ```
+
+Check the `Phase` variant name against `driver_core::Phase` before running; the sibling test uses
+`Phase::AwaitingColorSwap` for the swap case.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -826,7 +845,7 @@ In `crates/cli/src/pipeline.rs`, delete `CUT_STROKE` and `doc_from_svg_all_cutta
 
 Two visible consequences to accept deliberately, not to paper over:
 
-1. `cuthulhu cut --dry-run` on a plain cut prints `-- pass 1/1 (color none) --` instead of `(color #000000)`. `format_pass_color` (`crates/cli/src/cut.rs:45-50`) already renders `None` as `none`, and nothing pinned the old text — which is why this task adds `plain_dry_run_names_a_colourless_pass`. The old value was an invented stroke, so printing it was the lie.
+1. The operator prompt for a plain cut that needs confirmation reads `(color none)` instead of `(color #000000)` — `format_pass_color` (`crates/cli/src/cut.rs:45-50`) already renders `None` as `none`. That is the only colour a plain cut ever prints: its `--dry-run` branch emits bytes only. The old value was an invented stroke, so printing it was the lie, and `a_colourless_pass_is_named_none_in_the_prompt` pins the new one.
 2. A plain cut over an SVG whose paths are all invisible-painted still plans one pass, because cuttability is the attribute and import defaults it to `Cut`. That is the intended behaviour — it is the fill-only-clipart case — and `plain_cut_of_an_empty_svg_says_nothing_to_cut` (`:343`) still covers the genuinely empty file.
 
 Update `CLAUDE.md:90-95`, whose paragraph describes the overwrite as the plain path's mechanism, to describe `Grouping::Single` instead, and drop the sentence deferring to #68 — #68 is decided and #144 implemented it.
@@ -840,7 +859,8 @@ Expected: PASS, including the five plain-cut tests the scouted map flagged (`cra
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/cutplan/src/passes.rs crates/cutplan/src/plan.rs crates/cli/src/pipeline.rs CLAUDE.md
+git add crates/cutplan/src/passes.rs crates/cutplan/src/plan.rs crates/cli/src/pipeline.rs \
+        crates/cli/src/cut.rs CLAUDE.md
 git commit -m "Ask the planner for one pass, instead of overwriting every stroke to get one
 
 The plain cut's uniform stroke did two jobs: made geometry cuttable and
@@ -1290,7 +1310,16 @@ and pass both to the panel (`:458-464`), adding `cutLineType={cutLineType}` and 
 In `PropertiesPanel.tsx`, add `import type { CutLineTypeJson } from "./cutLineType";` beside the
 existing `Bounds`/`NumberField` imports, extend `Props` with
 `cutLineType: CutLineTypeJson | "mixed" | null` and `onChangeCutLineType: (v: CutLineTypeJson) => void`,
-and render the control below the four `NumberField`s. It cannot live inside the `bounds ?` branch:
+**and add both to the component's parameter destructuring** (`PropertiesPanel.tsx:13`), which names
+every prop explicitly — extending the type alone leaves the two identifiers undefined in the body
+and fails strict `tsc`:
+
+```tsx
+export function PropertiesPanel({ bounds, cutLineType, onChangeX, onChangeY, onChangeW, onChangeH,
+                                  onChangeCutLineType }: Props) {
+```
+
+Render the control below the four `NumberField`s. It cannot live inside the `bounds ?` branch:
 `selectedBounds` is null for every multi-node selection and for a selected container
 (`App.tsx:326`), both of which do have a cuttability.
 

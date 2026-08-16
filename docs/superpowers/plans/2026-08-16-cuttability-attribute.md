@@ -213,7 +213,7 @@ and what the TypeScript mirror in Task 8 declares.
 
 Run: `cargo test --workspace --locked`
 
-Expected: PASS. Nothing reads the new field yet, so `plan_passes` still filters on stroke and every existing test holds — including `snapshot_round_trips_through_json` (`crates/document/src/snapshot.rs:15`) and `save_then_load_round_trips_document` (`crates/fileio/src/project.rs:60`), both of which compare a `Document` written *after* this change.
+Expected: PASS. Nothing reads the new field yet, so `plan_passes` still filters on stroke and every existing test holds — including `snapshot_round_trips_through_json` (`crates/document/src/snapshot.rs:17`) and `save_then_load_round_trips_document` (`crates/fileio/src/project.rs:60`), both of which compare a `Document` written *after* this change.
 
 - [ ] **Step 5: Commit**
 
@@ -341,8 +341,8 @@ hand-writing a fixture, keeps the test from drifting from Document's shape."
 
 **Files:**
 - Modify: `crates/cutplan/src/passes.rs:6` (import `CutLineType`, `Style`), `:14-16` (`ColorPass` doc), `:62-66` (`plan_passes` doc), `:90-114` (the predicate and the grouping key), and add `pass_key` above `plan_passes`
-- Modify: `crates/cutplan/src/passes.rs:188-197` (test helper), `:239-264` (the grouping test's strokeless fixture)
-- Modify: `crates/cli/src/pipeline.rs:280-296` (the test whose premise inverts)
+- Modify: `crates/cutplan/src/passes.rs:188-197` (test helper), and three fixtures that made a shape skipped by removing its stroke — `:239-264`, `:341` and `:362-363`
+- Modify: `crates/cli/src/pipeline.rs:280-286` (the test whose premise inverts)
 - Modify: `CONTEXT.md:40-42` (ColorPass), and add the CutLineType term
 - Modify: `docs/superpowers/specs/2026-07-22-editor-shell-design.md:85` (mark superseded, do not edit silently)
 - Test: `crates/cutplan/src/passes.rs` (in `mod tests`)
@@ -495,7 +495,7 @@ Update the two doc comments the change falsifies. `ColorPass` (`:14`):
 /// malformed docs.
 ```
 
-Migrate the two existing fixtures whose premise was the stroke. The helper at `:188-197` keeps `with_stroke` (colour grouping is still real) and gains a sibling:
+Migrate **three** existing fixtures whose premise was the stroke. The helper at `:188-197` keeps `with_stroke` (colour grouping is still real) and gains a sibling:
 
 ```rust
     /// Mark a node not-cut. Since #144 a strokeless shape is cut by default, so a test that
@@ -506,25 +506,32 @@ Migrate the two existing fixtures whose premise was the stroke. The helper at `:
     }
 ```
 
-In `plans_group_by_stroke_rgba_with_single_traversal_transforms` (`:239`), the strokeless node that made `skipped_no_stroke == 1` (`:264`) must be wrapped in `with_no_cut(...)`; leave the assertion at 1.
+Three call sites need it, and two of them are #139's own tests — the plan's earlier claim that all three #139 tests pass untouched was wrong, and this is the correction:
 
-Then the CLI test whose premise inverts, `an_svg_with_nothing_stroked_is_refused_by_name` (`crates/cli/src/pipeline.rs:280`). Fill-only art is now cuttable, so `--by-color` plans it instead of refusing. Replace it with the truth it becomes:
+- `plans_group_by_stroke_rgba_with_single_traversal_transforms` (`:239`): the strokeless node that made the skipped count 1 (`:264`) becomes `with_no_cut(...)`; leave the assertion at 1.
+- `a_skipped_text_that_cannot_resolve_does_not_refuse_the_plan` (`:310`): the "same text, strokeless" node at `:341` is `with_stroke(…, None)`, which after this task is a *cut* shape whose outline cannot resolve — so `plan_passes` would refuse and the `.expect()` at `:344` would panic. It becomes `with_no_cut(Node::shape(text, unresolvable))`. The premise block at `:326-335` is untouched: it makes the same text refuse by giving it a stroke, and a stroked shape is still `Cut` by default.
+- `a_skipped_path_with_unreadable_data_does_not_refuse_the_plan` (`:353`): same shape of change at `:362-363`.
+
+`a_cut_shape_with_unreadable_data_still_refuses_the_plan` (`:374`) is genuinely untouched — its shape is stroked and cut, and it must keep refusing.
+
+What the three tests pin does not change: they pin *when* the outline resolves, and after this task they say it in the vocabulary that now decides it. A fixture that still said "strokeless" would be asserting the old rule.
+
+Then the CLI test whose premise inverts, `an_svg_with_nothing_stroked_is_refused_by_name` (`crates/cli/src/pipeline.rs:280-286`). Fill-only art is now cuttable, so `--by-color` plans it instead of refusing. Replace it with the truth it becomes, **through the same production entry point it called** — `plan_cut_from_svg`, not a hand-rolled `doc_from_svg` + `plan_passes`, or the test would stop covering the caller whose behaviour it is about:
 
 ```rust
 /// A fill-only SVG used to be refused by name here, because `plan_passes` cut only stroked
-/// shapes. Since #144 it plans — keyed on the fill — and the refusal it used to produce
-/// belongs to an SVG with no geometry at all, which
+/// shapes. Since #144 `--by-color` plans it, keyed on the fill, and the refusal it used to
+/// produce belongs to an SVG with no geometry at all — which
 /// `plain_cut_of_an_empty_svg_says_nothing_to_cut` covers.
 #[test]
-fn a_fill_only_svg_plans_a_pass_keyed_on_its_fill() {
-    let doc = doc_from_svg(FILL_ONLY_SVG).unwrap();
-    let planned = cutplan::plan_passes(&doc).unwrap();
-    assert_eq!(planned.passes.len(), 1);
-    assert_eq!(planned.passes[0].color, Some(0x00FF00FF));
+fn a_fill_only_svg_is_planned_by_color_on_its_fill() {
+    let plan = plan_cut_from_svg(FILL_ONLY, &driver(), &settings(), &[], None, false).unwrap();
+    assert_eq!(plan.passes.len(), 1);
+    assert_eq!(plan.passes[0].color, Some(0x00FF00FF));
 }
 ```
 
-Use whatever fixture the deleted test used rather than introducing `FILL_ONLY_SVG`, and take its expected colour from that fixture's own fill.
+Reuse the deleted test's own fixture, driver and settings helpers rather than introducing `FILL_ONLY`, and take the expected colour from that fixture's fill.
 
 Finally the two documents that state the old rule. `CONTEXT.md:40-42`, the ColorPass entry:
 
@@ -574,7 +581,7 @@ where that key must become the row index.
 
 Run: `cargo test --workspace --locked`
 
-Expected: PASS. The three #139 ordering tests (`crates/cutplan/src/passes.rs:310`, `:353`, `:377`) must pass **unchanged** — they pin when the outline resolves, which this must not disturb. The plain CLI path still plans exactly one pass because `doc_from_svg_all_cuttable` still stamps a uniform stroke; Task 5 removes it.
+Expected: PASS. The three #139 ordering tests (`crates/cutplan/src/passes.rs:310`, `:353`, `:374`) must still pass, and two of them only after their fixtures move from a missing stroke to `with_no_cut` — what must not change is the assertion each makes about *when* the outline resolves. If a fixture change tempts you into weakening one of those assertions, stop: #139's contract is the reason this task exists in the order it does. The plain CLI path still plans exactly one pass because `doc_from_svg_all_cuttable` still stamps a uniform stroke; Task 5 removes it.
 
 - [ ] **Step 5: Commit**
 
@@ -607,7 +614,7 @@ which makes ColorPass::color None reachable for the first time."
 
 - [ ] **Step 1: Rename, mechanically and completely**
 
-`skipped_no_stroke` → `skipped_not_cut` at all 12 code sites above. The derived local names rename with it: `skippedNoStroke`/`setSkippedNoStroke` → `skippedNotCut`/`setSkippedNotCut` (`CutDialog.tsx:109`, `:194`, `:623`), and the fake's accumulator stays `skipped` (`smoke.spec.ts:279`, `:287`) with only its returned key renamed at `:310`.
+`skipped_no_stroke` → `skipped_not_cut`. Counted against the current tree: **13 source occurrences** — 7 in `crates/cutplan/src/passes.rs` (field, counter, increment, struct build, and the three test assertions), 2 in `apps/desktop/src/device.rs`, and 1 each in `apps/desktop/ui/src/ipc.ts`, `apps/desktop/ui/src/cut/CutDialog.tsx`, `apps/desktop/ui/e2e/smoke.spec.ts` and `crates/trace/src/lib.rs` (a doc comment, whose whole block Task 6 deletes — leave it to Task 6 rather than renaming a sentence that is about to go). Plus the compiled copy in `apps/desktop/ui/dist`, which this task's rebuild regenerates. The camelCase locals rename with the field: `skippedNoStroke`/`setSkippedNoStroke` → `skippedNotCut`/`setSkippedNotCut` (`CutDialog.tsx:109`, `:194`, `:623`), while the fake's accumulator stays `skipped` (`smoke.spec.ts:279`, `:287`) with only its returned key renamed at `:310`.
 
 The e2e fake's `planFromDoc` (`smoke.spec.ts:276-311`) is a second implementation of `plan_passes` and must be brought in step with Task 3 in this commit — it still filters on the stroke:
 
@@ -660,8 +667,8 @@ fake's own copy of plan_passes has to filter on the attribute too."
 - Modify: `crates/cutplan/src/lib.rs` (export `Grouping`, if the crate re-exports item by item)
 - Modify: `crates/cutplan/src/plan.rs:74-79` (the comment that says a colourless pass cannot exist)
 - Modify: `crates/cli/src/pipeline.rs:71-94` (delete `CUT_STROKE` and `doc_from_svg_all_cuttable`), `:155-172` (`plan_plain_cut`), `:174-178` (`describe_cut_error`'s doc comment), and the tests at `:309-327`
-- Modify: `CLAUDE.md:88-95` (the paragraph describing how a plain cut reaches `plan_cut`)
-- Test: `crates/cutplan/src/passes.rs`, `crates/cli/src/pipeline.rs`
+- Modify: `CLAUDE.md:90-95` (the paragraph describing how a plain cut reaches `plan_cut`)
+- Test: `crates/cutplan/src/passes.rs`, `crates/cli/src/pipeline.rs`, `crates/cli/tests/dry_run.rs`
 
 **Interfaces:**
 - Consumes: Task 3's `pass_key`.
@@ -698,33 +705,50 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
     }
 ```
 
-Replace `fill_only_svg_plans_exactly_one_pass` (`crates/cli/src/pipeline.rs:309`) and `plain_cut_plans_one_pass` (`:319`) with versions that assert the new contract — one pass, no invented stroke, no colour:
+Replace `fill_only_svg_plans_exactly_one_pass` (`crates/cli/src/pipeline.rs:309`) and `plain_cut_plans_one_pass` (`:319`) with versions that assert the new contract — one pass, no invented stroke, no colour — and keep them on `plan_plain_cut`, the production caller they exercise today. Reaching for `plan_passes_with` directly would leave nothing checking that `plan_plain_cut` passes `Single` and selects the colourless pass, which is the whole of what this task changes:
 
 ```rust
 /// A plain cut means everything in the file in one pass, and since #144 it says so with a
-/// grouping mode instead of by overwriting every path's stroke. The document's real colours
-/// have to survive the import, because destroying them was only ever a way to force one
-/// bucket.
+/// grouping mode instead of by overwriting every path's stroke. Two different fills, one
+/// pass, and the document's real colours still intact afterwards — destroying them was only
+/// ever a way to force one bucket.
 #[test]
 fn plain_cut_plans_one_pass_without_touching_paint() {
-    let doc = doc_from_svg(TWO_FILLS_SVG).unwrap();
-    let planned = cutplan::plan_passes_with(&doc, cutplan::Grouping::Single).unwrap();
-    assert_eq!(planned.passes.len(), 1);
-    assert_eq!(planned.passes[0].color, None);
-    assert_eq!(planned.passes[0].shapes.len(), 2);
-    // Shapes only: the document's root is a container built by `Node::container`, whose
-    // `Style::default()` is the same opaque black this asserts the absence of. Walking every
-    // node would fail on the root while the imported paint was perfectly intact.
+    let plan = plan_plain_cut(TWO_FILLS, &driver(), &settings(), false).unwrap();
+    assert_eq!(plan.passes.len(), 1);
+    assert_eq!(plan.passes[0].color, None);
+
+    // The same import the plain path performs, inspected for what it did to the paint.
+    // Shapes only: the root is a container built by `Node::container`, whose `Style::default()`
+    // is the very opaque black this asserts the absence of, so walking every node would fail
+    // on the root while the imported paint was perfectly intact.
+    let doc = doc_from_svg(TWO_FILLS).unwrap();
     let shapes = doc.nodes.values().filter(|n| matches!(n.kind, document::NodeKind::Shape(_)));
+    let mut count = 0;
     for node in shapes {
         assert_eq!(node.style.stroke, None,
             "a plain cut no longer stamps a stroke on an imported path");
         assert!(node.style.fill.is_some(), "and the fill it really had survives");
+        count += 1;
     }
+    assert_eq!(count, 2, "premise: the fixture has two filled shapes");
 }
 ```
 
-Reuse the two-fill fixture the deleted `fill_only_svg_plans_exactly_one_pass` already had rather than adding `TWO_FILLS_SVG`; it is the exact document this needs.
+Reuse the two-fill fixture and the `driver()`/`settings()` helpers the deleted tests already had rather than adding `TWO_FILLS`; it is the exact document this needs.
+
+One observable output change needs pinning where nothing pins it today. A plain `--dry-run` prints its pass header through `format_pass_color` (`crates/cli/src/main.rs:173`), which becomes `-- pass 1/1 (color none) --`; `crates/cli/tests/dry_run.rs` only ever asserts on a refusal and on framing. Add a successful plain dry-run case there asserting that header, so the change is a pinned decision rather than a silent one:
+
+```rust
+/// A plain cut's pass has no colour to name since #144 — it is one pass by request, not one
+/// colour's worth of shapes. The old header printed `#000000`, which was the invented stroke
+/// the plain path used to stamp; nothing pinned it, so nothing caught it changing.
+#[test]
+fn plain_dry_run_names_a_colourless_pass() {
+    // Mirror `plain_dry_run_refuses_geometry_off_the_bed`'s setup, with in-bounds geometry.
+    // Assert on stdout: `-- pass 1/1 (color none) --`.
+}
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -802,10 +826,10 @@ In `crates/cli/src/pipeline.rs`, delete `CUT_STROKE` and `doc_from_svg_all_cutta
 
 Two visible consequences to accept deliberately, not to paper over:
 
-1. `cuthulhu cut --dry-run` on a plain cut prints `-- pass 1/1 (color none) --` instead of `(color #000000)`. `format_pass_color` (`crates/cli/src/cut.rs:45-50`) already renders `None` as `none`, and no test pins the old text. The old value was an invented stroke, so printing it was the lie.
+1. `cuthulhu cut --dry-run` on a plain cut prints `-- pass 1/1 (color none) --` instead of `(color #000000)`. `format_pass_color` (`crates/cli/src/cut.rs:45-50`) already renders `None` as `none`, and nothing pinned the old text — which is why this task adds `plain_dry_run_names_a_colourless_pass`. The old value was an invented stroke, so printing it was the lie.
 2. A plain cut over an SVG whose paths are all invisible-painted still plans one pass, because cuttability is the attribute and import defaults it to `Cut`. That is the intended behaviour — it is the fill-only-clipart case — and `plain_cut_of_an_empty_svg_says_nothing_to_cut` (`:343`) still covers the genuinely empty file.
 
-Update `CLAUDE.md:88-95`, whose paragraph describes the overwrite as the plain path's mechanism, to describe `Grouping::Single` instead, and drop the sentence deferring to #68 — #68 is decided and #144 implemented it.
+Update `CLAUDE.md:90-95`, whose paragraph describes the overwrite as the plain path's mechanism, to describe `Grouping::Single` instead, and drop the sentence deferring to #68 — #68 is decided and #144 implemented it.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -831,10 +855,10 @@ a planning input now, which is the direction #45 already prescribes."
 ### Task 6: Trace stops mirroring fill onto stroke
 
 **Files:**
-- Modify: `crates/trace/src/lib.rs` — delete `mirror_fill_onto_stroke` (`:322-350`) and `attr_value` (`:315-320`), and the call at `:304`
+- Modify: `crates/trace/src/lib.rs` — delete `mirror_fill_onto_stroke` (`:322-349`) and `attr_value` (`:315-320`), and the call at `:304`
 - Modify: `crates/trace/src/lib.rs:737` — delete `traced_paths_are_stroked_so_they_can_be_cut`, replace with its opposite
-- Modify: `crates/trace/tests/roundtrip.rs:18-45` — the stroke assertions become fill assertions
-- Modify: `crates/trace/src/lib.rs:366-373` (`flatten_onto_white`'s doc comment) and the comments on `a_fully_transparent_image_traces_to_nothing` (`:760-765`) and `a_transparent_background_is_not_a_path_in_color_mode` (`:780-783`) — three places that explain a real danger with the mirror as its mechanism
+- Modify: `crates/trace/tests/roundtrip.rs:18-42` — the stroke assertions (`:26-40`) become fill assertions
+- Modify: seven stroke-premise comments in `crates/trace/src/lib.rs`, listed in Step 3 — each explains a real danger with the mirror as its mechanism
 
 **Interfaces:**
 - Consumes: Task 3 (fill-only geometry plans passes) and Task 1 (import defaults to `Cut`). Deleting this before either is in place makes every trace uncuttable.
@@ -868,7 +892,7 @@ Replace `traced_paths_are_stroked_so_they_can_be_cut` (`crates/trace/src/lib.rs:
 
 The local `attr` helper the old test defined goes with it; nothing else uses it.
 
-In `crates/trace/tests/roundtrip.rs`, replace the stroke block (`:29-44`) with:
+In `crates/trace/tests/roundtrip.rs`, replace the stroke block (`:26-40`) with:
 
 ```rust
         // Importing cleanly is enough now. `cutplan` cuts a shape because its `CutLineType`
@@ -903,22 +927,33 @@ Delete `mirror_fill_onto_stroke` and `attr_value` from `crates/trace/src/lib.rs`
 
 Nothing else in the crate calls either function. `strip_empty_paths`' own doc comment must lose any claim about stroking; check it before committing.
 
-Three comments elsewhere in the crate reach a correct conclusion through the mirror, and must
-keep the conclusion while losing the mechanism — the danger they document is real and survives
-this change, which is exactly why they cannot be left saying something false:
+**Seven** comments elsewhere in the crate reach a correct conclusion through the mirror, and must
+keep the conclusion while losing the mechanism — the danger each documents is real and survives
+this change, which is exactly why none can be left saying something false. `grep -n "strok"
+crates/trace/src/lib.rs` after the deletion is the check that none was missed:
 
-- `flatten_onto_white`'s doc comment (`crates/trace/src/lib.rs:366-373`) ends "Because every
+- `flatten_onto_white`'s doc comment (`crates/trace/src/lib.rs:367-374`) ends "Because every
   emitted path is stroked, that rectangle is a cut line, so an invisible image would put a
   rectangle through the material." Replace the causal clause: a traced path is cut because
   import defaults its `CutLineType` to `Cut`, not because anything stroked it.
+- `trace`'s own pre-flatten comment (`:411-414`) says colour mode "clusters that white into a path
+  of its own, which `strip_empty_paths` strokes" — after this change `strip_empty_paths` strokes
+  nothing; the white path is cut because it is a path.
+- `trace`'s binary-mode comment (`:420-424`) says "the manufactured white would come back as a
+  stroked path the cut planner reports as a pass". Filled, and keyed on that fill.
+- The `should_key_image` comment (`:392-396`) says a `(0,0,0,0)` island "traces to a black shape
+  and, being stroked, cuts". Same correction.
 - `a_fully_transparent_image_traces_to_nothing` (`:760-765`) says "Since every traced path is now
   stroked, that phantom shape is cut geometry" and closes on "a stroked, cuttable canvas
-  rectangle". Same edit: still cuttable, no longer stroked.
+  rectangle".
 - `a_transparent_background_is_not_a_path_in_color_mode` (`:780-783`) says the flattened
   background "comes back as a stroked path, which the cut planner then reports as a pass". It
-  comes back as a filled path, and the planner reports a pass keyed on that fill.
+  comes back as a filled path.
+- `a_transparent_island_is_keyed_out_below_the_keying_threshold` (`:800-805`) says the island
+  "becomes a stroked black shape that cuts".
 
-Neither test's assertions change; both are about `path_count` and emitted colours.
+No test's assertions change; all of them are about `path_count`, emitted colours, or
+`TraceError::EmptyResult`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1061,7 +1096,7 @@ pub fn set_cut_line_type(doc: &Document, ids: &[NodeId], value: CutLineType)
 }
 ```
 
-`NodeOp::Update` carries whole `Node`s, so the inverse comes free from `Document::apply` (`crates/document/src/delta.rs:67-72`) and no new `NodeOp` variant is needed.
+`NodeOp::Update` carries whole `Node`s, so the inverse comes free from `Document::apply` (`crates/document/src/delta.rs:70-72`) and no new `NodeOp` variant is needed.
 
 In `apps/desktop/src/state.rs`, after `reorder` (`:64`):
 
@@ -1133,21 +1168,26 @@ Create `apps/desktop/ui/src/panels/cutLineType.test.ts`:
 ```ts
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
+import type { DocNode } from "../App";
 import { selectionCutLineType } from "./cutLineType";
 
-const shape = (id: number, cut: "Cut" | "NoCut") => ({
+// Annotated `DocNode` rather than inferred: `tsconfig.json` compiles `src/**/*.test.ts` under
+// `strict`, and an inferred `as const` transform is a *readonly* tuple, which `Affine6`
+// (`render/hittest.ts`) is not — the assignment fails to typecheck and takes `npm run build`
+// with it.
+const shape = (id: number, cut: "Cut" | "NoCut"): DocNode => ({
   id,
-  kind: { Shape: { Rect: { w: 1, h: 1 } } } as const,
-  transform: [1, 0, 0, 1, 0, 0] as const,
+  kind: { Shape: { Rect: { w: 1, h: 1 } } },
+  transform: [1, 0, 0, 1, 0, 0],
   children: [],
   cut_line_type: cut,
 });
-const group = (id: number, children: number[]) => ({
+const group = (id: number, children: number[]): DocNode => ({
   id,
-  kind: "Group" as const,
-  transform: [1, 0, 0, 1, 0, 0] as const,
+  kind: "Group",
+  transform: [1, 0, 0, 1, 0, 0],
   children,
-  cut_line_type: "Cut" as const,
+  cut_line_type: "Cut",
 });
 
 describe("selectionCutLineType", () => {
@@ -1226,7 +1266,15 @@ export type DocNode = {
 };
 ```
 
-In `App.tsx`, derive the value and dispatch the edit next to `commitAxis`/`commitScale`:
+In `App.tsx`, add the import beside the other `./panels` imports —
+
+```tsx
+import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
+```
+
+`CutLineTypeJson` is defined once, in `panels/cutLineType.ts`, and imported from there by both
+`App.tsx` and `PropertiesPanel.tsx` — no re-export. Then derive the value and dispatch the edit
+next to `commitAxis`/`commitScale`:
 
 ```tsx
   const cutLineType = doc ? selectionCutLineType(doc.nodes, selected) : null;
@@ -1239,9 +1287,21 @@ In `App.tsx`, derive the value and dispatch the edit next to `commitAxis`/`commi
 
 and pass both to the panel (`:458-464`), adding `cutLineType={cutLineType}` and `onChangeCutLineType={setCutLineType}`.
 
-In `PropertiesPanel.tsx`, extend `Props` with `cutLineType: CutLineTypeJson | "mixed" | null` and `onChangeCutLineType: (v: CutLineTypeJson) => void`, and render the control below the four `NumberField`s — inside the `bounds ?` branch is wrong, because a multi-node selection has no single bounds but does have a cuttability, so it is its own conditional:
+In `PropertiesPanel.tsx`, add `import type { CutLineTypeJson } from "./cutLineType";` beside the
+existing `Bounds`/`NumberField` imports, extend `Props` with
+`cutLineType: CutLineTypeJson | "mixed" | null` and `onChangeCutLineType: (v: CutLineTypeJson) => void`,
+and render the control below the four `NumberField`s. It cannot live inside the `bounds ?` branch:
+`selectedBounds` is null for every multi-node selection and for a selected container
+(`App.tsx:326`), both of which do have a cuttability.
+
+That also means the panel's `No selection` fallback (`PropertiesPanel.tsx:24-26`) stops being
+true as written — it currently reads "no bounds" as "nothing selected", and would print it above a
+live Cut control. Guard it on both:
 
 ```tsx
+      {bounds ? (
+        <>…the four NumberFields, unchanged…</>
+      ) : null}
       {cutLineType !== null ? (
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
           <input
@@ -1256,6 +1316,9 @@ In `PropertiesPanel.tsx`, extend `Props` with `cutLineType: CutLineTypeJson | "m
           />
           Cut
         </label>
+      ) : null}
+      {bounds === null && cutLineType === null ? (
+        <div style={{ fontSize: 12, color: "var(--muted)" }}>No selection</div>
       ) : null}
 ```
 

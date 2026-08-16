@@ -705,37 +705,43 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
     }
 ```
 
-Replace `fill_only_svg_plans_exactly_one_pass` (`crates/cli/src/pipeline.rs:309`) and `plain_cut_plans_one_pass` (`:319`) with versions that assert the new contract — one pass, no invented stroke, no colour — and keep them on `plan_plain_cut`, the production caller they exercise today. Reaching for `plan_passes_with` directly would leave nothing checking that `plan_plain_cut` passes `Single` and selects the colourless pass, which is the whole of what this task changes:
+Replace `fill_only_svg_plans_exactly_one_pass` (`crates/cli/src/pipeline.rs:309`) and `plain_cut_plans_one_pass` (`:319`) with versions that assert the new contract through the production callers they exercise today. Reaching for `plan_passes_with` directly would leave nothing checking that `plan_plain_cut` asks for `Single` and selects the colourless pass, which is the whole of what this task changes.
+
+The "no invented stroke" half cannot be observed by importing the same SVG a second time — that inspects a different document than the one `plan_plain_cut` built, so a production path that still stamped strokes would pass. Nor is it observable from the plain plan's pass colour, which is `None` under `Single` whatever the paint is. What *is* observable is the same fixture through the other production caller: if the import preserved the document's real colours, `--by-color` splits it into one pass per fill. So the two callers pin each other:
 
 ```rust
 /// A plain cut means everything in the file in one pass, and since #144 it says so with a
-/// grouping mode instead of by overwriting every path's stroke. Two different fills, one
-/// pass, and the document's real colours still intact afterwards — destroying them was only
-/// ever a way to force one bucket.
+/// grouping mode instead of by overwriting every path's stroke.
+///
+/// The second half is what proves the overwrite is gone: the same fixture through
+/// `--by-color` must still see two distinct fills. When the plain path stamped a uniform
+/// stroke it did so on its own document, so this pairing is the only way to observe from
+/// outside that the import stopped destroying paint — `CUT_STROKE`'s deletion is checked by
+/// the plan's verification grep, not by a test.
 #[test]
-fn plain_cut_plans_one_pass_without_touching_paint() {
-    let plan = plan_plain_cut(TWO_FILLS, &driver(), &settings(), false).unwrap();
+fn plain_cut_plans_one_pass_and_by_color_still_sees_both_fills() {
+    let plain = plan_plain_cut(TWO_FILLS, &driver(), &settings(), false).unwrap();
+    assert_eq!(plain.passes.len(), 1);
+    assert_eq!(plain.passes[0].color, None, "one pass by request names no colour");
+
+    let by_color = plan_cut_from_svg(TWO_FILLS, &driver(), &settings(), &[], None, false).unwrap();
+    assert_eq!(by_color.passes.len(), 2, "the fixture's two fills survived the import");
+    assert!(by_color.passes.iter().all(|p| p.color != Some(0x000000FF)),
+        "and neither pass is keyed on the stroke the plain path used to stamp");
+}
+
+/// The fill-only-clipart case, stated as behaviour rather than as a consequence: paint that
+/// nobody can see still cuts, because cuttability is the attribute and import defaults it to
+/// `Cut`. Before #144 this SVG planned nothing at all.
+#[test]
+fn plain_cut_plans_invisible_paint() {
+    let plan = plan_plain_cut(TRANSPARENT_FILL, &driver(), &settings(), false).unwrap();
     assert_eq!(plan.passes.len(), 1);
     assert_eq!(plan.passes[0].color, None);
-
-    // The same import the plain path performs, inspected for what it did to the paint.
-    // Shapes only: the root is a container built by `Node::container`, whose `Style::default()`
-    // is the very opaque black this asserts the absence of, so walking every node would fail
-    // on the root while the imported paint was perfectly intact.
-    let doc = doc_from_svg(TWO_FILLS).unwrap();
-    let shapes = doc.nodes.values().filter(|n| matches!(n.kind, document::NodeKind::Shape(_)));
-    let mut count = 0;
-    for node in shapes {
-        assert_eq!(node.style.stroke, None,
-            "a plain cut no longer stamps a stroke on an imported path");
-        assert!(node.style.fill.is_some(), "and the fill it really had survives");
-        count += 1;
-    }
-    assert_eq!(count, 2, "premise: the fixture has two filled shapes");
 }
 ```
 
-Reuse the two-fill fixture and the `driver()`/`settings()` helpers the deleted tests already had rather than adding `TWO_FILLS`; it is the exact document this needs.
+Reuse the two-fill fixture and the `driver()`/`settings()` helpers the deleted tests already had rather than adding `TWO_FILLS`; it is the exact document this needs. `TRANSPARENT_FILL` is new and small — one rect with `fill="#00ff00" fill-opacity="0"`, in bounds — and `plain_cut_of_an_empty_svg_says_nothing_to_cut` (`:343`) keeps covering the genuinely empty file.
 
 One observable change needs pinning where nothing pins it today, and it is **not** the dry-run
 header: the plain branch (`crates/cli/src/main.rs:119-127`) prints encoded bytes and no header at
@@ -846,7 +852,7 @@ In `crates/cli/src/pipeline.rs`, delete `CUT_STROKE` and `doc_from_svg_all_cutta
 Two visible consequences to accept deliberately, not to paper over:
 
 1. The operator prompt for a plain cut that needs confirmation reads `(color none)` instead of `(color #000000)` — `format_pass_color` (`crates/cli/src/cut.rs:45-50`) already renders `None` as `none`. That is the only colour a plain cut ever prints: its `--dry-run` branch emits bytes only. The old value was an invented stroke, so printing it was the lie, and `a_colourless_pass_is_named_none_in_the_prompt` pins the new one.
-2. A plain cut over an SVG whose paths are all invisible-painted still plans one pass, because cuttability is the attribute and import defaults it to `Cut`. That is the intended behaviour — it is the fill-only-clipart case — and `plain_cut_of_an_empty_svg_says_nothing_to_cut` (`:343`) still covers the genuinely empty file.
+2. A plain cut over an SVG whose paths are all invisible-painted still plans one pass, because cuttability is the attribute and import defaults it to `Cut`. That is the intended behaviour — the fill-only-clipart case — and `plain_cut_plans_invisible_paint` above pins it through the production caller, while `plain_cut_of_an_empty_svg_says_nothing_to_cut` (`:343`) keeps covering the genuinely empty file.
 
 Update `CLAUDE.md:90-95`, whose paragraph describes the overwrite as the plain path's mechanism, to describe `Grouping::Single` instead, and drop the sentence deferring to #68 — #68 is decided and #144 implemented it.
 
@@ -949,8 +955,10 @@ Nothing else in the crate calls either function. `strip_empty_paths`' own doc co
 
 **Seven** comments elsewhere in the crate reach a correct conclusion through the mirror, and must
 keep the conclusion while losing the mechanism — the danger each documents is real and survives
-this change, which is exactly why none can be left saying something false. `grep -n "strok"
-crates/trace/src/lib.rs` after the deletion is the check that none was missed:
+this change, which is exactly why none can be left saying something false. The check that none was
+missed is `grep -n "is stroked\|are stroked\|being stroked\|strokes" crates/trace/src/lib.rs`
+returning nothing — not a search for `strok`, which the replacement test legitimately contains in
+`assert!(!p.contains("stroke=\""), …)`:
 
 - `flatten_onto_white`'s doc comment (`crates/trace/src/lib.rs:367-374`) ends "Because every
   emitted path is stroked, that rectangle is a cut line, so an invisible image would put a
@@ -972,8 +980,10 @@ crates/trace/src/lib.rs` after the deletion is the check that none was missed:
 - `a_transparent_island_is_keyed_out_below_the_keying_threshold` (`:800-805`) says the island
   "becomes a stroked black shape that cuts".
 
-No test's assertions change; all of them are about `path_count`, emitted colours, or
-`TraceError::EmptyResult`.
+Only the two tests this task rewrites change their assertions — `traced_paths_carry_a_fill_and_no_stroke`
+and the trace round trip, both of which invert a stroke assertion into a fill one. The five
+comments above them are comments: the tests they sit on keep asserting exactly what they assert
+today, all of it about `path_count`, emitted colours, or `TraceError::EmptyResult`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

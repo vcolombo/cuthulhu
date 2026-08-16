@@ -138,12 +138,18 @@ effort.
 - **Migration is the load-bearing test**: a manifest written without the field, one node stroked
   and one not, loads to `Cut` and `NoCut` respectively — mirroring
   `legacy_machine_ids_migrate_on_load`, which is the precedent this follows.
-- **Round-trip stability**: a document saved after this change reloads byte-identically, and
-  `snapshot_round_trips_through_json` still holds with the wire struct in place.
+- **Round-trip stability**: a document saved after this change reloads *equal*, and
+  `snapshot_round_trips_through_json` still holds with the wire struct in place. Equal, not
+  byte-identical: `Document::nodes` is a `HashMap`, so `serde_json::to_string` is free to order
+  its keys differently between runs, and a test asserting on the bytes would pin a property the
+  format does not have. What the wire struct guarantees is that a file written once is never
+  ambiguous again — `Serialize` always writes a concrete `cut_line_type`.
 - **Planning**: a fill-only shape marked `Cut` plans into a pass keyed on its fill; a stroked
   shape marked `NoCut` plans into none; a shape with neither colour lands in the `None` pass.
 - **Regression**: the three ordering tests from #139 keep passing with the predicate swapped —
-  they pin *when* the outline resolves, which this must not disturb.
+  they pin *when* the outline resolves, which this must not disturb. Two of them build their
+  skipped shape by removing its stroke, so their fixtures move to the attribute even though
+  their assertions do not change.
 - **Trace**: the mirror's tests are deleted, replaced by one asserting that fill-only trace
   output plans a pass per fill colour without it.
 - **Grouping**: `Grouping::Single` over a multi-colour document yields exactly one pass whose

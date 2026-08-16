@@ -56,6 +56,45 @@ mod tests {
         assert_eq!(back.machine.unwrap().id, "puma");
     }
 
+    /// The migration through a real project file, which is the level it matters at:
+    /// `legacy_machine_ids_migrate_on_load` above could plant a legacy *value* in a live
+    /// `Document`, but an absent field cannot be planted that way — `save_project` always
+    /// writes it. So the manifest is pruned rather than hand-written: everything except
+    /// `cut_line_type` is exactly what `save_project` emits today, so the fixture cannot
+    /// drift from `Document`'s real shape.
+    #[test]
+    fn a_project_saved_before_cuttability_derives_it_from_stroke() {
+        let mut doc = document::Document::new();
+        let mut stroked = document::Node::shape(doc.ids.next(),
+            document::ShapeKind::Rect { w: 10.0, h: 10.0 });
+        stroked.style = document::Style { stroke: Some(0xFF0000FF), fill: None };
+        let stroked_id = stroked.id;
+        let mut fill_only = document::Node::shape(doc.ids.next(),
+            document::ShapeKind::Rect { w: 10.0, h: 10.0 });
+        fill_only.style = document::Style { stroke: None, fill: Some(0x00FF00FF) };
+        let fill_only_id = fill_only.id;
+        doc.apply(document::Delta(vec![
+            document::NodeOp::Add { parent: doc.root, node: stroked, index: usize::MAX },
+            document::NodeOp::Add { parent: doc.root, node: fill_only, index: usize::MAX },
+        ]));
+
+        let mut manifest: serde_json::Value = serde_json::from_str(&doc.snapshot_json()).unwrap();
+        for node in manifest["nodes"].as_object_mut().unwrap().values_mut() {
+            assert!(node.as_object_mut().unwrap().remove("cut_line_type").is_some(),
+                "premise: every node is written with the field, so pruning it makes an old file");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.cut");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        let back = load_project(&path).unwrap();
+        assert_eq!(back.get(stroked_id).unwrap().cut_line_type, document::CutLineType::Cut);
+        assert_eq!(back.get(fill_only_id).unwrap().cut_line_type, document::CutLineType::NoCut);
+    }
+
     #[test]
     fn save_then_load_round_trips_document() {
         let mut doc = document::Document::new();

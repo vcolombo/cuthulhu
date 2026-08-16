@@ -53,6 +53,7 @@ fn main() {
             ipc::add_text,
             ipc::delete,
             ipc::reorder,
+            ipc::set_cut_line_type,
             ipc::undo,
             ipc::redo,
             ipc::import_svg,

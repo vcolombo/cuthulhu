@@ -296,4 +296,20 @@ mod tests {
         assert!(confirm.contains("Pass 2/3"), "{confirm}");
         assert!(confirm.contains("once the machine finishes"), "waits on the blade, not the queue: {confirm}");
     }
+
+    /// A plain cut's pass has no colour to name since #144 — it is one pass by request, not one
+    /// colour's worth of shapes. The prompt used to read `#000000`, which was the invented stroke
+    /// the plain path stamped on every path; nothing pinned it, so nothing would catch it
+    /// changing.
+    #[test]
+    fn a_colourless_pass_is_named_none_in_the_prompt() {
+        let plan = plan(&[None]);
+        let parked = status(
+            Actions { cancel: true, confirm: true, ..Actions::default() },
+            Phase::AwaitingConfirmation,
+            Some(PassPosition { index: 0, total: 1 }),
+        );
+        let confirm = pause_prompt(Pause::Confirm, &plan, &parked);
+        assert!(confirm.contains("(color none)"), "{confirm}");
+    }
 }

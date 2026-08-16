@@ -84,6 +84,9 @@ The TS scene-graph mirrors the Rust document as a render tree; dirty-rect redraw
 
 **Properties model:** for a cutting tool, *stroke = the cut line*. V1 surfaces stroke (cut path) prominently; fill is preview-only. Nothing cuts until SP4, but the mental model is established here.
 
+> Superseded by `docs/superpowers/specs/2026-08-14-cuttability-attribute-design.md` (#144):
+> stroke is paint and a pass-grouping key; a Node's `CutLineType` decides what is cut.
+
 ## Design language — "Workbench"
 
 Dark-first, token-driven; chrome recedes, the artwork carries the color. Light theme ships too. All colors are CSS-variable tokens (shared with the canvas background/grid).

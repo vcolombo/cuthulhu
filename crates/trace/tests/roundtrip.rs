@@ -23,20 +23,19 @@ fn traced_svg_imports_cleanly_in_both_modes() {
             .unwrap_or_else(|e| panic!("{mode:?}: importer rejected trace output: {e:?}"));
         assert_eq!(imp.skipped, Vec::<String>::new(), "{mode:?}: importer skipped elements");
         assert!(!imp.paths.is_empty(), "{mode:?}: importer produced no paths");
-        // Importing cleanly is not enough to be cuttable. `cutplan` groups by stroke and skips
-        // shapes that have none, so a trace that imports as fill-only geometry plans zero
-        // passes and silently cannot be cut at all.
-        // Mirrors `plan_passes`, which skips on `stroke.filter(|c| c & 0xFF != 0)`: a present but
-        // fully transparent stroke is skipped exactly like an absent one, so asserting only
-        // `is_some()` would pass for geometry the planner still refuses to cut.
+        // Importing cleanly is enough now. `cutplan` cuts a shape because its `CutLineType`
+        // says `Cut` — which is what import defaults to — and keys its pass on the fill when
+        // there is no stroke, so fill-only trace output plans a pass per traced colour. The
+        // planning half of that contract is pinned in `cutplan`
+        // (`a_fill_only_shape_that_is_cut_plans_into_a_pass_keyed_on_its_fill`); what this
+        // test owns is that the trace really does arrive as fill-only geometry.
         for (i, (_, hint)) in imp.paths.iter().enumerate() {
-            let stroke = hint.stroke.unwrap_or_else(|| {
-                panic!("{mode:?}: imported path {i} has no stroke, so the cut planner would skip it")
+            assert_eq!(hint.stroke, None, "{mode:?}: imported path {i} carries an invented stroke");
+            let fill = hint.fill.unwrap_or_else(|| {
+                panic!("{mode:?}: imported path {i} has no fill, so nothing keys its pass")
             });
-            assert!(
-                stroke & 0xFF != 0,
-                "{mode:?}: imported path {i} has a fully transparent stroke ({stroke:#010x}), which the cut planner skips too",
-            );
+            assert!(fill & 0xFF != 0,
+                "{mode:?}: imported path {i} has a fully transparent fill ({fill:#010x})");
         }
     }
 }

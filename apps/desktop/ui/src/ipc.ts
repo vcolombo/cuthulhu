@@ -38,6 +38,10 @@ export async function reorder(args: Args) {
   return invoke("reorder", args);
 }
 
+export async function setCutLineType(args: Args) {
+  return invoke("set_cut_line_type", args);
+}
+
 export async function undo() {
   return invoke("undo", {});
 }
@@ -152,7 +156,7 @@ export type PlanCutPassSummary = {
 
 export type PlanCutResponse = {
   passes: PlanCutPassSummary[];
-  skipped_no_stroke: number;
+  skipped_not_cut: number;
   doc_revision: string;
   travel: [number, number, number, number][];
 };

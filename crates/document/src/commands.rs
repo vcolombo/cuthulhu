@@ -42,6 +42,44 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
     Ok(Delta(ops))
 }
 
+/// Mark every shape in `ids` — and every shape beneath a container in `ids` — with `value`.
+///
+/// Descends where `transform_nodes` suppresses: a transform is inherited through the tree,
+/// so applying it to a node *and* its selected ancestor would move it twice, but a
+/// `CutLineType` is read only on the shape that carries it (`cutplan::plan_passes`). Setting
+/// it on a Group alone would be a control that visibly does nothing, so the container's
+/// selection means its shapes.
+///
+/// Unchanged shapes emit no op, so re-picking the value a selection already has cannot land
+/// an undo step that undoes nothing.
+pub fn set_cut_line_type(doc: &Document, ids: &[NodeId], value: CutLineType)
+    -> Result<Delta, CmdError> {
+    if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    let mut ops = vec![];
+    let mut seen = HashSet::new();
+    let mut stack: Vec<NodeId> = ids.iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        // Also the cycle guard: a malformed document whose nodes contain each other would
+        // otherwise spin here. Unlike `plan_passes_with`, which errors on a revisit because a
+        // preorder walk from the single root can only reach a node twice through a cycle, this
+        // walk starts from an arbitrary selection where a revisit is the ordinary overlapping
+        // case — a group and a shape inside it — so it must skip the node, not refuse the edit.
+        if !seen.insert(id) { continue; }
+        match &node.kind {
+            NodeKind::Group | NodeKind::Layer => stack.extend(node.children.iter().rev().copied()),
+            NodeKind::Shape(_) => {
+                if node.cut_line_type == value { continue; }
+                let before = node.clone();
+                let mut after = before.clone();
+                after.cut_line_type = value;
+                ops.push(NodeOp::Update { id, before, after });
+            }
+        }
+    }
+    Ok(Delta(ops))
+}
+
 pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let selected: HashSet<NodeId> = ids.iter().copied().collect();
@@ -530,5 +568,60 @@ mod tests {
         ed.commit(delete_nodes(&ed.doc, &[gid, cid]).unwrap());
         assert!(ed.doc.get(gid).is_none());
         assert!(ed.doc.get(cid).is_none());
+    }
+
+    /// Selecting a container and marking it `NoCut` has to reach the shapes, because the
+    /// attribute does not inherit: `plan_passes` reads it only on shapes, so setting it on
+    /// a Group alone would be a control that visibly does nothing.
+    #[test]
+    fn setting_a_cut_line_type_reaches_the_shapes_under_a_container() {
+        let mut doc = Document::new();
+        let group = Node::container(doc.ids.next(), NodeKind::Group);
+        let group_id = group.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: group, index: usize::MAX },
+            NodeOp::Add { parent: group_id, node: shape, index: usize::MAX },
+        ]));
+
+        let d = set_cut_line_type(&doc, &[group_id], CutLineType::NoCut).unwrap();
+        doc.apply(d);
+        assert_eq!(doc.get(shape_id).unwrap().cut_line_type, CutLineType::NoCut);
+    }
+
+    /// A selection that already has the value produces no ops, so it cannot land an undo
+    /// step that undoes nothing — the panel dispatches on every click, including the one
+    /// that re-picks what is already set.
+    #[test]
+    fn setting_the_value_a_node_already_has_produces_no_ops() {
+        let mut doc = Document::new();
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+        assert_eq!(doc.get(shape_id).unwrap().cut_line_type, CutLineType::Cut, "premise");
+
+        let d = set_cut_line_type(&doc, &[shape_id], CutLineType::Cut).unwrap();
+        assert_eq!(d, Delta(vec![]));
+    }
+
+    /// Overlapping selections are one edit per shape, and an empty selection is refused
+    /// the same way every other command refuses it.
+    #[test]
+    fn a_shape_selected_twice_over_is_updated_once_and_nothing_is_refused_twice() {
+        let mut doc = Document::new();
+        let group = Node::container(doc.ids.next(), NodeKind::Group);
+        let group_id = group.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: group, index: usize::MAX },
+            NodeOp::Add { parent: group_id, node: shape, index: usize::MAX },
+        ]));
+
+        let d = set_cut_line_type(&doc, &[group_id, shape_id], CutLineType::NoCut).unwrap();
+        assert_eq!(d.0.len(), 1, "the shape is reached twice and updated once");
+        assert_eq!(set_cut_line_type(&doc, &[], CutLineType::NoCut), Err(CmdError::EmptySelection));
+        assert_eq!(set_cut_line_type(&doc, &[NodeId(9999)], CutLineType::NoCut), Err(CmdError::NotFound));
     }
 }

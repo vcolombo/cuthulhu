@@ -14,7 +14,7 @@ _Avoid_: file, project, canvas, scene
 
 **Node**:
 One entry in a Document's tree: either a shape with an outline, or a container holding other
-Nodes. Carries its own transform and stroke.
+Nodes. Carries its own transform, its paint, and its CutLineType.
 _Avoid_: element, object, layer, item
 
 **Delta**:
@@ -38,9 +38,18 @@ names
 ### Planning a cut
 
 **ColorPass**:
-Every shape in a Document sharing one stroke colour, grouped together because they are cut in a
-single run of the blade. A shape with no stroke belongs to no ColorPass and is not cut.
+Every shape in a Document cut in a single run of the blade. Asked to group by colour, the shapes
+in a pass share the colour it is keyed on — their stroke where that stroke is visible, otherwise
+their fill — and the pass keyed `None` is the one for shapes with no visible paint. Asked for a
+single pass instead, that one pass holds every cut shape whatever its paint and is keyed `None`
+for want of a colour, which then says nothing about what is in it. Which shapes are cut at all is
+their CutLineType's business, not their paint's.
 _Avoid_: layer, colour group, batch
+
+**CutLineType**:
+Whether a Node is cut, and how — `Cut` or `NoCut` today. An explicit attribute of the Node
+rather than something read off its stroke, defaulted to `Cut` at import.
+_Avoid_: cut style, cuttable flag, cut attribute
 
 **DocumentPasses**:
 Every ColorPass a Document contains, in the order they were first encountered. An inventory of
@@ -118,8 +127,9 @@ with. What a Driver encodes.
 _Avoid_: task, work item, payload
 
 **Pass**:
-One run of the blade over the material. Passes exist because a design with several stroke colours
-needs the operator to change tool or material between them.
+One run of the blade over the material. More than one exists because a design in several colours
+needs the operator to change tool or material between them — though a caller may ask for a single
+pass outright and cut everything in one go.
 _Avoid_: run, cycle, layer
 
 **CutStatus**:

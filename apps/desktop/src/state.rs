@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::Path;
-use document::{commands, CmdError, Delta, Editor, MachineProfile, NodeId, ShapeKind};
+use document::{commands, CmdError, CutLineType, Delta, Editor, MachineProfile, NodeId, ShapeKind};
 use fileio::IoError;
 use geometry::{Affine, BoolOp};
 
@@ -60,6 +60,15 @@ impl AppState {
 
     pub fn reorder(&mut self, id: NodeId, new_index: usize) -> Result<Delta, CmdError> {
         let d = commands::reorder(&self.editor.doc, id, new_index)?;
+        Ok(self.editor.commit(d))
+    }
+
+    pub fn set_cut_line_type(&mut self, ids: Vec<NodeId>, value: CutLineType)
+        -> Result<Delta, CmdError> {
+        let d = commands::set_cut_line_type(&self.editor.doc, &ids, value)?;
+        // An empty delta is a no-op the operator asked for; committing it would clear the
+        // redo stack and add an undo step that does nothing.
+        if d.0.is_empty() { return Ok(d); }
         Ok(self.editor.commit(d))
     }
 
@@ -147,5 +156,20 @@ mod tests {
         app.add_rect(1.0, 1.0);
         app.new_doc();
         assert!(app.undo().is_none());
+    }
+
+    /// The panel dispatches on every click, including the one that re-picks the value the
+    /// selection already carries. Committing that empty delta would clear the redo stack and
+    /// leave an undo step that undoes nothing, so the method must decline to commit it.
+    #[test]
+    fn app_state_set_cut_line_type_no_op_keeps_redo_stack() {
+        let mut app = AppState::new();
+        let id = app.add_rect(1.0, 1.0);
+        app.add_rect(2.0, 2.0);
+        app.undo();
+
+        let d = app.set_cut_line_type(vec![id], CutLineType::Cut).unwrap();
+        assert!(d.0.is_empty(), "premise: the rect already cuts");
+        assert!(app.redo().is_some(), "a no-op must not throw away redoable work");
     }
 }

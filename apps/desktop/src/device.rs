@@ -1103,7 +1103,7 @@ fn map_cut_error(e: CutError) -> IpcError {
 #[derive(Debug, Serialize)]
 pub struct PlanCutResponse {
     pub passes: Vec<PlanCutPassSummary>,
-    pub skipped_no_stroke: usize,
+    pub skipped_not_cut: usize,
     pub doc_revision: String,
     pub travel: Vec<[f64; 4]>,
 }
@@ -1135,7 +1135,7 @@ pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, Ip
                 s.polylines.first().and_then(|p| p.first()).map(|pt| [pt.x, pt.y])
             }).collect(),
         }).collect(),
-        skipped_no_stroke: planned.skipped_no_stroke,
+        skipped_not_cut: planned.skipped_not_cut,
         doc_revision: planned.doc_revision.to_string(),
         travel: travel.into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect(),
     })

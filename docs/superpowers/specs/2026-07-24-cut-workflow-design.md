@@ -20,6 +20,13 @@ Connect the editor to the machines: pick a device, pick a material, preview what
 ## Prerequisites (small, land first)
 
 1. **SVG stroke-color preservation.** `fileio::paint_rgba` currently maps every paint to opaque black, and import converts missing strokes to black — an imported red/blue SVG becomes one black pass, making the multi-color hardware gate unreachable. Fix: map real resolved RGB (alpha from usvg opacity); preserve `stroke: None` instead of manufacturing black. Regression test: red/blue SVG imports as two distinct stroke colors. **`stroke: None` means "do not cut"** — such shapes are excluded from planning (listed in the dialog as "not cut: N shapes"). Pass grouping keys on full RGBA; fully transparent strokes (alpha 0) count as `None`.
+
+   > Superseded by `docs/superpowers/specs/2026-08-14-cuttability-attribute-design.md` (#144):
+   > stroke is paint and a pass-grouping key — a pass is keyed on the visible stroke, else the
+   > visible fill — and a Node's `CutLineType` decides what is cut, so a stroke-less shape is
+   > planned rather than skipped. `skipped_no_stroke` is now `skipped_not_cut`. This governs
+   > the same rule where sections 4 and 5 below restate it.
+
 2. **Canonical machine ids.** Document profiles say `cameo5_alpha`/`puma_iv`; driver profiles say `cameo5`/`puma`. Canonical ids become **`cameo5`, `puma`** everywhere (drivers already use them). `document::machine` migrates; project load maps legacy ids (`cameo5_alpha→cameo5`, `puma_iv→puma`) so existing saves open. Machine **model id** (`cameo5`) is distinct from **device instance id** (a specific plugged-in unit).
 
 ## Architecture

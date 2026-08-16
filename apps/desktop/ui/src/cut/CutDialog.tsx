@@ -106,7 +106,7 @@ export function CutDialog({
   const [presets, setPresets] = useState<Preset[]>([]);
   const [rows, setRows] = useState<PassRow[]>([]);
   const [travel, setTravel] = useState<[number, number, number, number][]>([]);
-  const [skippedNoStroke, setSkippedNoStroke] = useState(0);
+  const [skippedNotCut, setSkippedNotCut] = useState(0);
   const [planRevision, setPlanRevision] = useState<string | null>(null);
   const [stalePlan, setStalePlan] = useState(false);
   /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
@@ -191,7 +191,7 @@ export function CutDialog({
           })),
         );
         setTravel(plan.travel);
-        setSkippedNoStroke(plan.skipped_no_stroke);
+        setSkippedNotCut(plan.skipped_not_cut);
         setPlanRevision(plan.doc_revision);
         setStalePlan(false);
       })
@@ -620,7 +620,9 @@ export function CutDialog({
           })}
         </div>
 
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>Not cut: {skippedNoStroke} shapes</div>
+        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+          Not cut: {skippedNotCut} shape{skippedNotCut === 1 ? "" : "s"} marked No Cut
+        </div>
 
         <CutPreview scene={scene} artboard={artboard} passes={rows} travel={travel} />
 

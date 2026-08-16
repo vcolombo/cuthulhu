@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct PlannedShape { pub node_id: NodeId, pub polylines: Vec<Polyline> }
 
-/// All shapes cut together as one pass, keyed on the colour they share (0xRRGGBBAA) —
-/// their stroke where they have a visible one, else their fill. `None` is a pass of shapes
-/// with no visible paint at all.
+/// All shapes cut together as one pass. Under `Grouping::ByColor` they share the colour the
+/// pass is keyed on (0xRRGGBBAA) — their stroke where they have a visible one, else their
+/// fill — and `None` is the pass of shapes with no visible paint at all. Under
+/// `Grouping::Single` there is one pass keyed `None` holding every cut shape whatever its
+/// paint: one pass by request rather than by colour, so `None` there says nothing about the
+/// paint of what is in it.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 

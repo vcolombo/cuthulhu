@@ -120,6 +120,24 @@ TypeScript gets one `parsePassKey` — needed for the swatch, which must recover
 carries — table-tested against the same examples as the Rust round-trip test. That table is the
 cross-language pin, and both halves must list every variant.
 
+### Verified, not assumed
+
+The wire mechanism was prototyped against the locked versions — `serde 1.0.229`, `serde_json
+1.0.151` — before this spec was approved, so the plan states these rather than hoping for them:
+
+- `#[serde(into = "String", try_from = "String")]` on an enum emits exactly the `Display` string
+  (`"color:ff0000ff"`, `"all"`) and accepts it back, nested in a struct field and in a `Vec`. It
+  requires `Clone` on the type, which `PassKey` needs anyway for its `String`.
+- A malformed key is a `serde` error, not a panic: `""`, `"all:1"`, `"color:"`, `"color:zz"`,
+  `"line-type:draw"` and `"colour:ff0000ff"` all deserialize to `Err`.
+- Uppercase hex parses and `Display` writes lowercase, so the round trip is a fixed point.
+- A wire struct can carry **two** absent-field rules at once: `cut_line_type` deriving from the
+  stroke and `material_preset` taking a plain `#[serde(default)]`. An explicit value on the wire
+  wins over both, and `Serialize` writes both, so a document round-trips once and is never
+  ambiguous again.
+- Splitting on the first `:` accepts a preset id containing one, so the grammar constrains ids no
+  further than they are constrained today.
+
 ## Grouping
 
 ```rust

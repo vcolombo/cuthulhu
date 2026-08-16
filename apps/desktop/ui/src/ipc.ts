@@ -152,7 +152,7 @@ export type PlanCutPassSummary = {
 
 export type PlanCutResponse = {
   passes: PlanCutPassSummary[];
-  skipped_no_stroke: number;
+  skipped_not_cut: number;
   doc_revision: string;
   travel: [number, number, number, number][];
 };

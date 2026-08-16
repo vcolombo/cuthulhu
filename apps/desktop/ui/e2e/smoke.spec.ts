@@ -7,7 +7,9 @@ import { test, expect } from "@playwright/test";
 // which is what actually parses this on the JS side.
 function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[] };
+  // cut_line_type is optional only until Task 8 stamps it on every literal: an absent value
+  // reads as cut, which is the import default.
+  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type?: "Cut" | "NoCut" };
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -273,22 +275,26 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   }
 
   function planFromDoc() {
-    // Mirrors crates/cutplan/src/passes.rs's plan_passes: preorder walk, group Shape
-    // leaf nodes by full stroke color (0-alpha counts as no stroke), first-seen order.
-    const byColor = new Map<number, { color: number; node_ids: number[] }>();
+    // Mirrors crates/cutplan/src/passes.rs's plan_passes: preorder walk, skip Shape leaf
+    // nodes whose CutLineType is NoCut, and key the rest on pass_key — stroke if visible,
+    // else fill, with 0-alpha counting as absent in both — in first-seen order. A shape
+    // with no visible paint keys on null, which is a colour the pass list carries.
+    const byColor = new Map<number | null, { color: number | null; node_ids: number[] }>();
     let skipped = 0;
     const walk = (id: number) => {
       const n = doc.nodes[id];
       if (!n) return;
       const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
       if (isShape) {
-        const stroke = n.style.stroke;
-        if (stroke === null || stroke === undefined || (stroke & 0xff) === 0) {
+        if (n.cut_line_type === "NoCut") {
           skipped++;
         } else {
-          const existing = byColor.get(stroke);
+          const key = ((n.style.stroke ?? 0) & 0xff) !== 0 ? n.style.stroke
+            : ((n.style.fill ?? 0) & 0xff) !== 0 ? n.style.fill
+            : null;
+          const existing = byColor.get(key);
           if (existing) existing.node_ids.push(id);
-          else byColor.set(stroke, { color: stroke, node_ids: [id] });
+          else byColor.set(key, { color: key, node_ids: [id] });
         }
       }
       for (const c of n.children) walk(c);
@@ -307,7 +313,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
     // bumped per command diverges on that, and silently goes stale-blind for any
     // command that mutates `doc` and forgets to bump (commit_transform did).
-    return { passes, skipped_no_stroke: skipped, doc_revision: JSON.stringify(doc), travel: [] as [number, number, number, number][] };
+    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel: [] as [number, number, number, number][] };
   }
 
   // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()

@@ -27,7 +27,7 @@ pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct DocumentPasses {
     pub passes: Vec<ColorPass>,
-    pub skipped_no_stroke: usize,
+    pub skipped_not_cut: usize,
     pub doc_revision: u64,
     /// The machine the document targets, if it names one. Carried here because
     /// preflight checks it and `plan_cut` no longer sees the `Document`.
@@ -82,7 +82,7 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
     let mut visited: HashSet<NodeId> = HashSet::new();
     let mut stack: Vec<(NodeId, Affine)> = vec![(doc.root, Affine::identity())];
     let mut passes: Vec<ColorPass> = vec![];
-    let mut skipped_no_stroke = 0usize;
+    let mut skipped_not_cut = 0usize;
 
     while let Some((id, parent_world)) = stack.pop() {
         if !visited.insert(id) {
@@ -108,7 +108,7 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
                 // known to be cut, so a font or path-data failure on a shape nobody cuts
                 // cannot refuse the whole plan.
                 match node.cut_line_type {
-                    CutLineType::NoCut => skipped_no_stroke += 1,
+                    CutLineType::NoCut => skipped_not_cut += 1,
                     CutLineType::Cut => {
                         // `None` here is `shape_outline`'s container signal, which `NodeKind`
                         // has already ruled out, so no `ShapeKind` reaches this today. A new
@@ -137,7 +137,7 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
 
     Ok(DocumentPasses {
         passes,
-        skipped_no_stroke,
+        skipped_not_cut,
         doc_revision: doc_revision(doc),
         machine_id: doc.machine.as_ref().map(|m| m.id.clone()),
     })
@@ -287,7 +287,7 @@ mod tests {
 
         let planned = plan_passes(&ed.doc).unwrap();
         assert_eq!(planned.passes.len(), 2, "red + blue; the not-cut rect excluded");
-        assert_eq!(planned.skipped_no_stroke, 1);
+        assert_eq!(planned.skipped_not_cut, 1);
         let red = &planned.passes[0]; // first-seen order
         assert_eq!(red.color, Some(RED));
         assert_eq!(red.shapes.len(), 2);
@@ -370,7 +370,7 @@ mod tests {
         let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
         assert_eq!(planned.passes.len(), 1, "the rect still plans");
         assert_eq!(planned.passes[0].shapes.len(), 1);
-        assert_eq!(planned.skipped_no_stroke, 1, "the text is skipped, not fatal");
+        assert_eq!(planned.skipped_not_cut, 1, "the text is skipped, not fatal");
     }
 
     /// Same ordering bug, reached through a different `shape_outline` branch — the defect
@@ -391,7 +391,7 @@ mod tests {
 
         let planned = plan_passes(&ed.doc).expect("a skipped shape must not refuse the plan");
         assert_eq!(planned.passes.len(), 1);
-        assert_eq!(planned.skipped_no_stroke, 1);
+        assert_eq!(planned.skipped_not_cut, 1);
     }
 
     /// The other half of the contract: deferring resolution must not swallow a failure on
@@ -464,7 +464,7 @@ mod tests {
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
 
         let planned = plan_passes(&doc).unwrap();
-        assert_eq!(planned.skipped_no_stroke, 0);
+        assert_eq!(planned.skipped_not_cut, 0);
         assert_eq!(planned.passes.len(), 1);
         assert_eq!(planned.passes[0].color, Some(0x00FF00FF));
     }
@@ -481,7 +481,7 @@ mod tests {
 
         let planned = plan_passes(&doc).unwrap();
         assert!(planned.passes.is_empty());
-        assert_eq!(planned.skipped_no_stroke, 1);
+        assert_eq!(planned.skipped_not_cut, 1);
     }
 
     /// Neither paint, and cut anyway. `ColorPass::color` has always been `Option<u32>`;

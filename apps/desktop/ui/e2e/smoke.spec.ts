@@ -741,12 +741,26 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
 
   await page.getByRole("button", { name: "Cut" }).click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-  await expect(page.getByText("Not cut: 1 shapes marked No Cut")).toBeVisible();
+  await expect(page.getByText("Not cut: 1 shape marked No Cut")).toBeVisible();
 
   // Discriminating step: a command that ignored `value` and only ever wrote NoCut would pass
   // everything above. Marking it back has to restore the pass and empty the readout.
   await page.getByRole("button", { name: "Close" }).click();
   await cuttable.check();
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
+
+  // A selection whose shapes disagree is the one state the panel cannot answer with a plain
+  // tick, and the direction it picks when clicked is not cosmetic: `checked={cutLineType !==
+  // "NoCut"}` would render mixed as *checked*, so the click commits NoCut across the whole
+  // selection and shapes silently stop cutting — with every other assertion here still green.
+  await page.getByRole("button", { name: "Close" }).click();
+  await cuttable.uncheck();
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await expect(cuttable).toBeChecked({ indeterminate: true });
+
+  await cuttable.click();
   await page.getByRole("button", { name: "Cut" }).click();
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();

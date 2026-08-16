@@ -41,13 +41,13 @@ enum Command {
         /// Serial baud rate
         #[arg(long, default_value_t = 9600)]
         baud: u32,
-        /// Cut each stroke color as a separate pass, pausing between passes for a tool swap
+        /// Cut each color as a separate pass, pausing between passes for a tool swap
         #[arg(long)]
         by_color: bool,
-        /// Skip cutting shapes with this stroke color (RRGGBBAA); may be repeated
+        /// Skip cutting shapes of this color (RRGGBBAA); may be repeated
         #[arg(long = "skip-color")]
         skip_color: Vec<String>,
-        /// Comma-separated color order (RRGGBBAA,...) for --by-color passes
+        /// Comma-separated color order (RRGGBBAA,...) for --by-color passes; like --skip-color, cannot name the colorless pass
         #[arg(long)]
         order: Option<String>,
         /// Send geometry that falls outside the machine's cutting area

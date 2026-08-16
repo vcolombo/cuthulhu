@@ -7,7 +7,7 @@ const FALLBACK_BORDER = "#2E2E34";
 const FALLBACK_PANEL = "#1F1F23";
 const FALLBACK_TEXT = "#E7E7EA";
 
-/** Converts a packed 0xRRGGBBAA stroke color (see document::Style) to a CSS rgba() string. */
+/** Converts a packed 0xRRGGBBAA paint color (see document::Style) to a CSS rgba() string. */
 export function cssColor(rgba: number): string {
   const r = (rgba >>> 24) & 0xff;
   const g = (rgba >>> 16) & 0xff;

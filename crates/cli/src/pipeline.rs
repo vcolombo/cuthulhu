@@ -258,7 +258,7 @@ mod tests {
     /// A fill-only SVG used to be refused by name here, because `plan_passes` cut only stroked
     /// shapes. Since #144 `--by-color` plans it, keyed on the fill, and the refusal it used to
     /// produce belongs to an SVG with no geometry at all — which
-    /// `plain_cut_of_an_empty_svg_says_nothing_to_cut` covers.
+    /// `by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name` covers.
     #[test]
     fn a_fill_only_svg_is_planned_by_color_on_its_fill() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
@@ -267,6 +267,20 @@ mod tests {
         let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert_eq!(plan.passes[0].color, Some(0xFF0000FF));
+    }
+
+    /// The `--by-color` route to "no cuttable paths in SVG": no geometry means no passes, so
+    /// preflight refuses the cut and `describe_cut_error` turns `NothingToCut` into that
+    /// operator-facing sentence. `plain_cut_of_an_empty_svg_says_nothing_to_cut` is not a
+    /// witness to it — `plan_plain_cut` returns the same words from its own early check and
+    /// never reaches `describe_cut_error` — and the fill-only SVG that used to arrive here
+    /// plans a pass since #144, so this is the only test holding that arm in place.
+    #[test]
+    fn by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false)
+            .expect_err("an SVG with no geometry has nothing to cut");
+        assert_eq!(err, "no cuttable paths in SVG");
     }
 
     #[test]

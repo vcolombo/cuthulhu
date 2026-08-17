@@ -32,7 +32,7 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
     </svg>"##;
     // Planned through the same entry point `cut --by-color` uses, preflight included.
     let puma = driver_for("puma").expect("registry id");
-    let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), &[], None, false).unwrap();
+    let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false).unwrap();
     let passes = &plan.passes;
     assert_eq!(passes.len(), 2);
 

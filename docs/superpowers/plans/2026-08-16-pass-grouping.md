@@ -4,73 +4,69 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let an operator choose how a Document's shapes are split into passes — by stroke colour, fill colour, material preset, line type, today's stroke-else-fill rule, or one pass over everything — by making a pass's identity a `PassKey` instead of an `Option<u32>` colour, and giving a Node an inheritable material preset to group on. Closes #148.
+**Goal:** Let an operator choose how a Document's shapes are split into passes — by stroke colour, fill colour, material preset, today's stroke-else-fill rule, or one pass over everything — by making a pass's identity a `PassKey` instead of an `Option<u32>` colour, and giving a Node an inheritable material assignment to group on. Closes #148.
 
-**Architecture:** `PassKey { All, Color(Option<u32>), LineType(CutLineType), Preset(Option<String>) }` replaces the colour that identifies a pass in ten places from `cutplan::passes` to the e2e fake, and it crosses every boundary as one canonical string (`all`, `color:ff0000ff`, `line-type:cut`, `preset:cameo5-htv`) so the CLI, the JSON DTOs, and the dialog's row keys cannot disagree. `ColorPass` becomes `DocumentPass`. `Grouping` gains `Stroke`, `Fill`, `LineType` and `Preset` beside today's `Color` (stroke-else-fill, still the library default) and `Single`. `Node` gains `material_preset: Option<String>`, inherited down `plan_passes_with`'s existing walk so a Layer's preset covers the shapes under it. The chosen grouping rides in the `plan_cut`, `travel_for_order` and `cut` payloads rather than in `AppState`, because those are three separate round trips and a stored mode can drift from the rows the operator is looking at.
+**Architecture:** `PassKey { All, Color(Option<u32>), Preset(Option<String>) }` replaces the colour that identifies a pass in ten places from `cutplan::passes` to the e2e fake, and it crosses every boundary as one canonical, **injective** string (`all`, `color:ff0000ff`, `no-color`, `preset:cameo5-htv`, `no-preset`) so the CLI, the JSON DTOs and the dialog's row keys cannot disagree. `ColorPass` becomes `DocumentPass`. `Grouping` becomes `{Single, Color, Stroke, Fill, Preset}` with `Color` (stroke-else-fill, today's rule) staying the library default. `Node` gains `material_preset: PresetAssignment` — a three-state `Inherit`/`Unassigned`/`Preset(id)` — resolved down `plan_passes_with`'s existing preorder walk, while the editing command writes only the selection. The chosen grouping rides in the `plan_cut`, `travel_for_order` and `cut` payloads, and the dialog holds it with the rows it produced as one installed-plan state.
 
-**Tech Stack:** Rust 2021 (`document`, `cutplan`, `cli`, `apps/desktop`), React + TypeScript (`apps/desktop/ui`), Playwright for e2e. **No new dependencies** in either language.
+**Tech Stack:** Rust 2021 (`document`, `fileio`, `cutplan`, `cli`, `apps/desktop`), React + TypeScript (`apps/desktop/ui`), Playwright for e2e. **No new dependencies** in either language.
 
-**Spec:** `docs/superpowers/specs/2026-08-16-pass-grouping-design.md` — read it first. It holds the reference-application research, the reasons `All` is not `Color(None)`, why the key is a string on the wire, why the planner does not validate a preset id, and the alternatives that were rejected.
+**Spec:** `docs/superpowers/specs/2026-08-16-pass-grouping-design.md` — read it first. It holds the reference-application research, why absence is its own grammar token, why `PresetAssignment` has three states, why assignment does not descend, why line-type grouping is *not* in this slice, and the alternatives that were rejected. Its *Revisions* section lists the four decisions a Codex review overturned; this plan implements the revised ones.
 
 ## Global Constraints
 
-**Reading the code blocks in this plan:** a block is the complete text of what it introduces
-unless it contains a bare `…` line. A `…` appears only inside a block quoting an *existing*
-function this plan modifies, and means "the surrounding lines are unchanged — do not retype
-them". Every such block names the file and line range it edits, so the unchanged part is
-readable in the tree. There are no placeholders: nothing in this plan is left for the
-implementer to invent.
+**Reading the code blocks in this plan:** a block is the complete text of what it introduces unless it contains a bare `…` line. A `…` appears only inside a block quoting an *existing* function this plan modifies, and means "the surrounding lines are unchanged — do not retype them". Every such block names the file and line range it edits. There are no placeholders: nothing here is left for the implementer to invent.
 
 - **SPDX header on every file** — `// SPDX-License-Identifier: GPL-3.0-or-later` (`<!-- -->` in Markdown, `//` in Rust and TypeScript). Every file this plan touches already has one; new files need one.
-- **`cargo test --workspace --locked` is the gate**, and `--locked` is mandatory. This change adds no dependency, so `Cargo.lock` must not change. If it does, something was added that this plan did not intend.
-- **`ui/dist` is committed.** Any task that edits `apps/desktop/ui/src` must end with `npm --prefix apps/desktop/ui run build` and commit `apps/desktop/ui/dist` in the same commit — CI rebuilds and fails on a stale bundle. Tasks 7, 8, 9 and 10 touch `ui/src`.
-- **`CONTEXT.md` is normative vocabulary**, and this change edits it (Task 11). Terms in play: **Node**, **DocumentPasses**, **PassSelection**, **CutPlan**, **Preflight**, **MaterialPreset**, **Settings**. **ColorPass is retired** and replaced by **DocumentPass** plus the new **PassKey**; do not leave both names alive.
-- **Comments explain why, not what.** Every comment specified below records a constraint, a trap, or a decision taken against an alternative. Do not add comments restating code.
-- **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path. Two are specified here: `Grouping::LineType`'s single reachable key, and the CLI's one-settings-pair-per-cut.
-- **The e2e fake mirrors the real backend** (`CLAUDE.md:135-138`). `apps/desktop/ui/e2e/smoke.spec.ts` re-implements `plan_passes` at `:302-341`; when the key or the grouping changes, so does the fake, or the suite lies.
-- **`Grouping::Color` stays what `plan_passes` defaults to.** Existing behaviour must not move: `Color` is verbatim today's stroke-else-fill rule, and every caller that does not name a mode gets it.
-- **The dialog's chosen grouping must reach all three planner call sites.** `plan_cut_response`, `travel_for_order` and `prepare_cut` each plan independently; if one of them plans a different grouping, the travel preview and the cut silently disagree. Any task that adds a call site adds the parameter.
-- **Out of scope, and must not creep in:** separate confirmed jobs versus one continuous job (#149), colour-layer alignment marks (#150), `CutEdge` or any new `CutLineType` member (#56), a second per-node "production role" enum (#68 settled that the role *is* `CutLineType`), a configurable import default (#54), and generated IPC types (#70).
+- **`cargo test --workspace --locked` is the gate**, and `--locked` is mandatory. This change adds no dependency, so `Cargo.lock` must not change.
+- **`ui/dist` is committed.** Any task that edits `apps/desktop/ui/src` must end with `npm --prefix apps/desktop/ui run build` and commit `apps/desktop/ui/dist` in the same commit — CI rebuilds and fails on a stale bundle. Tasks 6, 7, 8 and 9 touch `ui/src`.
+- **`CONTEXT.md` is normative vocabulary**, and this change edits it (Task 10). **ColorPass is retired** and replaced by **DocumentPass** plus **PassKey**, **Grouping** and **PresetAssignment**; do not leave both names alive.
+- **Comments explain why, not what.** Every comment specified below records a constraint, a trap, or a decision taken against an alternative.
+- **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path. One is specified here: the CLI's single settings pair for every pass.
+- **The e2e fake mirrors the real backend** (`CLAUDE.md:135-138`). `apps/desktop/ui/e2e/smoke.spec.ts` re-implements `plan_passes` at `:302-341`; a fake that ignores the grouping or skips the identity check makes the suite green on a frontend that cannot work.
+- **`Grouping::Color` stays what `plan_passes` defaults to.** Existing behaviour must not move.
+- **The grouping must reach all three planner call sites** — `plan_cut_response`, `travel_for_order`, `prepare_cut` — *and* the dialog must not be able to send rows from one mode under another. Both halves are required; the payload alone is not enough.
+- **Out of scope, and must not creep in:** separate confirmed jobs versus one continuous job (#149), colour-layer alignment marks (#150), `Grouping::LineType`/`PassKey::LineType` and `CutEdge` (#56), a second per-node "production role" enum (#68 settled that the role *is* `CutLineType`), a configurable import default (#54), generated IPC types (#70), per-pass CLI settings, and replacing `{e:?}` in `apps/desktop/src/ipc.rs` (#93 owns all eleven sites; doing one differently leaves two conventions in one file).
 
 ## File Structure
 
 | File | Responsibility after this change |
 |---|---|
-| `crates/cutplan/src/pass_key.rs` | **New.** Owns `PassKey`, its canonical string grammar (`Display`/`FromStr`), and its serde string representation. Kept out of `passes.rs`, which is already 582 lines and owns the walk. |
-| `crates/cutplan/src/passes.rs` | `DocumentPass { key, shapes }`, `Grouping`'s six modes, the key-selection rule per mode, and preset inheritance in the walk. |
+| `crates/cutplan/src/pass_key.rs` | **New.** Owns `PassKey`, its injective canonical grammar (`Display`/`FromStr`), and its serde string representation. Kept out of `passes.rs`, which is already 582 lines and owns the walk. |
+| `crates/cutplan/src/passes.rs` | `DocumentPass { key, shapes }`, `Grouping`'s five modes, the key rule per mode, and preset resolution in the walk. |
 | `crates/cutplan/src/plan.rs` | `PassSelection { key, settings }`, `PlannedPass { key, job }`, `CutError::UnknownPass(PassKey)` with code `unknown_pass`. |
 | `crates/cutplan/src/preflight.rs` | Unchanged rules; `ConfiguredPass::pass` is a `&DocumentPass`. |
-| `crates/document/src/node.rs` | `Node::material_preset`, defaulted absent through `NodeWire`. |
-| `crates/document/src/commands.rs` | `set_material_preset`, the second per-node production attribute command. |
-| `crates/cli/src/main.rs` | `--group-by`, `--skip-pass`, `--order` over pass keys; the dry-run pass label prints a `PassKey`. |
-| `crates/cli/src/pipeline.rs` | `pass_order` over keys, `check_pass_flag_scope`, and one planning entry point that takes a `Grouping`. |
-| `crates/cli/src/cut.rs` | The operator prompt names a pass by its key, not by a colour. |
+| `crates/document/src/node.rs` | `PresetAssignment` and `Node::material_preset`, defaulting to `Inherit` through `NodeWire`. |
+| `crates/document/src/commands.rs` | `set_material_preset`, which writes the selection and never descends. |
+| `crates/cli/src/main.rs` | `--group-by`, repeatable `--skip-pass` and `--order` over pass keys; the dry-run header rule. |
+| `crates/cli/src/pipeline.rs` | `pass_order` over keys with both flags validated, `check_pass_flag_scope`, and one planning entry point taking a `Grouping`. |
+| `crates/cli/src/cut.rs` | The operator prompt names a pass by its key. |
 | `apps/desktop/src/device.rs` | Cut DTOs carry `key` and `grouping`; the three planner call sites take a `Grouping`. |
 | `apps/desktop/src/{state,ipc,main}.rs` | `set_material_preset`, and the grouping parameter on `plan_cut`/`travel_for_order`. |
-| `apps/desktop/ui/src/ipc.ts` | `PassKey` (a string), `Grouping`, and the three cut callers that now pass a grouping. |
-| `apps/desktop/ui/src/cut/viewmodel.ts` | `PassVm.key`, `parsePassKey`, and the request builders. |
-| `apps/desktop/ui/src/cut/{CutDialog,CutPreview}.tsx` | The grouping picker, a row label per key kind, and a swatch derived from a parsed key. |
-| `apps/desktop/ui/src/panels/{materialPreset.ts,PropertiesPanel.tsx}` | The operator's per-node preset control, mirroring the cuttability one. |
-| `apps/desktop/ui/e2e/smoke.spec.ts` | The fake keys passes the same way, honours the grouping argument, and its stale `travel_for_order` comment is corrected (#143). |
-| `CONTEXT.md`, `CLAUDE.md`, `CHANGELOG.md` | DocumentPass and PassKey replace ColorPass in the normative vocabulary; the cut-path paragraph names the grouping. |
+| `apps/desktop/ui/src/ipc.ts` | `PassKey`, `Grouping`, `PresetAssignmentJson`, and the three cut callers. |
+| `apps/desktop/ui/src/cut/viewmodel.ts` | `PassVm.key`, `parsePassKey`, `passRowLabel`, `presetIdForKey`, and the request builders. |
+| `apps/desktop/ui/src/cut/{CutDialog,CutPreview}.tsx` | The grouping picker, one installed-plan state, grouping-aware row labels, a swatch from a parsed key. |
+| `apps/desktop/ui/src/panels/{materialPreset.ts,PropertiesPanel.tsx}` | The three-state per-Node material control and the pure helpers behind it. |
+| `apps/desktop/ui/src/App.tsx` | Owns the preset list (today it is local to the cut dialog) so the panel and the dialog read one copy. |
+| `apps/desktop/ui/e2e/smoke.spec.ts` | The fake keys passes, honours the grouping, mirrors the exact-once identity check, and implements `set_material_preset`. |
+| `CONTEXT.md`, `CLAUDE.md`, `CHANGELOG.md`, `apps/desktop/MANUAL-CHECKLIST.md` | Vocabulary, cut-path prose, operator-visible changes, and the two live checks that name removed flags. |
 
-**Task order is load-bearing.** Tasks 1 and 2 add things nothing reads yet (`PassKey`, `Node::material_preset`). Task 3 makes the planner key on `PassKey` and inherit presets — the first behaviour change, and the one every later task consumes. Task 4 carries it through selection and refusal. Tasks 5 and 6 give the two binaries a way to choose a mode. Tasks 7–9 are the UI, in dependency order (wire → dialog → panel). Task 10 makes the e2e fake tell the truth again. Task 11 updates the vocabulary the whole change contradicts. **Every task ends green on `cargo test --workspace --locked`**, and every task that touches `ui/src` also ends green on `npm --prefix apps/desktop/ui test`.
+**Task order is load-bearing.** Tasks 1 and 2 add things nothing reads yet. Task 3 is the cutover — planner *and* selection in one commit, because the type change cannot be split below that pair without leaving the workspace unbuildable (a Codex review confirmed even `cargo test -p cutplan --lib passes` cannot compile with `plan.rs` still on colours: Cargo compiles every library test module before filtering by name). Tasks 4 and 5 give the two binaries the choice. Tasks 6–8 are the UI in dependency order. Task 9 makes the e2e fake tell the truth. Task 10 updates the vocabulary the change contradicts. **Every task ends green on `cargo test --workspace --locked`**, and every task touching `ui/src` also ends green on `npm --prefix apps/desktop/ui test`.
 
 ---
 
-### Task 1: `PassKey` and its one grammar
+### Task 1: `PassKey` and its injective grammar
 
 **Files:**
 - Create: `crates/cutplan/src/pass_key.rs`
-- Modify: `crates/cutplan/src/lib.rs` (add `mod pass_key;` and re-export)
+- Modify: `crates/cutplan/src/lib.rs` (add `mod pass_key;` and re-export as the neighbouring modules are re-exported)
 
 **Interfaces:**
-- Consumes: `document::CutLineType`.
-- Produces: `cutplan::PassKey` with `Display`, `FromStr` (`Err = String`), `From<PassKey> for String`, `TryFrom<String>`, `Serialize`/`Deserialize` as the canonical string. Task 3 keys passes with it, Task 4 selects and refuses with it, Task 5 parses CLI values into it, Task 6 serializes it, Task 7 mirrors it in TypeScript.
+- Consumes: nothing.
+- Produces: `cutplan::PassKey` with `Display`, `FromStr` (`Err = String`), `From<PassKey> for String`, `TryFrom<String>`, and `Serialize`/`Deserialize` as the canonical string. Task 3 keys passes with it, Task 4 parses CLI values into it, Task 5 serializes it, Task 6 mirrors it in TypeScript.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/cutplan/src/pass_key.rs` containing only the SPDX header, `use` lines, and this test module:
+Create `crates/cutplan/src/pass_key.rs` with the SPDX header and this test module only:
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -78,28 +74,54 @@ Create `crates/cutplan/src/pass_key.rs` containing only the SPDX header, `use` l
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    /// Every variant, in both directions. The same table appears in TypeScript
-    /// (`apps/desktop/ui/src/cut/viewmodel.test.ts`) because the string is the only thing
-    /// that crosses the boundary — if the two tables disagree, the dialog and the planner
-    /// disagree about what a pass is called.
+    /// Every variant, both directions, plus the JSON form. The same table appears in
+    /// TypeScript (`apps/desktop/ui/src/cut/viewmodel.test.ts`) because the string is the
+    /// only thing that crosses the boundary — if the two tables disagree, the dialog and the
+    /// planner disagree about what a pass is called.
     #[test]
     fn every_key_round_trips_through_its_canonical_string() {
         let table = [
             (PassKey::All, "all"),
             (PassKey::Color(Some(0xFF0000FF)), "color:ff0000ff"),
             (PassKey::Color(Some(0x0000FFFF)), "color:0000ffff"),
-            (PassKey::Color(None), "color:none"),
-            (PassKey::LineType(CutLineType::Cut), "line-type:cut"),
-            (PassKey::LineType(CutLineType::NoCut), "line-type:no-cut"),
+            (PassKey::Color(None), "no-color"),
             (PassKey::Preset(Some("cameo5-htv".into())), "preset:cameo5-htv"),
-            (PassKey::Preset(None), "preset:none"),
+            (PassKey::Preset(None), "no-preset"),
         ];
         for (key, text) in table {
             assert_eq!(key.to_string(), text);
             assert_eq!(text.parse::<PassKey>().unwrap(), key);
             assert_eq!(serde_json::to_string(&key).unwrap(), format!("\"{text}\""));
             assert_eq!(serde_json::from_str::<PassKey>(&format!("\"{text}\"")).unwrap(), key);
+        }
+    }
+
+    /// The property the first spelling lacked. A preset id is an unrestricted operator
+    /// string (`presets.rs:9-15`), so `preset:none` for "no preset" collided with a preset
+    /// whose id is literally `none` — two passes writing one string, which is duplicate
+    /// React keys and a `plan_mismatch` no operator can clear. Absence is its own token.
+    #[test]
+    fn no_two_keys_write_the_same_string() {
+        let keys = [
+            PassKey::All,
+            PassKey::Color(Some(0xFF0000FF)),
+            PassKey::Color(None),
+            PassKey::Preset(None),
+            PassKey::Preset(Some("none".into())),
+            PassKey::Preset(Some("no-preset".into())),
+            PassKey::Preset(Some("all".into())),
+            PassKey::Preset(Some("vinyl:thin".into())),
+            PassKey::Preset(Some("with,comma".into())),
+        ];
+        let mut seen: HashMap<String, PassKey> = HashMap::new();
+        for key in &keys {
+            let text = key.to_string();
+            assert_eq!(text.parse::<PassKey>().unwrap(), *key, "round trip {text}");
+            if let Some(prev) = seen.insert(text.clone(), key.clone()) {
+                panic!("{prev:?} and {key:?} both write {text}");
+            }
         }
     }
 
@@ -112,8 +134,8 @@ mod tests {
         assert_eq!(PassKey::Color(Some(0xFF0000FF)).to_string(), "color:ff0000ff");
     }
 
-    /// A preset id may contain a colon, because ids are the operator's and nothing
-    /// validates them. Splitting on the first separator is what allows that.
+    /// A preset id may contain the separator, because ids are the operator's and nothing
+    /// validates them. Splitting on the first `:` is what allows that.
     #[test]
     fn a_preset_id_may_contain_the_separator() {
         let key: PassKey = "preset:vinyl:thin".parse().unwrap();
@@ -121,21 +143,18 @@ mod tests {
         assert_eq!(key.to_string(), "preset:vinyl:thin");
     }
 
-    /// Refused rather than coerced, and refused with the string in the message: these
-    /// arrive from a person typing `--skip-pass`, so the error is read by a human.
+    /// Refused rather than coerced, and quoting the input: these arrive from a person typing
+    /// `--skip-pass`. `preset:` is refused because an empty tail is the one id that would be
+    /// indistinguishable from a truncated key; `color:none` and `line-type:cut` are refused
+    /// because they are the retired spellings, and accepting them quietly would resurrect the
+    /// collision and a mode that no longer exists.
     #[test]
     fn a_malformed_key_is_refused_by_name() {
-        for bad in ["", "all:1", "color:", "color:zz", "color:ff0000", "line-type:draw", "colour:ff0000ff"] {
-            let err = bad.parse::<PassKey>().expect_err("{bad} must not parse");
+        for bad in ["", "all:1", "preset:", "color:", "color:zz", "color:ff0000",
+                    "color:none", "line-type:cut", "no-material", "colour:ff0000ff"] {
+            let err = bad.parse::<PassKey>().expect_err("must not parse");
             assert!(err.contains(bad), "{err} should quote the input");
         }
-    }
-
-    /// A 6-digit colour is the trap `parse_hex_color` was written for: it would parse as
-    /// `0x00RRGGBB`, a colour no shape has, and silently match nothing.
-    #[test]
-    fn a_six_digit_colour_is_refused_rather_than_zero_padded() {
-        assert!("color:ff0000".parse::<PassKey>().is_err());
     }
 }
 ```
@@ -148,13 +167,12 @@ Expected: compile errors — `cannot find type 'PassKey' in this scope`.
 
 - [ ] **Step 3: Write the implementation**
 
-Above the test module in `crates/cutplan/src/pass_key.rs`:
+Above the test module:
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! What a pass is called, and the one string form that name takes everywhere.
 
-use document::CutLineType;
 use serde::{Deserialize, Serialize};
 
 /// What a `DocumentPass` is keyed on — the answer to "which pass is this?" for whichever
@@ -162,23 +180,21 @@ use serde::{Deserialize, Serialize};
 ///
 /// `All` is deliberately not `Color(None)`. Before #148 the single pass a `Grouping::Single`
 /// plan holds and the pass of shapes with no visible paint were both keyed `None`, so a
-/// refusal could only say the evasive "no planned pass without a color". One value meaning
-/// two things is what this variant buys out.
+/// refusal could only say the evasive "no planned pass without a color".
 ///
-/// The `Option`s are inside their variants rather than a shared `Unassigned`, because
-/// absence is a property of that mode's key: `Color(None)` is a shape with no visible paint,
-/// and `Preset(None)` is a shape nobody has assigned a material to — the ordinary state, not
-/// an error.
+/// The `Option`s sit inside their variants rather than a shared `Unassigned`, because absence
+/// is a property of that mode's key: `Color(None)` is a shape with no visible paint *in the
+/// mode's terms*, and `Preset(None)` is a shape resolving to no material — the ordinary
+/// state, not an error.
 ///
-/// Serialized as its canonical string (`Display`/`FromStr`) rather than as a tagged enum:
-/// the CLI needs a human grammar, the cut dialog needs a stable row key, and the e2e fake
-/// has to produce byte-identical values. One representation cannot drift from itself.
+/// Serialized as its canonical string (`Display`/`FromStr`) rather than as a tagged enum: the
+/// CLI needs a human grammar, the cut dialog needs a stable row key, and the e2e fake has to
+/// produce byte-identical values. One representation cannot drift from itself.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub enum PassKey {
     All,
     Color(Option<u32>),
-    LineType(CutLineType),
     Preset(Option<String>),
 }
 
@@ -189,11 +205,13 @@ impl std::fmt::Display for PassKey {
             // Lowercase, always: `FromStr` accepts either case, so writing one of them is
             // what makes the round trip a fixed point.
             PassKey::Color(Some(c)) => write!(f, "color:{c:08x}"),
-            PassKey::Color(None) => write!(f, "color:none"),
-            PassKey::LineType(CutLineType::Cut) => write!(f, "line-type:cut"),
-            PassKey::LineType(CutLineType::NoCut) => write!(f, "line-type:no-cut"),
             PassKey::Preset(Some(id)) => write!(f, "preset:{id}"),
-            PassKey::Preset(None) => write!(f, "preset:none"),
+            // Absence is its own token, never a reserved value inside a mode's namespace: a
+            // preset id is an unrestricted operator string, so `preset:none` would collide
+            // with a preset actually called `none`. `no-color` follows the same rule for one
+            // grammar rather than two, even though 8 hex digits could not have collided.
+            PassKey::Color(None) => write!(f, "no-color"),
+            PassKey::Preset(None) => write!(f, "no-preset"),
         }
     }
 }
@@ -201,23 +219,26 @@ impl std::fmt::Display for PassKey {
 impl std::str::FromStr for PassKey {
     type Err = String;
     fn from_str(s: &str) -> Result<PassKey, String> {
-        let unknown = || format!("'{s}' is not a pass key (all, color:RRGGBBAA, color:none, line-type:cut, line-type:no-cut, preset:<id>, preset:none)");
-        // First separator only: a preset id is the operator's string and may contain a
-        // colon, so the grammar must not constrain ids further than the app does.
+        let unknown = || format!("'{s}' is not a pass key (all, color:RRGGBBAA, no-color, preset:<id>, no-preset)");
+        // First separator only: a preset id may contain a colon, so the grammar must not
+        // constrain ids further than the application does.
         let Some((mode, value)) = s.split_once(':') else {
-            return if s == "all" { Ok(PassKey::All) } else { Err(unknown()) };
+            return match s {
+                "all" => Ok(PassKey::All),
+                "no-color" => Ok(PassKey::Color(None)),
+                "no-preset" => Ok(PassKey::Preset(None)),
+                _ => Err(unknown()),
+            };
         };
         match (mode, value) {
-            ("color", "none") => Ok(PassKey::Color(None)),
-            // Eight digits exactly: a 6-digit RRGGBB would parse as 0x00RRGGBB — a colour
-            // no shape carries — and match nothing while looking like it should.
+            // Eight digits exactly: a 6-digit RRGGBB would parse as 0x00RRGGBB — a colour no
+            // shape carries — and match nothing while looking like it should.
             ("color", hex) if hex.len() == 8 => u32::from_str_radix(hex, 16)
                 .map(|c| PassKey::Color(Some(c)))
                 .map_err(|_| format!("'{s}' has a colour that is not 8 hex digits (RRGGBBAA)")),
             ("color", _) => Err(format!("'{s}' has a colour that is not 8 hex digits (RRGGBBAA)")),
-            ("line-type", "cut") => Ok(PassKey::LineType(CutLineType::Cut)),
-            ("line-type", "no-cut") => Ok(PassKey::LineType(CutLineType::NoCut)),
-            ("preset", "none") => Ok(PassKey::Preset(None)),
+            // An empty id is the one tail that would make two keys indistinguishable.
+            ("preset", "") => Err(format!("'{s}' names an empty preset id")),
             ("preset", id) => Ok(PassKey::Preset(Some(id.to_string()))),
             _ => Err(unknown()),
         }
@@ -235,90 +256,109 @@ impl TryFrom<String> for PassKey {
 }
 ```
 
-In `crates/cutplan/src/lib.rs`, add the module beside the existing ones and re-export it exactly as `passes`/`plan` are re-exported (match whatever form that file already uses — `pub use pass_key::*;` if the others are glob re-exports).
-
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --workspace --locked`
 
-Expected: PASS. Nothing consumes `PassKey` yet, so no existing test can see it.
+Expected: PASS. Nothing consumes `PassKey` yet.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/cutplan/src/pass_key.rs crates/cutplan/src/lib.rs
-git commit -m "Give a pass a name that is not a colour, in one spelling
+git commit -m "Give a pass a name that is not a colour, in one spelling nothing else can write
 
-#148 needs a pass key that can be a line type or a preset, and the CLI, the
-IPC payloads, the cut dialog's row keys and the e2e fake all have to agree on
-what a pass is called. One canonical string, parsed and written in one place,
-is what keeps four consumers from inventing four encodings."
+#148 needs a key that can also be a material preset, and the CLI, the IPC
+payloads, the dialog's row keys and the e2e fake must agree on what a pass is
+called. Absence is its own token rather than a reserved value inside a mode:
+preset ids are unrestricted operator strings, so a preset called `none` would
+otherwise write the same string as no preset at all."
 ```
 
 ---
 
-### Task 2: A Node carries a material preset
+### Task 2: A Node carries a material assignment
 
 **Files:**
-- Modify: `crates/document/src/node.rs:44-63` (the `Node` struct and its two constructors), plus `NodeWire` and its `From` impl
-- Modify: `crates/document/src/commands.rs` (add `set_material_preset` after `set_cut_line_type` at `:55-81`)
-- Test: `crates/document/src/node.rs` (existing `mod tests`), `crates/document/src/commands.rs` (existing `mod tests`), `crates/fileio/src/project.rs` (existing `mod tests`, beside `a_project_saved_before_cuttability_derives_it_from_stroke`)
+- Modify: `crates/document/src/node.rs:44-63` (`Node` and its two constructors), plus `NodeWire` and its `From` impl
+- Modify: `crates/document/src/commands.rs` (add `set_material_preset` after `set_cut_line_type`, `:55-81`)
+- Test: `crates/document/src/node.rs` and `crates/document/src/commands.rs` (existing `mod tests`), `crates/fileio/src/project.rs` (existing `mod tests`, beside `a_project_saved_before_cuttability_derives_it_from_stroke`)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Node::material_preset: Option<String>` and `document::commands::set_material_preset(&Document, &[NodeId], Option<String>) -> Result<Delta, CmdError>`. Task 3 groups on the field, Task 6 exposes the command over IPC, Task 9 renders its control.
+- Produces: `document::PresetAssignment { Inherit, Unassigned, Preset(String) }`, `Node::material_preset: PresetAssignment`, and `document::commands::set_material_preset(&Document, &[NodeId], PresetAssignment) -> Result<Delta, CmdError>`. Task 3 resolves it in the walk, Task 5 exposes the command over IPC, Task 8 renders its control.
 
 - [ ] **Step 1: Write the failing tests**
 
 Append to `mod tests` in `crates/document/src/node.rs`:
 
 ```rust
-    /// A new Node has no material assigned. Unlike `cut_line_type`, there is no
-    /// import default to argue about: a preset is the operator's choice per shape or
-    /// per Layer, and "none" is the honest starting state.
+    /// A new Node inherits. There is no import default to argue about: a material is the
+    /// operator's choice per shape or per Layer, and inheriting is the state that lets a
+    /// Layer's choice reach the shapes under it.
     #[test]
-    fn a_new_node_has_no_material_preset() {
+    fn a_new_node_inherits_its_material() {
         let mut ids = IdGen::default();
-        assert_eq!(Node::shape(ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 }).material_preset, None);
-        assert_eq!(Node::container(ids.next(), NodeKind::Group).material_preset, None);
+        assert_eq!(Node::shape(ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 }).material_preset,
+            PresetAssignment::Inherit);
+        assert_eq!(Node::container(ids.next(), NodeKind::Group).material_preset,
+            PresetAssignment::Inherit);
     }
 
-    /// A document written before the field existed had no way to assign a preset, so
-    /// absence genuinely means none — the migration is the default, and this is the one
-    /// place that is true of the two production attributes a Node carries.
+    /// Three states, and the wire form each takes. `Unassigned` is the one the two-state
+    /// spelling could not express: a shape deliberately carrying no material *inside* an
+    /// assigned Layer, which is a pass an operator can otherwise never reach.
     #[test]
-    fn a_node_saved_without_a_material_preset_has_none() {
+    fn a_material_assignment_round_trips_in_all_three_states() {
+        for (value, json) in [
+            (PresetAssignment::Inherit, r#"{"state":"inherit"}"#),
+            (PresetAssignment::Unassigned, r#"{"state":"unassigned"}"#),
+            (PresetAssignment::Preset("cameo5-htv".into()), r#"{"state":"preset","id":"cameo5-htv"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<PresetAssignment>(json).unwrap(), value);
+        }
+    }
+
+    /// A document written before the field existed had no way to assign a material, so
+    /// absence means inherit — and an explicit `null` means the same, which serde gives for
+    /// free and which is deliberate: nothing this workspace writes can produce one, so it
+    /// only ever arrives from a hand-edited file.
+    #[test]
+    fn a_node_saved_without_a_material_assignment_inherits() {
         let json = r#"{"id":7,"kind":{"Shape":{"Rect":{"w":1.0,"h":1.0}}},
                        "transform":[1.0,0.0,0.0,1.0,0.0,0.0],
                        "style":{"stroke":255,"fill":null},
                        "cut_line_type":"Cut","children":[]}"#;
         let node: Node = serde_json::from_str(json).unwrap();
-        assert_eq!(node.material_preset, None);
+        assert_eq!(node.material_preset, PresetAssignment::Inherit);
         assert_eq!(node.cut_line_type, CutLineType::Cut, "premise: the other attribute still decodes");
+
+        let nulled = json.replace(r#""cut_line_type":"Cut""#, r#""cut_line_type":"Cut","material_preset":null"#);
+        assert_eq!(serde_json::from_str::<Node>(&nulled).unwrap().material_preset,
+            PresetAssignment::Inherit);
     }
 
-    /// Written on every save, so a preset survives a round trip and the field stops being
-    /// absent the first time a document is written by this version.
+    /// Written on every save, so the field stops being absent the first time a document is
+    /// written by this version and is never ambiguous again.
     #[test]
-    fn a_material_preset_round_trips() {
+    fn a_material_assignment_is_always_written() {
         let mut node = Node::shape(NodeId(1), ShapeKind::Rect { w: 1.0, h: 1.0 });
-        node.material_preset = Some("cameo5-htv".into());
+        node.material_preset = PresetAssignment::Preset("cameo5-htv".into());
         let json = serde_json::to_string(&node).unwrap();
-        assert!(json.contains(r#""material_preset":"cameo5-htv""#), "{json}");
+        assert!(json.contains(r#""material_preset":{"state":"preset","id":"cameo5-htv"}"#), "{json}");
         assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
     }
 ```
 
-Append to `mod tests` in `crates/fileio/src/project.rs`, beside the cuttability migration test
-#144 added — serde in isolation cannot see the container an operator's file actually is:
+Append to `mod tests` in `crates/fileio/src/project.rs`, beside the cuttability migration test #144 added — serde in isolation cannot see the container an operator's file actually is:
 
 ```rust
     /// The migration at the level an operator experiences it: a real `.cut` written before
     /// the field existed. The manifest is pruned rather than hand-written, so the fixture
-    /// cannot drift from `Document`'s real shape — everything except `material_preset` is
-    /// exactly what `save_project` emits today.
+    /// cannot drift from `Document`'s real shape.
     #[test]
-    fn a_project_saved_before_material_presets_loads_with_none() {
+    fn a_project_saved_before_material_assignments_inherits() {
         let mut doc = document::Document::new();
         let shape = document::Node::shape(doc.ids.next(),
             document::ShapeKind::Rect { w: 10.0, h: 10.0 });
@@ -340,58 +380,82 @@ Append to `mod tests` in `crates/fileio/src/project.rs`, beside the cuttability 
         zip.finish().unwrap();
 
         let back = load_project(&path).unwrap();
-        assert_eq!(back.get(shape_id).unwrap().material_preset, None);
+        assert_eq!(back.get(shape_id).unwrap().material_preset, document::PresetAssignment::Inherit);
         assert_eq!(back.get(shape_id).unwrap().cut_line_type, document::CutLineType::Cut,
             "premise: the neighbouring migration still runs");
     }
 ```
 
-`design.svg` is deliberately absent from the fixture: `load_project` reads only `manifest.json`
-(`crates/fileio/src/project.rs:29`), so a container without it is a valid old file for this
-test's purpose and one fewer thing to keep in step.
+`design.svg` is deliberately absent: `load_project` reads only `manifest.json` (`crates/fileio/src/project.rs:29`), so a container without it is a valid old file for this test's purpose.
 
 Append to `mod tests` in `crates/document/src/commands.rs`:
 
 ```rust
-    /// Descends into containers for the same reason `set_cut_line_type` does: the planner
-    /// reads a preset on the shape it inherits to, and a control that set it on a Group
-    /// alone would look like it did nothing. Selecting a Layer means its shapes.
+    /// Writes the selection and nothing else. This is the opposite of `set_cut_line_type`,
+    /// which descends — and the difference is the whole point: a `CutLineType` does not
+    /// inherit, so a value on a Group would be inert, while a material *does*. Descending
+    /// here would set today's shapes and leave the Layer holding nothing, after which a
+    /// shape added to it would disagree with its siblings.
     #[test]
-    fn set_material_preset_marks_shapes_under_a_container() {
+    fn set_material_preset_writes_the_selected_layer_and_not_its_children() {
         let mut doc = Document::new();
-        let group = Node::container(doc.ids.next(), NodeKind::Group);
-        let group_id = group.id;
+        let layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        let layer_id = layer.id;
         let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
         let shape_id = shape.id;
         doc.apply(Delta(vec![
-            NodeOp::Add { parent: doc.root, node: group, index: usize::MAX },
-            NodeOp::Add { parent: group_id, node: shape, index: usize::MAX },
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: shape, index: usize::MAX },
         ]));
 
-        let delta = set_material_preset(&doc, &[group_id], Some("cameo5-htv".into())).unwrap();
+        let delta = set_material_preset(&doc, &[layer_id],
+            PresetAssignment::Preset("cameo5-htv".into())).unwrap();
         doc.apply(delta);
-        assert_eq!(doc.get(shape_id).unwrap().material_preset.as_deref(), Some("cameo5-htv"));
-        assert_eq!(doc.get(group_id).unwrap().material_preset, None,
-            "the container is not what the planner reads");
+        assert_eq!(doc.get(layer_id).unwrap().material_preset,
+            PresetAssignment::Preset("cameo5-htv".into()));
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Inherit,
+            "the child still inherits — resolution is the planner's, not a stored copy's");
     }
 
-    /// Clearing is a value, not a separate verb — the panel's "No preset" option and an
-    /// undo of an assignment are the same edit.
+    /// A container and a shape inside it, both selected: both get the value. Nothing about
+    /// the overlap is special, because nothing descends.
     #[test]
-    fn set_material_preset_clears_with_none() {
+    fn set_material_preset_writes_every_selected_node_once() {
         let mut doc = Document::new();
-        let mut shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
-        shape.material_preset = Some("cameo5-htv".into());
+        let layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        let layer_id = layer.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: shape, index: usize::MAX },
+        ]));
+
+        let delta = set_material_preset(&doc, &[layer_id, shape_id, layer_id],
+            PresetAssignment::Unassigned).unwrap();
+        assert_eq!(delta.0.len(), 2, "one op per distinct node, duplicates ignored");
+        doc.apply(delta);
+        assert_eq!(doc.get(layer_id).unwrap().material_preset, PresetAssignment::Unassigned);
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Unassigned);
+    }
+
+    /// `Unassigned` is a value, not a clear: it stops inheritance, where `Inherit` restores
+    /// it. Both are reachable, because the panel offers both.
+    #[test]
+    fn set_material_preset_can_stop_or_restore_inheritance() {
+        let mut doc = Document::new();
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
         let shape_id = shape.id;
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
 
-        let delta = set_material_preset(&doc, &[shape_id], None).unwrap();
-        doc.apply(delta);
-        assert_eq!(doc.get(shape_id).unwrap().material_preset, None);
+        doc.apply(set_material_preset(&doc, &[shape_id], PresetAssignment::Unassigned).unwrap());
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Unassigned);
+        doc.apply(set_material_preset(&doc, &[shape_id], PresetAssignment::Inherit).unwrap());
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Inherit);
     }
 
-    /// Re-picking the value a selection already has emits nothing, so it cannot land an
-    /// undo step that undoes nothing — the same rule `set_cut_line_type` follows.
+    /// Re-picking the value a selection already has emits nothing, so it cannot land an undo
+    /// step that undoes nothing — the same rule `set_cut_line_type` follows.
     #[test]
     fn set_material_preset_emits_nothing_for_an_unchanged_selection() {
         let mut doc = Document::new();
@@ -399,96 +463,106 @@ Append to `mod tests` in `crates/document/src/commands.rs`:
         let shape_id = shape.id;
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
 
-        assert!(set_material_preset(&doc, &[shape_id], None).unwrap().0.is_empty());
-        assert_eq!(set_material_preset(&doc, &[], None), Err(CmdError::EmptySelection));
+        assert!(set_material_preset(&doc, &[shape_id], PresetAssignment::Inherit).unwrap().0.is_empty());
+        assert_eq!(set_material_preset(&doc, &[], PresetAssignment::Inherit),
+            Err(CmdError::EmptySelection));
     }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p document material_preset`
+Run: `cargo test -p document material` and `cargo test -p fileio material`
 
-Expected: compile errors — `no field 'material_preset' on type 'Node'` and `cannot find function 'set_material_preset'`.
+Expected: compile errors — `cannot find type 'PresetAssignment'`, `no field 'material_preset' on type 'Node'`, `cannot find function 'set_material_preset'`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `crates/document/src/node.rs`, add the field to `Node` (after `cut_line_type` at `:51`) and to both constructors:
+In `crates/document/src/node.rs`, above `Node`:
 
 ```rust
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-#[serde(from = "NodeWire")]
-pub struct Node {
-    pub id: NodeId,
-    pub kind: NodeKind,
-    pub transform: Affine,   // relative to parent
-    pub style: Style,
-    pub cut_line_type: CutLineType,
-    /// The `MaterialPreset::id` this Node's geometry is cut with, if the operator assigned
-    /// one. A sibling of `cut_line_type` and for the same reason (#68): production intent is
-    /// not paint. Read by `cutplan::plan_passes`, which inherits it down the tree, so a
-    /// value on a Layer covers the shapes under it.
-    ///
-    /// Never validated here: presets are machine-scoped and a user entry can be deleted, so
-    /// an id that resolves to nothing is a real state a Document may hold.
-    pub material_preset: Option<String>,
-    pub children: Vec<NodeId>,
+/// Which `MaterialPreset` a Node's geometry is cut with, or where to look for one.
+///
+/// A sibling of `cut_line_type`, and not on `Style`, for the reason #68 settled: production
+/// intent is not paint.
+///
+/// Three states rather than `Option<String>`, because the two-state spelling cannot say
+/// "deliberately no material, do not inherit". With absence meaning inherit, a shape inside an
+/// HTV Layer could never reach the no-preset pass — a pass that exists and resolves to the
+/// operator's own settings. `cutplan::plan_passes_with` resolves the chain; nothing stores a
+/// resolved value, so reparenting cannot leave a stale one.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "state", content = "id", rename_all = "kebab-case")]
+pub enum PresetAssignment {
+    /// Take the nearest ancestor's assignment; no ancestor means no material.
+    #[default]
+    Inherit,
+    /// No material, whatever any ancestor says.
+    Unassigned,
+    /// This `MaterialPreset::id`. Never validated here: presets are machine-scoped and a
+    /// user entry can be deleted, so an id that resolves to nothing is a real state.
+    Preset(String),
 }
-impl Node {
+```
+
+Add the field to `Node` (after `cut_line_type` at `:51`) and to both constructors:
+
+```rust
+    pub cut_line_type: CutLineType,
+    pub material_preset: PresetAssignment,
+    pub children: Vec<NodeId>,
+```
+
+```rust
     pub fn shape(id: NodeId, kind: ShapeKind) -> Node {
         Node { id, kind: NodeKind::Shape(kind), transform: Affine::identity(),
                style: Style::default(), cut_line_type: CutLineType::Cut,
-               material_preset: None, children: vec![] }
+               material_preset: PresetAssignment::Inherit, children: vec![] }
     }
     pub fn container(id: NodeId, kind: NodeKind) -> Node {
         Node { id, kind, transform: Affine::identity(),
                style: Style::default(), cut_line_type: CutLineType::Cut,
-               material_preset: None, children: vec![] }
+               material_preset: PresetAssignment::Inherit, children: vec![] }
     }
-}
 ```
 
-Add the field to `NodeWire` beside `cut_line_type`, and to its `From` impl. `#[serde(default)]` is the whole migration here — say why in a comment, because the neighbouring field's rule is deliberately different:
+In `NodeWire`, beside `cut_line_type`:
 
 ```rust
     /// A plain `#[serde(default)]`, unlike `cut_line_type` above: a document written before
-    /// this field existed had no way to assign a preset, so absence *is* none. There is
-    /// nothing to derive and no old behaviour to preserve.
+    /// this field existed had no way to assign a material, so absence *is* `Inherit`. There
+    /// is nothing to derive and no old behaviour to preserve.
     #[serde(default)]
-    material_preset: Option<String>,
+    material_preset: Option<PresetAssignment>,
 ```
 
-and in `From<NodeWire> for Node`, pass it straight through: `material_preset: w.material_preset,`.
+and in `From<NodeWire> for Node`: `material_preset: w.material_preset.unwrap_or_default(),`.
 
-In `crates/document/src/commands.rs`, add after `set_cut_line_type` (`:81`):
+In `crates/document/src/commands.rs`, after `set_cut_line_type` (`:81`):
 
 ```rust
-/// Assign `value` to every shape in `ids` and every shape beneath a container in `ids`.
+/// Assign `value` to every Node in `ids`, and to nothing else.
 ///
-/// The same walk as `set_cut_line_type`, for the same reason: `cutplan::plan_passes` reads
-/// the attribute on the shape (inheriting a container's value down to it), so setting it on
-/// a Group alone would be a control that visibly does nothing.
-pub fn set_material_preset(doc: &Document, ids: &[NodeId], value: Option<String>)
+/// Deliberately *not* `set_cut_line_type`'s walk. That command descends into containers
+/// because a `CutLineType` is read only on the shape that carries it, so a value on a Group
+/// would be inert. A material assignment is the opposite: `cutplan::plan_passes_with`
+/// resolves it down the tree, so writing a Layer's value is what makes every shape under it
+/// cut with that material — including shapes added or reparented later, which a descent would
+/// have left behind while making the Layer itself look assigned.
+pub fn set_material_preset(doc: &Document, ids: &[NodeId], value: PresetAssignment)
     -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let mut ops = vec![];
     let mut seen = HashSet::new();
-    let mut stack: Vec<NodeId> = ids.iter().rev().copied().collect();
-    while let Some(id) = stack.pop() {
-        let node = doc.get(id).ok_or(CmdError::NotFound)?;
-        // Skips a revisit rather than refusing it: an overlapping selection (a Group and a
-        // shape inside it) is the ordinary case here, unlike `plan_passes_with`'s walk from
-        // the single root where a revisit can only mean a cycle.
+    for &id in ids {
+        // A selection can name a node twice (a Layer and its shape are both ordinary
+        // selections); one op each, or the inverse delta would undo through a duplicate.
         if !seen.insert(id) { continue; }
-        match &node.kind {
-            NodeKind::Group | NodeKind::Layer => stack.extend(node.children.iter().rev().copied()),
-            NodeKind::Shape(_) => {
-                if node.material_preset == value { continue; }
-                let before = node.clone();
-                let mut after = before.clone();
-                after.material_preset = value.clone();
-                ops.push(NodeOp::Update { id, before, after });
-            }
-        }
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        if node.material_preset == value { continue; }
+        let before = node.clone();
+        let mut after = before.clone();
+        after.material_preset = value.clone();
+        ops.push(NodeOp::Update { id, before, after });
     }
     Ok(Delta(ops))
 }
@@ -498,45 +572,48 @@ pub fn set_material_preset(doc: &Document, ids: &[NodeId], value: Option<String>
 
 Run: `cargo test --workspace --locked`
 
-Expected: PASS. Every `Node` literal in the workspace is built through `Node::shape`/`Node::container`, so the new field needs no other edit; if a struct literal exists somewhere, the compiler names it.
+Expected: PASS. Every `Node` is built through the two constructors, so the new field needs no other edit; if a struct literal exists somewhere, the compiler names it.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/document/src/node.rs crates/document/src/commands.rs crates/fileio/src/project.rs
-git commit -m "Let a Node say which material it is cut with, and inherit nothing yet
+git commit -m "Let a Node say which material it is cut with, or that it inherits one
 
-#148 groups passes by material preset, which needs somewhere to put one. It
-sits beside cut_line_type rather than in Style for the reason #68 settled:
-production intent is not paint. Absence is none here, with nothing to derive
-from an old document, because a preset was never assignable before now."
+#148 groups passes by material, which needs somewhere to put one. Three states,
+not an Option: with absence meaning inherit, a shape inside an assigned Layer
+could never reach the no-preset pass. Assignment writes only the selection —
+the neighbouring cut-line-type command descends precisely because that
+attribute does not inherit, and copying it here would cancel out the
+inheritance the planner does."
 ```
 
 ---
 
-### Task 3: The planner keys on a `PassKey` and inherits a preset
+### Task 3: The planner and selection speak in keys
 
 **Files:**
-- Modify: `crates/cutplan/src/passes.rs:14-21` (`ColorPass` → `DocumentPass`), `:31-32` (`DocumentPasses::passes`), `:67-100` (`pass_key`, `Grouping`, `plan_passes`), `:100-169` (`plan_passes_with`'s walk), `:175` (`travel_moves`)
-- Modify: `crates/cutplan/src/preflight.rs:5-11` (the `ColorPass` import and `ConfiguredPass::pass`)
-- Test: `crates/cutplan/src/passes.rs` (existing `mod tests` from `:193`)
+- Modify: `crates/cutplan/src/passes.rs:14-21` (`ColorPass` → `DocumentPass`), `:31-32`, `:67-100` (`pass_key`, `Grouping`, `plan_passes`), `:100-169` (the walk), `:175` (`travel_moves`), and its `mod tests` from `:193`
+- Modify: `crates/cutplan/src/plan.rs:15-22`, `:38-44`, `:58-99`, `:125-152`, and its `mod tests` from `:154`
+- Modify: `crates/cutplan/src/preflight.rs:5-11`, and its test helpers at `:227` and `:238`
 
 **Interfaces:**
-- Consumes: `PassKey` (Task 1), `Node::material_preset` (Task 2).
-- Produces: `DocumentPass { key: PassKey, shapes: Vec<PlannedShape> }`, `Grouping { Single, Color, Stroke, Fill, LineType, Preset }`, and `plan_passes_with(&Document, Grouping)`. Task 4 matches selections against `key`; Tasks 5–10 choose a `Grouping`.
+- Consumes: `PassKey` (Task 1), `PresetAssignment` (Task 2).
+- Produces: `DocumentPass { key, shapes }`, `Grouping { Single, Color, Stroke, Fill, Preset }`, `plan_passes_with(&Document, Grouping)`, `PassSelection { key, settings }`, `PlannedPass { key, job }`, `CutError::UnknownPass(PassKey)` with code `unknown_pass`. Tasks 4–9 consume all of it.
+
+**This task is one commit on purpose.** The type change cannot be split: `plan.rs` and `preflight.rs` name `ColorPass` and match on `color`, and Cargo compiles every library test module before filtering by test name, so no smaller boundary is even buildable.
 
 - [ ] **Step 1: Write the failing tests**
 
 Append to `mod tests` in `crates/cutplan/src/passes.rs`:
 
 ```rust
-    /// One document, six modes, and the key set each produces. The point of the table is
-    /// that the modes are only different in what they key on: the same shapes are cut, in
-    /// the same document order, and only the split changes.
+    /// One document, five modes, and the key set each produces. The point of the table is
+    /// that the modes differ only in what they key on: the same shapes are cut, in the same
+    /// document order, and only the split changes.
     #[test]
     fn every_grouping_keys_the_same_shapes_differently() {
         let mut doc = Document::new();
-        // Red stroke + green fill, green stroke + green fill, fill only, no visible paint.
         let mut a = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
         a.style = Style { stroke: Some(RED), fill: Some(GREEN) };
         let mut b = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
@@ -559,18 +636,14 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
         assert_eq!(keys(Grouping::Single), vec!["all"]);
         // Stroke where visible, else fill: the rule #144 shipped, unchanged.
         assert_eq!(keys(Grouping::Color),
-            vec!["color:ff0000ff", "color:00ff00ff", "color:0000ffff", "color:none"]);
-        // Strict: a shape with no visible stroke keys on no colour at all, which is the
-        // same bucket a shape with no paint whatsoever lands in.
-        assert_eq!(keys(Grouping::Stroke), vec!["color:ff0000ff", "color:00ff00ff", "color:none"]);
-        assert_eq!(keys(Grouping::Fill), vec!["color:00ff00ff", "color:0000ffff", "color:none"]);
-        // One reachable key until CutLineType gains a second cuttable member (#56).
-        assert_eq!(keys(Grouping::LineType), vec!["line-type:cut"]);
-        assert_eq!(keys(Grouping::Preset), vec!["preset:none"]);
+            vec!["color:ff0000ff", "color:00ff00ff", "color:0000ffff", "no-color"]);
+        // Strict: a shape with no visible stroke keys on no colour at all, which is the same
+        // bucket a shape with no paint whatsoever lands in.
+        assert_eq!(keys(Grouping::Stroke), vec!["color:ff0000ff", "color:00ff00ff", "no-color"]);
+        assert_eq!(keys(Grouping::Fill), vec!["color:00ff00ff", "color:0000ffff", "no-color"]);
+        assert_eq!(keys(Grouping::Preset), vec!["no-preset"]);
 
-        // Every mode cuts all four shapes; only the split differs.
-        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill,
-                  Grouping::LineType, Grouping::Preset] {
+        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
             let planned = plan_passes_with(&doc, g).unwrap();
             let shapes: usize = planned.passes.iter().map(|p| p.shapes.len()).sum();
             assert_eq!(shapes, 4, "{g:?} dropped a shape");
@@ -587,51 +660,83 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
         shape.style = Style { stroke: None, fill: Some(RED) };
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
 
-        assert_eq!(plan_passes(&doc).unwrap().passes, plan_passes_with(&doc, Grouping::Color).unwrap().passes);
+        assert_eq!(plan_passes(&doc).unwrap().passes,
+            plan_passes_with(&doc, Grouping::Color).unwrap().passes);
         assert_eq!(plan_passes(&doc).unwrap().passes[0].key, PassKey::Color(Some(RED)));
     }
 
-    /// A preset on a Layer covers the shapes under it, and a shape overrides it. This is
-    /// why inheritance lives in the walk: the alternative is storing a derived value on
-    /// every shape, which goes stale the moment a node is reparented.
+    /// The three assignment states, resolved down the tree. `Unassigned` is the one that
+    /// earns the enum: without it the second shape could not leave its Layer's pass.
     #[test]
-    fn a_preset_is_inherited_from_the_nearest_ancestor() {
+    fn a_material_resolves_from_the_nearest_assigned_ancestor() {
         let mut doc = Document::new();
         let mut layer = Node::container(doc.ids.next(), NodeKind::Layer);
-        layer.material_preset = Some("cameo5-htv".into());
+        layer.material_preset = PresetAssignment::Preset("cameo5-htv".into());
         let layer_id = layer.id;
         let inherits = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let mut refuses = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        refuses.material_preset = PresetAssignment::Unassigned;
         let mut overrides = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
-        overrides.material_preset = Some("cameo5-vinyl-adhesive".into());
+        overrides.material_preset = PresetAssignment::Preset("cameo5-vinyl-adhesive".into());
         let outside = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
         doc.apply(Delta(vec![
             NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
             NodeOp::Add { parent: layer_id, node: inherits, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: refuses, index: usize::MAX },
             NodeOp::Add { parent: layer_id, node: overrides, index: usize::MAX },
             NodeOp::Add { parent: doc.root, node: outside, index: usize::MAX },
         ]));
 
         let keys: Vec<String> = plan_passes_with(&doc, Grouping::Preset).unwrap()
             .passes.iter().map(|p| p.key.to_string()).collect();
-        assert_eq!(keys, vec!["preset:cameo5-htv", "preset:cameo5-vinyl-adhesive", "preset:none"]);
+        assert_eq!(keys, vec!["preset:cameo5-htv", "no-preset", "preset:cameo5-vinyl-adhesive"]);
     }
 
-    /// An id no preset file resolves keys a pass anyway. Refusing here would put a
-    /// settings-file concern behind `plan_cut`, which exists to refuse geometry and machine
-    /// mismatches — and a user preset can be deleted while a document still names it.
+    /// Resolution lives in the walk, so a shape moved into an assigned Layer picks that
+    /// Layer's material up with no edit of its own. A stored resolved value would have gone
+    /// stale here, silently, and only shown up as the wrong settings on real material.
+    #[test]
+    fn a_reparented_shape_inherits_without_being_edited() {
+        let mut doc = Document::new();
+        let mut layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        layer.material_preset = PresetAssignment::Preset("cameo5-htv".into());
+        let layer_id = layer.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX },
+        ]));
+        assert_eq!(plan_passes_with(&doc, Grouping::Preset).unwrap().passes.len(), 2,
+            "premise: outside the Layer it is its own pass");
+
+        let moved = doc.get(shape_id).unwrap().clone();
+        doc.apply(Delta(vec![
+            NodeOp::Remove { parent: doc.root, node: moved.clone(), index: 1 },
+            NodeOp::Add { parent: layer_id, node: moved, index: usize::MAX },
+        ]));
+
+        let keys: Vec<String> = plan_passes_with(&doc, Grouping::Preset).unwrap()
+            .passes.iter().map(|p| p.key.to_string()).collect();
+        assert_eq!(keys, vec!["preset:cameo5-htv"]);
+    }
+
+    /// An id no preset file resolves still keys a pass. Refusing here would put a
+    /// settings-file concern behind `plan_cut`, and a user preset can be deleted while a
+    /// document still names it.
     #[test]
     fn an_unknown_preset_id_still_keys_a_pass() {
         let mut doc = Document::new();
         let mut shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
-        shape.material_preset = Some("deleted-by-the-operator".into());
+        shape.material_preset = PresetAssignment::Preset("deleted-by-the-operator".into());
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
 
         assert_eq!(plan_passes_with(&doc, Grouping::Preset).unwrap().passes[0].key,
             PassKey::Preset(Some("deleted-by-the-operator".into())));
     }
 
-    /// The predicate is still `cut_line_type`, and it is still checked before the outline
-    /// is resolved (#139) — a grouping mode changes the key, never the order of those two.
+    /// The predicate is still `cut_line_type`, still checked before the outline is resolved
+    /// (#139) — a grouping mode changes the key, never that order.
     #[test]
     fn a_no_cut_shape_is_counted_under_every_grouping() {
         let mut doc = Document::new();
@@ -640,8 +745,7 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
         shape.cut_line_type = CutLineType::NoCut;
         doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
 
-        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill,
-                  Grouping::LineType, Grouping::Preset] {
+        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
             let planned = plan_passes_with(&doc, g).unwrap();
             assert_eq!(planned.skipped_not_cut, 1, "{g:?}");
             assert!(planned.passes.is_empty(), "{g:?}");
@@ -649,32 +753,64 @@ Append to `mod tests` in `crates/cutplan/src/passes.rs`:
     }
 ```
 
-Add `const GREEN: u32 = 0x00FF00FF;` beside the existing colour constants if the module does not already have one, and extend the module's `use` line with `CutLineType` and `NodeKind` if they are not already imported.
+Add `const GREEN: u32 = 0x00FF00FF;` beside the module's existing colour constants, and extend its `use` line with `CutLineType`, `NodeKind` and `PresetAssignment` as needed.
+
+In `crates/cutplan/src/plan.rs`'s `mod tests`, replace `unknown_pass_color_is_refused_not_dropped` (`:213`) and the `UnknownPassColor` arms of `every_refusal_has_a_sentence_and_a_code` (`:292`):
+
+```rust
+    /// A selection naming a pass that was not planned is refused, never quietly dropped:
+    /// cutting three of four passes because one name was wrong is a ruined sheet.
+    #[test]
+    fn an_unknown_pass_is_refused_not_dropped() {
+        let planned = passes(&[(RED, 0.0, 0.0)]);
+        let missing = PassKey::Color(Some(0xDEADBEEF));
+        let err = plan_cut(&planned, &profile(500.0, 500.0), &caps(),
+            &opts(vec![PassSelection { key: missing.clone(), settings: Settings::default() }]))
+            .unwrap_err();
+        assert_eq!(err, CutError::UnknownPass(missing));
+    }
+```
+
+and inside `every_refusal_has_a_sentence_and_a_code`, replacing its three `UnknownPassColor` assertions:
+
+```rust
+        for (key, sentence) in [
+            (PassKey::Color(Some(0xFF0000FF)), "no planned pass is called color:ff0000ff"),
+            (PassKey::Color(None), "no planned pass is called no-color"),
+            (PassKey::All, "no planned pass is called all"),
+            (PassKey::Preset(Some("cameo5-htv".into())), "no planned pass is called preset:cameo5-htv"),
+            (PassKey::Preset(None), "no planned pass is called no-preset"),
+        ] {
+            let err = CutError::UnknownPass(key);
+            assert_eq!(err.code(), "unknown_pass");
+            assert_eq!(err.to_string(), sentence);
+        }
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p cutplan passes`
+Run: `cargo test -p cutplan`
 
 Expected: compile errors — `no variant 'Stroke' found for enum 'Grouping'`, `no field 'key' on type 'ColorPass'`.
 
 - [ ] **Step 3: Write the implementation**
 
-Rename the type and key it (replacing `crates/cutplan/src/passes.rs:14-21`):
+Replace `crates/cutplan/src/passes.rs:14-21`:
 
 ```rust
-/// All shapes cut together as one pass, and the key that says which pass it is. What the
-/// key means is the `Grouping`'s business: a colour, a line type, a material preset, or
-/// `All` for the single pass a `Grouping::Single` plan holds.
+/// All shapes cut together as one pass, and the key that says which pass it is. What the key
+/// means is the `Grouping`'s business: a colour, a material preset, or `All` for the single
+/// pass a `Grouping::Single` plan holds.
 ///
-/// Named for the Document rather than for a colour because a colour is now one of four
-/// things a pass can be keyed on — the type was `ColorPass` while that was the only one.
+/// Named for the Document rather than for a colour because a colour is now one of three
+/// things a pass can be keyed on — the type was `ColorPass` while it was the only one.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct DocumentPass { pub key: PassKey, pub shapes: Vec<PlannedShape> }
 ```
 
 Update `DocumentPasses::passes` to `Vec<DocumentPass>` (`:31-32`) and `travel_moves`'s parameter to `&[&DocumentPass]` (`:175`).
 
-Replace `pass_key`, `Grouping` and `plan_passes` (`:67-97`) with:
+Replace `pass_key`, `Grouping` and `plan_passes` (`:67-97`):
 
 ```rust
 /// The colour a shape's pass is keyed on under a colour-ish `Grouping`. Alpha-0 counts as
@@ -691,8 +827,8 @@ fn color_key(style: &Style, grouping: Grouping) -> Option<u32> {
         Grouping::Color => visible(style.stroke).or(visible(style.fill)),
         Grouping::Stroke => visible(style.stroke),
         Grouping::Fill => visible(style.fill),
-        // Not reachable: the caller only asks for a colour under a colour mode.
-        Grouping::Single | Grouping::LineType | Grouping::Preset => None,
+        // Not reachable: the caller asks for a colour only under a colour mode.
+        Grouping::Single | Grouping::Preset => None,
     }
 }
 
@@ -702,11 +838,12 @@ fn color_key(style: &Style, grouping: Grouping) -> Option<u32> {
 /// caller that names no mode plans exactly what it planned before #148. `Single` is one pass
 /// in document order, which is what `cuthulhu cut` without `--group-by` has always meant.
 ///
-/// ponytail: `LineType` has one reachable key while `CutLineType` is `{Cut, NoCut}` — a
-/// `NoCut` shape never reaches a pass at all. It splits real passes as soon as the enum
-/// gains a second cuttable member (`CutEdge`, #56), with no change needed here.
+/// There is no line-type mode: `CutLineType` is `{Cut, NoCut}` and a `NoCut` shape never
+/// reaches a pass, so such a mode would be `Single` under another name while carrying
+/// different skip/order semantics. #56 adds it with `CutEdge`, the member that makes it split
+/// anything.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub enum Grouping { Single, Color, Stroke, Fill, LineType, Preset }
+pub enum Grouping { Single, Color, Stroke, Fill, Preset }
 
 /// Walk the document in preorder from `doc.root`, group the shapes whose `CutLineType` is
 /// `Cut` by the key `grouping` asks for, and flatten each shape's outline under its
@@ -718,39 +855,51 @@ pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
 }
 ```
 
-In `plan_passes_with`, the stack carries the inherited preset alongside the world transform, and the key comes from the mode. Replace the stack declaration and the push in the container arm:
+In `plan_passes_with`, the stack carries the resolved material beside the world transform:
 
 ```rust
-    // The nearest ancestor's preset rides down the walk beside the world transform. Storing
-    // a resolved value on each shape instead would go stale the moment a node is reparented.
+    // The nearest assigned ancestor's material rides down the walk beside the world
+    // transform. Storing a resolved value on each shape instead would go stale the moment a
+    // node is reparented — silently, and only visible as the wrong settings on real material.
     let mut stack: Vec<(NodeId, Affine, Option<&str>)> = vec![(doc.root, Affine::identity(), None)];
 ```
 
+with `while let Some((id, parent_world, inherited)) = stack.pop()`, and immediately after `let world = …`:
+
+```rust
+        // Resolved for this node and everything under it. `Unassigned` is what stops the
+        // chain — the state an `Option<String>` could not express.
+        let material: Option<&str> = match &node.material_preset {
+            PresetAssignment::Inherit => inherited,
+            PresetAssignment::Unassigned => None,
+            PresetAssignment::Preset(id) => Some(id.as_str()),
+        };
+```
+
+the container arm pushes `material`:
+
 ```rust
             NodeKind::Group | NodeKind::Layer => {
-                let inherited = node.material_preset.as_deref().or(preset);
                 // Push in reverse so preorder visits children left-to-right.
                 for &child in node.children.iter().rev() {
-                    stack.push((child, world, inherited));
+                    stack.push((child, world, material));
                 }
             }
 ```
 
-and in the `Cut` arm, replace the `let color = match grouping { … }` block plus the pass lookup:
+and the `CutLineType::Cut` arm replaces the `let color = match grouping { … }` block and the pass lookup:
 
 ```rust
                         let key = match grouping {
-                            // One bucket, and a key that says so: `Color(None)` would be
-                            // the pass of unpainted shapes, which is a different fact.
+                            // One bucket, and a key that says so: `Color(None)` is the pass
+                            // of unpainted shapes, which is a different fact.
                             Grouping::Single => PassKey::All,
                             Grouping::Color | Grouping::Stroke | Grouping::Fill =>
                                 PassKey::Color(color_key(&node.style, grouping)),
-                            Grouping::LineType => PassKey::LineType(node.cut_line_type),
-                            // A shape's own value wins over what it inherited; neither is
-                            // checked against the preset file, which is `plan_cut`'s
-                            // non-business (a deleted user preset is a real state).
-                            Grouping::Preset => PassKey::Preset(
-                                node.material_preset.clone().or_else(|| preset.map(String::from))),
+                            // Not checked against the preset file: a deleted user preset is a
+                            // real state, and refusing a cut over a settings lookup is not
+                            // `plan_cut`'s job.
+                            Grouping::Preset => PassKey::Preset(material.map(String::from)),
                         };
                         match passes.iter_mut().find(|p| p.key == key) {
                             Some(pass) => pass.shapes.push(shape),
@@ -758,100 +907,19 @@ and in the `Cut` arm, replace the `let color = match grouping { … }` block plu
                         }
 ```
 
-Destructure the third stack element in the `while let` (`(id, parent_world, preset)`), and add `PassKey` to the module's imports.
+Add `PassKey` and `PresetAssignment` to the module's imports.
 
-In `crates/cutplan/src/preflight.rs`, change the import at `:5` to `use crate::passes::DocumentPass;` and `ConfiguredPass::pass` to `&'a DocumentPass`.
+**The mechanical migrations in this file and its neighbours — none optional, all named:**
 
-Fix the doc comments that describe the old behaviour: `DocumentPasses`' own comment (`:23-29`) is still true; `plan.rs:15-17`'s "keyed on the colour" is Task 4's to fix.
+- `crates/cutplan/src/passes.rs:317` — `assert_eq!(red.color, Some(RED))` becomes `assert_eq!(red.key, PassKey::Color(Some(RED)))`.
+- `crates/cutplan/src/passes.rs:463` — the `ColorPass { … }` literal in the travel test becomes `DocumentPass { key: …, shapes: … }`.
+- Every other `.color` on a pass, and every `Grouping::ByColor`, in that module's tests: `Grouping::ByColor` no longer exists — it is `Grouping::Color`.
+- `crates/cutplan/src/preflight.rs:5` — `use crate::passes::DocumentPass;`, and `ConfiguredPass::pass` becomes `&'a DocumentPass`.
+- `crates/cutplan/src/preflight.rs:227` — `fn make_pass(color: Option<u32>, shapes: Vec<PlannedShape>) -> ColorPass` becomes `fn make_pass(key: PassKey, shapes: Vec<PlannedShape>) -> DocumentPass`; its call sites pass `PassKey::Color(Some(…))`.
+- `crates/cutplan/src/preflight.rs:238` — `make_configured_pass`'s `&'a ColorPass` becomes `&'a DocumentPass`.
+- `crates/cutplan/src/plan.rs:188` — `fn select(colors: &[u32]) -> Vec<PassSelection>` becomes `fn select(keys: &[PassKey]) -> Vec<PassSelection>`; its callers at `:215`, `:223` and `:231` pass keys.
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-Run: `cargo test --workspace --locked`
-
-Expected: compile errors first in `crates/cutplan/src/plan.rs` and the desktop, which Tasks 4 and 6 own. **Get `-p cutplan --lib passes` green in this task, and expect the workspace build to fail until Task 4 lands** — the rename cannot be split from its consumers any smaller than that. If a reviewer needs a green workspace at every task boundary, fold Task 4 into this one.
-
-Run: `cargo test -p cutplan --lib passes`
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/cutplan/src/passes.rs crates/cutplan/src/preflight.rs
-git commit -m "Split passes by what the caller asked for, not only by a colour
-
-Grouping gains stroke, fill, line type and preset beside the stroke-else-fill
-rule, which stays the default so nothing existing re-plans differently. The
-pass a Single plan holds is keyed All rather than the colourless key it shared
-with unpainted shapes. A preset inherits down the walk, so a Layer's value
-covers its shapes without storing a copy that reparenting would falsify."
-```
-
----
-
-### Task 4: Selection and refusal speak in keys
-
-**Files:**
-- Modify: `crates/cutplan/src/plan.rs:15-22` (`PassSelection`), `:38-44` (`PlannedPass`), `:58-99` (`CutError`, its `Display`, its `code`), `:125-152` (matching and flattening)
-- Test: `crates/cutplan/src/plan.rs` (existing `mod tests` from `:154`)
-
-**Interfaces:**
-- Consumes: `PassKey` (Task 1), `DocumentPass` (Task 3).
-- Produces: `PassSelection { key: PassKey, settings: Settings }`, `PlannedPass { key: PassKey, job: Job }`, `CutError::UnknownPass(PassKey)` with `code()` `"unknown_pass"`. Tasks 5 and 6 build selections; Task 5 prints `PlannedPass::key`.
-
-- [ ] **Step 1: Write the failing tests**
-
-Replace the two colour-named tests in `crates/cutplan/src/plan.rs`'s `mod tests` — `unknown_pass_color_is_refused_not_dropped` (`:213`) and the refusal-table entries in `every_refusal_has_a_code_and_a_sentence` (`:292-305`) — with:
-
-```rust
-    /// A selection naming a pass that was not planned is refused, never quietly dropped:
-    /// cutting three of four passes because one name was wrong is a ruined sheet.
-    #[test]
-    fn an_unknown_pass_is_refused_not_dropped() {
-        let planned = passes(&[(RED, 0.0, 0.0)]);
-        let missing = PassKey::Color(Some(0xDEADBEEF));
-        let err = plan_cut(&planned, &profile(500.0, 500.0), &caps(),
-            &opts(vec![PassSelection { key: missing.clone(), settings: Settings::default() }]))
-            .unwrap_err();
-        assert_eq!(err, CutError::UnknownPass(missing));
-    }
-
-    /// Every refusal, with the code a caller branches on and the sentence an operator
-    /// reads. One arm per key kind, because the sentence names the key: "no planned pass
-    /// called preset:cameo5-htv" is a different fact from a colour that is not there.
-    #[test]
-    fn every_refusal_has_a_code_and_a_sentence() {
-        let stale = CutError::StalePlan { expected: 7, actual: 9 };
-        assert_eq!(stale.code(), "stale_plan");
-        assert_eq!(stale.to_string(), "the document changed since this cut was planned");
-
-        for (key, sentence) in [
-            (PassKey::Color(Some(0xFF0000FF)), "no planned pass is called color:ff0000ff"),
-            (PassKey::Color(None), "no planned pass is called color:none"),
-            (PassKey::All, "no planned pass is called all"),
-            (PassKey::LineType(document::CutLineType::Cut), "no planned pass is called line-type:cut"),
-            (PassKey::Preset(Some("cameo5-htv".into())), "no planned pass is called preset:cameo5-htv"),
-        ] {
-            let err = CutError::UnknownPass(key);
-            assert_eq!(err.code(), "unknown_pass");
-            assert_eq!(err.to_string(), sentence);
-        }
-
-        let wrapped = CutError::Preflight(PreflightError::NothingToCut);
-        assert_eq!(wrapped.code(), "nothing_to_cut");
-        assert_eq!(wrapped.to_string(), PreflightError::NothingToCut.to_string());
-    }
-```
-
-Update the module's other tests mechanically: every `PassSelection { color: Some(RED), … }` becomes `PassSelection { key: PassKey::Color(Some(RED)), … }`, and every `p.color` on a `PlannedPass` becomes `p.key`. The `select(&[…])` helper (used at `:215`, `:220`, `:229`) should take `PassKey`s so the call sites read as keys rather than as colours.
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `cargo test -p cutplan plan`
-
-Expected: compile errors — `no field 'key' on type 'PassSelection'`, `no variant 'UnknownPass'`.
-
-- [ ] **Step 3: Write the implementation**
+Then the selection types in `plan.rs`:
 
 ```rust
 /// One pass the caller wants cut, named by the key `plan_passes` gave it. Order within
@@ -864,8 +932,8 @@ pub struct PassSelection {
 ```
 
 ```rust
-/// One pass, ready to encode. Keeps its key attached to the geometry it belongs to so
-/// callers can label passes without index-matching a second list.
+/// One pass, ready to encode. Keeps its key attached to the geometry it belongs to so callers
+/// can label passes without index-matching a second list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlannedPass {
     pub key: PassKey,
@@ -882,7 +950,7 @@ pub enum CutError {
 }
 ```
 
-In `Display`, the two colour arms collapse into one, because the key knows how to name itself — which is the point of it having one spelling:
+In `Display`, the two colour arms collapse into one, because the key knows how to name itself:
 
 ```rust
             // The key's own `Display`, not a re-spelling of it: a caller who typed
@@ -890,9 +958,7 @@ In `Display`, the two colour arms collapse into one, because the key knows how t
             CutError::UnknownPass(key) => write!(f, "no planned pass is called {key}"),
 ```
 
-In `code()`, `CutError::UnknownPass(_) => "unknown_pass"`.
-
-In `plan_cut`, match on the key:
+In `code()`: `CutError::UnknownPass(_) => "unknown_pass"`. In `plan_cut`:
 
 ```rust
         let pass = planned
@@ -908,88 +974,114 @@ and in the `CutPlan` construction, `key: c.pass.key.clone(),`.
 
 Run: `cargo test -p cutplan --locked`
 
-Expected: PASS. The workspace still fails to build in `cli` and `apps/desktop`, which Tasks 5 and 6 own.
+Expected: PASS. The workspace still fails to build in `cli` and `apps/desktop`, which Tasks 4 and 5 own — this is the one boundary that cannot be green, and it is why those two tasks follow immediately.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/cutplan/src/plan.rs
-git commit -m "Refuse a pass by the name it was asked for, whatever kind of name it is
+git add crates/cutplan/src
+git commit -m "Split passes by what the caller asked for, and name them by key
 
-A selection is keyed rather than coloured, so the refusal says which pass was
-not planned in exactly the spelling the caller used. Two colour-specific
-sentences collapse into one, including the evasive 'no planned pass without a
-color' that only existed because a colourless pass and a single pass shared
-one key."
+Grouping gains strict stroke, strict fill and material preset beside the
+stroke-else-fill rule, which stays the default so nothing existing re-plans
+differently. A Single plan's pass is keyed All rather than sharing the
+colourless key with unpainted shapes, which is what lets a refusal say which
+pass was missing. A material resolves down the walk, so a reparented shape
+inherits without an edit and Unassigned can stop the chain."
 ```
 
 ---
 
-### Task 5: The CLI chooses a grouping and names passes by key
+### Task 4: The CLI chooses a grouping and names passes by key
 
 **Files:**
 - Modify: `crates/cli/src/main.rs:44-54` (the three flags), `:113-131` (dispatch), `:155-188` (`cut_by_color`)
 - Modify: `crates/cli/src/pipeline.rs:71-96` (`pass_order`), `:98-151` (both planning entry points), `:168-205` (`parse_hex_color`, the scope check, `check_interactive`)
-- Modify: `crates/cli/src/cut.rs:44-50` (`format_pass_color`), `:99-106` (`pass_color`)
-- Test: `crates/cli/src/pipeline.rs` and `crates/cli/src/cut.rs` (existing `mod tests`)
+- Modify: `crates/cli/src/cut.rs:44-50` (`format_pass_color`), `:88-106` (`pause_prompt`, `pass_color`)
+- Modify: `crates/cli/tests/plain_cut.rs`, `crates/cli/tests/dry_run.rs` (the `plan_cut_from_svg` call sites)
+- Test: the existing `mod tests` in `pipeline.rs` (from `:207`) and `cut.rs` (from `:241`)
 
 **Interfaces:**
 - Consumes: `PassKey`, `Grouping`, `PassSelection { key, .. }`, `PlannedPass { key, .. }`.
-- Produces: `--group-by`, `--skip-pass`, `--order`; `pipeline::plan_cut_from_svg(svg, driver, settings, grouping, skip_passes, order, allow_out_of_bounds)`, `pipeline::check_pass_flag_scope`, `cut::format_pass_key`.
+- Produces: `--group-by`, repeatable `--skip-pass` and `--order`; `pipeline::plan_cut_from_svg(svg, driver, settings, grouping, skip_passes, order, allow_out_of_bounds)`, `pipeline::pass_order(&[DocumentPass], &[String], &[String])`, `pipeline::check_pass_flag_scope`, `cut::format_pass_key`.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `crates/cli/src/pipeline.rs`'s `mod tests`, replace `colour_flags_are_refused_without_by_color` (`:367-380`) and `parse_hex_color_requires_eight_digits` (`:301-306`), and add the grouping cases:
+In `crates/cli/src/pipeline.rs`'s `mod tests`, replace `by_color_plans_from_svg_respects_skip_and_order` (`:226-233`), `parse_hex_color_requires_eight_digits` (`:297-301`), `noninteractive_multicolor_is_error` (`:291-299`) and `colour_flags_are_refused_without_by_color` (`:364-373`) with:
 
 ```rust
-    /// `--skip-pass` and `--order` name passes, and a single-pass cut has one pass whose
-    /// name nobody needs. Refused rather than ignored: a flag that silently does nothing is
-    /// how a cut ends up including a colour the operator thought they had skipped.
+    fn planned_two_colours() -> cutplan::DocumentPasses {
+        cutplan::plan_passes(&doc_from_svg(two_color_svg()).unwrap()).unwrap()
+    }
+
+    /// `--order` puts named passes first in the order given, then everything else in planned
+    /// order; `--skip-pass` removes. Keys, not colours, so a preset-grouped cut can be
+    /// sequenced exactly as a colour-grouped one always could.
+    #[test]
+    fn pass_order_sequences_and_skips_by_key() {
+        let planned = planned_two_colours();
+        let blue_first = pass_order(&planned.passes, &[], &["color:0000ffff".into()]).unwrap();
+        assert_eq!(blue_first,
+            vec![PassKey::Color(Some(0x0000FFFF)), PassKey::Color(Some(0xFF0000FF))]);
+
+        let without_red = pass_order(&planned.passes, &["color:ff0000ff".into()], &[]).unwrap();
+        assert_eq!(without_red, vec![PassKey::Color(Some(0x0000FFFF))]);
+
+        // Order is applied before the skip filter, as it always was.
+        let both = pass_order(&planned.passes, &["color:ff0000ff".into()],
+            &["color:0000ffff".into(), "color:ff0000ff".into()]).unwrap();
+        assert_eq!(both, vec![PassKey::Color(Some(0x0000FFFF))]);
+    }
+
+    /// `--order` is repeatable rather than comma-separated, because a preset id may contain a
+    /// comma and a split list would make such a pass unnameable — an operator's own string
+    /// deciding whether a flag can address a pass.
+    #[test]
+    fn order_is_repeatable_and_keeps_the_order_given() {
+        let planned = planned_two_colours();
+        let keys = pass_order(&planned.passes, &[],
+            &["color:0000ffff".into(), "color:ff0000ff".into()]).unwrap();
+        assert_eq!(keys, vec![PassKey::Color(Some(0x0000FFFF)), PassKey::Color(Some(0xFF0000FF))]);
+    }
+
+    /// Both flags refuse a key that names no planned pass. `--order` used to drop one
+    /// silently and `--skip-pass`'s predecessor still did: with four spellings of a key a
+    /// typo is likelier than it was, and a skipped pass that was never there means cutting a
+    /// colour the operator believed they had excluded.
+    #[test]
+    fn a_key_that_names_no_planned_pass_is_refused() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &[], &["no-preset".into()]).unwrap_err();
+        assert!(err.contains("no-preset"), "{err}");
+
+        let err = pass_order(&planned.passes, &["preset:cameo5-htv".into()], &[]).unwrap_err();
+        assert!(err.contains("preset:cameo5-htv"), "{err}");
+    }
+
+    /// A malformed key is `PassKey`'s own error, surfaced unchanged: one grammar means one
+    /// message, and the CLI is where a person types it.
+    #[test]
+    fn a_malformed_pass_key_is_refused_with_the_grammar() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &["ff0000ff".into()], &[]).unwrap_err();
+        assert!(err.contains("is not a pass key"), "{err}");
+    }
+
+    /// A single-pass cut has one pass whose name nobody needs, so these flags cannot do
+    /// anything and are refused rather than ignored.
     #[test]
     fn pass_flags_are_refused_for_a_single_pass_cut() {
         assert_eq!(
-            check_pass_flag_scope(&["color:ff0000ff".into()], &None, Grouping::Single),
+            check_pass_flag_scope(&["color:ff0000ff".into()], &[], Grouping::Single),
             Err("--skip-pass applies to a grouped cut; --group-by single is one pass over every shape".into())
         );
         assert_eq!(
-            check_pass_flag_scope(&[], &Some("color:ff0000ff".into()), Grouping::Single),
+            check_pass_flag_scope(&[], &["color:ff0000ff".into()], Grouping::Single),
             Err("--order applies to a grouped cut; --group-by single is one pass over every shape".into())
         );
-        for g in [Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::LineType, Grouping::Preset] {
-            assert!(check_pass_flag_scope(&["color:ff0000ff".into()], &Some("color:ff0000ff".into()), g).is_ok());
+        for g in [Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
+            assert!(check_pass_flag_scope(&["color:ff0000ff".into()], &["color:ff0000ff".into()], g).is_ok());
         }
-    }
-
-    /// `--order` puts named passes first in the order given, then everything else in
-    /// planned order; `--skip-pass` removes. Keys, not colours, so a preset-grouped cut can
-    /// be sequenced the same way a colour-grouped one always could.
-    #[test]
-    fn pass_order_sequences_and_skips_by_key() {
-        let planned = passes(&[(RED, 0.0, 0.0), (BLUE, 20.0, 0.0)]);
-        let keys = pass_order(&planned.passes, &[], Some("color:0000ffff".into())).unwrap();
-        assert_eq!(keys, vec![PassKey::Color(Some(BLUE)), PassKey::Color(Some(RED))]);
-
-        let keys = pass_order(&planned.passes, &["color:ff0000ff".into()], None).unwrap();
-        assert_eq!(keys, vec![PassKey::Color(Some(BLUE))]);
-    }
-
-    /// A key that names no planned pass is refused by name rather than ignored — including
-    /// a key from another mode, which needs no rule of its own because it simply is not
-    /// there. `--order` used to drop unknown colours silently.
-    #[test]
-    fn an_order_key_that_names_no_pass_is_refused() {
-        let planned = cutplan::plan_passes(&doc_from_svg(two_color_svg()).unwrap()).unwrap();
-        let err = pass_order(&planned.passes, &[], Some("line-type:cut".into())).unwrap_err();
-        assert!(err.contains("line-type:cut"), "{err}");
-    }
-
-    /// A malformed key is `PassKey`'s error, surfaced unchanged: one grammar means one
-    /// error message, and the CLI is where a person types it.
-    #[test]
-    fn a_malformed_pass_key_is_refused_with_the_grammar() {
-        let planned = cutplan::plan_passes(&doc_from_svg(two_color_svg()).unwrap()).unwrap();
-        let err = pass_order(&planned.passes, &["ff0000ff".into()], None).unwrap_err();
-        assert!(err.contains("is not a pass key"), "{err}");
     }
 
     /// The plain path still means one pass over everything, and now says so with a mode.
@@ -998,19 +1090,29 @@ In `crates/cli/src/pipeline.rs`'s `mod tests`, replace `colour_flags_are_refused
         let two_fills = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
         let plan = plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(),
-            Grouping::Single, &[], None, false).unwrap();
+            Grouping::Single, &[], &[], false).unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert_eq!(plan.passes[0].key, PassKey::All);
+
+        let by_colour = plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(),
+            Grouping::Color, &[], &[], false).unwrap();
+        assert_eq!(by_colour.passes.len(), 2, "the same file, split by its fills");
     }
 
-    /// And a grouped cut still sees both fills, through the caller the CLI uses.
+    /// Two different empty cuts, two different sentences. "no cuttable paths in SVG" used to
+    /// cover both, which told an operator their file was empty when in fact their own
+    /// `--skip-pass` had emptied the selection.
     #[test]
-    fn colour_grouping_plans_a_pass_per_visible_paint() {
-        let two_fills = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
-            <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
-        let plan = plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(),
-            Grouping::Color, &[], None, false).unwrap();
-        assert_eq!(plan.passes.len(), 2);
+    fn an_empty_file_and_an_emptied_selection_read_differently() {
+        let empty = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
+        let err = plan_cut_from_svg(empty, cameo5().as_ref(), &cut_settings(),
+            Grouping::Color, &[], &[], false).unwrap_err();
+        assert_eq!(err, "no cuttable paths in SVG");
+
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &cut_settings(),
+            Grouping::Color, &["color:ff0000ff".into(), "color:0000ffff".into()], &[], false)
+            .unwrap_err();
+        assert_eq!(err, "every pass in this file was skipped; nothing is left to cut");
     }
 
     /// The TTY rule is about passes, not about a flag name: one pass never pauses, so it is
@@ -1026,26 +1128,46 @@ In `crates/cli/src/pipeline.rs`'s `mod tests`, replace `colour_flags_are_refused
     }
 ```
 
-In `crates/cli/src/cut.rs`'s `mod tests`, update the two prompt assertions (`:290-297`, `:312-314`) to the key spelling:
+In `crates/cli/src/cut.rs`'s `mod tests`, replace the colour assertions in `a_prompt_takes_both_halves_of_the_position_from_the_status` (`:281-298`) and `a_colourless_pass_is_named_none_in_the_prompt` (`:304-314`). The module's `plan(&[…])` helper now takes keys:
 
 ```rust
     /// The prompt names the pass the way every other surface does. `#0000ff` was a second
     /// spelling of one key, invented here and nowhere else.
     #[test]
-    fn a_swap_prompt_names_the_pass_by_its_key() {
-        // `plan` and `status` are the module's existing helpers; `plan` now takes keys.
-        let plan = plan(&[PassKey::Color(Some(0xFF0000FF)), PassKey::Color(Some(0x0000FFFF)), PassKey::All]);
+    fn a_prompt_takes_both_halves_of_the_position_from_the_status() {
+        let plan = plan(&[PassKey::Color(Some(0xff0000ff)), PassKey::Color(Some(0x0000ffff)), PassKey::All]);
         let at_second = status(
             Actions { cancel: true, resume: true, ..Actions::default() },
             Phase::AwaitingColorSwap,
             Some(PassPosition { index: 1, total: 3 }),
         );
-        assert_eq!(pause_prompt(Pause::Swap, &plan, &at_second),
-            "Pass 2/3 (color:0000ffff): swap tool, press Enter to resume");
+
+        let swap = pause_prompt(Pause::Swap, &plan, &at_second);
+        assert!(swap.contains("Pass 2/3"), "counts from 1, out of the job's own total: {swap}");
+        assert!(swap.contains("color:0000ffff"), "names the pass being swapped to: {swap}");
+        assert!(swap.contains("swap tool"), "says what to do: {swap}");
+
+        let confirm = pause_prompt(Pause::Confirm, &plan, &at_second);
+        assert!(confirm.contains("Pass 2/3"), "{confirm}");
+        assert!(confirm.contains("once the machine finishes"), "{confirm}");
     }
 
-    /// A pass index the plan does not have degrades to a readable label rather than
-    /// panicking a live cut — the prompt is cosmetic, the cut is not.
+    /// A single-pass cut's pass is named for what it is rather than for a colour it does not
+    /// have. The prompt used to read `#000000` — the invented stroke the plain path stamped
+    /// on every path before #144 — and then `none`, which said nothing.
+    #[test]
+    fn the_single_pass_is_named_all_in_the_prompt() {
+        let plan = plan(&[PassKey::All]);
+        let parked = status(
+            Actions { cancel: true, confirm: true, ..Actions::default() },
+            Phase::AwaitingConfirmation,
+            Some(PassPosition { index: 0, total: 1 }),
+        );
+        assert!(pause_prompt(Pause::Confirm, &plan, &parked).contains("(all)"));
+    }
+
+    /// A pass index the plan does not have degrades to a label rather than panicking a live
+    /// cut — the prompt is cosmetic, the cut is not.
     #[test]
     fn a_prompt_for_a_pass_outside_the_plan_says_unknown() {
         let plan = plan(&[PassKey::All]);
@@ -1062,35 +1184,17 @@ In `crates/cli/src/cut.rs`'s `mod tests`, update the two prompt assertions (`:29
 
 Run: `cargo test -p cli`
 
-Expected: compile errors — `cannot find function 'check_pass_flag_scope'`, and `plan_cut_from_svg` taking the wrong number of arguments.
+Expected: compile errors — `cannot find function 'check_pass_flag_scope'`, `plan_cut_from_svg` taking the wrong number of arguments.
 
 - [ ] **Step 3: Write the implementation**
 
-`crates/cli/src/main.rs` — replace the three flags (`:44-54`):
+`crates/cli/src/main.rs` — a clap-side enum beside `Command`, so kebab-case flag values are clap's business and the planner's enum stays free of presentation:
 
 ```rust
-        /// How to split the cut into passes: single (one pass over everything), color
-        /// (stroke where visible, else fill), stroke, fill, line-type, or preset
-        #[arg(long, value_enum, default_value_t = GroupBy::Single)]
-        group_by: GroupBy,
-        /// Skip cutting the pass with this key (e.g. color:ff0000ff, preset:cameo5-htv);
-        /// may be repeated
-        #[arg(long = "skip-pass")]
-        skip_pass: Vec<String>,
-        /// Comma-separated pass keys to cut first, in this order; the rest follow in
-        /// planned order
-        #[arg(long)]
-        order: Option<String>,
-```
-
-with a `clap::ValueEnum` next to `Command` that maps to `cutplan::Grouping` — clap owns the flag's spelling (`single`, `color`, `stroke`, `fill`, `line-type`, `preset`), `cutplan` owns the enum:
-
-```rust
-/// The `--group-by` spellings. A separate enum from `cutplan::Grouping` so the CLI's
-/// kebab-case flag values are clap's business and the planner's enum stays free of
-/// presentation.
+/// The `--group-by` spellings. Separate from `cutplan::Grouping` so the flag's vocabulary and
+/// the planner's are free to differ; the `From` below is the only place they meet.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum GroupBy { Single, Color, Stroke, Fill, LineType, Preset }
+enum GroupBy { Single, Color, Stroke, Fill, Preset }
 
 impl From<GroupBy> for cutplan::Grouping {
     fn from(g: GroupBy) -> cutplan::Grouping {
@@ -1099,14 +1203,30 @@ impl From<GroupBy> for cutplan::Grouping {
             GroupBy::Color => cutplan::Grouping::Color,
             GroupBy::Stroke => cutplan::Grouping::Stroke,
             GroupBy::Fill => cutplan::Grouping::Fill,
-            GroupBy::LineType => cutplan::Grouping::LineType,
             GroupBy::Preset => cutplan::Grouping::Preset,
         }
     }
 }
 ```
 
-Rewrite the dispatch arm (`:115-132`) so one planning call serves both paths — the old `if !by_color` split existed because the plain path had its own planner call, and a mode makes that split nothing but a dry-run label difference:
+Replace the three flags (`:44-54`):
+
+```rust
+        /// How to split the cut into passes: single (one pass over every cut shape), color
+        /// (stroke where visible, else fill), stroke, fill, or preset
+        #[arg(long, value_enum, default_value_t = GroupBy::Single)]
+        group_by: GroupBy,
+        /// Do not cut the pass with this key (all, color:RRGGBBAA, no-color, preset:<id>,
+        /// no-preset); may be repeated
+        #[arg(long = "skip-pass")]
+        skip_pass: Vec<String>,
+        /// Cut this pass first, by key; repeat to sequence more, and the rest follow in
+        /// planned order
+        #[arg(long)]
+        order: Vec<String>,
+```
+
+Rewrite the dispatch arm (`:115-132`) so one call serves both paths — the old `if !by_color` split existed only because the plain path did its own planning:
 
 ```rust
         Command::Cut { file, device, dry_run, speed, force, port, baud, group_by, skip_pass, order, allow_out_of_bounds } => {
@@ -1115,17 +1235,22 @@ Rewrite the dispatch arm (`:115-132`) so one planning call serves both paths —
             check_pass_flag_scope(&skip_pass, &order, grouping)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
             let settings = Settings { speed, force, repeat_count: 1 };
-            cut_planned(&svg, driver.as_ref(), &device, &settings, grouping, &skip_pass, order,
+            cut_planned(&svg, driver.as_ref(), &device, &settings, grouping, &skip_pass, &order,
                         dry_run, port, baud, allow_out_of_bounds)
         }
 ```
 
-Rename `cut_by_color` to `cut_planned`, give it a `grouping: cutplan::Grouping` parameter, pass it through to `plan_cut_from_svg`, and print the key:
+Rename `cut_by_color` to `cut_planned`, give it `grouping: cutplan::Grouping` and `order: &[String]`, forward them to `plan_cut_from_svg`, and print headers by mode:
 
 ```rust
     if dry_run {
         for (i, pass) in passes.iter().enumerate() {
-            println!("-- pass {}/{} ({}) --", i + 1, passes.len(), pass.key);
+            // A header names a pass among several. `single` has none to name, and a bare
+            // `cuthulhu cut --dry-run` has always printed bytes and nothing else — scripts
+            // parse that output, so the merge of the two paths must not add a line to it.
+            if grouping != cutplan::Grouping::Single {
+                println!("-- pass {}/{} ({}) --", i + 1, passes.len(), pass.key);
+            }
             let bytes = dry_run_pass_bytes(driver, &pass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }
@@ -1133,48 +1258,45 @@ Rename `cut_by_color` to `cut_planned`, give it a `grouping: cutplan::Grouping` 
     }
 ```
 
-`crates/cli/src/pipeline.rs` — `pass_order` returns keys and refuses an unknown one:
+`crates/cli/src/pipeline.rs` — `pass_order` over keys, validating both flags:
 
 ```rust
-/// The passes to cut, in cut order: apply `--order` (named passes to the front, in the
-/// order given; the rest keep their planned order) and then `--skip-pass`.
+/// The passes to cut, in cut order: apply `--order` (named passes to the front, in the order
+/// given; the rest keep their planned order) and then `--skip-pass`.
 ///
-/// An `--order` key that names no planned pass is refused rather than ignored. It used to
-/// be dropped silently, which made a typo indistinguishable from a colour the document did
-/// not contain — and with four kinds of key, a typo is likelier, not rarer.
+/// A key that names no planned pass is refused, for either flag. `--order` used to drop one
+/// silently and `--skip-color` still did, which made a typo indistinguishable from a colour
+/// the document did not contain — and a silently ignored skip means cutting a pass the
+/// operator believed they had excluded.
 pub fn pass_order(
     planned: &[cutplan::DocumentPass],
     skip_passes: &[String],
-    order: Option<String>,
+    order: &[String],
 ) -> Result<Vec<cutplan::PassKey>, String> {
     let mut keys: Vec<cutplan::PassKey> = planned.iter().map(|p| p.key.clone()).collect();
+    let parse = |s: &String| s.trim().parse::<cutplan::PassKey>();
 
-    if let Some(order) = order {
-        let wanted: Vec<cutplan::PassKey> = order
-            .split(',')
-            .map(|s| s.trim().parse::<cutplan::PassKey>())
-            .collect::<Result<_, _>>()?;
-        let mut front = vec![];
-        for key in wanted {
-            let Some(i) = keys.iter().position(|k| *k == key) else {
-                return Err(format!("--order names {key}, which is not a pass this file plans"));
-            };
-            front.push(keys.remove(i));
-        }
-        front.extend(keys);
-        keys = front;
+    let mut front = vec![];
+    for key in order.iter().map(parse).collect::<Result<Vec<_>, _>>()? {
+        let Some(i) = keys.iter().position(|k| *k == key) else {
+            return Err(format!("--order names {key}, which is not a pass this file plans"));
+        };
+        front.push(keys.remove(i));
     }
+    front.extend(keys);
+    keys = front;
 
-    let skip: Vec<cutplan::PassKey> = skip_passes
-        .iter()
-        .map(|s| s.trim().parse::<cutplan::PassKey>())
-        .collect::<Result<_, _>>()?;
-    keys.retain(|k| !skip.contains(k));
+    for key in skip_passes.iter().map(parse).collect::<Result<Vec<_>, _>>()? {
+        let Some(i) = keys.iter().position(|k| *k == key) else {
+            return Err(format!("--skip-pass names {key}, which is not a pass this file plans"));
+        };
+        keys.remove(i);
+    }
     Ok(keys)
 }
 ```
 
-`plan_cut_from_svg` gains `grouping` and drops the plain/grouped split; `plan_plain_cut` and `parse_hex_color` are deleted — `plan_plain_cut` is `plan_cut_from_svg(.., Grouping::Single, &[], None, ..)`, and colour parsing now lives in `PassKey::from_str`:
+One planning entry point; `plan_plain_cut` and `parse_hex_color` are deleted — the plain cut is `Grouping::Single`, and colour parsing lives in `PassKey::from_str`:
 
 ```rust
 /// Plan a cut from an SVG: import, group, order, select, and validate through
@@ -1190,22 +1312,26 @@ pub fn plan_cut_from_svg(
     settings: &Settings,
     grouping: cutplan::Grouping,
     skip_passes: &[String],
-    order: Option<String>,
+    order: &[String],
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg(svg)?;
-    // Planned once: --order and --skip-pass name passes, so the keys have to be known
-    // before a selection can be built, and plan_cut cuts the very passes handed to it here.
+    // Planned once: the flags name passes, so the keys have to be known before a selection
+    // can be built, and `plan_cut` cuts the very passes handed to it here.
     let planned = cutplan::plan_passes_with(&doc, grouping).map_err(|e| e.to_string())?;
-    // Checked here rather than left to `plan_cut`: with no passes at all, every selection is
-    // unmatched, and "no planned pass is called all" describes the request instead of the file.
+    // Two different empty cuts, told apart here because only this caller knows an SVG was
+    // imported and what the operator asked to skip. Left to `plan_cut`, both would arrive as
+    // an unmatched selection or `NothingToCut`, and one sentence would have to cover both.
     if planned.passes.is_empty() {
         return Err("no cuttable paths in SVG".into());
     }
     let keys = pass_order(&planned.passes, skip_passes, order)?;
+    if keys.is_empty() {
+        return Err("every pass in this file was skipped; nothing is left to cut".into());
+    }
 
     // ponytail: one `--speed`/`--force` pair applies to every pass; the CLI has no per-pass
-    // settings and no presets. Per-pass settings would need a flag that names a pass key.
+    // settings and no presets. Per-pass settings need a flag that names a pass key.
     let passes = keys
         .into_iter()
         .map(|key| cutplan::PassSelection { key, settings: settings.clone() })
@@ -1217,15 +1343,15 @@ pub fn plan_cut_from_svg(
 }
 ```
 
-The scope check and the TTY check stop naming a flag that no longer exists:
+The scope check and the TTY check stop naming flags that no longer exist:
 
 ```rust
-/// `--skip-pass` and `--order` name passes, which only a grouped cut has more than one of.
-/// A single-pass cut puts every shape in one pass, so these flags cannot do anything there
+/// `--skip-pass` and `--order` name passes, which only a grouped cut has more than one of. A
+/// single-pass cut puts every cut shape in one pass, so these flags cannot do anything there
 /// and are refused rather than ignored.
 pub fn check_pass_flag_scope(
     skip_passes: &[String],
-    order: &Option<String>,
+    order: &[String],
     grouping: cutplan::Grouping,
 ) -> Result<(), String> {
     if grouping != cutplan::Grouping::Single {
@@ -1234,7 +1360,7 @@ pub fn check_pass_flag_scope(
     if !skip_passes.is_empty() {
         return Err("--skip-pass applies to a grouped cut; --group-by single is one pass over every shape".into());
     }
-    if order.is_some() {
+    if !order.is_empty() {
         return Err("--order applies to a grouped cut; --group-by single is one pass over every shape".into());
     }
     Ok(())
@@ -1250,14 +1376,14 @@ pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> 
 }
 ```
 
-`crates/cli/src/cut.rs` — the prompt names the key:
+`crates/cli/src/cut.rs` — delete `format_pass_color` and `pass_color`, and add:
 
 ```rust
-/// The pass the job is paused on, as the operator sees it named everywhere else.
+/// The pass the job is paused on, named as every other surface names it.
 ///
 /// A bad index cannot happen on the normal path (the reported position indexes the same
-/// plan), but the prompt is cosmetic, so a mismatch degrades to a label rather than
-/// panicking a process mid-cut.
+/// plan), but the prompt is cosmetic, so a mismatch degrades to a label rather than panicking
+/// a process mid-cut.
 pub fn format_pass_key(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
     let index = status.pass.map(|p| p.index).unwrap_or(0);
     match plan.passes.get(index) {
@@ -1267,9 +1393,22 @@ pub fn format_pass_key(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
 }
 ```
 
-and `pause_prompt` interpolates it directly: `format!("Pass {pass}/{total} ({key}): swap tool, press Enter to resume")`. Delete `format_pass_color` and `pass_color`.
+with `pause_prompt` interpolating it:
 
-Update `crates/cli/tests/plain_cut.rs` and `crates/cli/tests/dry_run.rs` call sites to the new `plan_cut_from_svg` signature (they call it directly with `&[], None`; add `cutplan::Grouping::Color` or `Single` to match what each test's comment says it is exercising).
+```rust
+fn pause_prompt(pause: Pause, plan: &cutplan::CutPlan, status: &CutStatus) -> String {
+    let (pass, total) = pass_position(status);
+    let key = format_pass_key(plan, status);
+    match pause {
+        Pause::Swap => format!("Pass {pass}/{total} ({key}): swap tool, press Enter to resume"),
+        Pause::Confirm => {
+            format!("Pass {pass}/{total} ({key}) cutting; press Enter once the machine finishes")
+        }
+    }
+}
+```
+
+Update the two integration tests' `plan_cut_from_svg` calls: `crates/cli/tests/dry_run.rs:35` and any in `crates/cli/tests/plain_cut.rs` gain `cutplan::Grouping::Color` (or `Single`, matching what each test's comment says it exercises) plus `&[], &[]`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1283,102 +1422,151 @@ Expected: PASS.
 git add crates/cli
 git commit -m "Let the CLI ask for a grouping, and name a pass the way everything else does
 
---group-by replaces --by-color, --skip-pass replaces --skip-color, and --order
-takes pass keys, so a preset-grouped cut can be sequenced the way a colour one
-always could. An --order key that names no pass is now refused: it used to be
-dropped silently, which made a typo look like a colour the file did not have.
-The plain path loses its own planner call, since a mode says what it meant."
+--group-by replaces --by-color and --skip-pass replaces --skip-color, both over
+pass keys, so a preset-grouped cut can be sequenced the way a colour one always
+could. --order is repeatable rather than comma-separated, because a preset id
+may contain a comma and a split list would make that pass unnameable. Both
+flags now refuse a key that names no pass, and an emptied selection stops
+reporting itself as an empty file. A single-pass dry run still prints bytes and
+no header, which is what scripts parse."
 ```
 
 ---
 
-### Task 6: The desktop threads the grouping through all three planner calls
+### Task 5: The desktop threads the grouping through all three planner calls
 
 **Files:**
-- Modify: `apps/desktop/src/device.rs:50-65` (`CutRequest`, `ConfiguredPassDto`), `:840-874` (`prepare_cut`), `:1103-1142` (`PlanCutResponse`, `plan_cut_response`), `:1147-1203` (`TravelPassDto`, `travel_for_order`)
-- Modify: `apps/desktop/src/state.rs` (add `set_material_preset` beside `set_cut_line_type` at `:66`), `apps/desktop/src/ipc.rs:53-57` and `:138-145`, `apps/desktop/src/main.rs:47-92` (register the command)
-- Test: `apps/desktop/src/device.rs` (existing `mod tests`)
+- Modify: `apps/desktop/src/device.rs:50-65`, `:840-874` (`prepare_cut`), `:1103-1142` (response DTOs and `plan_cut_response`), `:1147-1203` (`TravelPassDto`, `travel_for_order`)
+- Modify: `apps/desktop/src/state.rs` (add `set_material_preset` after `set_cut_line_type`, `:66-73`), `apps/desktop/src/ipc.rs:53-57` and `:137-145`, `apps/desktop/src/main.rs:47-92`
+- Test: `apps/desktop/src/device.rs`'s `mod tests` — the helpers at `:1295-1307` and `:1363-1364`, and the tests at `:1331-1340`, `:1366-1439`
 
 **Interfaces:**
-- Consumes: `PassKey`, `Grouping`, `PassSelection { key, .. }`, `document::commands::set_material_preset`.
-- Produces: `plan_cut(state, grouping)`, `travel_for_order(state, doc_revision, grouping, passes)`, `cut(state, dev, request)` where `CutRequest` carries `grouping`, `set_material_preset(state, ids, value)`. Task 7 calls all four from TypeScript.
+- Consumes: `PassKey`, `Grouping`, `DocumentPass`, `PassSelection { key, .. }`, `document::PresetAssignment`, `document::commands::set_material_preset`.
+- Produces: `plan_cut(state, grouping)`, `travel_for_order(state, doc_revision, grouping, passes)`, `cut(state, dev, request)` with `CutRequest::grouping`, `set_material_preset(state, ids, value)`, and `device::plan_cut_response(doc, grouping)`. Task 6 calls all of them.
 
 - [ ] **Step 1: Write the failing tests**
 
-In `apps/desktop/src/device.rs`'s `mod tests`, update the two error-code assertions (`:1331-1340`, `:1403-1409`) to `"unknown_pass"`, and add:
+First the existing helpers, which every test in the module goes through (`:1299-1307`, `:1363-1364`):
 
 ```rust
-    /// The grouping the dialog asked for is the grouping that gets cut. Without this the
-    /// operator could preview a fill-grouped plan and cut a stroke-grouped one, because
-    /// each command plans on its own.
+    fn request_from(plan: DocumentPasses) -> CutRequest {
+        CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: plan.doc_revision.to_string(),
+            // The mode the passes were planned under. `plan_for` uses the default, so this
+            // must too, or every request in this module would be refused as unknown keys.
+            grouping: Grouping::Color,
+            passes: plan.passes.iter().map(|p| ConfiguredPassDto {
+                key: p.key.clone(), enabled: true, preset_id: None,
+                speed: None, force: None, repeat_count: None,
+            }).collect(),
+        }
+    }
+
+    fn on(key: PassKey) -> TravelPassDto { TravelPassDto { key, enabled: true } }
+    fn off(key: PassKey) -> TravelPassDto { TravelPassDto { key, enabled: false } }
+    fn colour(c: u32) -> PassKey { PassKey::Color(Some(c)) }
+```
+
+Every `on(RED)`/`off(BLUE)` call in `:1366-1425` becomes `on(colour(RED))`/`off(colour(BLUE))`; `:1406`'s unknown colour becomes `TravelPassDto { key: colour(0xDEADBEEF), enabled: true }`; the two `plan_cut_response(&app.editor.doc)` calls at `:1372` and `:1430` gain `Grouping::Color`; `:1436`'s `p.color == Some(BLUE)` becomes `p.key == colour(BLUE)`; and the code assertions at `:1339` and `:1408` become `"unknown_pass"`.
+
+Then the new cases:
+
+```rust
+    /// The grouping the dialog asked for is the grouping that gets cut. Without it the
+    /// operator could preview a fill-grouped plan and cut a stroke-grouped one, because each
+    /// command plans the document itself.
     #[test]
     fn a_cut_honours_the_grouping_it_was_sent() {
         let mut app = AppState::new();
         let dev = test_device_setup();
-        // One shape with a red stroke and a green fill: the two colour modes key it
-        // differently, so the request's grouping is observable in what matches.
+        // A red stroke over a green fill: the two colour modes key this shape differently,
+        // so the request's grouping is observable in what matches.
         app.add_rect_with_style(10.0, 10.0, Some(RED), Some(GREEN));
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
 
-        let planned = plan_cut_response(&app.editor.doc, Grouping::Fill).expect("premise: a plan exists");
-        let stroke_key = "color:ff0000ff";
         let request = CutRequest {
-            device_instance_id: dev.instance_id.clone(),
-            doc_revision: planned.doc_revision.clone(),
+            device_instance_id: dev_instance_id(&dev),
+            doc_revision: revision,
             grouping: Grouping::Fill,
-            passes: vec![enabled_pass(stroke_key)],
+            passes: vec![ConfiguredPassDto {
+                key: colour(RED), enabled: true, preset_id: None,
+                speed: None, force: None, repeat_count: None }],
         };
-        // Fill grouping keys that shape on its fill, so the stroke key names nothing.
-        let err = dev.cut_from_request(&app, request).unwrap_err();
-        assert_eq!(err.code, "unknown_pass");
+        // Fill grouping keys that shape on its fill, so the stroke's key names nothing.
+        assert_eq!(dev.cut_from_request(&app, request).unwrap_err().code, "unknown_pass");
     }
 
-    /// Travel is replanned with the same grouping for the same reason, and a stale
-    /// revision still wins over a key mismatch: the document changing is the more
-    /// actionable fact.
+    /// Travel is replanned with the same grouping, for the same reason.
     #[test]
     fn travel_honours_the_grouping_it_was_sent() {
         let mut app = AppState::new();
         app.add_rect_with_style(10.0, 10.0, Some(RED), Some(GREEN));
-        let revision = plan_cut_response(&app.editor.doc).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
 
         assert!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
-            &[on("color:00ff00ff")]).is_ok());
-        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
-            &[on("color:ff0000ff")]).unwrap_err();
-        assert_eq!(err.code, "unknown_pass");
+            &[on(colour(GREEN))]).is_ok());
+        assert_eq!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
+            &[on(colour(RED))]).unwrap_err().code, "unknown_pass");
     }
 
-    /// The response tells the dialog what to key its rows on, in the same spelling the
-    /// request must send back.
+    /// The response names its passes in the spelling a request must send back.
     #[test]
     fn a_plan_response_names_its_passes_by_key() {
         let mut app = AppState::new();
         app.add_rect(10.0, 10.0);
         let response = plan_cut_response(&app.editor.doc, Grouping::Single).unwrap();
-        assert_eq!(response.passes[0].key, "all");
+        assert_eq!(response.passes[0].key, PassKey::All);
+    }
+
+    /// A preset-keyed pass is cut with that preset's settings. This is the whole point of
+    /// grouping by material: `prepare_cut` reads only `preset_id`, so a row that arrives with
+    /// none is cut with defaults no matter what its key says.
+    #[test]
+    fn a_preset_keyed_pass_cuts_with_that_presets_settings() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        let id = app.add_rect(10.0, 10.0);
+        app.set_material_preset(vec![id], PresetAssignment::Preset("cameo5-htv".into())).unwrap();
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: dev_instance_id(&dev),
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                key: PassKey::Preset(Some("cameo5-htv".into())),
+                enabled: true,
+                // What the dialog now sends for a preset-keyed row: the key's own id.
+                preset_id: Some("cameo5-htv".into()),
+                speed: None, force: None, repeat_count: None }],
+        };
+        let (_, passes) = dev.prepare_cut(&app, request).unwrap();
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.id == "cameo5-htv").expect("premise: the builtin exists");
+        assert_eq!(passes[0].job.settings.speed, builtin.settings.speed);
+        assert_eq!(passes[0].job.settings.force, builtin.settings.force);
     }
 ```
 
-Add the two test helpers the cases above use, next to the existing ones: `enabled_pass(key: &str) -> ConfiguredPassDto` and `on(key: &str) -> TravelPassDto`, both parsing the key with `key.parse().unwrap()`; and `AppState::add_rect_with_style` if `add_rect` cannot set paint (follow whatever the existing helper does).
+Add the two helpers these need beside the existing ones: `dev_instance_id(&DeviceManagerHandle) -> String` (or reuse `test_instance().instance_id` as `request_from` does), and `AppState::add_rect_with_style(w, h, stroke, fill) -> NodeId` modelled on the existing `add_rect`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p cuthulhu-desktop` (or the desktop crate's real name from its `Cargo.toml`)
+Run: `cargo test -p cuthulhu-desktop` (the desktop crate's name is in `apps/desktop/Cargo.toml`)
 
-Expected: compile errors — `no field 'grouping' on type 'CutRequest'`, and `plan_cut_response` taking one argument.
+Expected: compile errors — `no field 'grouping' on type 'CutRequest'`, `plan_cut_response` taking one argument.
 
 - [ ] **Step 3: Write the implementation**
-
-DTOs carry the key and the mode:
 
 ```rust
 #[derive(Deserialize)]
 pub struct CutRequest {
     pub device_instance_id: String,
     pub doc_revision: String,
-    /// How the dialog grouped the passes it is naming. Sent rather than remembered: the
-    /// plan, the travel and the cut are three round trips, and a mode kept in `AppState`
-    /// could be changed between them while the stale-plan check only guards the document.
+    /// How the dialog grouped the passes it is naming. Sent rather than remembered: the plan,
+    /// the travel and the cut are three round trips, and a mode kept in `AppState` could be
+    /// changed between them while the stale-plan check only guards the document.
     pub grouping: Grouping,
     pub passes: Vec<ConfiguredPassDto>,
 }
@@ -1394,25 +1582,14 @@ pub struct ConfiguredPassDto {
 }
 ```
 
-In `prepare_cut`, the selection carries the key and the plan uses the request's grouping:
-
-```rust
-                PassSelection { key: dto.key.clone(), settings: resolve_settings(preset, &override_) }
-```
-
-```rust
-        let planned = plan_passes_with(&app.editor.doc, request.grouping)
-            .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
-```
-
-`plan_cut_response` gains a mode. Keep the no-argument name as the `Grouping::Color` default only if a caller needs it; otherwise thread the parameter and rename:
+In `prepare_cut` (`:850-873`): `PassSelection { key: dto.key.clone(), settings: resolve_settings(preset, &override_) }`, and `plan_passes_with(&app.editor.doc, request.grouping)`.
 
 ```rust
 #[derive(Debug, Serialize)]
 pub struct PlanCutPassSummary {
-    /// The pass's key, as the canonical string the dialog keys its rows on and sends back
-    /// in a cut request. A string rather than a tagged object so the CLI, this DTO and the
-    /// dialog all hold one spelling.
+    /// The pass's key, as the canonical string the dialog keys its rows on and sends back. A
+    /// string rather than a tagged object so the CLI, this DTO and the dialog hold one
+    /// spelling.
     pub key: PassKey,
     pub shape_count: usize,
     pub node_ids: Vec<document::NodeId>,
@@ -1426,7 +1603,8 @@ pub struct PlanCutPassSummary {
 /// caller that means "whatever the default is" — the dialog always has a mode selected.
 pub fn plan_cut_response(doc: &document::Document, grouping: Grouping)
     -> Result<PlanCutResponse, IpcError> {
-    let planned = plan_passes_with(doc, grouping).map_err(|e| IpcError::new("plan_error", e.to_string()))?;
+    let planned = plan_passes_with(doc, grouping)
+        .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
     let refs: Vec<&DocumentPass> = planned.passes.iter().collect();
     let travel = cutplan::travel_moves(&refs);
     Ok(PlanCutResponse {
@@ -1445,18 +1623,7 @@ pub fn plan_cut_response(doc: &document::Document, grouping: Grouping)
 }
 ```
 
-`travel_for_order` takes the mode and matches keys — including the duplicate-versus-unknown distinction, which is about identity and so is unchanged in shape:
-
-```rust
-pub fn travel_for_order(
-    doc: &document::Document,
-    doc_revision: &str,
-    grouping: Grouping,
-    configured: &[TravelPassDto],
-) -> Result<Vec<[f64; 4]>, IpcError> {
-```
-
-with `plan_passes_with(doc, grouping)` inside, `remaining`/`refs` as `Vec<&DocumentPass>`, and the lookup:
+`TravelPassDto::color` becomes `pub key: PassKey`; `travel_for_order` gains `grouping: Grouping` after `doc_revision`, plans with `plan_passes_with(doc, grouping)`, holds `Vec<&DocumentPass>`, and keeps its duplicate-versus-unknown distinction on keys:
 
 ```rust
         let Some(i) = remaining.iter().position(|p| p.key == pass.key) else {
@@ -1468,33 +1635,28 @@ with `plan_passes_with(doc, grouping)` inside, `remaining`/`refs` as `Vec<&Docum
         };
 ```
 
-`TravelPassDto::color` becomes `pub key: PassKey`.
-
 `state.rs`, mirroring `set_cut_line_type` (`:66-73`) — the whole method:
 
 ```rust
-    pub fn set_material_preset(&mut self, ids: Vec<NodeId>, value: Option<String>)
+    pub fn set_material_preset(&mut self, ids: Vec<NodeId>, value: PresetAssignment)
         -> Result<Delta, CmdError> {
         let d = commands::set_material_preset(&self.editor.doc, &ids, value)?;
-        // Same rule as `set_cut_line_type`: an empty delta is a no-op the operator asked
-        // for, and committing it would clear the redo stack and add an undo step that does
-        // nothing.
+        // Same rule as `set_cut_line_type`: an empty delta is a no-op the operator asked for,
+        // and committing it would clear the redo stack and add an undo step that does nothing.
         if d.0.is_empty() { return Ok(d); }
         Ok(self.editor.commit(d))
     }
 ```
 
-`ipc.rs` — one thin command each, and the two planner commands gain the parameter:
+`ipc.rs` — one thin command, and the two planner commands gain the parameter:
 
 ```rust
 #[tauri::command]
-pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: Option<String>)
+pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: PresetAssignment)
     -> Result<Delta, String> {
     state.lock().unwrap().set_material_preset(ids, value).map_err(|e| format!("{e:?}"))
 }
-```
 
-```rust
 #[tauri::command]
 pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping) -> Result<PlanCutResponse, IpcError> {
     plan_cut_response(&state.lock().unwrap().editor.doc, grouping)
@@ -1512,60 +1674,55 @@ pub fn travel_for_order(
 }
 ```
 
-(keep whatever the existing bodies do about locking; only the signature and the forwarded argument change.)
-
 Register `ipc::set_material_preset` in `main.rs`'s `generate_handler!` list, immediately after `ipc::set_cut_line_type` (`:56`).
-
-**`{e:?}` is deliberate here** — #93 owns replacing `Debug` with `Display` across all eleven editor/file commands, and doing one of them differently would leave two conventions in one file.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --workspace --locked`
 
-Expected: PASS. This is the first task where the whole workspace builds again since Task 3.
+Expected: PASS. This is the first task since Task 3 where the whole workspace builds.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/src
-git commit -m "Send the grouping with every cut request, so three round trips agree
+git commit -m "Send the grouping with every cut request, and cut a preset pass with its preset
 
-plan_cut, travel_for_order and cut each plan the document themselves; a mode
-kept in AppState could change between them and the stale-plan check would not
-notice, so the preview would show one arrangement and the machine cut another.
-Also exposes set_material_preset, the second per-node production attribute."
+plan_cut, travel_for_order and cut each plan the document themselves, so a mode
+kept in AppState could change between them with the stale-plan check none the
+wiser: the preview would show one arrangement and the machine cut another. The
+preset test pins the thing grouping by material exists for — prepare_cut
+resolves settings from preset_id alone, so a preset-keyed pass whose row
+carried none was cut with defaults."
 ```
 
 ---
 
-### Task 7: The TypeScript wire speaks in keys
+### Task 6: The TypeScript wire speaks in keys
 
 **Files:**
-- Modify: `apps/desktop/ui/src/ipc.ts:148-162` (`PlanCutPassSummary`), `:209-225` (`planCut`, `TravelPass`, `travelForOrder`), and the `setCutLineType` neighbourhood at `:41-43` (add `setMaterialPreset`)
-- Modify: `apps/desktop/ui/src/cut/viewmodel.ts:8-38` (`PassVm`, `ConfiguredPassDto`, `CutRequest`), `:166-170` (`toTravelPasses`), `:232-249` (`toCutRequest`), and add `parsePassKey`
+- Modify: `apps/desktop/ui/src/ipc.ts:148-162`, `:209-225`, and the `setCutLineType` neighbourhood at `:41-43`
+- Modify: `apps/desktop/ui/src/cut/viewmodel.ts:8-38`, `:166-170`, `:232-249`, adding `parsePassKey`, `passRowLabel` and `presetIdForKey`
 - Test: `apps/desktop/ui/src/cut/viewmodel.test.ts`
 
 **Interfaces:**
-- Consumes: the Rust DTOs from Task 6.
-- Produces: `PassKey` (a string alias), `Grouping`, `ParsedPassKey`, `parsePassKey`, `PassVm.key`, `planCut(grouping)`, `travelForOrder(docRevision, grouping, passes)`, `setMaterialPreset(args)`. Tasks 8 and 9 consume them.
+- Consumes: the Rust DTOs from Task 5.
+- Produces: `PassKey` (string alias), `Grouping`, `PresetAssignmentJson`, `ParsedPassKey`, `parsePassKey`, `passRowLabel`, `presetIdForKey`, `PassVm.key`, `planCut(grouping)`, `travelForOrder(docRevision, grouping, passes)`, `toCutRequest(dev, revision, grouping, rows)`, `setMaterialPreset(args)`. Tasks 7 and 8 consume them.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `apps/desktop/ui/src/cut/viewmodel.test.ts`:
+Add to `viewmodel.test.ts`, and update every existing `PassVm` literal — `reorderPass` (`:129-205`), `reorderForReplan` (`:209-231`), `toTravelPasses` (`:236-247`), `effectiveSettings` (`:250-338`), `toCutRequest` (`:383-430` **and the multi-pass literals at `:437-456`**) — to carry `key: "color:ff0000ff"`-style values instead of `color: 0xff0000ff`:
 
 ```ts
 describe("parsePassKey", () => {
-  // The same table as crates/cutplan/src/pass_key.rs's round-trip test. These two tables
-  // are the only thing keeping the dialog and the planner agreed on what a pass is called,
-  // so a variant added on one side must be added here.
+  // The same table as crates/cutplan/src/pass_key.rs's round-trip test. These two tables are
+  // the only thing keeping the dialog and the planner agreed on what a pass is called.
   it.each([
     ["all", { kind: "all" }],
     ["color:ff0000ff", { kind: "color", color: 0xff0000ff }],
-    ["color:none", { kind: "color", color: null }],
-    ["line-type:cut", { kind: "lineType", lineType: "Cut" }],
-    ["line-type:no-cut", { kind: "lineType", lineType: "NoCut" }],
+    ["no-color", { kind: "color", color: null }],
     ["preset:cameo5-htv", { kind: "preset", presetId: "cameo5-htv" }],
-    ["preset:none", { kind: "preset", presetId: null }],
+    ["no-preset", { kind: "preset", presetId: null }],
   ])("parses %s", (key, expected) => {
     expect(parsePassKey(key)).toEqual(expected);
   });
@@ -1574,45 +1731,107 @@ describe("parsePassKey", () => {
     expect(parsePassKey("preset:vinyl:thin")).toEqual({ kind: "preset", presetId: "vinyl:thin" });
   });
 
-  // A key the backend produced that this cannot read is a backend/frontend mismatch, not
-  // operator input. It renders as itself rather than throwing, because a dialog that
-  // crashes mid-cut is worse than one showing a string nobody recognises.
+  // The collision the grammar exists to avoid: a preset actually called "none" is not the
+  // absence of a preset.
+  it("tells a preset called none from no preset at all", () => {
+    expect(parsePassKey("preset:none")).toEqual({ kind: "preset", presetId: "none" });
+    expect(parsePassKey("no-preset")).toEqual({ kind: "preset", presetId: null });
+  });
+
+  // A key the backend produced that this cannot read is a version mismatch, not operator
+  // input: it renders as itself rather than throwing, because a dialog that crashes mid-cut
+  // is worse than one showing a string nobody recognises.
   it("returns the raw key it cannot parse", () => {
-    expect(parsePassKey("line-type:draw")).toEqual({ kind: "unknown", raw: "line-type:draw" });
+    expect(parsePassKey("line-type:cut")).toEqual({ kind: "unknown", raw: "line-type:cut" });
+    expect(parsePassKey("preset:")).toEqual({ kind: "unknown", raw: "preset:" });
   });
 });
 
-describe("toTravelPasses", () => {
-  it("names every row by key, disabled ones included", () => {
-    const rows = [
-      { key: "color:00ff00ff", enabled: false },
-      { key: "all", enabled: true },
-    ];
-    expect(toTravelPasses(rows)).toEqual([
-      { key: "color:00ff00ff", enabled: false },
-      { key: "all", enabled: true },
-    ]);
+describe("passRowLabel", () => {
+  const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+                     settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
+
+  it("names a colour pass by its swatch, not by words", () => {
+    expect(passRowLabel("color:ff0000ff", presets, "Color")).toEqual({ swatch: "#ff0000", text: null });
+  });
+
+  // Grouping-aware, because `no-color` means something different in each colour mode: under
+  // Stroke it can hold brightly filled shapes, so "no visible paint" would be false.
+  it.each([
+    ["Color", "No visible paint"],
+    ["Stroke", "No visible stroke"],
+    ["Fill", "No visible fill"],
+  ])("says what the colourless pass holds under %s", (grouping, text) => {
+    expect(passRowLabel("no-color", presets, grouping as Grouping)).toEqual({ swatch: null, text });
+  });
+
+  // Not "every shape": a NoCut shape is excluded and counted as skipped.
+  it("names the single pass for what it holds", () => {
+    expect(passRowLabel("all", presets, "Single")).toEqual({ swatch: null, text: "Every cut shape" });
+  });
+
+  it("resolves a preset to its name", () => {
+    expect(passRowLabel("preset:cameo5-htv", presets, "Preset")).toEqual({ swatch: null, text: "HTV" });
+  });
+
+  // A preset a document names but the file no longer has: the planner keys the pass anyway,
+  // so the dialog has to render one.
+  it("shows an unresolved preset id as unknown", () => {
+    expect(passRowLabel("preset:deleted", presets, "Preset"))
+      .toEqual({ swatch: null, text: "deleted (unknown preset)" });
+  });
+
+  it("names the pass that resolves to no material", () => {
+    expect(passRowLabel("no-preset", presets, "Preset")).toEqual({ swatch: null, text: "No preset" });
+  });
+});
+
+describe("presetIdForKey", () => {
+  // What makes grouping by material do the thing it exists for: the pass's own preset
+  // supplies its settings, instead of the operator re-picking it once per pass.
+  it("takes the preset a preset-keyed pass names", () => {
+    expect(presetIdForKey("preset:cameo5-htv")).toBe("cameo5-htv");
+  });
+
+  // Kept even when it resolves to nothing: prepare_cut falls back to the override-or-default
+  // path, and clearing it here would silently drop what the document said.
+  it("keeps an id that may not resolve", () => {
+    expect(presetIdForKey("preset:deleted")).toBe("deleted");
+  });
+
+  it.each(["all", "no-color", "no-preset", "color:ff0000ff"])("has nothing to take from %s", (key) => {
+    expect(presetIdForKey(key)).toBeNull();
   });
 });
 
 describe("toCutRequest", () => {
   it("sends the grouping alongside the keyed passes", () => {
     const rows: PassVm[] = [
-      { key: "preset:cameo5-htv", shapeCount: 2, enabled: true, presetId: null,
+      { key: "preset:cameo5-htv", shapeCount: 2, enabled: true, presetId: "cameo5-htv",
         speed: null, force: null, repeatCount: null },
     ];
     expect(toCutRequest("dev-1", "42", "Preset", rows)).toEqual({
       device_instance_id: "dev-1",
       doc_revision: "42",
       grouping: "Preset",
-      passes: [{ key: "preset:cameo5-htv", enabled: true, preset_id: null,
+      passes: [{ key: "preset:cameo5-htv", enabled: true, preset_id: "cameo5-htv",
                  speed: null, force: null, repeat_count: null }],
     });
   });
 });
-```
 
-Update every existing `PassVm` literal in that file (`reorderPass` at `:129-205`, `reorderForReplan` at `:209-231`, `effectiveSettings` at `:250-338`, `toCutRequest` at `:383-430`) to carry `key: "color:ff0000ff"`-style values instead of `color: 0xff0000ff`.
+describe("toTravelPasses", () => {
+  it("names every row by key, disabled ones included", () => {
+    expect(toTravelPasses([
+      { key: "no-color", enabled: false },
+      { key: "all", enabled: true },
+    ])).toEqual([
+      { key: "no-color", enabled: false },
+      { key: "all", enabled: true },
+    ]);
+  });
+});
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1626,12 +1845,19 @@ Expected: FAIL — `parsePassKey is not a function`, and type errors on `key`.
 
 ```ts
 /** A pass's name, in the canonical form `cutplan::PassKey` writes: `all`, `color:ff0000ff`,
- *  `color:none`, `line-type:cut`, `line-type:no-cut`, `preset:<id>`, `preset:none`. Sent
- *  back verbatim in a travel or cut request — the string *is* the identity. */
+ *  `no-color`, `preset:<id>`, `no-preset`. Sent back verbatim in a travel or cut request —
+ *  the string *is* the identity. Absence has its own token because a preset id is an
+ *  unrestricted operator string, so `preset:none` would collide with a preset called `none`. */
 export type PassKey = string;
 
 /** How the planner splits shapes into passes. Mirrors `cutplan::Grouping`. */
-export type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "LineType" | "Preset";
+export type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
+
+/** Mirrors `document::PresetAssignment`'s adjacently-tagged JSON. */
+export type PresetAssignmentJson =
+  | { state: "inherit" }
+  | { state: "unassigned" }
+  | { state: "preset"; id: string };
 
 export type PlanCutPassSummary = {
   key: PassKey;
@@ -1668,7 +1894,7 @@ export async function setMaterialPreset(args: Args) {
 }
 ```
 
-`apps/desktop/ui/src/cut/viewmodel.ts`:
+`apps/desktop/ui/src/cut/viewmodel.ts` — the types, then the three pure helpers:
 
 ```ts
 export type PassVm = {
@@ -1698,38 +1924,79 @@ export type CutRequest = {
   passes: ConfiguredPassDto[];
 };
 
-/** What a `PassKey` says, for the one thing the UI needs from inside it: a swatch needs the
- *  RGBA, a row label needs the preset id. The mirror of `cutplan::PassKey::from_str` — the
- *  example table in `viewmodel.test.ts` is what keeps the two agreed. */
+/** What a `PassKey` says, for the two things the UI needs from inside one: a swatch needs the
+ *  RGBA, a row label and a row's settings need the preset id. The mirror of
+ *  `cutplan::PassKey::from_str`; the example table in `viewmodel.test.ts` keeps the two
+ *  agreed. */
 export type ParsedPassKey =
   | { kind: "all" }
   | { kind: "color"; color: number | null }
-  | { kind: "lineType"; lineType: "Cut" | "NoCut" }
   | { kind: "preset"; presetId: string | null }
   | { kind: "unknown"; raw: string };
 
 export function parsePassKey(key: PassKey): ParsedPassKey {
   if (key === "all") return { kind: "all" };
+  if (key === "no-color") return { kind: "color", color: null };
+  if (key === "no-preset") return { kind: "preset", presetId: null };
   // First separator only, so a preset id may contain one — same rule as the Rust parser.
   const at = key.indexOf(":");
   if (at === -1) return { kind: "unknown", raw: key };
   const mode = key.slice(0, at);
   const value = key.slice(at + 1);
   if (mode === "color") {
-    if (value === "none") return { kind: "color", color: null };
-    // Eight digits exactly: a shorter string would parse to a colour no shape carries.
+    // Eight digits exactly: anything shorter would parse to a colour no shape carries.
     if (/^[0-9a-fA-F]{8}$/.test(value)) return { kind: "color", color: parseInt(value, 16) };
     return { kind: "unknown", raw: key };
   }
-  if (mode === "line-type") {
-    if (value === "cut") return { kind: "lineType", lineType: "Cut" };
-    if (value === "no-cut") return { kind: "lineType", lineType: "NoCut" };
-    return { kind: "unknown", raw: key };
-  }
-  if (mode === "preset") {
-    return { kind: "preset", presetId: value === "none" ? null : value };
-  }
+  // An empty id is refused for the same reason the Rust grammar refuses it.
+  if (mode === "preset" && value !== "") return { kind: "preset", presetId: value };
   return { kind: "unknown", raw: key };
+}
+
+/** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
+ *  Grouping-aware because `no-color` means something different per mode — under Stroke it can
+ *  hold brightly filled shapes, so calling it "no visible paint" would be false. */
+export function passRowLabel(
+  key: PassKey,
+  presets: Preset[],
+  grouping: Grouping,
+): { swatch: string | null; text: string | null } {
+  const parsed = parsePassKey(key);
+  switch (parsed.kind) {
+    case "color":
+      if (parsed.color !== null) {
+        // Drop the alpha byte: a swatch is a colour, and 0-alpha keys never reach here.
+        return { swatch: `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`, text: null };
+      }
+      return {
+        swatch: null,
+        text: grouping === "Stroke" ? "No visible stroke"
+            : grouping === "Fill" ? "No visible fill"
+            : "No visible paint",
+      };
+    // Not "every shape": a NoCut shape is excluded from it and counted as skipped.
+    case "all":
+      return { swatch: null, text: "Every cut shape" };
+    case "preset": {
+      if (parsed.presetId === null) return { swatch: null, text: "No preset" };
+      const preset = presets.find((p) => p.id === parsed.presetId);
+      // An id the preset file no longer resolves is a real state: presets are machine-scoped
+      // and a user entry can be deleted while a document still names it.
+      return { swatch: null, text: preset ? preset.name : `${parsed.presetId} (unknown preset)` };
+    }
+    case "unknown":
+      return { swatch: null, text: parsed.raw };
+  }
+}
+
+/** The preset a pass is keyed on, which is the preset it must be cut with. `prepare_cut`
+ *  resolves settings from `preset_id` alone, so a preset-keyed row that arrives without one is
+ *  cut with defaults — the operator groups by material and gets none of that material's
+ *  settings. Kept even when it resolves to nothing, so the request still says what the
+ *  document said. */
+export function presetIdForKey(key: PassKey): string | null {
+  const parsed = parsePassKey(key);
+  return parsed.kind === "preset" ? parsed.presetId : null;
 }
 ```
 
@@ -1766,133 +2033,142 @@ export function toCutRequest(
 }
 ```
 
-Import `PassKey` and `Grouping` from `../ipc` in `viewmodel.ts`.
+Import `PassKey`, `Grouping` from `../ipc` in `viewmodel.ts`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `npm --prefix apps/desktop/ui test`
+Run: `npm --prefix apps/desktop/ui test -- viewmodel`
 
-Expected: PASS for `viewmodel`; `CutDialog`-level failures are Task 8's.
+Expected: PASS. `CutDialog`-level type errors are Task 7's.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/ui/src/ipc.ts apps/desktop/ui/src/cut/viewmodel.ts apps/desktop/ui/src/cut/viewmodel.test.ts
-git commit -m "Carry a pass key across IPC as the one string both sides already write
+git commit -m "Carry a pass key across IPC as the one string both sides write
 
 The wire type is the canonical spelling rather than a mirrored union, so the
-dialog keys rows on exactly what the planner named and sends it back verbatim.
-parsePassKey exists for the two things the UI needs from inside a key — a
-swatch's RGBA and a preset id — and its example table matches the Rust one."
+dialog keys rows on what the planner named and sends it back verbatim. Labels
+are grouping-aware because the colourless pass holds something different in
+each colour mode, and presetIdForKey exists so a preset-keyed pass is cut with
+its own preset rather than with defaults."
 ```
 
 ---
 
-### Task 8: The cut dialog offers the choice
+### Task 7: The cut dialog offers the choice, atomically
 
 **Files:**
-- Modify: `apps/desktop/ui/src/cut/CutDialog.tsx:167-202` (`replan`), `:363-395` (travel refresh, enable), `:548-625` (rows and the skipped sentence), plus the grouping control and its state
-- Modify: `apps/desktop/ui/src/cut/CutPreview.tsx:19-25` (`PreviewPass.color` → `key`), `:75-83,118-130` (pass colour from a parsed key)
-- Test: `apps/desktop/ui/src/cut/viewmodel.test.ts` (the row-label helper)
+- Modify: `apps/desktop/ui/src/cut/CutDialog.tsx:105-109` (state), `:167-202` (`replan`), `:314-331` (`startCut`), `:354-394` (row edits and travel), `:539-546` (the stale-plan Replan button), `:548-625` (rows and the skipped sentence)
+- Modify: `apps/desktop/ui/src/cut/CutPreview.tsx:19-25` (`PreviewPass.color` → `key`), `:75-83`, `:118-130`
 
 **Interfaces:**
-- Consumes: `parsePassKey`, `PassVm.key`, `planCut(grouping)`, `travelForOrder(docRevision, grouping, passes)`, `toCutRequest(dev, revision, grouping, rows)`.
-- Produces: `passRowLabel(key, presets)` in `viewmodel.ts` — the pure half of a row's label, so the JSX stays a rendering of it.
+- Consumes: `parsePassKey`, `passRowLabel`, `presetIdForKey`, `planCut(grouping)`, `travelForOrder(docRevision, grouping, passes)`, `toCutRequest(dev, revision, grouping, rows)`.
+- Produces: the operator-visible grouping control. Nothing else consumes this task.
+
+**The state change is the substance of this task, not the picker.** Today the mode's three companions are independent `useState` values (`:105-109`) read separately by `startCut` (`:315-316`) and `refreshTravel` (`:365-368`). Adding a mode beside them means that between selecting a new mode and its plan arriving, the *old* rows are sendable under the *new* mode — and where the two key sets overlap, the backend accepts them and cuts the wrong shapes. So the plan, its mode, its revision and its rows install together or not at all.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `viewmodel.test.ts`:
+The behaviour is a dialog-level interleaving, so it is pinned in the e2e suite (Task 9) where the fake can hold a reply, and by types here. Add the type-level guard to `viewmodel.test.ts`:
 
 ```ts
-describe("passRowLabel", () => {
-  const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
-                     settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
-
-  it("names a colour pass by its swatch, not by words", () => {
-    expect(passRowLabel("color:ff0000ff", presets)).toEqual({ swatch: "#ff0000", text: null });
-  });
-
-  it("says what the colourless pass holds, since no swatch can", () => {
-    expect(passRowLabel("color:none", presets)).toEqual({ swatch: null, text: "No visible paint" });
-  });
-
-  it("names the single pass for what it is", () => {
-    expect(passRowLabel("all", presets)).toEqual({ swatch: null, text: "Every shape" });
-  });
-
-  it("resolves a preset to its name", () => {
-    expect(passRowLabel("preset:cameo5-htv", presets)).toEqual({ swatch: null, text: "HTV" });
-  });
-
-  // A preset a document names but the preset file no longer has: the planner keys the pass
-  // anyway (a user entry can be deleted), so the dialog has to render one.
-  it("shows an unresolved preset id as unknown", () => {
-    expect(passRowLabel("preset:deleted", presets)).toEqual({ swatch: null, text: "deleted (unknown preset)" });
-  });
-
-  it("names the unassigned-preset pass", () => {
-    expect(passRowLabel("preset:none", presets)).toEqual({ swatch: null, text: "No preset" });
-  });
-
-  it("names a line-type pass", () => {
-    expect(passRowLabel("line-type:cut", presets)).toEqual({ swatch: null, text: "Cut lines" });
+describe("installed plan", () => {
+  // The rows and the mode that produced them travel together. A row list is only ever sent
+  // with the grouping of the plan it came from, which is what this shape enforces: there is
+  // no way to build a request from rows without naming their plan's grouping.
+  it("builds a request only from a plan's own grouping and rows", () => {
+    const plan = { grouping: "Fill" as Grouping, revision: "7", skippedNotCut: 0, rows: [
+      { key: "color:00ff00ff", shapeCount: 1, enabled: true, presetId: null,
+        speed: null, force: null, repeatCount: null },
+    ] };
+    const request = toCutRequest("dev-1", plan.revision, plan.grouping, plan.rows);
+    expect(request.grouping).toBe("Fill");
+    expect(request.passes.map((p) => p.key)).toEqual(["color:00ff00ff"]);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run it to verify it fails**
 
 Run: `npm --prefix apps/desktop/ui test -- viewmodel`
 
-Expected: FAIL — `passRowLabel is not a function`.
+Expected: FAIL — `toCutRequest` takes three arguments until Task 6 is in place; if Task 6 is already committed this passes immediately and the real proof of this task is Task 9's e2e case plus `tsc`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `viewmodel.ts`:
-
-```ts
-/** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
- *  Pure so the wording is testable without rendering the dialog — the same split every
- *  other dialog here uses. */
-export function passRowLabel(
-  key: PassKey,
-  presets: Preset[],
-): { swatch: string | null; text: string | null } {
-  const parsed = parsePassKey(key);
-  switch (parsed.kind) {
-    case "color":
-      return parsed.color === null
-        ? { swatch: null, text: "No visible paint" }
-        // Drop the alpha byte: a swatch is a colour, and 0-alpha keys never reach here.
-        : { swatch: `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`, text: null };
-    case "all":
-      return { swatch: null, text: "Every shape" };
-    case "lineType":
-      return { swatch: null, text: parsed.lineType === "Cut" ? "Cut lines" : "No-cut lines" };
-    case "preset": {
-      if (parsed.presetId === null) return { swatch: null, text: "No preset" };
-      const preset = presets.find((p) => p.id === parsed.presetId);
-      // An id the preset file no longer resolves is a real state, not a bug: presets are
-      // machine-scoped and a user entry can be deleted while a document still names it.
-      return { swatch: null, text: preset ? preset.name : `${parsed.presetId} (unknown preset)` };
-    }
-    case "unknown":
-      return { swatch: null, text: parsed.raw };
-  }
-}
-```
-
-In `CutDialog.tsx`, hold the mode in state and pass it to all three calls:
+Replace the four independent pieces of plan state (`:105-109` keeps `capsFor`; `rows`, `travel`, `skippedNotCut`, `planRevision` go):
 
 ```tsx
-  // The dialog owns the mode and sends it with every request. Held here rather than in the
-  // backend so the rows on screen and the mode that produced them are one piece of state.
+  /** A plan and everything derived from it, installed as one value. The mode belongs here
+   *  rather than beside it: rows keyed under one grouping must never be sent under another,
+   *  and the stale-plan check guards the document, not the mode. */
+  type InstalledPlan = {
+    grouping: ipc.Grouping;
+    revision: string;
+    rows: PassRow[];
+    skippedNotCut: number;
+  };
+
+  const [plan, setPlan] = useState<InstalledPlan | null>(null);
+  const [travel, setTravel] = useState<[number, number, number, number][]>([]);
+  /** The mode the operator has chosen, which is `plan.grouping` except while a replan is in
+   *  flight. Cut and the row controls are unavailable in that window. */
   const [grouping, setGrouping] = useState<ipc.Grouping>("Color");
+  const [replanning, setReplanning] = useState(false);
 ```
 
-`replan` becomes `replan(mode = grouping)` and calls `ipc.planCut(mode)`, mapping `key: p.key` instead of `color: p.color`; the travel refresh calls `ipc.travelForOrder(planRevision, grouping, toTravelPasses(rows))`; the cut calls `toCutRequest(dev, planRevision, grouping, rows)`.
+`replan` takes the mode explicitly and installs everything at once:
 
-Add the control above the pass list:
+```tsx
+  const replan = (mode: ipc.Grouping = grouping) => {
+    const seq = ++planSeq.current;
+    // A fresh plan orphans every reorder request: once when it is asked for (a reply landing
+    // during the fetch would redraw travel the incoming plan replaces) and again when it
+    // installs (a move made while the fetch was out carries the old revision, and its late
+    // stale_plan rejection would re-raise the banner this plan just cleared — Greptile drove
+    // exactly that interleaving on PR #142).
+    travelSeq.current++;
+    setReplanning(true);
+    // Travel from the previous mode describes an arrangement that no longer exists.
+    setTravel([]);
+    ipc
+      .planCut(mode)
+      .then((response) => {
+        if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
+        travelSeq.current++;
+        setPlan({
+          grouping: mode,
+          revision: response.doc_revision,
+          skippedNotCut: response.skipped_not_cut,
+          rows: response.passes.map((p) => ({
+            key: p.key,
+            shapeCount: p.shape_count,
+            nodeIds: p.node_ids,
+            starts: p.starts,
+            enabled: true,
+            // A preset-keyed pass starts with the preset it is keyed on, or it would be cut
+            // with defaults — the one thing grouping by material exists to avoid.
+            presetId: presetIdForKey(p.key),
+            speed: null,
+            force: null,
+            repeatCount: null,
+          })),
+        });
+        setTravel(response.travel);
+        setStalePlan(false);
+      })
+      .catch((e) => {
+        if (seq !== planSeq.current) return; // superseded: its failure is no longer news
+        onError(ipc.ipcErrorMessage(e));
+      })
+      .finally(() => {
+        if (seq === planSeq.current) setReplanning(false);
+      });
+  };
+```
+
+The control sits above the pass list:
 
 ```tsx
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
@@ -1900,12 +2176,10 @@ Add the control above the pass list:
           <select
             aria-label="Group passes by"
             value={grouping}
+            disabled={replanning}
             onChange={(e) => {
               const next = e.target.value as ipc.Grouping;
               setGrouping(next);
-              // Replanned with the new mode immediately: the rows, the skipped count, the
-              // travel and the preview are all derived from it, and showing rows from the
-              // previous mode beside the new selection is the disagreement this avoids.
               replan(next);
             }}
           >
@@ -1913,18 +2187,27 @@ Add the control above the pass list:
             <option value="Stroke">Stroke colour</option>
             <option value="Fill">Fill colour</option>
             <option value="Preset">Material preset</option>
-            <option value="LineType">Line type</option>
             <option value="Single">One pass over everything</option>
           </select>
         </label>
 ```
 
-The row keys off the pass key and renders the label:
+Every remaining read follows mechanically, and each one is why the state was merged:
+
+- `startCut` (`:314-316`): `if (!connected || plan === null || replanning) return;` then
+  `toCutRequest(connected.instance_id, plan.revision, plan.grouping, plan.rows)`.
+- The Cut button gains `disabled={… || plan === null || replanning}`, and the row controls
+  (`Enabled`, preset, speed, force, repeat, Up, Down) gain `disabled={replanning}`.
+- `refreshTravel(next)` (`:363-368`): returns early when `plan === null`, and calls
+  `ipc.travelForOrder(plan.revision, plan.grouping, toTravelPasses(next))`.
+- `updateRow`, `movePass`, `setPassEnabled` (`:354-394`) operate on `plan.rows` and write back
+  with `setPlan((p) => (p === null ? p : { ...p, rows: next }))`.
+- The stale-plan button (`:542`): `onClick={() => replan()}` — bare `onClick={replan}` would pass
+  the mouse event as the mode.
+- Rows (`:549-620`): `rows` becomes `plan?.rows ?? []`, `key={row.key}`, and the swatch/label come
+  from `passRowLabel(row.key, presets, plan.grouping)`:
 
 ```tsx
-              const label = passRowLabel(row.key, presets);
-              …
-              <div key={row.key} data-testid="cut-pass-row" style={{…}}>
                 {label.swatch !== null ? (
                   <span style={{ width: 12, height: 12, display: "inline-block", background: label.swatch }} />
                 ) : null}
@@ -1932,86 +2215,122 @@ The row keys off the pass key and renders the label:
                 <span>{row.shapeCount} shape(s)</span>
 ```
 
-In `CutPreview.tsx`, the pass's draw colour comes from the parsed key rather than a numeric field: `const parsed = parsePassKey(pass.key); const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : textColor;` — keeping the existing fallback exactly as it is for every non-colour key, which is what a non-colour pass has always looked like.
+- The skipped sentence (`:623-625`): `plan?.skippedNotCut ?? 0`.
+- `<CutPreview … passes={plan?.rows ?? []} … />`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+In `CutPreview.tsx`, `PreviewPass.color: number | null` becomes `key: PassKey`, and both draw sites derive the colour from the parsed key, keeping today's fallback for every non-colour pass:
 
-Run: `npm --prefix apps/desktop/ui test` then `npm --prefix apps/desktop/ui run build`
+```tsx
+      const parsed = parsePassKey(pass.key);
+      const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : textColor;
+```
 
-Expected: PASS, and a clean build.
+- [ ] **Step 4: Verify**
+
+Run: `npm --prefix apps/desktop/ui test && npm --prefix apps/desktop/ui run build`
+
+Expected: PASS and a clean build. `tsc` is the real gate here: it names every `rows`/`planRevision` read the merge missed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add apps/desktop/ui/src/cut apps/desktop/ui/dist
-git commit -m "Give the operator the grouping control, and a row that can name itself
+git commit -m "Install a plan, its mode, its revision and its rows as one value
 
-A pass keyed on a preset or a line type has no swatch to be recognised by, so
-the row says what it holds instead — including an unresolved preset id, which
-is a real state because a user preset can be deleted while a document names it.
-Changing the mode replans at once: rows, skipped count, travel and preview all
-come from it, and a stale row list beside a new mode is the lie to avoid."
+A grouping in the payload is necessary and not sufficient: while a replan was in
+flight the previous mode's rows were still sendable under the new one, and where
+two key sets overlap the backend accepts them and cuts the wrong shapes. Cut and
+the row controls are unavailable until the new plan lands. A row keyed on a
+preset now starts with that preset, and a row that has no swatch says what it
+holds instead."
 ```
 
 ---
 
-### Task 9: The operator can assign a material preset
+### Task 8: The operator can assign a material
 
 **Files:**
-- Create: `apps/desktop/ui/src/panels/materialPreset.ts`
-- Modify: `apps/desktop/ui/src/panels/PropertiesPanel.tsx:1-51`, and `App.tsx` where `cutLineType`/`onChangeCutLineType` are wired
-- Test: `apps/desktop/ui/src/panels/materialPreset.test.ts` (create, mirroring the cut-line-type helper's tests if they exist)
+- Create: `apps/desktop/ui/src/panels/materialPreset.ts`, `apps/desktop/ui/src/panels/materialPreset.test.ts`
+- Modify: `apps/desktop/ui/src/panels/PropertiesPanel.tsx:1-51`, `apps/desktop/ui/src/App.tsx` (the `DocNode` type at `:19-45`, the preset list, and the panel's props)
+- Modify: `apps/desktop/ui/src/cut/CutDialog.tsx:106` (stop owning the preset list)
 
 **Interfaces:**
-- Consumes: `ipc.setMaterialPreset`, `Preset` from `viewmodel.ts`.
-- Produces: `selectionMaterialPreset(nodes, selected)` returning `string | null | "mixed"`, and the panel control.
+- Consumes: `ipc.setMaterialPreset`, `ipc.PresetAssignmentJson`, `Preset` from `viewmodel.ts`.
+- Produces: `selectionAssignment(nodes, selected)`, `effectiveMaterials(nodes, root)`, and the panel control.
 
-- [ ] **Step 1: Write the failing test**
+**The preset list moves up.** `presets` is local to the cut dialog (`CutDialog.tsx:106`), which is mounted only while the dialog is open (`App.tsx:480`), so the panel cannot read it there. `App` loads it and passes it to both. The machine it loads for is the document's, falling back to the connected device's — the same choice the dialog already makes for caps.
+
+- [ ] **Step 1: Write the failing tests**
 
 Create `apps/desktop/ui/src/panels/materialPreset.test.ts`:
 
 ```ts
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from "vitest";
-import { selectionMaterialPreset } from "./materialPreset";
+import { effectiveMaterials, selectionAssignment } from "./materialPreset";
 
-const shape = (id: number, material_preset: string | null) => ({
+const shape = (id: number, material_preset: unknown) => ({
   id, kind: { Shape: { Rect: { w: 1, h: 1 } } }, transform: [1, 0, 0, 1, 0, 0],
-  style: { stroke: 255, fill: null }, cut_line_type: "Cut" as const, material_preset,
-  children: [] as number[],
-});
-const group = (id: number, children: number[]) => ({
-  id, kind: "Group" as const, transform: [1, 0, 0, 1, 0, 0],
   style: { stroke: 255, fill: null }, cut_line_type: "Cut" as const,
-  material_preset: null, children,
+  material_preset, children: [] as number[],
+});
+const layer = (id: number, material_preset: unknown, children: number[]) => ({
+  id, kind: "Layer" as const, transform: [1, 0, 0, 1, 0, 0],
+  style: { stroke: null, fill: null }, cut_line_type: "Cut" as const,
+  material_preset, children,
+});
+const INHERIT = { state: "inherit" } as const;
+const UNASSIGNED = { state: "unassigned" } as const;
+const htv = { state: "preset", id: "cameo5-htv" } as const;
+
+describe("selectionAssignment", () => {
+  it("reports the one local assignment a selection agrees on", () => {
+    const nodes = { "1": shape(1, htv), "2": shape(2, htv) };
+    expect(selectionAssignment(nodes as never, [1, 2])).toEqual(htv);
+  });
+
+  // Mixed on the *local* assignment, even when both resolve to the same id: the control
+  // edits local values, and saying otherwise would misreport what a click overwrites.
+  it("reports mixed when a Layer's own value differs from its child's", () => {
+    const nodes = { "1": layer(1, htv, [2]), "2": shape(2, INHERIT) };
+    expect(selectionAssignment(nodes as never, [1, 2])).toBe("mixed");
+  });
+
+  // No descent: unlike the cuttability helper, a selected Layer speaks for itself, because
+  // that is what the command writes.
+  it("reads a selected Layer's own value, not its children's", () => {
+    const nodes = { "1": layer(1, htv, [2]), "2": shape(2, UNASSIGNED) };
+    expect(selectionAssignment(nodes as never, [1])).toEqual(htv);
+  });
+
+  it("returns undefined when nothing is selected", () => {
+    expect(selectionAssignment({} as never, [])).toBeUndefined();
+  });
 });
 
-describe("selectionMaterialPreset", () => {
-  it("reports the one value a selection agrees on", () => {
-    const nodes = { "1": shape(1, "cameo5-htv"), "2": shape(2, "cameo5-htv") };
-    expect(selectionMaterialPreset(nodes as never, [1, 2])).toBe("cameo5-htv");
+describe("effectiveMaterials", () => {
+  // Mirrors the planner's walk (crates/cutplan/src/passes.rs): nearest assigned ancestor
+  // wins, and Unassigned stops the chain rather than deferring up it.
+  it("resolves each node the way the planner will", () => {
+    const nodes = {
+      "1": layer(1, htv, [2, 3, 4]),
+      "2": shape(2, INHERIT),
+      "3": shape(3, UNASSIGNED),
+      "4": shape(4, { state: "preset", id: "cameo5-vinyl-adhesive" }),
+    };
+    expect(effectiveMaterials(nodes as never, 1)).toEqual({
+      1: "cameo5-htv", 2: "cameo5-htv", 3: null, 4: "cameo5-vinyl-adhesive",
+    });
   });
 
-  it("reports mixed when the shapes disagree", () => {
-    const nodes = { "1": shape(1, "cameo5-htv"), "2": shape(2, null) };
-    expect(selectionMaterialPreset(nodes as never, [1, 2])).toBe("mixed");
-  });
-
-  // Walks into containers for the same reason the cut-line-type helper does: the value is
-  // read on the shape, so a Group's own null would show a control that does nothing.
-  it("reads the shapes under a selected container", () => {
-    const nodes = { "1": group(1, [2]), "2": shape(2, "cameo5-htv") };
-    expect(selectionMaterialPreset(nodes as never, [1])).toBe("cameo5-htv");
-  });
-
-  // Distinct from "no preset assigned", which is `null` on a shape that exists.
-  it("returns undefined when there is no shape to speak for", () => {
-    expect(selectionMaterialPreset({} as never, [])).toBeUndefined();
+  it("resolves to nothing when no ancestor assigns one", () => {
+    const nodes = { "1": layer(1, INHERIT, [2]), "2": shape(2, INHERIT) };
+    expect(effectiveMaterials(nodes as never, 1)).toEqual({ 1: null, 2: null });
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run them to verify they fail**
 
 Run: `npm --prefix apps/desktop/ui test -- materialPreset`
 
@@ -2024,36 +2343,101 @@ Create `apps/desktop/ui/src/panels/materialPreset.ts`:
 ```ts
 // SPDX-License-Identifier: GPL-3.0-or-later
 import type { DocNode } from "../App";
+import type { PresetAssignmentJson } from "../ipc";
 
-/// What to show for a selection: the one id every shape agrees on, `null` for "no preset",
-/// `"mixed"` when they disagree, or `undefined` when there is no shape to speak for.
-/// `null` and `undefined` are different answers — one is a shape with no material, the
-/// other is nothing selected — and the panel renders them differently.
+/// The local assignment a selection agrees on, `"mixed"` when it does not, or `undefined`
+/// when nothing is selected.
 ///
-/// Mirrors `commands::set_material_preset`, which walks into containers because the
-/// attribute is read on shapes: a panel that read a Group's own value would show an inert one.
-export function selectionMaterialPreset(
+/// Deliberately no descent, unlike `selectionCutLineType`: `commands::set_material_preset`
+/// writes the selected Nodes themselves, because a material inherits and a Layer's own value
+/// is what reaches the shapes under it. Reporting a child's value for a selected Layer would
+/// describe something the control cannot write.
+export function selectionAssignment(
   nodes: Record<string, DocNode>,
   selected: number[],
-): string | null | "mixed" | undefined {
-  const values = new Set<string | null>();
+): PresetAssignmentJson | "mixed" | undefined {
+  const seen = new Set<string>();
+  let first: PresetAssignmentJson | undefined;
+  for (const id of selected) {
+    const node = nodes[String(id)];
+    if (!node) continue;
+    const assignment = node.material_preset;
+    const fingerprint = JSON.stringify(assignment);
+    if (seen.size === 0) first = assignment;
+    seen.add(fingerprint);
+    if (seen.size > 1) return "mixed";
+  }
+  return first;
+}
+
+/// What each Node's material resolves to, keyed by id — the planner's rule, mirrored so the
+/// panel can say "Inherited — HTV" without guessing. Nearest assigned ancestor wins, and
+/// `unassigned` stops the chain instead of deferring up it.
+export function effectiveMaterials(
+  nodes: Record<string, DocNode>,
+  root: number,
+): Record<number, string | null> {
+  const resolved: Record<number, string | null> = {};
   const seen = new Set<number>();
-  const stack = [...selected];
+  const stack: [number, string | null][] = [[root, null]];
   while (stack.length > 0) {
-    const id = stack.pop()!;
+    const [id, inherited] = stack.pop()!;
+    // A malformed document whose nodes contain each other would otherwise spin here.
     if (seen.has(id)) continue;
     seen.add(id);
     const node = nodes[String(id)];
     if (!node) continue;
-    if (typeof node.kind === "object" && "Shape" in node.kind) values.add(node.material_preset ?? null);
-    else stack.push(...node.children);
+    const assignment = node.material_preset;
+    const material =
+      assignment.state === "preset" ? assignment.id
+      : assignment.state === "unassigned" ? null
+      : inherited;
+    resolved[id] = material;
+    for (const child of node.children) stack.push([child, material]);
   }
-  if (values.size === 0) return undefined;
-  return values.size === 1 ? [...values][0] : "mixed";
+  return resolved;
 }
 ```
 
-Add `material_preset: string | null` to the `DocNode` type in `App.tsx` (beside `cut_line_type`), add the two props to `PropertiesPanel`, and render the control beside the cuttability checkbox:
+Add `material_preset: PresetAssignmentJson` to `DocNode` in `App.tsx:19-45`.
+
+In `PropertiesPanel.tsx`, add the props and the control. The states are named, not prose:
+
+```tsx
+type Props = {
+  bounds: Bounds | null;
+  cutLineType: CutLineTypeJson | "mixed" | null;
+  /** The selection's own assignment; `undefined` when there is no selection. */
+  materialPreset: PresetAssignmentJson | "mixed" | undefined;
+  /** What that selection resolves to, for the inherited case — `null` is "no material". */
+  effectiveMaterial: string | null;
+  presets: Preset[];
+  onChangeX: (v: number) => void;
+  onChangeY: (v: number) => void;
+  onChangeW: (v: number) => void;
+  onChangeH: (v: number) => void;
+  onChangeCutLineType: (v: CutLineTypeJson) => void;
+  onChangeMaterialPreset: (v: PresetAssignmentJson) => void;
+};
+```
+
+```tsx
+/** What the material row reads for each state. `Inherit` shows what it resolves to, because
+ *  "inherit" alone does not tell an operator which material the blade will be set for. */
+function materialLabel(
+  assignment: PresetAssignmentJson | "mixed",
+  effective: string | null,
+  presets: Preset[],
+): string {
+  const name = (id: string) => presets.find((p) => p.id === id)?.name ?? `Unresolved (${id})`;
+  if (assignment === "mixed") return "Mixed";
+  switch (assignment.state) {
+    case "preset": return name(assignment.id);
+    case "unassigned": return "No preset";
+    case "inherit": return effective === null ? "Inherited — No preset" : `Inherited — ${name(effective)}`;
+  }
+}
+```
 
 ```tsx
       {materialPreset !== undefined ? (
@@ -2061,25 +2445,40 @@ Add `material_preset: string | null` to the `DocNode` type in `App.tsx` (beside 
           Material
           <select
             aria-label="Material preset"
-            value={materialPreset === "mixed" ? "" : materialPreset ?? ""}
-            onChange={(e) => onChangeMaterialPreset(e.target.value === "" ? null : e.target.value)}
+            value={materialPreset === "mixed" ? "" :
+                   materialPreset.state === "preset" ? `preset:${materialPreset.id}` : materialPreset.state}
+            onChange={(e) => {
+              const v = e.target.value;
+              onChangeMaterialPreset(
+                v === "inherit" ? { state: "inherit" }
+                : v === "unassigned" ? { state: "unassigned" }
+                : { state: "preset", id: v.slice("preset:".length) },
+              );
+            }}
           >
-            {/* A mixed selection shows this empty option as selected rather than picking a
-                side; choosing it commits "no preset", which one undo reverses. */}
-            <option value="">{materialPreset === "mixed" ? "Mixed" : "No preset"}</option>
-            {presets.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {/* A mixed selection shows this inert option as selected rather than picking a
+                side; every other option commits, which one undo reverses. */}
+            {materialPreset === "mixed" ? <option value="" disabled>Mixed</option> : null}
+            <option value="inherit">Inherit</option>
+            <option value="unassigned">No preset</option>
+            {presets.map((p) => (
+              <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>
+            ))}
           </select>
+          <span style={{ color: "var(--muted)" }}>
+            {materialLabel(materialPreset, effectiveMaterial, presets)}
+          </span>
         </label>
       ) : null}
 ```
 
-Wire it in `App.tsx` the way `onChangeCutLineType` is wired: call `ipc.setMaterialPreset({ ids: selection, value })`, apply the returned `Delta`, and refresh the snapshot — copy the existing handler's shape exactly rather than inventing a second pattern. The panel needs the machine's presets, which the app already loads for the cut dialog; pass that list down.
+Update the "No selection" condition to `bounds === null && cutLineType === null && materialPreset === undefined`.
 
-Update the `bounds === null && cutLineType === null` "No selection" condition to also require `materialPreset === undefined`, so a selection that has a material never shows "No selection".
+In `App.tsx`: load the preset list where the machine is known (mirroring how the dialog does it via `ipc.listPresets`), pass it to both `PropertiesPanel` and `CutDialog`, compute `selectionAssignment(nodes, selection)` and `effectiveMaterials(nodes, doc.root)[selection[0]] ?? null` for the props, and wire `onChangeMaterialPreset` exactly as `onChangeCutLineType` is wired — `ipc.setMaterialPreset({ ids: selection, value })`, apply the returned `Delta`, refresh the snapshot. In `CutDialog.tsx`, delete the local `presets` state (`:106`) and take it as a prop.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Verify**
 
-Run: `npm --prefix apps/desktop/ui test` then `npm --prefix apps/desktop/ui run build`
+Run: `npm --prefix apps/desktop/ui test && npm --prefix apps/desktop/ui run build`
 
 Expected: PASS, clean build.
 
@@ -2087,40 +2486,29 @@ Expected: PASS, clean build.
 
 ```bash
 git add apps/desktop/ui/src apps/desktop/ui/dist
-git commit -m "Let the operator put a material on a Node, so preset grouping has input
+git commit -m "Let the operator put a material on a Node, and say where it came from
 
-Mirrors the cuttability control, including walking into containers: the value
-is read on the shape, so assigning it to a Layer has to reach the shapes under
-it or the control would look inert. 'No preset' and 'nothing selected' are
-different answers and render differently."
+Three states need three options, and Inherit has to show what it resolves to —
+'inherit' alone does not tell an operator which material the blade will be set
+for. The panel reads the selection's own value with no descent, because that is
+what the command writes. The preset list moves to App: it was local to the cut
+dialog, which only exists while that dialog is open."
 ```
 
 ---
 
-### Task 10: The e2e fake tells the truth again
+### Task 9: The e2e fake tells the truth again
 
 **Files:**
-- Modify: `apps/desktop/ui/e2e/smoke.spec.ts:1-70` (the fake's `Node` type and fixtures), `:302-341` (`planFromDoc`), `:459-505` (the three handlers), and every pass/travel/cut assertion at `:707,733,774,798,823,842,864`
-- Modify: the stale comment at `:468-472` (#143)
+- Modify: `apps/desktop/ui/e2e/smoke.spec.ts:23-66` (fixtures), `:84`, `:95`, `:146` (the three Node constructors), `:302-341` (`planFromDoc`), `:459-505` (the three handlers), `:468-472` (the stale comment, #143), and the pass/travel/cut assertions at `:707`, `:733`, `:774`, `:798`, `:823`, `:842`, `:864`
 
 **Interfaces:**
-- Consumes: the real DTO shapes from Tasks 6 and 7.
+- Consumes: the real DTO shapes from Tasks 5 and 6.
 - Produces: nothing — this is the suite catching up to the backend it mirrors.
 
 - [ ] **Step 1: Write the failing assertions**
 
-Update the fake's fixtures to carry the new field, and the pass assertions to keys. The two-colour test at `:707` becomes:
-
-```ts
-    // The fake groups by the mode the dialog asked for, so this asserts the same thing the
-    // real planner would: two visible strokes, two passes, keyed the way the planner keys them.
-    const keys = await page.evaluate(() => (window as unknown as {
-      __travelRequests: { key: string; enabled: boolean }[][]
-    }).__travelRequests.at(-1)?.map((p) => p.key));
-    expect(keys).toEqual(["color:ff0000ff", "color:00ff00ff"]);
-```
-
-and add a mode test:
+The fake's `Node` type gains `material_preset`, and every constructor — `freshDoc` (`:34`), the seeded rects (`:48-64`), and the three at `:84`, `:95`, `:146` — carries `material_preset: { state: "inherit" }`. Then the pass assertions move to keys, and two new cases:
 
 ```ts
   test("changing the grouping replans and renames the passes", async ({ page }) => {
@@ -2130,7 +2518,24 @@ and add a mode test:
     await page.getByLabel("Group passes by").selectOption("Single");
     // One pass, named for what it holds rather than for a colour it does not have.
     await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-    await expect(page.getByText("Every shape")).toBeVisible();
+    await expect(page.getByText("Every cut shape")).toBeVisible();
+
+    const last = await page.evaluate(() => (window as unknown as {
+      __travelRequests: { key: string; enabled: boolean }[][] }).__travelRequests.at(-1));
+    expect(last?.map((p) => p.key)).toEqual(["all"]);
+  });
+
+  test("a cut cannot be sent with rows from the previous grouping", async ({ page }) => {
+    await openCutDialog(page);
+    await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+
+    await page.getByLabel("Group passes by").selectOption("Single");
+    // The replan is parked, so the old rows are still on screen — and must not be sendable.
+    await expect(page.getByRole("button", { name: "Cut" })).toBeDisabled();
+
+    await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+    await expect(page.getByRole("button", { name: "Cut" })).toBeEnabled();
+    await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   });
 ```
 
@@ -2138,84 +2543,144 @@ and add a mode test:
 
 Run: `npm --prefix apps/desktop/ui run e2e`
 
-Expected: FAIL — the fake still returns `color`, and the dialog has no grouping control in the fake's world.
+Expected: FAIL — the fake still returns `color`, and its handlers ignore the grouping.
 
 - [ ] **Step 3: Update the fake**
 
-`planFromDoc` takes the grouping and keys the way the planner does:
+`planFromDoc` takes the grouping and keys the way the planner does, resolving materials down the tree:
 
 ```ts
   // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
   // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
-  // (stroke where visible, else fill, with 0-alpha counting as absent; strict under Stroke
-  // and Fill), the line type, the inherited material preset, or `all` for one pass.
+  // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
+  // absent), the resolved material, or `all` for one pass. Absence is its own token
+  // (`no-color`, `no-preset`) because a preset id may be any string.
   function planFromDoc(grouping: Grouping = "Color") {
     const byKey = new Map<string, { key: string; node_ids: number[] }>();
     let skipped = 0;
-    const visible = (c: number | null | undefined) => ((c ?? 0) & 0xff) !== 0 ? c! : null;
-    const colorKey = (n: Node) => {
+    const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
+    const colorKey = (n: FakeNode) => {
       const stroke = visible(n.style.stroke);
       const fill = visible(n.style.fill);
       const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
-      return c === null ? "color:none" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
+      return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
     };
     const walk = (id: number, inherited: string | null) => {
       const n = doc.nodes[id];
       if (!n) return;
+      const a = n.material_preset;
+      const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
       const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
-      const preset = n.material_preset ?? inherited;
       if (isShape) {
         if (n.cut_line_type === "NoCut") {
           skipped++;
         } else {
           const key =
             grouping === "Single" ? "all"
-            : grouping === "LineType" ? `line-type:${n.cut_line_type === "Cut" ? "cut" : "no-cut"}`
-            : grouping === "Preset" ? `preset:${preset ?? "none"}`
+            : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
             : colorKey(n);
           const existing = byKey.get(key);
           if (existing) existing.node_ids.push(id);
           else byKey.set(key, { key, node_ids: [id] });
         }
       }
-      for (const c of n.children) walk(c, preset);
+      for (const c of n.children) walk(c, material);
     };
     walk(doc.root, null);
-    …
+    // starts is all-null on purpose: the fake carries no geometry to flatten, and null is the
+    // real backend's no-outline case — so e2e renders exercise the preview's bounds-corner
+    // badge fallback rather than a fixture pretending to be a blade path.
+    const passes = [...byKey.values()].map((p) => ({
+      key: p.key,
+      shape_count: p.node_ids.length,
+      node_ids: p.node_ids,
+      starts: p.node_ids.map(() => null),
+    }));
+    // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
+    // snapshot_json: a doc edited back to a previous state is not stale.
+    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc),
+             travel: [] as [number, number, number, number][] };
   }
 ```
 
-(keep the `starts`-all-null comment and the snapshot-as-revision comment verbatim; only the keying changes.)
-
-The three handlers take the grouping and key on it — and the stale comment #143 filed gets fixed here, which is the ride-along it was filed for:
+All three handlers honour the grouping, and travel and cut **mirror the backend's exact-once
+identity check** — without it the fake accepts stale keys and the suite stays green on a frontend
+that cannot work:
 
 ```ts
     plan_cut: (a) => {
       const plan = planFromDoc(a.grouping as Grouping);
-      …
+      if (!holding) return plan;
+      return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
     },
     // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
-    // refusal, then synthetic segments (one per adjacent pair of *enabled* passes, x
-    // encoding the position in the order) — the real command does not route the head to a
-    // pass that will not be cut. Received lists are recorded on `window.__travelRequests`
-    // so a test can assert what the dialog asked for, including the grouping; travel itself
-    // lands on a canvas Playwright cannot read.
+    // refusal, the same exact-once identity check over the requested keys, then synthetic
+    // segments — one per adjacent pair of *enabled* passes, x encoding the position in the
+    // order, because the real command does not route the head to a pass that will not be cut.
+    // Requests are recorded on `window.__travelRequests` so a test can assert what the dialog
+    // asked for; travel itself lands on a canvas Playwright cannot read.
     travel_for_order: (a) => {
       const passes = a.passes as { key: string; enabled: boolean }[];
-      …
-      const stale = planFromDoc(a.grouping as Grouping).doc_revision !== a.docRevision;
-      …
+      const grouping = a.grouping as Grouping;
+      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests ??= [];
+      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests.push(passes);
+      const settle = () => {
+        const plan = planFromDoc(grouping);
+        // Decided at settle time, like the real command — a request issued before a replan is
+        // stale even if it settles after one.
+        if (plan.doc_revision !== a.docRevision) {
+          throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+        }
+        const remaining = plan.passes.map((p) => p.key);
+        for (const pass of passes) {
+          const i = remaining.indexOf(pass.key);
+          if (i === -1) {
+            throw plan.passes.some((p) => p.key === pass.key)
+              ? ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
+              : ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+          }
+          remaining.splice(i, 1);
+        }
+        if (remaining.length > 0) {
+          throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
+        }
+        const cut = passes.filter((p) => p.enabled);
+        return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+      };
+      if (!holding) return settle();
+      return new Promise((resolve, reject) => heldTravel.push(() => {
+        try { resolve(settle()); } catch (e) { reject(e); }
+      }));
     },
     cut: (a) => {
       const request = a.request as { device_instance_id: string; doc_revision: string;
         grouping: Grouping; passes: { key: string; enabled: boolean }[] };
-      …
+      if (!connected) throw ipcError("not_connected", "no device connected");
+      if (connected.instance_id !== request.device_instance_id) {
+        throw ipcError("device_mismatch", "connected device changed since planning");
+      }
       const plan = planFromDoc(request.grouping);
+      if (plan.doc_revision !== request.doc_revision) {
+        throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+      }
+      if (doc.machine && doc.machine.id !== connected.machine_id) {
+        throw ipcError("machine_mismatch", "document is set up for a different machine");
+      }
+      // A key the plan does not have is refused here too, so rows from a previous grouping
+      // cannot cut the wrong shapes just because the fake was more forgiving than Rust.
+      for (const pass of request.passes) {
+        if (!plan.passes.some((p) => p.key === pass.key)) {
+          throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+        }
+      }
+      planPasses = request.passes;
       …
     },
 ```
 
-Add `material_preset: null` to every fixture Node the fake builds (`:1-70`), and `material_preset: string | null` to its `Node` type.
+Add a `set_material_preset` handler beside `set_cut_line_type`'s, writing the assignment to each
+named node and returning the same `Delta` shape the real command does — an unimplemented command
+throws (`:68-70`), so the panel control cannot be exercised without it.
 
 - [ ] **Step 4: Run the suite to verify it passes**
 
@@ -2227,80 +2692,111 @@ Expected: PASS on both.
 
 ```bash
 git add apps/desktop/ui/e2e/smoke.spec.ts
-git commit -m "Teach the e2e fake to key passes and honour a grouping, and fix its comment
+git commit -m "Make the e2e fake as strict as the backend it stands in for
 
-The fake re-implements plan_passes, so a grouping it ignores makes the suite
-green on a dialog that cannot work. Also settles #143: the comment named a
-hook that had been renamed to __travelRequests and a rule that had changed to
-enabled-passes-only."
+A fake that ignores the grouping and accepts any key stays green while the
+frontend sends rows from one mode under another — the exact failure the dialog
+change prevents. It now keys passes, resolves materials down the tree, and
+mirrors the exact-once identity check. Also settles #143: the comment named a
+hook renamed to __travelRequests and a rule that had become enabled-only."
 ```
 
 ---
 
-### Task 11: The vocabulary says what the code now does
+### Task 10: The vocabulary and the checklists say what the code does
 
 **Files:**
-- Modify: `CONTEXT.md:40-47` (the ColorPass entry), `:59-62` (PassSelection), and add PassKey
+- Modify: `CONTEXT.md:40-47` (the ColorPass entry), `:59-62` (PassSelection), adding PassKey, Grouping and PresetAssignment
 - Modify: `CLAUDE.md:79-99` (the cut-path section), `:154-160` (the vocabulary list)
+- Modify: `apps/desktop/MANUAL-CHECKLIST.md:91`, `:102` (two live checks naming removed flags)
 - Modify: `CHANGELOG.md`
 
-**Interfaces:**
-- Consumes: everything above.
-- Produces: no code.
+**Interfaces:** consumes everything above; produces no code.
 
 - [ ] **Step 1: Update `CONTEXT.md`**
 
-Replace the **ColorPass** entry with **DocumentPass** and add **PassKey** and **Grouping** beside it:
+Replace the **ColorPass** entry with **DocumentPass**, and add the three new terms:
 
 ```markdown
 **DocumentPass**:
 Every shape in a Document cut in a single run of the blade, together with the PassKey that
-says which pass it is. What the shapes have in common is whatever the Grouping asked for —
-a colour, a line type, a material preset — or nothing but the operator's request, for the
-single pass. Which shapes are cut at all is their CutLineType's business, not their paint's.
+says which pass it is. What its shapes share is whatever the Grouping asked for — a colour, a
+material preset — or nothing but the operator's request, for the single pass. Which shapes are
+cut at all is their CutLineType's business, not their paint's.
 _Avoid_: ColorPass (retired with #148), layer, colour group, batch
 
 **PassKey**:
-What a DocumentPass is called: `all` for the single pass, a colour, a CutLineType, or a
-MaterialPreset id — each with one canonical spelling (`color:ff0000ff`, `line-type:cut`,
-`preset:cameo5-htv`) that the CLI, the IPC payloads and the cut dialog all use. Absence
-inside a key is a real value: `color:none` is a shape with no visible paint, `preset:none`
-one nobody assigned a material to.
+What a DocumentPass is called: `all` for the single pass, a colour, or a MaterialPreset id,
+each with one canonical spelling (`color:ff0000ff`, `preset:cameo5-htv`) that the CLI, the IPC
+payloads and the cut dialog all use. Absence is its own token — `no-color` for a shape with no
+visible paint, `no-preset` for one with no material — never a reserved value inside a mode,
+because a preset id is an unrestricted operator string.
 _Avoid_: pass id, pass name, colour
 
 **Grouping**:
 How a Document's cut shapes are split into DocumentPasses — by stroke colour, fill colour,
-stroke-else-fill, material preset, line type, or not at all. A request, not a property of
-the Document: the same Document plans differently under two Groupings, and the mode travels
-with every cut request so a preview and a cut cannot disagree about it.
+stroke-else-fill, material preset, or not at all. A request, not a property of the Document:
+the same Document plans differently under two Groupings, so the mode travels with every cut
+request, and the dialog holds it with the rows it produced.
 _Avoid_: mode, split, pass strategy
+
+**PresetAssignment**:
+What a Node says about its material: inherit from the nearest assigned ancestor, no material
+at all, or a named MaterialPreset. Resolved during planning rather than stored, so moving a
+Node between Layers changes what it is cut with and nothing has to be rewritten.
+_Avoid_: material, preset id, optional preset
 ```
 
-Update the **PassSelection** entry: it names a pass "by its PassKey", not "by colour".
+Update the **PassSelection** entry: it names a pass "by its PassKey", not by colour.
 
 - [ ] **Step 2: Update `CLAUDE.md`**
 
-In the cut-path section, the plain-CLI paragraph (`:90-97`) now reads as `--group-by single` rather than "no `--by-color`", and the pass-identity sentence gains the key. In the conventions list (`:156-160`), replace `ColorPass` with `DocumentPass`, `PassKey` and `Grouping`.
+In the cut-path section, the plain-CLI paragraph (`:90-97`) reads as `--group-by single` rather than "no `--by-color`", and the pass-identity sentence names the key. In the conventions list (`:156-160`), replace `ColorPass` with `DocumentPass`, `PassKey`, `Grouping` and `PresetAssignment`.
 
-- [ ] **Step 3: Update `CHANGELOG.md`**
+- [ ] **Step 3: Update the manual checklist**
 
-Follow the file's existing format. The operator-visible facts: grouping is selectable in the cut dialog and with `--group-by`; a Node can carry a material preset; `--by-color` and `--skip-color` are gone, replaced by `--group-by` and `--skip-pass`; `--order` takes pass keys.
+`apps/desktop/MANUAL-CHECKLIST.md:91` and `:102` name flags this change removes, and a live operator check that cannot be run is worse than none:
 
-- [ ] **Step 4: Verify**
+```markdown
+- [ ] `cuthulhu cut a.svg --skip-pass color:FF0000FF` — refused, naming `--group-by single`.
+```
 
-Run: `cargo test --workspace --locked && npm --prefix apps/desktop/ui test && grep -rn "ColorPass\|by-color\|skip-color" --include="*.rs" --include="*.ts" --include="*.tsx" --include="*.md" . | grep -v CHANGELOG`
+```markdown
+- [ ] `cuthulhu cut --group-by color` on the Puma still prompts per pass and completes.
+```
 
-Expected: tests PASS, and the grep returns nothing outside `CHANGELOG.md` (where the removed flags are named as removed). A surviving `ColorPass` is a rename this plan missed.
+Add one check for the new capability, since it is operator-visible and only real material proves it:
 
-- [ ] **Step 5: Commit**
+```markdown
+- [ ] `cuthulhu cut two-materials.cut --group-by preset` — one pass per material, each cut with
+      that preset's settings, prompting between them.
+```
+
+- [ ] **Step 4: Update `CHANGELOG.md`**
+
+Following the file's existing format, the operator-visible facts: grouping is selectable in the cut dialog and with `--group-by`; a Node can carry a material preset that Layers pass down; `--by-color` and `--skip-color` are gone, replaced by `--group-by` and `--skip-pass`; `--order` takes pass keys and is repeatable rather than comma-separated.
+
+- [ ] **Step 5: Verify and commit**
 
 ```bash
-git add CONTEXT.md CLAUDE.md CHANGELOG.md
+cargo test --workspace --locked && npm --prefix apps/desktop/ui test && npm --prefix apps/desktop/ui run e2e
+# Live source and normative docs only: historical plans and specs record the old names on
+# purpose, and CHANGELOG.md names the removed flags as removed. `!` because rg exits 1 when it
+# finds nothing, which is the passing case here.
+! rg -n 'ColorPass|--by-color|--skip-color|UnknownPassColor' crates apps CONTEXT.md CLAUDE.md \
+    --glob '!apps/desktop/ui/dist/**'
+```
+
+Expected: tests PASS, and the `rg` line succeeds by finding nothing. A surviving `ColorPass` is a rename this plan missed.
+
+```bash
+git add CONTEXT.md CLAUDE.md CHANGELOG.md apps/desktop/MANUAL-CHECKLIST.md
 git commit -m "Retire ColorPass from the vocabulary, since a pass is no longer a colour
 
-CONTEXT.md is normative, so the term the code no longer has cannot stay in it.
-DocumentPass, PassKey and Grouping replace it, and PassSelection now names a
-pass by its key."
+CONTEXT.md is normative, so a term the code no longer has cannot stay in it:
+DocumentPass, PassKey, Grouping and PresetAssignment replace it. The manual
+checklist had two live operator checks running flags this change removes, which
+is worse than having none."
 ```
 
 ---
@@ -2310,7 +2806,7 @@ pass by its key."
 The plan is done when, from a clean tree on `vcolombo/pass-grouping`:
 
 - `cargo test --workspace --locked` passes and `Cargo.lock` is unchanged.
-- `npm --prefix apps/desktop/ui test` and `npm --prefix apps/desktop/ui run e2e` pass, and `apps/desktop/ui/dist` is committed and current.
-- `cuthulhu cut file.svg --device cameo5 --dry-run` prints one pass labelled `all`; `--group-by color --dry-run` prints one labelled pass per visible paint; `--group-by preset --skip-pass preset:none --dry-run` refuses by name when nothing carries a preset.
-- The grep in Task 11 Step 4 returns nothing.
-- Hardware verification is **not** required and nothing is added to `apps/desktop/MANUAL-CHECKLIST.md`: every decision here lands before a byte reaches a Transport, and the `MockTransport`/dry-run paths cover it. A real multi-pass cut grouped by preset is worth doing opportunistically, not blocking on.
+- `npm --prefix apps/desktop/ui test` and `npm --prefix apps/desktop/ui run e2e` pass, with `apps/desktop/ui/dist` committed and current.
+- `cuthulhu cut file.svg --device cameo5 --dry-run` prints bytes with no pass header, exactly as before this change; `--group-by color --dry-run` prints one labelled pass per visible paint; `--group-by preset --skip-pass no-preset --dry-run` on a file where nothing carries a material refuses by name rather than reporting an empty file.
+- The `rg` assertion in Task 10 Step 5 finds nothing.
+- Hardware verification is not required for correctness — every decision lands before a byte reaches a Transport, and the `MockTransport`/dry-run paths cover it — but `apps/desktop/MANUAL-CHECKLIST.md` gains the preset-grouping check, because "each pass cut with its own material's settings" is a claim only real material can settle.

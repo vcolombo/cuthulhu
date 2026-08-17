@@ -1606,8 +1606,13 @@ mod tests {
         let builtin = cutplan::presets::builtin_presets().into_iter()
             .find(|p| p.id == "cameo5-htv").expect("premise: the builtin exists");
         assert_eq!(passes[0].job.settings.speed, Some(7), "the operator's own speed is used");
-        assert_ne!(passes[0].job.settings.speed, builtin.settings.speed,
-            "premise: the builtin would have said something else, so this asserts a choice");
+        // Force is what discriminates, and speed cannot: an override beats a preset either way
+        // (`presets.rs:44`), so a speed assertion passes even if the preset were wrongly
+        // re-derived from the key. Force was left unset, so it says which of the two happened.
+        assert!(builtin.settings.force.is_some(),
+            "premise: HTV states a force, so re-deriving it from the key would show here");
+        assert_eq!(passes[0].job.settings.force, None,
+            "no preset was selected, so no preset's force is applied");
     }
 
     /// A pass naming a preset the file cannot resolve is refused rather than cut with

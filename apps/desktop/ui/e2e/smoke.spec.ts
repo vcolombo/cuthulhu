@@ -891,6 +891,56 @@ test("a rejected replan keeps the travel it was showing", async ({ page }) => {
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
 
+// Codex's finding on the first fix for the test above: restoring travel from a value captured when
+// the replan started only works for one replan. A second replan beginning *while* the first is still
+// out captures the already-cleared travel and restores that empty value on failure - so the preview
+// went empty anyway, while the plan that was never replaced stayed installed and cuttable. Travel
+// now lives in the installed plan, so a failure has nothing to restore and cannot lose it.
+//
+// The picker is disabled during a replan, so the two overlapping replans arrive the way an operator
+// would actually produce them: through the stale-plan banner, whose Replan is deliberately still
+// pressable - the banner is how a wedged plan gets unwedged, and a second press must not make
+// things worse than the first.
+test("a replan failing while another is parked keeps the installed plan's travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // Stale the plan so the banner - and its Replan - are on screen.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+
+  // First Replan is parked in flight: the window in which travel used to be cleared.
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByRole("button", { name: "Replan" }).click();
+
+  // Second Replan, pressed inside that window, fails at once - `failNextPlan` is read before the
+  // hold. Under the old design its rollback value was the cleared travel, not the installed one.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByRole("button", { name: "Replan" }).click();
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+
+  // Nothing was ever replaced, so the original plan is still the installed one - and the preview
+  // must still describe it rather than showing a cut with no travel at all.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // The parked reply lands last and is superseded, so it changes nothing either.
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+});
+
 // The whole material path through the real UI: the panel assigns a preset, preset grouping keys
 // the pass on it, the row carries that preset's id, and the cut is refused because this machine
 // cannot offer it. Nothing else drives preset grouping end to end, and without this the fake's

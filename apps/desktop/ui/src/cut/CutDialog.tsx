@@ -26,15 +26,23 @@ const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOpera
 type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[] };
 
 /** A plan the dialog is showing: the mode that produced it, the revision it was planned
- *  against, its rows, and its skipped count. One value because they are only ever true
- *  together — a mode change that left the previous rows sendable is how travel and a cut end
- *  up describing different geometry.
+ *  against, its rows, its skipped count, and the travel between those rows. One value because
+ *  they are only ever true together — a mode change that left the previous rows sendable is how
+ *  travel and a cut end up describing different geometry.
+ *
+ *  Travel lives here rather than beside this, because it is derived from the plan and only
+ *  meaningful against these rows. Held separately it could be cleared while the plan it belonged
+ *  to was still installed and cuttable, which is exactly what happened: a replan cleared travel on
+ *  the way out, and a *second* replan then captured the cleared value as the one to restore. There
+ *  is nothing to restore now — a failed replan does not touch the plan, so it does not touch its
+ *  travel.
  */
 type InstalledPlan = {
   grouping: ipc.Grouping;
   revision: string;
   rows: PassRow[];
   skippedNotCut: number;
+  travel: [number, number, number, number][];
 };
 
 type Props = {
@@ -122,7 +130,6 @@ export function CutDialog({
    *  rather than beside it: rows keyed under one grouping must never be sent under another,
    *  and the stale-plan check guards the document, not the mode. */
   const [plan, setPlan] = useState<InstalledPlan | null>(null);
-  const [travel, setTravel] = useState<[number, number, number, number][]>([]);
   /** The mode the operator has chosen, which is `plan.grouping` except while a replan is in
    *  flight. Cut and the row controls are unavailable in that window, because rows from the
    *  previous mode would otherwise be sendable under this one. */
@@ -193,13 +200,10 @@ export function CutDialog({
     // plan just cleared — Greptile drove exactly that interleaving on PR #142).
     travelSeq.current++;
     setReplanning(true);
-    // Travel from the previous mode describes an arrangement that no longer exists — but the
-    // previous plan is still the installed one until this reply lands, and if the reply is a
-    // failure it stays installed and cuttable. So the travel it describes has to come back with
-    // it, or the operator is offered a cut whose preview shows no travel at all (Greptile drove
-    // exactly that on this PR: rows 2, cuttable true, travel lines 1 -> 0).
-    const priorTravel = travel;
-    setTravel([]);
+    // Nothing is cleared on the way out. The previous plan stays installed until this reply
+    // lands, and it is still the one that would be cut if this reply is a failure — so the travel
+    // describing it stays on screen with it. Cut and the row controls are unavailable while
+    // `replanning`, so the window cannot be acted on either way.
     ipc
       .planCut(mode)
       .then((response) => {
@@ -222,8 +226,8 @@ export function CutDialog({
             force: null,
             repeatCount: null,
           })),
+          travel: response.travel,
         });
-        setTravel(response.travel);
         setStalePlan(false);
       })
       .catch((e) => {
@@ -233,7 +237,6 @@ export function CutDialog({
         // plan, the dialog would offer a Cut it cannot keep: the operator reads "one pass" and
         // the machine does the split the old plan still holds.
         setGrouping(plan?.grouping ?? "Color");
-        setTravel(priorTravel);
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => {
@@ -413,7 +416,9 @@ export function CutDialog({
     ipc
       .travelForOrder(plan.revision, plan.grouping, toTravelPasses(next))
       .then((t) => {
-        if (seq === travelSeq.current) setTravel(t);
+        // Onto whatever plan is installed when the reply lands, not the one captured when it was
+        // asked for: the sequence guard has already established they are the same plan.
+        if (seq === travelSeq.current) setPlan((prev) => (prev === null ? prev : { ...prev, travel: t }));
       })
       .catch((e) => {
         if (seq !== travelSeq.current) return;
@@ -706,7 +711,7 @@ export function CutDialog({
           Not cut: {plan?.skippedNotCut ?? 0} shape{(plan?.skippedNotCut ?? 0) === 1 ? "" : "s"} marked No Cut
         </div>
 
-        <CutPreview scene={scene} artboard={artboard} passes={plan?.rows ?? []} travel={travel} />
+        <CutPreview scene={scene} artboard={artboard} passes={plan?.rows ?? []} travel={plan?.travel ?? []} />
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}

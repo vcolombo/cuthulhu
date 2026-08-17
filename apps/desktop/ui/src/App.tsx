@@ -381,8 +381,16 @@ export function App() {
   // The selection's own assignment, and what it resolves to. Both, because `Inherit` alone
   // does not tell an operator which material the blade will be set for.
   const materialPreset = doc ? selectionAssignment(doc.nodes, selected) : undefined;
-  const effectiveMaterial =
-    doc && selected.length > 0 ? effectiveMaterials(doc.nodes, doc.root)[selected[0]] ?? null : null;
+  // Across the whole selection, not just its first node: two shapes that both say `Inherit`
+  // under different Layers agree on their *local* value and resolve differently, and labelling
+  // that with the first one's material misreports what a bulk edit is about to replace.
+  const effectiveMaterial = ((): string | null | "mixed" => {
+    if (!doc || selected.length === 0) return null;
+    const resolved = effectiveMaterials(doc.nodes, doc.root);
+    const distinct = new Set(selected.map((id) => resolved[id] ?? null));
+    if (distinct.size > 1) return "mixed";
+    return [...distinct][0] ?? null;
+  })();
 
   const setMaterialPreset = (value: ipc.PresetAssignmentJson) => {
     if (selected.length === 0) return;

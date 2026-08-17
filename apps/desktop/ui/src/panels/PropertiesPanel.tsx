@@ -10,8 +10,10 @@ type Props = {
   cutLineType: CutLineTypeJson | "mixed" | null;
   /** The selection's own assignment; `undefined` when there is no selection. */
   materialPreset: PresetAssignmentJson | "mixed" | undefined;
-  /** What that selection resolves to, for the inherited case — `null` is "no material". */
-  effectiveMaterial: string | null;
+  /** What that selection resolves to: an id, `null` for "no material", or `"mixed"` when the
+   *  selected Nodes inherit from ancestors that disagree. Distinct from a preset id, which is
+   *  why it is a literal and not a widened string. */
+  effectiveMaterial: string | null | "mixed";
   presets: Preset[];
   onChangeX: (v: number) => void;
   onChangeY: (v: number) => void;
@@ -25,7 +27,7 @@ type Props = {
  *  "inherit" alone does not tell an operator which material the blade will be set for. */
 function materialLabel(
   assignment: PresetAssignmentJson | "mixed",
-  effective: string | null,
+  effective: string | null | "mixed",
   presets: Preset[],
 ): string {
   const name = (id: string) => presets.find((p) => p.id === id)?.name ?? `Unresolved (${id})`;
@@ -33,7 +35,10 @@ function materialLabel(
   switch (assignment.state) {
     case "preset": return name(assignment.id);
     case "unassigned": return "No preset";
-    case "inherit": return effective === null ? "Inherited — No preset" : `Inherited — ${name(effective)}`;
+    case "inherit":
+      return effective === "mixed" ? "Inherited — Mixed"
+           : effective === null ? "Inherited — No preset"
+           : `Inherited — ${name(effective)}`;
   }
 }
 

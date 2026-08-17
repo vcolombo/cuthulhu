@@ -561,6 +561,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         if (!plan.passes.some((p) => p.key === pass.key)) {
           throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
         }
+        // And a preset this machine cannot offer is refused rather than cut with defaults,
+        // mirroring prepare_cut. `list_presets` answers empty here, so any named preset is
+        // unavailable — which is the state the real refusal exists for.
+        const named = (pass as { preset_id?: string | null }).preset_id;
+        if (pass.enabled && named) {
+          throw ipcError("unknown_preset",
+            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
+        }
       }
       planPasses = request.passes;
       jobId = nextJobId++;
@@ -826,6 +834,34 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
+// Greptile's P1 on PR #152, reproduced with a held reply: while a replacement plan is in flight
+// the rows on screen still belong to the previous grouping, so an edit accepted there is
+// discarded when the new plan installs — silently, with the operator's speed still on screen
+// until it vanishes. Every row control is unavailable in that window.
+test("row controls are unavailable while a replacement plan is in flight", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
+
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // Still the old mode's two rows, and not one of their controls will take an edit.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Speed for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Force for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Repeat count for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Preset for pass 1")).toBeDisabled();
+  await expect(page.getByRole("checkbox", { name: "Enabled" }).first()).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Down" }).first()).toBeDisabled();
+
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
+});
+
 // The whole operator-facing round trip: the properties panel's control, the real
 // set_cut_line_type command, and the plan that then leaves the shape out. Nothing else in this
 // suite reads the dialog's not-cut line, so a readout wired to a renamed field would render an
@@ -979,15 +1015,18 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(banner).toBeVisible();
 
-  // Replan is in flight (held) when the pass moves, so the move is sent with the revision
-  // the fresh plan is about to replace.
+  // The interleaving, without editing a row during a replan — which the dialog now refuses,
+  // because rows belonging to a plan being replaced must not accept edits the arriving plan
+  // discards. The reorder goes out *first* and is held, which is what the defect's own story
+  // says anyway: "a reorder issued before Replan carries the old revision".
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
-  await page.getByRole("button", { name: "Replan" }).click();
   await page.getByRole("button", { name: "Down" }).first().click();
+  await page.getByRole("button", { name: "Replan" }).click();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<unknown> }).__releasePlans());
   await expect(banner).toHaveCount(0);
 
+  // The late refusal for the revision the fresh plan replaced must not re-raise the banner.
   await page.evaluate(() => (window as unknown as { __releaseTravel: () => Promise<unknown> }).__releaseTravel());
   await expect(banner).toHaveCount(0);
 });

@@ -853,15 +853,30 @@ impl DeviceManagerHandle {
 
         let passes: Vec<PassSelection> = enabled()
             .map(|dto| {
-                let preset = dto.preset_id.as_deref().and_then(|id| presets.iter().find(|p| p.id == id));
+                let preset = match dto.preset_id.as_deref() {
+                    // A named preset that the file no longer resolves is refused, not silently
+                    // replaced by defaults. The operator asked for that material's speed and
+                    // force; falling back would cut real material with settings unrelated to
+                    // what the pass is named for, and a machine-scoped preset disappears for
+                    // ordinary reasons — the project was converted, or the entry was deleted.
+                    // The planner still keys such a pass (a document may name anything); it is
+                    // this boundary, which is where the preset file is actually read, that has
+                    // to fail closed.
+                    Some(id) => match presets.iter().find(|p| p.id == id) {
+                        Some(found) => Some(found),
+                        None => return Err(IpcError::new("unknown_preset",
+                            format!("this cut uses the material preset `{id}`, which is not available for this machine; pick another for that pass"))),
+                    },
+                    None => None,
+                };
                 let override_ = SettingsOverride {
                     speed: dto.speed,
                     force: dto.force,
                     repeat_count: dto.repeat_count,
                 };
-                PassSelection { key: dto.key.clone(), settings: resolve_settings(preset, &override_) }
+                Ok(PassSelection { key: dto.key.clone(), settings: resolve_settings(preset, &override_) })
             })
-            .collect();
+            .collect::<Result<_, IpcError>>()?;
 
         // The wire carries the revision as a string. One that isn't a u64 was
         // never issued by `doc_revision`, so it cannot be the current plan.
@@ -1546,6 +1561,34 @@ mod tests {
             .find(|p| p.id == "cameo5-htv").expect("premise: the builtin exists");
         assert_eq!(passes[0].job.settings.speed, builtin.settings.speed);
         assert_eq!(passes[0].job.settings.force, builtin.settings.force);
+    }
+
+    /// A pass naming a preset the file cannot resolve is refused rather than cut with
+    /// defaults. Greptile's P1 on PR #152: a machine-scoped preset disappears for ordinary
+    /// reasons — the project was converted, the entry was deleted — and cutting real material
+    /// with settings unrelated to the pass's own name is the failure that costs a sheet.
+    #[test]
+    fn a_pass_naming_an_unavailable_preset_is_refused_not_defaulted() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        let id = app.add_rect(10.0, 10.0);
+        app.set_material_preset(vec![id], document::PresetAssignment::Preset("deleted-by-hand".into()))
+            .expect("assignable");
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                key: PassKey::Preset(Some("deleted-by-hand".into())),
+                enabled: true,
+                preset_id: Some("deleted-by-hand".into()),
+                speed: None, force: None, repeat_count: None }],
+        };
+        let err = dev.prepare_cut(&app, request).unwrap_err();
+        assert_eq!(err.code, "unknown_preset");
+        assert!(err.message.contains("deleted-by-hand"), "names the preset it cannot find: {}", err.message);
     }
 
     /// The bridge used to synthesize `Transmitting` from `Progress` because the

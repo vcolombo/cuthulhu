@@ -605,6 +605,9 @@ export function CutDialog({
           </select>
         </label>
 
+        {/* Every row control below is unavailable while `replanning`: these rows belong to the
+            previous grouping, and the arriving plan replaces them wholesale — an edit accepted
+            in that window is discarded without a trace (Greptile reproduced exactly that). */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {(plan?.rows ?? []).map((row, i) => {
             const eff = effectiveSettings(row, presets);
@@ -632,11 +635,12 @@ export function CutDialog({
                 {label.text !== null ? <span>{label.text}</span> : null}
                 <span>{row.shapeCount} shape(s)</span>
                 <label>
-                  <input type="checkbox" checked={row.enabled} onChange={(e) => setPassEnabled(i, e.target.checked)} />
+                  <input type="checkbox" disabled={replanning} checked={row.enabled} onChange={(e) => setPassEnabled(i, e.target.checked)} />
                   Enabled
                 </label>
                 <select
                   aria-label={`Preset for pass ${i + 1}`}
+                  disabled={replanning}
                   value={row.presetId ?? ""}
                   onChange={(e) => updateRow(i, { presetId: e.target.value || null })}
                 >
@@ -650,7 +654,7 @@ export function CutDialog({
                 <input
                   aria-label={`Speed for pass ${i + 1}`}
                   type="number"
-                  disabled={speedDisabled}
+                  disabled={speedDisabled || replanning}
                   value={eff.speed ?? ""}
                   placeholder="speed"
                   onChange={(e) => updateRow(i, { speed: e.target.value === "" ? null : Number(e.target.value) })}
@@ -659,7 +663,7 @@ export function CutDialog({
                 <input
                   aria-label={`Force for pass ${i + 1}`}
                   type="number"
-                  disabled={forceDisabled}
+                  disabled={forceDisabled || replanning}
                   value={eff.force ?? ""}
                   placeholder="force"
                   onChange={(e) => updateRow(i, { force: e.target.value === "" ? null : Number(e.target.value) })}
@@ -668,6 +672,7 @@ export function CutDialog({
                 <input
                   aria-label={`Repeat count for pass ${i + 1}`}
                   type="number"
+                  disabled={replanning}
                   min={1}
                   value={eff.repeatCount}
                   placeholder="repeat"
@@ -675,10 +680,10 @@ export function CutDialog({
                   style={{ width: 50 }}
                 />
                 {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
-                <button style={btn} onClick={() => movePass(i, -1)} disabled={i === 0}>
+                <button style={btn} onClick={() => movePass(i, -1)} disabled={replanning || i === 0}>
                   Up
                 </button>
-                <button style={btn} onClick={() => movePass(i, 1)} disabled={i === (plan?.rows.length ?? 0) - 1}>
+                <button style={btn} onClick={() => movePass(i, 1)} disabled={replanning || i === (plan?.rows.length ?? 0) - 1}>
                   Down
                 </button>
               </div>

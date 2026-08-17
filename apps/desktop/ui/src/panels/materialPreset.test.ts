@@ -79,3 +79,26 @@ describe("effectiveMaterials", () => {
     expect(effectiveMaterials(nodes, 1)).toEqual({ 1: "cameo5-htv", 2: "cameo5-htv" });
   });
 });
+
+describe("effective material across a selection", () => {
+  // Greptile's and Copilot's P1 on PR #152: two shapes that both say `Inherit` under different
+  // Layers agree on their *local* value, so the panel is not "Mixed" on assignment — and
+  // reading the effective material from the first of them labelled the pair with one Layer's
+  // material. The distinct-set reduction App.tsx performs is what this pins.
+  it("is mixed when inheriting nodes resolve to different materials", () => {
+    const nodes = {
+      "1": layer(1, HTV, [2]),
+      "2": shape(2, INHERIT),
+      "3": layer(3, { state: "preset", id: "cameo5-copy-paper" }, [4]),
+      "4": shape(4, INHERIT),
+    };
+    const resolved = effectiveMaterials(nodes, 1);
+    Object.assign(resolved, effectiveMaterials(nodes, 3));
+
+    // Both selected shapes inherit, so their local assignments agree...
+    expect(selectionAssignment(nodes, [2, 4])).toEqual(INHERIT);
+    // ...while what they resolve to does not.
+    const distinct = new Set([2, 4].map((id) => resolved[id] ?? null));
+    expect(distinct.size).toBe(2);
+  });
+});

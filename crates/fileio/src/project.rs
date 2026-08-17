@@ -95,6 +95,37 @@ mod tests {
         assert_eq!(back.get(fill_only_id).unwrap().cut_line_type, document::CutLineType::NoCut);
     }
 
+    /// The same migration for the material assignment, which needs its own fixture because
+    /// the two absent-field rules are deliberately different: a missing `cut_line_type`
+    /// derives from the stroke, a missing `material_preset` is simply `Inherit`.
+    #[test]
+    fn a_project_saved_before_material_assignments_inherits() {
+        let mut doc = document::Document::new();
+        let shape = document::Node::shape(doc.ids.next(),
+            document::ShapeKind::Rect { w: 10.0, h: 10.0 });
+        let shape_id = shape.id;
+        doc.apply(document::Delta(vec![
+            document::NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX },
+        ]));
+
+        let mut manifest: serde_json::Value = serde_json::from_str(&doc.snapshot_json()).unwrap();
+        for node in manifest["nodes"].as_object_mut().unwrap().values_mut() {
+            assert!(node.as_object_mut().unwrap().remove("material_preset").is_some(),
+                "premise: every node is written with the field, so pruning it makes an old file");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.cut");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        let back = load_project(&path).unwrap();
+        assert_eq!(back.get(shape_id).unwrap().material_preset, document::PresetAssignment::Inherit);
+        assert_eq!(back.get(shape_id).unwrap().cut_line_type, document::CutLineType::Cut,
+            "premise: the neighbouring migration still runs");
+    }
+
     #[test]
     fn save_then_load_round_trips_document() {
         let mut doc = document::Document::new();

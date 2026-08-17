@@ -80,6 +80,33 @@ pub fn set_cut_line_type(doc: &Document, ids: &[NodeId], value: CutLineType)
     Ok(Delta(ops))
 }
 
+/// Assign `value` to every Node in `ids`, and to nothing else.
+///
+/// Deliberately *not* `set_cut_line_type`'s walk. That command descends into containers
+/// because a `CutLineType` is read only on the shape that carries it, so a value on a Group
+/// would be inert. A material assignment is the opposite: `cutplan::plan_passes_with`
+/// resolves it down the tree, so writing a Layer's value is what makes every shape under it
+/// cut with that material — including shapes added or reparented later, which a descent would
+/// have left behind while making the Layer itself look assigned.
+pub fn set_material_preset(doc: &Document, ids: &[NodeId], value: PresetAssignment)
+    -> Result<Delta, CmdError> {
+    if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    let mut ops = vec![];
+    let mut seen = HashSet::new();
+    for &id in ids {
+        // A selection can name a node twice (a Layer and its shape are both ordinary
+        // selections); one op each, or the inverse delta would undo through a duplicate.
+        if !seen.insert(id) { continue; }
+        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        if node.material_preset == value { continue; }
+        let before = node.clone();
+        let mut after = before.clone();
+        after.material_preset = value.clone();
+        ops.push(NodeOp::Update { id, before, after });
+    }
+    Ok(Delta(ops))
+}
+
 pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let selected: HashSet<NodeId> = ids.iter().copied().collect();
@@ -623,5 +650,86 @@ mod tests {
         assert_eq!(d.0.len(), 1, "the shape is reached twice and updated once");
         assert_eq!(set_cut_line_type(&doc, &[], CutLineType::NoCut), Err(CmdError::EmptySelection));
         assert_eq!(set_cut_line_type(&doc, &[NodeId(9999)], CutLineType::NoCut), Err(CmdError::NotFound));
+    }
+
+    /// Writes the selection and nothing else. This is the opposite of `set_cut_line_type`,
+    /// which descends — and the difference is the whole point: a `CutLineType` does not
+    /// inherit, so a value on a Group would be inert, while a material *does*. Descending
+    /// here would set today's shapes and leave the Layer holding nothing, after which a
+    /// shape added to it would disagree with its siblings.
+    #[test]
+    fn set_material_preset_writes_the_selected_layer_and_not_its_children() {
+        let mut doc = Document::new();
+        let layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        let layer_id = layer.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: shape, index: usize::MAX },
+        ]));
+
+        let delta = set_material_preset(&doc, &[layer_id],
+            PresetAssignment::Preset("cameo5-htv".into())).unwrap();
+        doc.apply(delta);
+        assert_eq!(doc.get(layer_id).unwrap().material_preset,
+            PresetAssignment::Preset("cameo5-htv".into()));
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Inherit,
+            "the child still inherits — resolution is the planner's, not a stored copy's");
+    }
+
+    /// A container and a shape inside it, both selected: both get the value. Nothing about
+    /// the overlap is special, because nothing descends.
+    #[test]
+    fn set_material_preset_writes_every_selected_node_once() {
+        let mut doc = Document::new();
+        let layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        let layer_id = layer.id;
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: shape, index: usize::MAX },
+        ]));
+
+        let delta = set_material_preset(&doc, &[layer_id, shape_id, layer_id],
+            PresetAssignment::Unassigned).unwrap();
+        assert_eq!(delta.0.len(), 2, "one op per distinct node, duplicates ignored");
+        doc.apply(delta);
+        assert_eq!(doc.get(layer_id).unwrap().material_preset, PresetAssignment::Unassigned);
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Unassigned);
+    }
+
+    /// `Unassigned` is a value, not a clear: it stops inheritance, where `Inherit` restores
+    /// it. Both are reachable, because the panel offers both.
+    #[test]
+    fn set_material_preset_can_stop_or_restore_inheritance() {
+        let mut doc = Document::new();
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        let d = set_material_preset(&doc, &[shape_id], PresetAssignment::Unassigned).unwrap();
+        doc.apply(d);
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Unassigned);
+        let d = set_material_preset(&doc, &[shape_id], PresetAssignment::Inherit).unwrap();
+        doc.apply(d);
+        assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Inherit);
+    }
+
+    /// Re-picking the value a selection already has emits nothing, so it cannot land an undo
+    /// step that undoes nothing — the same rule `set_cut_line_type` follows.
+    #[test]
+    fn set_material_preset_emits_nothing_for_an_unchanged_selection() {
+        let mut doc = Document::new();
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        assert!(set_material_preset(&doc, &[shape_id], PresetAssignment::Inherit).unwrap().0.is_empty());
+        assert_eq!(set_material_preset(&doc, &[], PresetAssignment::Inherit),
+            Err(CmdError::EmptySelection));
+        assert_eq!(set_material_preset(&doc, &[NodeId(9999)], PresetAssignment::Inherit),
+            Err(CmdError::NotFound));
     }
 }

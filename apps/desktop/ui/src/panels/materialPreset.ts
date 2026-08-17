@@ -56,3 +56,22 @@ export function effectiveMaterials(
   }
   return resolved;
 }
+
+/// What a selection's material resolves to: one value — an id, or `null` for no material — or
+/// more than one, when the selected Nodes inherit from ancestors that disagree. Tagged rather
+/// than a reserved string, because a preset id is the operator's own and one called `mixed`
+/// would collide with the marker.
+export type EffectiveMaterial = { kind: "one"; id: string | null } | { kind: "mixed" };
+
+/// Reduce a whole selection to one answer. Every selected Node, never just the first: two shapes
+/// that both say `Inherit` under different Layers agree on their *local* value and resolve
+/// differently, and labelling the pair with one of them misreports what a bulk edit replaces.
+export function summariseEffectiveMaterial(
+  materialsByNode: Record<number, string | null>,
+  selected: number[],
+): EffectiveMaterial {
+  if (selected.length === 0) return { kind: "one", id: null };
+  const distinct = new Set(selected.map((id) => materialsByNode[id] ?? null));
+  if (distinct.size > 1) return { kind: "mixed" };
+  return { kind: "one", id: [...distinct][0] ?? null };
+}

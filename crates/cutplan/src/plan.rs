@@ -60,6 +60,9 @@ impl CutPlan {
 pub enum CutError {
     StalePlan { expected: u64, actual: u64 },
     UnknownPass(PassKey),
+    /// One pass named twice in a selection. Distinct from `UnknownPass`, because the pass plainly
+    /// exists — saying otherwise would send a caller looking for a key that is right there.
+    DuplicatePass(PassKey),
     Preflight(PreflightError),
 }
 
@@ -75,6 +78,7 @@ impl std::fmt::Display for CutError {
             // The key's own `Display`, not a re-spelling of it: a caller who typed
             // `--skip-pass preset:cameo5-htv` must read that string back verbatim.
             CutError::UnknownPass(key) => write!(f, "no planned pass is called {key}"),
+            CutError::DuplicatePass(key) => write!(f, "the pass {key} is selected more than once"),
             CutError::Preflight(e) => write!(f, "{e}"),
         }
     }
@@ -89,6 +93,7 @@ impl CutError {
         match self {
             CutError::StalePlan { .. } => "stale_plan",
             CutError::UnknownPass(_) => "unknown_pass",
+            CutError::DuplicatePass(_) => "duplicate_pass",
             CutError::Preflight(e) => e.code(),
         }
     }
@@ -120,8 +125,20 @@ pub fn plan_cut(
 
     // Every selected pass is enabled by construction — omitting a pass is the
     // only way to not cut it, which is why `PassSelection` has no such flag.
+    //
+    // A key named twice is refused rather than cut twice. Two selections resolve the same
+    // `DocumentPass`, so the identical geometry would be flattened into two Jobs and the worker
+    // would run both — a second pass over material the blade has already been through, which on
+    // vinyl means cutting the backing. `travel_for_order` has always enforced exactly-once for
+    // the *preview*; this is the cut path finally agreeing with it. No UI can produce a
+    // duplicate (the dialog's rows are unique by key), so this guards the IPC boundary itself.
     let mut configured: Vec<ConfiguredPass> = Vec::with_capacity(opts.passes.len());
+    let mut seen: Vec<&PassKey> = Vec::with_capacity(opts.passes.len());
     for sel in &opts.passes {
+        if seen.contains(&&sel.key) {
+            return Err(CutError::DuplicatePass(sel.key.clone()));
+        }
+        seen.push(&sel.key);
         let pass = planned
             .passes
             .iter()
@@ -218,6 +235,18 @@ mod tests {
         assert_eq!(err, CutError::UnknownPass(PassKey::Color(Some(0xDEADBEEF))));
     }
 
+    /// Codex's blocking finding on PR #152: two selections naming one pass resolve the same
+    /// `DocumentPass`, so the identical geometry was flattened into two Jobs and the worker ran
+    /// both — a second pass over material the blade had already been through. Predates #148 (the
+    /// same hole existed keyed on colour) and is refused here rather than cut.
+    #[test]
+    fn one_pass_selected_twice_is_refused_not_cut_twice() {
+        let planned = passes(&[(RED, 0.0, 0.0)]);
+        let twice = select(&[RED, RED]);
+        let err = plan_cut(&planned, &profile(500.0, 500.0), &caps(), &opts(twice)).unwrap_err();
+        assert_eq!(err, CutError::DuplicatePass(PassKey::Color(Some(RED))));
+    }
+
     #[test]
     fn selection_order_is_cut_order() {
         // plan_passes groups first-seen: red then blue. The selection reverses it.
@@ -309,6 +338,10 @@ mod tests {
             assert_eq!(err.code(), "unknown_pass");
             assert_eq!(err.to_string(), sentence);
         }
+
+        let duplicate = CutError::DuplicatePass(PassKey::Color(Some(0xFF0000FF)));
+        assert_eq!(duplicate.code(), "duplicate_pass");
+        assert_eq!(duplicate.to_string(), "the pass color:ff0000ff is selected more than once");
 
         let wrapped = CutError::Preflight(PreflightError::NothingToCut);
         assert_eq!(wrapped.code(), "nothing_to_cut");

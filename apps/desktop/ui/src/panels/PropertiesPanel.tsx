@@ -3,13 +3,8 @@ import type { Bounds } from "../render/hittest";
 import type { CutLineTypeJson } from "./cutLineType";
 import type { PresetAssignmentJson } from "../ipc";
 import type { Preset } from "../cut/viewmodel";
+import type { EffectiveMaterial } from "./materialPreset";
 import { NumberField } from "./NumberField";
-
-/** What a selection's material resolves to: one value — an id, or `null` for no material — or
- *  more than one, when the selected Nodes inherit from ancestors that disagree. Tagged rather
- *  than a reserved string, because a preset id is the operator's own and one called `mixed`
- *  would collide with the marker. */
-export type EffectiveMaterial = { kind: "one"; id: string | null } | { kind: "mixed" };
 
 type Props = {
   bounds: Bounds | null;
@@ -26,9 +21,10 @@ type Props = {
   onChangeMaterialPreset: (v: PresetAssignmentJson) => void;
 };
 
-/** What the material row reads for each state. `Inherit` shows what it resolves to, because
+/** What the material row reads for each state. Exported for its own test: it is the consumer
+ *  that has to keep a preset called `mixed` apart from a mixed selection. `Inherit` shows what it resolves to, because
  *  "inherit" alone does not tell an operator which material the blade will be set for. */
-function materialLabel(
+export function materialLabel(
   assignment: PresetAssignmentJson | "mixed",
   effective: EffectiveMaterial,
   presets: Preset[],

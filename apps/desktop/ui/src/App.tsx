@@ -11,8 +11,7 @@ import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
-import { effectiveMaterials, selectionAssignment } from "./panels/materialPreset";
-import type { EffectiveMaterial } from "./panels/PropertiesPanel";
+import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import type { Preset } from "./cut/viewmodel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
@@ -392,15 +391,7 @@ export function App() {
     () => (doc ? effectiveMaterials(doc.nodes, doc.root) : {}),
     [doc],
   );
-  // Out of band, not a reserved string: a preset id is the operator's own, so a preset called
-  // `mixed` would otherwise be indistinguishable from "these resolve differently" — the same
-  // collision the pass-key grammar avoids by giving absence its own token.
-  const effectiveMaterial = ((): EffectiveMaterial => {
-    if (!doc || selected.length === 0) return { kind: "one", id: null };
-    const distinct = new Set(selected.map((id) => materialsByNode[id] ?? null));
-    if (distinct.size > 1) return { kind: "mixed" };
-    return { kind: "one", id: [...distinct][0] ?? null };
-  })();
+  const effectiveMaterial = summariseEffectiveMaterial(materialsByNode, selected);
 
   const setMaterialPreset = (value: ipc.PresetAssignmentJson) => {
     if (selected.length === 0) return;

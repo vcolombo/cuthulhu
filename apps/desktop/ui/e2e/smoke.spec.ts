@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -36,7 +36,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } } },
       root: rootId,
       artboard: { x: 0, y: 0, w: 330, h: 3000 },
-      machine: null,
+      // Presets are machine-scoped, so a test that needs the Material control to offer anything
+      // has to name a machine: App reads the list for the document's machine.
+      machine: opts?.seedMachine
+        ? { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 }
+        : null,
     };
   };
   let doc = freshDoc();
@@ -573,7 +577,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         // mirroring prepare_cut. `list_presets` answers empty here, so any named preset is
         // unavailable — which is the state the real refusal exists for.
         const named = (pass as { preset_id?: string | null }).preset_id;
-        if (pass.enabled && named) {
+        // Explicit rather than truthy: an empty id is a named preset too, and `&& named` would
+        // wave it through — the fake being more permissive than Rust is the false green this
+        // whole mirror exists to avoid.
+        if (pass.enabled && named !== undefined && named !== null) {
           throw ipcError("unknown_preset",
             `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
         }
@@ -669,7 +676,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       return null;
     },
-    list_presets: () => [],
+    // One preset, so the properties panel's Material control has something to offer and the
+    // preset-grouping path is reachable through the UI. The fake owns no preset file, so any
+    // named preset is unavailable at cut time — which is the state `prepare_cut`'s refusal
+    // exists for, and what the cut handler below mirrors.
+    list_presets: () => [
+      { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+        settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
+    ],
     // Deliberately one constant, not a per-machine table: that mapping is pinned in
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
@@ -844,6 +858,34 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// The whole material path through the real UI: the panel assigns a preset, preset grouping keys
+// the pass on it, the row carries that preset's id, and the cut is refused because this machine
+// cannot offer it. Nothing else drives preset grouping end to end, and without this the fake's
+// `unknown_preset` branch could be deleted with every test still green — which is exactly the
+// false green the fake's strictness exists to prevent.
+test("a pass grouped by a material this machine cannot offer is refused, not cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+
+  await page.getByTestId("layer-row").first().click();
+  await expect(page.getByLabel("Material preset")).toBeVisible();
+  await page.getByLabel("Material preset").selectOption("preset:cameo5-htv");
+  // The row's readout, not the option that was just picked: this is what tells an operator which
+  // material the blade will be set for.
+  await expect(page.getByLabel("Material preset")).toHaveValue("preset:cameo5-htv");
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Group passes by").selectOption("Preset");
+  // One pass for the assigned material, one for everything that resolves to none.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByTestId("cut-pass-row").first()).toContainText("HTV");
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText(/not available for this machine/)).toBeVisible();
 });
 
 // Greptile's P1 on the fifth push: a replan that *fails* leaves the previous plan in force —

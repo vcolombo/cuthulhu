@@ -618,7 +618,7 @@ export function CutDialog({
             const eff = effectiveSettings(row, presets);
             const speedDisabled = fieldDisabled("speed", caps);
             const forceDisabled = fieldDisabled("force", caps);
-            // A pass keyed on a preset or a line type has no swatch to be recognised by, so
+            // A pass keyed on a preset has no swatch to be recognised by, so
             // the row says what it holds instead.
             const label = passRowLabel(row.key, presets, plan?.grouping ?? grouping);
             return (

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from "vitest";
-import { effectiveMaterials, selectionAssignment } from "./materialPreset";
+import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial,
+  type EffectiveMaterial } from "./materialPreset";
+import { materialLabel } from "./PropertiesPanel";
 import type { DocNode } from "../App";
 
 const shape = (id: number, material_preset: DocNode["material_preset"]): DocNode => ({
@@ -80,42 +82,47 @@ describe("effectiveMaterials", () => {
   });
 });
 
-describe("effective material across a selection", () => {
-  // Greptile's and Copilot's P1 on PR #152: two shapes that both say `Inherit` under different
-  // Layers agree on their *local* value, so the panel is not "Mixed" on assignment — and
-  // reading the effective material from the first of them labelled the pair with one Layer's
-  // material. The distinct-set reduction App.tsx performs is what this pins.
-  it("is mixed when inheriting nodes resolve to different materials", () => {
-    const nodes = {
-      "1": layer(1, HTV, [2]),
-      "2": shape(2, INHERIT),
-      "3": layer(3, { state: "preset", id: "cameo5-copy-paper" }, [4]),
-      "4": shape(4, INHERIT),
-    };
-    const resolved = effectiveMaterials(nodes, 1);
-    Object.assign(resolved, effectiveMaterials(nodes, 3));
-
-    // Both selected shapes inherit, so their local assignments agree...
-    expect(selectionAssignment(nodes, [2, 4])).toEqual(INHERIT);
-    // ...while what they resolve to does not.
-    const distinct = new Set([2, 4].map((id) => resolved[id] ?? null));
-    expect(distinct.size).toBe(2);
+describe("summariseEffectiveMaterial", () => {
+  // The production reduction, not a copy of it in the test. Greptile's and Copilot's P1: two
+  // shapes that both say `Inherit` under different Layers agree on their *local* value, so the
+  // panel is not "Mixed" on assignment — and reading the first one's material labelled the pair
+  // with it. Reverting to `selected[0]` fails here.
+  it("is mixed when the selection resolves to more than one material", () => {
+    const resolved = { 2: "cameo5-htv", 4: "cameo5-copy-paper" };
+    expect(summariseEffectiveMaterial(resolved, [2, 4])).toEqual({ kind: "mixed" });
+    expect(summariseEffectiveMaterial(resolved, [2])).toEqual({ kind: "one", id: "cameo5-htv" });
   });
-});
 
-describe("a preset called mixed", () => {
-  // Greptile's P1 on the fourth push, and the same class as the pass-key grammar's `preset:none`
-  // collision: a preset id is the operator's own string, so the "these disagree" marker must not
-  // live inside the same namespace. Tagged out of band, one value cannot be read as the other.
-  it("resolves like any other id, distinct from the mixed marker", () => {
-    const nodes = {
-      "1": layer(1, { state: "preset", id: "mixed" }, [2]),
-      "2": shape(2, INHERIT),
-    };
-    expect(effectiveMaterials(nodes, 1)[2]).toBe("mixed");
-    // The union keeps them apart: this is `{kind:"one", id:"mixed"}`, never `{kind:"mixed"}`.
-    const distinct = new Set([2].map((id) => effectiveMaterials(nodes, 1)[id] ?? null));
-    expect(distinct.size).toBe(1);
-    expect([...distinct][0]).toBe("mixed");
+  it("is one answer when they agree, including agreeing on nothing", () => {
+    expect(summariseEffectiveMaterial({ 2: "cameo5-htv", 3: "cameo5-htv" }, [2, 3]))
+      .toEqual({ kind: "one", id: "cameo5-htv" });
+    expect(summariseEffectiveMaterial({ 2: null, 3: null }, [2, 3])).toEqual({ kind: "one", id: null });
+    expect(summariseEffectiveMaterial({}, [])).toEqual({ kind: "one", id: null });
+  });
+
+  // Greptile's fourth-push P1, at the consumer that has to keep them apart: a preset whose id is
+  // literally `mixed` is one answer, not "these disagree". An in-band sentinel fails here.
+  it("keeps a preset called mixed apart from a mixed selection", () => {
+    const one = summariseEffectiveMaterial({ 2: "mixed" }, [2]);
+    expect(one).toEqual({ kind: "one", id: "mixed" });
+
+    const presets = [{ id: "mixed", name: "Mixed Media", machine_id: "cameo5",
+                       settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: false }];
+    expect(materialLabel({ state: "inherit" }, one, presets)).toBe("Inherited — Mixed Media");
+    expect(materialLabel({ state: "inherit" }, { kind: "mixed" }, presets)).toBe("Inherited — Mixed");
+  });
+
+  // And the rest of the label's states, since it is what an operator reads before a bulk edit.
+  it("labels each assignment state", () => {
+    const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+                       settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
+    const none: EffectiveMaterial = { kind: "one", id: null };
+    expect(materialLabel("mixed", none, presets)).toBe("Mixed");
+    expect(materialLabel({ state: "unassigned" }, none, presets)).toBe("No preset");
+    expect(materialLabel({ state: "preset", id: "cameo5-htv" }, none, presets)).toBe("HTV");
+    expect(materialLabel({ state: "preset", id: "gone" }, none, presets)).toBe("Unresolved (gone)");
+    expect(materialLabel({ state: "inherit" }, none, presets)).toBe("Inherited — No preset");
+    expect(materialLabel({ state: "inherit" }, { kind: "one", id: "cameo5-htv" }, presets))
+      .toBe("Inherited — HTV");
   });
 });

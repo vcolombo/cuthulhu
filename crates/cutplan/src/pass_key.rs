@@ -65,8 +65,13 @@ impl std::str::FromStr for PassKey {
                 .map(|c| PassKey::Color(Some(c)))
                 .map_err(|_| format!("'{s}' has a colour that is not 8 hex digits (RRGGBBAA)")),
             ("color", _) => Err(format!("'{s}' has a colour that is not 8 hex digits (RRGGBBAA)")),
-            // An empty id is the one tail that would make two keys indistinguishable.
-            ("preset", "") => Err(format!("'{s}' names an empty preset id")),
+            // An empty id is accepted, because `Display` can write one and a grammar whose own
+            // output it refuses is not a round trip: `PassKey::Preset(Some(String::new()))` is a
+            // constructible state (nothing validates a `MaterialPreset::id`), and serde would
+            // emit `preset:` for it. Refusing it here was inherited from the first spelling,
+            // where absence *was* `preset:none` and an empty tail really was ambiguous; with
+            // absence spelled `no-preset`, `preset:` means one thing only. Whether an empty id
+            // should be storable at all is a preset-file question, not this grammar's — #153.
             ("preset", id) => Ok(PassKey::Preset(Some(id.to_string()))),
             _ => Err(unknown()),
         }
@@ -126,6 +131,9 @@ mod tests {
             PassKey::Preset(Some("all".into())),
             PassKey::Preset(Some("vinyl:thin".into())),
             PassKey::Preset(Some("with,comma".into())),
+            // Constructible, so it must round-trip: `Display` writes `preset:` for it, and a
+            // grammar that refuses its own output is not one.
+            PassKey::Preset(Some(String::new())),
         ];
         let mut seen: HashMap<String, PassKey> = HashMap::new();
         for key in &keys {
@@ -162,7 +170,7 @@ mod tests {
     /// collision and a mode that no longer exists.
     #[test]
     fn a_malformed_key_is_refused_by_name() {
-        for bad in ["", "all:1", "preset:", "color:", "color:zz", "color:ff0000",
+        for bad in ["", "all:1", "color:", "color:zz", "color:ff0000",
                     "color:none", "line-type:cut", "no-material", "colour:ff0000ff"] {
             let err = bad.parse::<PassKey>().expect_err("must not parse");
             assert!(err.contains(bad), "{err} should quote the input");

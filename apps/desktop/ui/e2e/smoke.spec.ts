@@ -7,7 +7,9 @@ import { test, expect } from "@playwright/test";
 // which is what actually parses this on the JS side.
 function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut" };
+  type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
+  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
+  type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -31,7 +33,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const freshDoc = (): Doc => {
     const rootId = nextId++;
     return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut" } },
+      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } } },
       root: rootId,
       artboard: { x: 0, y: 0, w: 330, h: 3000 },
       machine: null,
@@ -52,6 +54,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       style: { stroke: 0xff0000ff, fill: null },
       children: [],
       cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
     };
     const greenId = nextId++;
     doc.nodes[greenId] = {
@@ -61,6 +64,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       style: { stroke: 0x00ff00ff, fill: null },
       children: [],
       cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, greenId);
   }
@@ -81,7 +85,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // Same test-only override as `a.stroke`: no UI control sets cuttability at creation, so
       // this is the only way to seed a NoCut shape without going through set_cut_line_type.
       const cutLineType = a.cut_line_type !== undefined ? (a.cut_line_type as "Cut" | "NoCut") : "Cut";
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType };
+      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType, material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -92,7 +96,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
       if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -133,6 +137,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }
       return {};
     },
+    // Mirrors commands::set_material_preset: writes the selection and nothing else, because a
+    // material inherits and the planner resolves it. Descending here would be the bug the real
+    // command was written to avoid.
+    set_material_preset: (a) => {
+      const value = a.value as PresetAssignment;
+      const ids = a.ids as number[];
+      if (ids.length === 0) throw new Error("set_material_preset: EmptySelection");
+      for (const id of ids) {
+        const n = doc.nodes[id];
+        if (!n) throw new Error("set_material_preset: NotFound");
+        n.material_preset = value;
+      }
+      return {};
+    },
     // Four commands the fake has never performed. They used to answer "ok" while leaving
     // `doc` untouched, which is the false green this file exists to avoid: each one edits
     // the document in the real backend, so a plan made before it goes stale and `plan_cut`
@@ -143,7 +161,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     boolean_op: () => unimplemented("boolean_op"),
     import_svg: (a) => {
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return [{}, []];
     },
@@ -272,7 +290,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let listDeviceCalls = 0;
   let nextJobId = 1;
   let jobId: number | null = null;
-  let planPasses: { color: number | null; enabled: boolean }[] = [];
+  let planPasses: { key: string; enabled: boolean }[] = [];
   let failNextResume = false;
   let failNextCut = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
@@ -299,37 +317,49 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     return { code, message };
   }
 
-  function planFromDoc() {
-    // Mirrors crates/cutplan/src/passes.rs's plan_passes: preorder walk, skip Shape leaf
-    // nodes whose CutLineType is NoCut, and key the rest on pass_key — stroke if visible,
-    // else fill, with 0-alpha counting as absent in both — in first-seen order. A shape
-    // with no visible paint keys on null, which is a colour the pass list carries.
-    const byColor = new Map<number | null, { color: number | null; node_ids: number[] }>();
+  function planFromDoc(grouping: Grouping = "Color") {
+    // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
+    // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
+    // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
+    // absent), the resolved material, or `all` for one pass. Absence is its own token
+    // (`no-color`, `no-preset`) because a preset id may be any string, so a preset called
+    // `none` must not write what no preset at all writes.
+    const byKey = new Map<string, { key: string; node_ids: number[] }>();
     let skipped = 0;
-    const walk = (id: number) => {
+    const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
+    const colorKey = (n: Node) => {
+      const stroke = visible(n.style.stroke);
+      const fill = visible(n.style.fill);
+      const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
+      return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
+    };
+    const walk = (id: number, inherited: string | null) => {
       const n = doc.nodes[id];
       if (!n) return;
+      const a = n.material_preset;
+      const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
       const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
       if (isShape) {
         if (n.cut_line_type === "NoCut") {
           skipped++;
         } else {
-          const key = ((n.style.stroke ?? 0) & 0xff) !== 0 ? n.style.stroke
-            : ((n.style.fill ?? 0) & 0xff) !== 0 ? n.style.fill
-            : null;
-          const existing = byColor.get(key);
+          const key =
+            grouping === "Single" ? "all"
+            : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
+            : colorKey(n);
+          const existing = byKey.get(key);
           if (existing) existing.node_ids.push(id);
-          else byColor.set(key, { color: key, node_ids: [id] });
+          else byKey.set(key, { key, node_ids: [id] });
         }
       }
-      for (const c of n.children) walk(c);
+      for (const c of n.children) walk(c, material);
     };
-    walk(doc.root);
+    walk(doc.root, null);
     // starts is all-null on purpose: the fake carries no geometry to flatten, and null
     // is the real backend's no-outline case — so e2e renders exercise the preview's
     // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
-    const passes = [...byColor.values()].map((p) => ({
-      color: p.color,
+    const passes = [...byKey.values()].map((p) => ({
+      key: p.key,
       shape_count: p.node_ids.length,
       node_ids: p.node_ids,
       starts: p.node_ids.map(() => null),
@@ -457,30 +487,52 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return status;
     },
     get_connected_device: () => connected,
-    plan_cut: () => {
+    plan_cut: (a) => {
       // Answered from the document as it is *now*, like the real command, then parked if
       // the test has armed the hold: which of a replan and an older reorder settles first
       // is the whole subject of the race test, and a timing race cannot state it.
-      const plan = planFromDoc();
+      const plan = planFromDoc(a.grouping as Grouping);
       if (!holding) return plan;
       return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
     },
     // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
-    // refusal, then synthetic segments (one per adjacent pair, x encoding the position in
-    // the order). Received orders are recorded on `window.__travelOrders` so a test can
-    // assert what the dialog asked for — travel itself lands on a canvas Playwright
-    // cannot read.
+    // refusal, the same exact-once identity check over the requested keys, then synthetic
+    // segments (one per adjacent pair of *enabled* passes, x encoding the position in the
+    // order) — the real command does not route the head to a pass that will not be cut.
+    // Received lists are recorded on `window.__travelRequests` so a test can assert what the
+    // dialog asked for; travel itself lands on a canvas Playwright cannot read.
     travel_for_order: (a) => {
-      const passes = a.passes as { color: number | null; enabled: boolean }[];
-      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests ??= [];
-      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests.push(passes);
-      // Decided against the document at call time, like the real command — a request
-      // issued before a replan is stale even if it settles after one.
-      const stale = planFromDoc().doc_revision !== a.docRevision;
+      const passes = a.passes as { key: string; enabled: boolean }[];
+      const grouping = a.grouping as Grouping;
+      // The page's own hook object, which only this fake and the tests reading it touch. Named
+      // rather than cast inline at each use: `window` genuinely has no type for a property the
+      // test harness invents, and one reason beats two identical assertions.
+      const hooks = window as unknown as { __travelRequests?: typeof passes[] };
+      hooks.__travelRequests ??= [];
+      hooks.__travelRequests.push(passes);
       const settle = () => {
-        if (stale) throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-        // One segment between each pair of *cut* passes, mirroring the real command
-        // skipping the head-travel to a pass that will not be cut.
+        // Decided at settle time, like the real command — a request issued before a replan is
+        // stale even if it settles after one.
+        const plan = planFromDoc(grouping);
+        if (plan.doc_revision !== a.docRevision) {
+          throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+        }
+        // The list must name each planned pass exactly once. Without this the fake accepts
+        // rows from a previous grouping and the suite stays green on a frontend that cannot
+        // work — which is the whole reason the dialog installs a plan atomically.
+        const remaining = plan.passes.map((p) => p.key);
+        for (const pass of passes) {
+          const i = remaining.indexOf(pass.key);
+          if (i === -1) {
+            throw plan.passes.some((p) => p.key === pass.key)
+              ? ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
+              : ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+          }
+          remaining.splice(i, 1);
+        }
+        if (remaining.length > 0) {
+          throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
+        }
         const cut = passes.filter((p) => p.enabled);
         return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
       };
@@ -490,17 +542,25 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }));
     },
     cut: (a) => {
-      const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
+      const request = a.request as { device_instance_id: string; doc_revision: string;
+        grouping: Grouping; passes: { key: string; enabled: boolean }[] };
       if (!connected) throw ipcError("not_connected", "no device connected");
       if (connected.instance_id !== request.device_instance_id) {
         throw ipcError("device_mismatch", "connected device changed since planning");
       }
-      const plan = planFromDoc();
+      const plan = planFromDoc(request.grouping);
       if (plan.doc_revision !== request.doc_revision) {
         throw ipcError("stale_plan", "document changed since the cut was planned; replan");
       }
       if (doc.machine && doc.machine.id !== connected.machine_id) {
         throw ipcError("machine_mismatch", "document is set up for a different machine");
+      }
+      // A key this plan does not have is refused here too, so rows from a previous grouping
+      // cannot cut the wrong shapes just because the fake was more forgiving than Rust.
+      for (const pass of request.passes) {
+        if (!plan.passes.some((p) => p.key === pass.key)) {
+          throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+        }
       }
       planPasses = request.passes;
       jobId = nextJobId++;
@@ -725,6 +785,47 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
+// The operator-facing half of #148: the picker, the replan it triggers, and a row named for
+// what it holds rather than for a colour it does not have. Nothing else in this suite selects a
+// grouping, so a picker wired to a mode the backend ignores would leave every other test green.
+test("changing the grouping replans and renames the passes", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByText("Every cut shape")).toBeVisible();
+
+  // And back again: switching modes replans each time rather than keeping the first answer.
+  await page.getByLabel("Group passes by").selectOption("Stroke");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+});
+
+// The race the dialog's installed-plan state exists to prevent: while a replan is parked, the
+// rows on screen still belong to the previous grouping, and sending them under the new one
+// would cut whatever that mode happens to key the same way. Cut has to be unavailable until
+// the new plan lands — a fact only a held reply can state.
+test("a cut cannot be sent with rows from the previous grouping", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  // Still showing the old mode's rows, which is exactly why Cut is unavailable.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
 // The whole operator-facing round trip: the properties panel's control, the real
 // set_cut_line_type command, and the plan that then leaves the shape out. Nothing else in this
 // suite reads the dialog's not-cut line, so a readout wired to a renamed field would render an
@@ -810,11 +911,11 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
 
   // The wire is the contract under test: the replan request names the swapped order.
   const requests = await page.evaluate(
-    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
   );
   expect(requests).toEqual([[
-    { color: 0x00ff00ff, enabled: true },
-    { color: 0xff0000ff, enabled: true },
+    { key: "color:00ff00ff", enabled: true },
+    { key: "color:ff0000ff", enabled: true },
   ]]);
 });
 
@@ -829,13 +930,13 @@ test("disabling a pass replans travel without it", async ({ page }) => {
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
 
   const requests = await page.evaluate(
-    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
   );
   // Both passes still named — the disabled one is dropped from the travel by the planner,
   // not from the list, so a pass going missing stays distinguishable from a frontend bug.
   expect(requests).toEqual([[
-    { color: 0xff0000ff, enabled: false },
-    { color: 0x00ff00ff, enabled: true },
+    { key: "color:ff0000ff", enabled: false },
+    { key: "color:00ff00ff", enabled: true },
   ]]);
 });
 

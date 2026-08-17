@@ -152,8 +152,10 @@ for them:
 - The grammar is **injective**: nine keys including `Preset(None)`, `Preset(Some("none"))`,
   `Preset(Some("no-preset"))`, `Preset(Some("all"))`, an id containing `:` and an id containing `,`
   all write distinct strings and round-trip. This is the property the first spelling lacked.
-- Malformed keys are `serde` errors, not panics: `""`, `"preset:"`, `"color:none"`, `"color:ff0000"`,
-  `"line-type:cut"`, `"no-material"` and `"all:1"` all deserialize to `Err`.
+- Malformed keys are `serde` errors, not panics: `""`, `"color:"`, `"color:zz"`, `"color:ff0000"`,
+  `"color:none"`, `"line-type:cut"`, `"no-material"` and `"all:1"` all deserialize to `Err`.
+  `"preset:"` is *not* among them — see *One grammar*: it parses as an empty id, and the ways an
+  empty id could mean something are closed where they live.
 - `PresetAssignment` (below) serializes as `{"state":"inherit"}`, `{"state":"unassigned"}` and
   `{"state":"preset","id":"cameo5-htv"}`, `#[derive(Default)]` with `#[default]` on `Inherit`
   works, and both an absent field and an explicit `null` decode to `Inherit` while `Serialize`
@@ -254,9 +256,15 @@ inheritance it feeds.
 
 **The planner does not validate the id.** Presets are machine-scoped and a user entry can be
 deleted or shadowed (`presets.rs:170-210`), so an id that resolves to nothing is a real state, not
-a corruption. It keys a pass; the dialog renders it unresolved and falls back to the operator's
-settings. Refusing a cut inside the planner over a settings *lookup* would put a preset-file
-concern behind `plan_cut`, which exists to refuse geometry and machine mismatches.
+a corruption. It keys a pass, and the dialog renders it unresolved. Refusing a cut inside the
+planner over a settings *lookup* would put a preset-file concern behind `plan_cut`, which exists to
+refuse geometry and machine mismatches.
+
+**`prepare_cut` refuses it, though** — that is the boundary where the preset file is actually read,
+and it is machine-scoped there too, so an id belonging to another cutter is refused like one that
+was deleted (`unknown_preset`). An earlier draft of this spec had it fall back to the
+override-or-default path; that was wrong, and cutting real material with settings unrelated to the
+pass's own name is what the silence cost.
 
 ### What the panel shows
 
@@ -374,7 +382,7 @@ Everything here is decided before a byte reaches a Transport, so nothing is adde
   variant.
 - **Desktop** — a grouping chosen in the dialog reaches all three planner call sites; a mode change
   makes Cut and travel unavailable until the new plan installs; a preset-keyed row carries that
-  preset's settings into the `Job`; an unresolved preset renders as a row and still cuts.
+  preset's settings into the `Job`; an unresolved preset renders as a row and is refused at Cut.
 - **CLI** — every mode accepted, `--skip-pass`/`--order` refused under `single` and refused for a
   key that names no pass, `--order` repeatable and order-preserving, the dry-run header rule, and
   the two distinct empty-cut sentences.

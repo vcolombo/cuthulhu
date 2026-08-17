@@ -558,6 +558,38 @@ describe("presetIdForKey", () => {
   });
 });
 
+describe("installed plan", () => {
+  // The rows and the mode that produced them travel together. A row list is only ever sent
+  // with the grouping of the plan it came from, which is what this shape enforces: there is no
+  // way to build a request from rows without naming their plan's grouping.
+  it("builds a request only from a plan's own grouping and rows", () => {
+    const plan = {
+      grouping: "Fill" as Grouping,
+      revision: "7",
+      skippedNotCut: 0,
+      rows: [
+        { key: "color:00ff00ff", shapeCount: 1, enabled: true, presetId: null,
+          speed: null, force: null, repeatCount: null },
+      ],
+    };
+    const request = toCutRequest("dev-1", plan.revision, plan.grouping, plan.rows);
+    expect(request.grouping).toBe("Fill");
+    expect(request.passes.map((p) => p.key)).toEqual(["color:00ff00ff"]);
+  });
+
+  // A preset-grouped plan's rows carry their own preset, which is what makes the pass cut with
+  // that material rather than with defaults.
+  it("carries each preset-keyed row's own preset into the request", () => {
+    const rows = ["preset:cameo5-htv", "no-preset"].map((key) => ({
+      key, shapeCount: 1, enabled: true, presetId: presetIdForKey(key),
+      speed: null, force: null, repeatCount: null,
+    }));
+    const request = toCutRequest("dev-1", "7", "Preset", rows);
+    expect(request.passes.map((p) => p.preset_id)).toEqual(["cameo5-htv", null]);
+  });
+});
+
+
 describe("DeviceInfo.host", () => {
   it("distinguishes a cutter on this computer from one on a Cut Host", () => {
     const local: DeviceInfo = { ...aDevice(), host: null };

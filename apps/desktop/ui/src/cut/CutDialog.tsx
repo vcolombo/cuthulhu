@@ -11,6 +11,8 @@ import {
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
+  passRowLabel,
+  presetIdForKey,
   type PassVm,
   type Caps,
   type Preset,
@@ -22,6 +24,18 @@ import {
 const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
 type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[] };
+
+/** A plan the dialog is showing: the mode that produced it, the revision it was planned
+ *  against, its rows, and its skipped count. One value because they are only ever true
+ *  together — a mode change that left the previous rows sendable is how travel and a cut end
+ *  up describing different geometry.
+ */
+type InstalledPlan = {
+  grouping: ipc.Grouping;
+  revision: string;
+  rows: PassRow[];
+  skippedNotCut: number;
+};
 
 type Props = {
   scene: Scene;
@@ -104,10 +118,16 @@ export function CutDialog({
   // is the exact defect this fetch was added to remove.
   const [capsFor, setCapsFor] = useState<{ machineId: string; caps: Caps } | null>(null);
   const [presets, setPresets] = useState<Preset[]>([]);
-  const [rows, setRows] = useState<PassRow[]>([]);
+  /** A plan and everything derived from it, installed as one value. The mode belongs here
+   *  rather than beside it: rows keyed under one grouping must never be sent under another,
+   *  and the stale-plan check guards the document, not the mode. */
+  const [plan, setPlan] = useState<InstalledPlan | null>(null);
   const [travel, setTravel] = useState<[number, number, number, number][]>([]);
-  const [skippedNotCut, setSkippedNotCut] = useState(0);
-  const [planRevision, setPlanRevision] = useState<string | null>(null);
+  /** The mode the operator has chosen, which is `plan.grouping` except while a replan is in
+   *  flight. Cut and the row controls are unavailable in that window, because rows from the
+   *  previous mode would otherwise be sendable under this one. */
+  const [grouping, setGrouping] = useState<ipc.Grouping>("Color");
+  const [replanning, setReplanning] = useState(false);
   const [stalePlan, setStalePlan] = useState(false);
   /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
    *  started. Cleared by the next press of Cut, which is the thing that makes it untrue. */
@@ -164,7 +184,7 @@ export function CutDialog({
   /** Serial number of the newest Replan, so two in flight cannot install out of order. */
   const planSeq = useRef(0);
 
-  const replan = () => {
+  const replan = (mode: ipc.Grouping = grouping) => {
     const seq = ++planSeq.current;
     // A fresh plan orphans every reorder request: once when it is asked for (a reply
     // landing during the fetch would redraw travel the incoming plan replaces) and
@@ -172,32 +192,41 @@ export function CutDialog({
     // revision, and its late stale_plan rejection would re-raise the banner this
     // plan just cleared — Greptile drove exactly that interleaving on PR #142).
     travelSeq.current++;
+    setReplanning(true);
+    // Travel from the previous mode describes an arrangement that no longer exists.
+    setTravel([]);
     ipc
-      .planCut()
-      .then((plan) => {
+      .planCut(mode)
+      .then((response) => {
         if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
         travelSeq.current++;
-        setRows(
-          plan.passes.map((p) => ({
-            color: p.color,
+        setPlan({
+          grouping: mode,
+          revision: response.doc_revision,
+          skippedNotCut: response.skipped_not_cut,
+          rows: response.passes.map((p) => ({
+            key: p.key,
             shapeCount: p.shape_count,
             nodeIds: p.node_ids,
             starts: p.starts,
             enabled: true,
-            presetId: null,
+            // A preset-keyed pass starts with the preset it is keyed on, or it would be cut
+            // with defaults — the one thing grouping by material exists to avoid.
+            presetId: presetIdForKey(p.key),
             speed: null,
             force: null,
             repeatCount: null,
           })),
-        );
-        setTravel(plan.travel);
-        setSkippedNotCut(plan.skipped_not_cut);
-        setPlanRevision(plan.doc_revision);
+        });
+        setTravel(response.travel);
         setStalePlan(false);
       })
       .catch((e) => {
         if (seq !== planSeq.current) return; // superseded: its failure is no longer news
         onError(ipc.ipcErrorMessage(e));
+      })
+      .finally(() => {
+        if (seq === planSeq.current) setReplanning(false);
       });
   };
 
@@ -312,8 +341,11 @@ export function CutDialog({
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
 
   const startCut = () => {
-    if (!connected || planRevision === null) return;
-    const request = toCutRequest(connected.instance_id, planRevision, rows);
+    // `replanning` guards the window a mode change opens: the rows on screen still belong to
+    // the previous grouping until the new plan installs, and sending them under the new one
+    // would cut whatever that mode happens to key the same way.
+    if (!connected || plan === null || replanning) return;
+    const request = toCutRequest(connected.instance_id, plan.revision, plan.grouping, plan.rows);
     setAlreadyAccepted(false);
     setCutInFlight(true);
     ipc
@@ -352,7 +384,10 @@ export function CutDialog({
   };
 
   const updateRow = (i: number, patch: Partial<PassRow>) => {
-    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+    setPlan((prev) => (prev === null ? prev : {
+      ...prev,
+      rows: prev.rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)),
+    }));
   };
 
   // Travel is the planner's answer about the configured list — reorder and enable both
@@ -362,10 +397,10 @@ export function CutDialog({
   // state, and `replan` bumps the sequence too, so a fresh plan orphans them all.
   const refreshTravel = (next: PassRow[]) => {
     // No plan means no travel on screen to go stale (the initial plan itself failed).
-    if (planRevision === null) return;
+    if (plan === null) return;
     const seq = ++travelSeq.current;
     ipc
-      .travelForOrder(planRevision, toTravelPasses(next))
+      .travelForOrder(plan.revision, plan.grouping, toTravelPasses(next))
       .then((t) => {
         if (seq === travelSeq.current) setTravel(t);
       })
@@ -379,17 +414,19 @@ export function CutDialog({
   };
 
   const movePass = (i: number, dir: -1 | 1) => {
-    const next = reorderForReplan(rows, i, dir);
+    if (plan === null) return;
+    const next = reorderForReplan(plan.rows, i, dir);
     if (!next) return;
-    setRows(next);
+    setPlan({ ...plan, rows: next });
     refreshTravel(next);
   };
 
   // The head never travels to a pass that will not be cut, so enabling is as much a
   // travel edit as reordering is.
   const setPassEnabled = (i: number, enabled: boolean) => {
-    const next = rows.map((r, idx) => (idx === i ? { ...r, enabled } : r));
-    setRows(next);
+    if (plan === null) return;
+    const next = plan.rows.map((r, idx) => (idx === i ? { ...r, enabled } : r));
+    setPlan({ ...plan, rows: next });
     refreshTravel(next);
   };
 
@@ -539,31 +576,60 @@ export function CutDialog({
         {stalePlan ? (
           <div style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
             Document changed since this plan was made.
-            <button style={btn} onClick={replan}>
+            <button style={btn} onClick={() => replan()}>
               Replan
             </button>
           </div>
         ) : null}
 
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+          Group passes by
+          <select
+            aria-label="Group passes by"
+            value={grouping}
+            disabled={replanning}
+            onChange={(e) => {
+              const next = e.target.value as ipc.Grouping;
+              setGrouping(next);
+              // Replanned at once: the rows, the skipped count, the travel and the preview are
+              // all derived from the mode, and showing the previous mode's rows beside the new
+              // selection is the disagreement this avoids.
+              replan(next);
+            }}
+          >
+            <option value="Color">Colour (stroke, else fill)</option>
+            <option value="Stroke">Stroke colour</option>
+            <option value="Fill">Fill colour</option>
+            <option value="Preset">Material preset</option>
+            <option value="Single">One pass over everything</option>
+          </select>
+        </label>
+
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {rows.map((row, i) => {
+          {(plan?.rows ?? []).map((row, i) => {
             const eff = effectiveSettings(row, presets);
             const speedDisabled = fieldDisabled("speed", caps);
             const forceDisabled = fieldDisabled("force", caps);
+            // A pass keyed on a preset or a line type has no swatch to be recognised by, so
+            // the row says what it holds instead.
+            const label = passRowLabel(row.key, presets, plan?.grouping ?? grouping);
             return (
               <div
-                key={row.color ?? "none"}
+                key={row.key}
                 data-testid="cut-pass-row"
                 style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, border: "1px solid var(--border)", padding: 6 }}
               >
-                <span
-                  style={{
-                    width: 12,
-                    height: 12,
-                    display: "inline-block",
-                    background: row.color !== null ? `#${(row.color >>> 8).toString(16).padStart(6, "0")}` : "var(--muted)",
-                  }}
-                />
+                {label.swatch !== null ? (
+                  <span
+                    style={{
+                      width: 12,
+                      height: 12,
+                      display: "inline-block",
+                      background: label.swatch,
+                    }}
+                  />
+                ) : null}
+                {label.text !== null ? <span>{label.text}</span> : null}
                 <span>{row.shapeCount} shape(s)</span>
                 <label>
                   <input type="checkbox" checked={row.enabled} onChange={(e) => setPassEnabled(i, e.target.checked)} />
@@ -612,7 +678,7 @@ export function CutDialog({
                 <button style={btn} onClick={() => movePass(i, -1)} disabled={i === 0}>
                   Up
                 </button>
-                <button style={btn} onClick={() => movePass(i, 1)} disabled={i === rows.length - 1}>
+                <button style={btn} onClick={() => movePass(i, 1)} disabled={i === (plan?.rows.length ?? 0) - 1}>
                   Down
                 </button>
               </div>
@@ -621,10 +687,10 @@ export function CutDialog({
         </div>
 
         <div style={{ fontSize: 12, color: "var(--muted)" }}>
-          Not cut: {skippedNotCut} shape{skippedNotCut === 1 ? "" : "s"} marked No Cut
+          Not cut: {plan?.skippedNotCut ?? 0} shape{(plan?.skippedNotCut ?? 0) === 1 ? "" : "s"} marked No Cut
         </div>
 
-        <CutPreview scene={scene} artboard={artboard} passes={rows} travel={travel} />
+        <CutPreview scene={scene} artboard={artboard} passes={plan?.rows ?? []} travel={travel} />
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
@@ -663,7 +729,8 @@ export function CutDialog({
           <button
             aria-label="Start Cut"
             style={btn}
-            disabled={!status.actions.cut || !connected || machineMismatch || rows.length === 0 || cutInFlight}
+            disabled={!status.actions.cut || !connected || machineMismatch || plan === null
+              || plan.rows.length === 0 || replanning || cutInFlight}
             onClick={startCut}
           >
             Start Cut

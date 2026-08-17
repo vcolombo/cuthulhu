@@ -841,12 +841,21 @@ impl DeviceManagerHandle {
         let profile = driver.profile().clone();
         let caps = driver.caps();
 
-        // Only enabled passes are cut, so only their presets are worth reading.
+        // Only enabled passes are cut, so only their presets are worth reading. Filtered to the
+        // connected machine here rather than at the lookup below: `load_presets` returns every
+        // machine's entries (that is what `list_presets` filters for display), and a preset is
+        // machine-scoped — its speed and force mean nothing on another cutter. Builtin ids are
+        // machine-prefixed so they could not collide, but a *user* preset's id is the
+        // operator's own string, so `my-vinyl` can exist for both a Puma and a Cameo.
         let enabled = || request.passes.iter().filter(|p| p.enabled);
         let presets: Vec<MaterialPreset> = if enabled().any(|p| p.preset_id.is_some()) {
             let path = default_presets_path()
                 .ok_or_else(|| IpcError::new("no_config_dir", "cannot resolve presets file location"))?;
-            load_presets(&path).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
+            load_presets(&path)
+                .map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
+                .into_iter()
+                .filter(|p| p.machine_id == connected.machine_id)
+                .collect()
         } else {
             Vec::new()
         };
@@ -1589,6 +1598,43 @@ mod tests {
         let err = dev.prepare_cut(&app, request).unwrap_err();
         assert_eq!(err.code, "unknown_preset");
         assert!(err.message.contains("deleted-by-hand"), "names the preset it cannot find: {}", err.message);
+    }
+
+    /// A preset belonging to another cutter is not this cut's preset. Greptile's P1 on the third
+    /// push: `load_presets` returns every machine's entries, and while builtin ids are
+    /// machine-prefixed, a *user* preset's id is the operator's own string — so a Puma entry
+    /// could resolve for a Cameo cut and hand it that machine's speed and force.
+    ///
+    /// `puma-htv` stands in for the collision: it is a real builtin for the other machine, so
+    /// the lookup finds it if and only if the machine filter is missing. (Greptile could not run
+    /// this itself — its container lacked `gdk-3.0.pc` — so it is written here from its
+    /// finding.)
+    #[test]
+    fn a_preset_owned_by_a_different_machine_is_refused() {
+        let mut app = AppState::new();
+        let dev = test_device_setup(); // connects `cameo5`
+        let id = app.add_rect(10.0, 10.0);
+        app.set_material_preset(vec![id], document::PresetAssignment::Preset("puma-htv".into()))
+            .expect("assignable");
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                key: PassKey::Preset(Some("puma-htv".into())),
+                enabled: true,
+                preset_id: Some("puma-htv".into()),
+                speed: None, force: None, repeat_count: None }],
+        };
+        let err = dev.prepare_cut(&app, request).unwrap_err();
+        assert_eq!(err.code, "unknown_preset",
+            "a Puma preset must not supply settings for a Cameo cut");
+
+        // Premise: that id really is a preset — just not one for this machine.
+        assert!(cutplan::presets::builtin_presets().iter().any(|p| p.id == "puma-htv"),
+            "premise: puma-htv is a builtin, so only the machine filter can refuse it");
     }
 
     /// The bridge used to synthesize `Transmitting` from `Progress` because the

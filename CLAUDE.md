@@ -82,21 +82,25 @@ geometry ──► document ──► cutplan ──► driver-core (traits only
 `DeviceManager::cut` → `Driver` bytes → `Transport`.
 
 `cutplan::plan_cut` is the single chokepoint, and every path now goes through it. Everything that
-can refuse a cut lives behind it: the stale-plan check (`doc_revision`), colour→pass matching, and
+can refuse a cut lives behind it: the stale-plan check (`doc_revision`), key→pass matching, and
 `preflight` (finite/in-bounds/non-degenerate geometry, settings within machine range, document
 meant for the connected machine, output size). A caller hands over `DocumentPasses` plus a
 `PlanOptions` and gets a `CutPlan` or a `CutError`. Do not add a way around it; extend it.
 
-A plain `cuthulhu cut` (no `--by-color`) reaches it by asking the planner for one pass:
-`plan_passes_with(&doc, Grouping::Single)` groups every cut shape into a single `ColorPass`, in
-document order, and the selection asks for that pass by its colour — `None`, because a pass of
-mixed paint has no colour to name. That is the plain path saying explicitly what it always meant
-— everything in the file, one pass — rather than arriving there by skipping the planner. It used
-to say it by stamping a uniform stroke on every imported path, which also made the geometry
-cuttable; #144 took that second job away and left the overwrite destroying the document's real
-colours for nothing.
+`cuthulhu cut --group-by single` (the default) reaches it by asking the planner for one pass:
+`plan_passes_with(&doc, Grouping::Single)` groups every cut shape into a single `DocumentPass`, in
+document order, keyed `PassKey::All` — one pass by request, which is a different fact from the
+pass of shapes with no visible paint (`no-color`). Since #148 every mode takes that same route;
+the plain path has no planning function of its own.
 
-A pass is not "enabled/disabled": a colour nobody lists in `PlanOptions::passes` is not cut.
+A pass is identified by its `PassKey`, in one canonical string (`all`, `color:ff0000ff`,
+`no-color`, `preset:cameo5-htv`, `no-preset`) that the CLI, the IPC payloads and the cut dialog's
+row keys all share. Absence is its own token because a preset id is an unrestricted operator
+string. **The `Grouping` travels in the `plan_cut`, `travel_for_order` and `cut` payloads**, and
+the dialog holds it with the rows it produced: those are three separate round trips, and rows
+keyed under one mode sent under another match passes holding different shapes.
+
+A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` is not cut.
 
 ### Devices
 
@@ -153,11 +157,13 @@ A pass is not "enabled/disabled": a colour nobody lists in `PlanOptions::passes`
 
 ## Conventions
 
-- **`CONTEXT.md` is normative vocabulary.** It defines Document, Node, Delta, ColorPass,
-  DocumentPasses, PassSelection, CutPlan, Preflight, Settings, MaterialPreset, MachineProfile,
-  MachineCaps, Driver, Transport, Job, Pass — each with an explicit `_Avoid_` list (no "layer"
-  for ColorPass, no "backend"/"plugin" for Driver, no "validation" for Preflight). Use these
-  words in code, comments, commits, and issues.
+- **`CONTEXT.md` is normative vocabulary.** It defines Document, Node, Delta, DocumentPass,
+  PassKey, Grouping, PresetAssignment, DocumentPasses, PassSelection, CutPlan, Preflight,
+  Settings, MaterialPreset, MachineProfile, MachineCaps, Driver, Transport, Job, Pass — each with
+  an explicit `_Avoid_` list (no "layer" for DocumentPass, no "backend"/"plugin" for Driver, no
+  "validation" for Preflight). `ColorPass` is retired with #148: a pass is named by a PassKey,
+  which is a colour only under a colour Grouping. Use these words in code, comments, commits,
+  and issues.
 - **SPDX header on every file**: `// SPDX-License-Identifier: GPL-3.0-or-later` (or the
   language's comment form — `<!-- ... -->` in Markdown, `#` in Python).
 - **Comments explain why, not what.** The existing ones document the constraint or the trap that

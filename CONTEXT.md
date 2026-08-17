@@ -37,14 +37,33 @@ names
 
 ### Planning a cut
 
-**ColorPass**:
-Every shape in a Document cut in a single run of the blade. Asked to group by colour, the shapes
-in a pass share the colour it is keyed on — their stroke where that stroke is visible, otherwise
-their fill — and the pass keyed `None` is the one for shapes with no visible paint. Asked for a
-single pass instead, that one pass holds every cut shape whatever its paint and is keyed `None`
-for want of a colour, which then says nothing about what is in it. Which shapes are cut at all is
-their CutLineType's business, not their paint's.
-_Avoid_: layer, colour group, batch
+**DocumentPass**:
+Every shape in a Document cut in a single run of the blade, together with the PassKey that says
+which pass it is. What its shapes share is whatever the Grouping asked for — a colour, a material
+preset — or nothing but the operator's request, for the single pass. Which shapes are cut at all
+is their CutLineType's business, not their paint's.
+_Avoid_: ColorPass (retired with #148), layer, colour group, batch
+
+**PassKey**:
+What a DocumentPass is called: `all` for the single pass, a colour, or a MaterialPreset id, each
+with one canonical spelling (`color:ff0000ff`, `preset:cameo5-htv`) that the CLI, the IPC payloads
+and the cut dialog all use. Absence is its own token — `no-color` for a shape with no visible
+paint, `no-preset` for one resolving to no material — never a reserved value inside a mode,
+because a preset id is an unrestricted operator string and one called `none` would collide.
+_Avoid_: pass id, pass name, colour
+
+**Grouping**:
+How a Document's cut shapes are split into DocumentPasses — by stroke colour, fill colour,
+stroke-else-fill, material preset, or not at all. A request, not a property of the Document: the
+same Document plans differently under two Groupings, so the mode travels with every cut request,
+and the cut dialog holds it with the rows it produced.
+_Avoid_: mode, split, pass strategy
+
+**PresetAssignment**:
+What a Node says about its material: inherit from the nearest assigned ancestor, no material at
+all, or a named MaterialPreset. Resolved while planning rather than stored, so moving a Node
+between Layers changes what it is cut with and nothing has to be rewritten.
+_Avoid_: material, preset id, optional preset
 
 **CutLineType**:
 Whether a Node is cut, and how — `Cut` or `NoCut` today. An explicit attribute of the Node
@@ -52,13 +71,13 @@ rather than something read off its stroke, defaulted to `Cut` at import.
 _Avoid_: cut style, cuttable flag, cut attribute
 
 **DocumentPasses**:
-Every ColorPass a Document contains, in the order they were first encountered. An inventory of
+Every DocumentPass a Document contains, in the order they were first encountered. An inventory of
 what *could* be cut — nothing has been chosen, checked, or configured yet.
 _Avoid_: planned cut, plan
 
 **PassSelection**:
-A request to cut one ColorPass, naming it by colour and saying which Settings to use. Their
-order is the order the passes are cut, and a colour nobody selects is not cut.
+A request to cut one DocumentPass, naming it by its PassKey and saying which Settings to use.
+Their order is the order the passes are cut, and a pass nobody selects is not cut.
 _Avoid_: configured pass, enabled pass
 
 **CutPlan**:

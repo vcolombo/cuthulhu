@@ -535,9 +535,9 @@ mod tests {
         assert_eq!(planned.skipped_not_cut, 1);
     }
 
-    /// Neither paint, and cut anyway. `ColorPass::color` has always been `Option<u32>`;
-    /// this is the first thing that can make it `None`, so every consumer that renders a
-    /// swatch or prints a header now has a case that reaches it.
+    /// Neither paint, and cut anyway. A pass has always been able to carry no colour;
+    /// #144 made that reachable, so every consumer that renders a swatch or prints a header
+    /// has a case for it — which is now `PassKey::Color(None)`, written `no-color`.
     #[test]
     fn a_cut_shape_with_no_paint_lands_in_the_colorless_pass() {
         let mut doc = Document::new();

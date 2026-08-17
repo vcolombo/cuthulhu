@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The cut loop driven against a fake device: the bytes a real machine would
-//! receive on the plain (`cuthulhu cut`, no `--by-color`) path, the refusals that
+//! receive on the single-pass (`cuthulhu cut`, `--group-by single`) path, the refusals that
 //! stop bytes being produced at all, and how the loop reports the way a job ended.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -16,7 +16,7 @@ use driver_core::{
 const SQUARE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
     <rect width="10" height="10" fill="#ff0000"/></svg>"##;
 
-/// Two stroke colours, so `--by-color` plans the multi-pass cut an unattended run
+/// Two stroke colours, so a colour grouping plans the multi-pass cut an unattended run
 /// has to refuse.
 const TWO_COLORS: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
     <rect width="5" height="5" fill="none" stroke="#ff0000"/>

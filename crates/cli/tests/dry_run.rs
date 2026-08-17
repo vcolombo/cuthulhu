@@ -4,7 +4,7 @@ use driver_core::Settings;
 
 /// A dry run must refuse what a real cut would refuse. Through `build_bytes` it did
 /// not: off-bed geometry printed bytes, so `--dry-run` reported a cut that
-/// `--by-color` and the desktop would both have rejected.
+/// a grouped cut and the desktop would both have rejected.
 #[test]
 fn plain_dry_run_refuses_geometry_off_the_bed() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -30,7 +30,7 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
         <path d="M0 0 L20 0" stroke="#ff0000"/>
         <path d="M0 10 L20 10" stroke="#00ff00"/>
     </svg>"##;
-    // Planned through the same entry point `cut --by-color` uses, preflight included.
+    // Planned through the one entry point every mode uses since #148, preflight included.
     let puma = driver_for("puma").expect("registry id");
     let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false).unwrap();
     let passes = &plan.passes;

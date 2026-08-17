@@ -234,7 +234,7 @@ mod tests {
     }
 
     /// A fill-only SVG used to be refused by name here, because `plan_passes` cut only stroked
-    /// shapes. Since #144 `--by-color` plans it, keyed on the fill, and the refusal it used to
+    /// shapes. Since #144 a colour grouping plans it, keyed on the fill, and the refusal it used to
     /// produce belongs to an SVG with no geometry at all — which
     /// `by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name` covers.
     #[test]

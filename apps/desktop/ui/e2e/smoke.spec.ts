@@ -941,6 +941,38 @@ test("a replan failing while another is parked keeps the installed plan's travel
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
 
+// Codex's finding on the fix above, and the other half of it: moving travel into the plan removed
+// the need to orphan pending travel when a replan *starts*, and leaving that bump in place turned it
+// into the bug. A row edit's travel reply, orphaned on the way out of a replan that then fails, never
+// lands - and the plan keeps the edited rows, so one enabled pass is left showing the travel of two,
+// permanently. Orphaning belongs at installation, which is the one moment the rows a reply was
+// computed for stop being the rows on screen.
+test("a travel reply owed to a row edit still lands when a replan fails", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // Disable a pass and park the travel reply it asks for: one pass left to cut means no travel
+  // between passes, which is the answer this plan is owed.
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move");
+
+  // Now a replan fails. The edited rows stay installed - so the parked reply is still the right
+  // answer for them, and discarding it would leave the count above standing for good.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() => (window as unknown as { __releaseTravel: () => void }).__releaseTravel());
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+});
+
 // The whole material path through the real UI: the panel assigns a preset, preset grouping keys
 // the pass on it, the row carries that preset's id, and the cut is refused because this machine
 // cannot offer it. Nothing else drives preset grouping end to end, and without this the fake's

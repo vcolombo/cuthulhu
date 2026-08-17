@@ -193,21 +193,25 @@ export function CutDialog({
 
   const replan = (mode: ipc.Grouping = grouping) => {
     const seq = ++planSeq.current;
-    // A fresh plan orphans every reorder request: once when it is asked for (a reply
-    // landing during the fetch would redraw travel the incoming plan replaces) and
-    // again when it installs (a move made while the fetch was out carries the old
-    // revision, and its late stale_plan rejection would re-raise the banner this
-    // plan just cleared — Greptile drove exactly that interleaving on PR #142).
-    travelSeq.current++;
     setReplanning(true);
-    // Nothing is cleared on the way out. The previous plan stays installed until this reply
-    // lands, and it is still the one that would be cut if this reply is a failure — so the travel
-    // describing it stays on screen with it. Cut and the row controls are unavailable while
-    // `replanning`, so the window cannot be acted on either way.
+    // Nothing is cleared or orphaned on the way out. The previous plan stays installed until this
+    // reply lands, and if the reply is a failure it stays installed for good — so both the travel
+    // describing it and any travel reply still owed to it are still wanted. Orphaning them here is
+    // what Codex caught: disable a pass, hold its (now zero-move) travel reply, then fail a
+    // replan, and the plan keeps the edited rows while the reply that would have matched them was
+    // thrown away. One enabled pass, one travel move, forever.
+    //
+    // Installation is where orphaning belongs, and it is enough: it happens at the one moment the
+    // rows a pending reply was computed for stop being the rows on screen. A reply landing before
+    // then was asked for against the plan that is still installed, so it is not stale at all.
     ipc
       .planCut(mode)
       .then((response) => {
         if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
+        // The rows are about to change, so every travel reply owed to the old ones is stale from
+        // here: a move made while this fetch was out carries the old revision, and its late
+        // stale_plan rejection would re-raise the banner this plan just cleared (Greptile drove
+        // exactly that interleaving on PR #142).
         travelSeq.current++;
         setPlan({
           grouping: mode,

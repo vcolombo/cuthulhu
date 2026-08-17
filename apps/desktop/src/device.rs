@@ -1572,6 +1572,44 @@ mod tests {
         assert_eq!(passes[0].job.settings.force, builtin.settings.force);
     }
 
+    /// Greptile's P1 on PR #152 read this as "a preset key silently uses defaults". It is the
+    /// operator clearing the preset on a row: the key says which shapes share the pass, the row's
+    /// `preset_id` says what settings to cut them with, and those are deliberately two fields. A
+    /// colour-keyed pass has no preset either and cuts with the operator's settings - the ordinary
+    /// case nobody calls a bug. Refusing here would make preset-keyed passes the only kind that
+    /// cannot be cut with settings of the operator's own choosing.
+    ///
+    /// It is not silent: the row shows "No preset" where it showed the material, and the speed and
+    /// force fields show what will be used. The refusal below is for an id that *cannot resolve* -
+    /// the file changing under the operator - which is a different fact from a choice.
+    #[test]
+    fn a_preset_keyed_pass_with_the_preset_cleared_cuts_with_the_operators_settings() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        let id = app.add_rect(10.0, 10.0);
+        app.set_material_preset(vec![id], document::PresetAssignment::Preset("cameo5-htv".into()))
+            .expect("assignable");
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                key: PassKey::Preset(Some("cameo5-htv".into())),
+                enabled: true,
+                // The operator picked "No preset" on a row keyed by a material.
+                preset_id: None,
+                speed: Some(7), force: None, repeat_count: None }],
+        };
+        let (_, passes) = dev.prepare_cut(&app, request).expect("planned, not refused");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.id == "cameo5-htv").expect("premise: the builtin exists");
+        assert_eq!(passes[0].job.settings.speed, Some(7), "the operator's own speed is used");
+        assert_ne!(passes[0].job.settings.speed, builtin.settings.speed,
+            "premise: the builtin would have said something else, so this asserts a choice");
+    }
+
     /// A pass naming a preset the file cannot resolve is refused rather than cut with
     /// defaults. Greptile's P1 on PR #152: a machine-scoped preset disappears for ordinary
     /// reasons — the project was converted, the entry was deleted — and cutting real material

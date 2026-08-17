@@ -166,5 +166,22 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     ctx.setLineDash([]);
   }, [scene, artboard, passes, travel]);
 
-  return <canvas ref={canvasRef} width={400} height={300} style={{ background: "var(--workspace)" }} />;
+  // A canvas has no accessible name of its own, and this one carries the answer to "what is about
+  // to be cut" — so it says what it drew: the passes that will run and the moves between them.
+  // Counted from the same two arrays the effect above draws, so the sentence cannot drift from
+  // the picture.
+  const cutting = passes.filter((p) => p.enabled).length;
+  const label =
+    `Cut preview: ${cutting} ${cutting === 1 ? "pass" : "passes"}, ` +
+    `${travel.length} travel ${travel.length === 1 ? "move" : "moves"}`;
+  return (
+    <canvas
+      ref={canvasRef}
+      role="img"
+      aria-label={label}
+      width={400}
+      height={300}
+      style={{ background: "var(--workspace)" }}
+    />
+  );
 }

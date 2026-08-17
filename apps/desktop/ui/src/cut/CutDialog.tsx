@@ -193,7 +193,12 @@ export function CutDialog({
     // plan just cleared — Greptile drove exactly that interleaving on PR #142).
     travelSeq.current++;
     setReplanning(true);
-    // Travel from the previous mode describes an arrangement that no longer exists.
+    // Travel from the previous mode describes an arrangement that no longer exists — but the
+    // previous plan is still the installed one until this reply lands, and if the reply is a
+    // failure it stays installed and cuttable. So the travel it describes has to come back with
+    // it, or the operator is offered a cut whose preview shows no travel at all (Greptile drove
+    // exactly that on this PR: rows 2, cuttable true, travel lines 1 -> 0).
+    const priorTravel = travel;
     setTravel([]);
     ipc
       .planCut(mode)
@@ -228,6 +233,7 @@ export function CutDialog({
         // plan, the dialog would offer a Cut it cannot keep: the operator reads "one pass" and
         // the machine does the split the old plan still holds.
         setGrouping(plan?.grouping ?? "Color");
+        setTravel(priorTravel);
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => {

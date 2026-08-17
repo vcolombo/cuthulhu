@@ -373,7 +373,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
     // bumped per command diverges on that, and silently goes stale-blind for any
     // command that mutates `doc` and forgets to bump (commit_transform did).
-    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel: [] as [number, number, number, number][] };
+    // Travel by the same rule `travel_for_order` uses below - one segment per adjacent pair of
+    // passes to be cut - because the real `plan_cut` returns the travel for the order it just
+    // planned, and a fake that plans passes but never any travel between them cannot show a
+    // preview going empty. Every pass a fresh plan produces is enabled.
+    const travel = passes.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel };
   }
 
   // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
@@ -858,6 +863,32 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// Greptile's P1 on this PR, with its own Playwright repro: a replan that fails leaves the previous
+// plan installed and cuttable, and the picker goes back to its mode - but travel was cleared on the
+// way out and nothing brought it back. The operator was then offered a cut whose preview showed no
+// travel at all, while the cut itself would travel exactly as before. The preview's accessible name
+// is what makes the two states tellable apart from outside.
+test("a rejected replan keeps the travel it was showing", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  // Two passes means one move between them - the travel this test is about.
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // The plan failed, so the previous one is still in force: same rows, same mode, still cuttable.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // ...and the preview still describes the arrangement that cut would use.
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
 
 // The whole material path through the real UI: the panel assigns a preset, preset grouping keys

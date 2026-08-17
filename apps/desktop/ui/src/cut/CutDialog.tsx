@@ -223,6 +223,11 @@ export function CutDialog({
       })
       .catch((e) => {
         if (seq !== planSeq.current) return; // superseded: its failure is no longer news
+        // A plan that failed to install leaves the previous one in force, rows and mode alike,
+        // so the picker goes back to *its* grouping. Left showing the mode nobody managed to
+        // plan, the dialog would offer a Cut it cannot keep: the operator reads "one pass" and
+        // the machine does the split the old plan still holds.
+        setGrouping(plan?.grouping ?? "Color");
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => {

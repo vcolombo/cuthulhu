@@ -293,6 +293,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let planPasses: { key: string; enabled: boolean }[] = [];
   let failNextResume = false;
   let failNextCut = false;
+  let failNextPlan = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
   // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
   // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
@@ -488,6 +489,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     get_connected_device: () => connected,
     plan_cut: (a) => {
+      // A planner that refuses is an ordinary outcome — a font that will not resolve, a shape
+      // with no outline — and the dialog has to survive one without lying about what it will
+      // cut next.
+      if (failNextPlan) {
+        failNextPlan = false;
+        throw ipcError("plan_error", "shape #2: no fonts are installed on this system");
+      }
       // Answered from the document as it is *now*, like the real command, then parked if
       // the test has armed the hold: which of a replan and an older reorder settles first
       // is the whole subject of the race test, and a timing race cannot state it.
@@ -646,6 +654,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     // Same, for a fault during the first pass of the next cut.
+    __test_fail_next_plan: () => {
+      failNextPlan = true;
+      return {};
+    },
     __test_fail_next_cut: () => {
       failNextCut = true;
       return null;
@@ -832,6 +844,27 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// Greptile's P1 on the fifth push: a replan that *fails* leaves the previous plan in force —
+// rows, revision and mode — but the picker had already moved to the mode nobody managed to plan.
+// Cut then sent the old grouping while the operator read the new one off the screen. Nothing
+// miscuts, which is what makes it worth a test: the lie is only visible on the dialog.
+test("a grouping whose plan fails does not stay on the picker", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // The refusal is reported, the previous plan is still what would be cut, and the picker says
+  // so rather than advertising the mode that failed.
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 });
 
 // Greptile's P1 on PR #152, reproduced with a held reply: while a replacement plan is in flight

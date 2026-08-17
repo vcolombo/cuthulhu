@@ -3,7 +3,8 @@
 # Pass grouping as an explicit choice — design
 
 Date: 2026-08-16
-Status: approved — four scoping decisions confirmed 2026-08-16
+Status: approved — four scoping decisions confirmed 2026-08-16; revised the same day after a Codex
+review returned BLOCKING on fourteen findings, all accepted (see *Revisions*).
 
 ## Purpose
 
@@ -19,16 +20,16 @@ Two of those four are not colours, and **a pass is identified by a colour everyw
 `CutRequest`/`ConfiguredPassDto` (`apps/desktop/src/device.rs:51-68`) →
 `PlanCutResponse` (`apps/desktop/ui/src/ipc.ts:148-158`) → `PassVm` and the travel/cut request
 builders (`apps/desktop/ui/src/cut/viewmodel.ts:8-38,135-169,224-248`) → the dialog's row keys and
-swatches (`apps/desktop/ui/src/cut/CutDialog.tsx:181-198,554-618`) → the preview
-(`CutPreview.tsx:75-83,118-130`) → the e2e fake (`ui/e2e/smoke.spec.ts:275,302-337,473-505`) →
-the CLI's `--skip-color` and `--order` (`crates/cli/src/main.rs:45-54`).
+swatches (`CutDialog.tsx:181-198,554-618`) → the preview (`CutPreview.tsx:19-25,75-83,118-130`) →
+the e2e fake (`ui/e2e/smoke.spec.ts:275,302-341,473-505`) → the CLI's `--skip-color` and `--order`
+(`crates/cli/src/main.rs:45-54`).
 
-So this cannot be added as a planner flag. Pass identity stops being a colour, once, and the four
-keys #45 asks for join the two `Grouping` already has — today's stroke-else-fill default and the
-single pass — for six modes in total. **#148 tracks this slice**; #45 stays open as the parity
-umbrella, and
-its remaining criteria are #149 (one continuous job versus separate confirmed jobs) and #150
-(colour-layer alignment marks), both listed under *Out of scope* below.
+So this cannot be added as a planner flag. Pass identity stops being a colour, once, and the modes
+arrive on top of it: **five in total** — the two `Grouping` already has (today's stroke-else-fill
+default, and the single pass) plus strict stroke, strict fill, and material preset. Line type is
+*not* among them; see *Line type is not a mode yet*. **#148 tracks this slice**; #45 stays open as
+the parity umbrella, and its remaining criteria are #149 (one continuous job versus separate
+confirmed jobs) and #150 (colour-layer alignment marks).
 
 ## What the reference applications do
 
@@ -45,44 +46,45 @@ Sources: [cut by line colour or fill colour](https://www.silhouette101.com/archi
 [cut line types](https://www.thepinningmama.com/cut-lines-explanation-and-types-in-silhouette-studio-silhouette-bootcamp-lesson-25/),
 [Cut Line Type in SCAL Pro](https://www.craftedge.com/tutorials/cutlinetype/cutlinetype.php),
 [SCAL cut settings](https://www.craftedge.com/help/scalbridge/cutwindow_general.php).
-Vendor-doc and community sourced; not verified by driving the applications.
+Vendor-doc and community sourced; not verified by driving the applications. **Nothing in this spec
+rests on how either application inherits a material down a layer** — that behaviour is unverified
+and is not cited as support for the inheritance model below.
 
 ## The key
 
-`PassKey`, in `cutplan::passes` beside the type it keys:
+`PassKey`, in `cutplan::pass_key` beside the type it keys:
 
 ```rust
 pub enum PassKey {
     All,
     Color(Option<u32>),
-    LineType(CutLineType),
     Preset(Option<String>),
 }
 ```
 
 `Option` inside two variants rather than one shared `Unassigned`: absence is a property of the
-mode's key, not a fifth kind of pass. `Color(None)` is a shape with no visible paint at all;
-`Preset(None)` is a shape no operator has assigned a material to — which, unlike the colour case,
-is the *usual* state and the one most passes will carry.
+mode's key, not a fifth kind of pass. `Color(None)` is a shape with no visible paint *in the mode's
+terms* — no visible stroke under `Stroke`, no visible fill under `Fill` — and `Preset(None)` is a
+shape that resolves to no material, which is the *usual* state and the one most passes carry.
 
 **`All` is not `Color(None)`.** Today `Grouping::Single` keys its one pass `None`, and both
 `passes.rs:14-19` and `plan.rs:77-81` carry prose apologising for it — the same value means "one
-pass by request, whatever its paint" in one place and "the pass of shapes with no visible paint"
-in the other, so `CutError`'s message for a missing selection has to be the evasive "no planned
-pass without a color". Generalising the key is the one moment that costs nothing to fix.
+pass by request, whatever its paint" in one place and "the pass of shapes with no visible paint" in
+the other, so `CutError`'s message for a missing selection has to be the evasive "no planned pass
+without a color". Generalising the key is the one moment that costs nothing to fix.
 
 `ColorPass` is renamed **`DocumentPass`**: its container is already `DocumentPasses`
 (`passes.rs:30-38`), so the singular is free, and every alternative collides with vocabulary
 `CONTEXT.md` already spends — `Pass` is a run of the blade, `CutPass` is `driver-core`'s,
 `PlannedPass` is the post-preflight one, and "group"/"batch" are on ColorPass's own `_Avoid_` list.
-`CONTEXT.md`'s ColorPass entry becomes the DocumentPass entry and gains PassKey; the ColorPass
-name is retired, not aliased.
+`CONTEXT.md`'s ColorPass entry becomes the DocumentPass entry and gains PassKey; the ColorPass name
+is retired, not aliased.
 
 The rest of the rename follows mechanically: `PassSelection { key, settings }`,
 `PlannedPass { key, job }`, and `CutError::UnknownPass(PassKey)` whose `code()` becomes
 `unknown_pass`. That code crosses IPC but nothing reads it: the frontend keys off `stale_plan`
 alone (`CutDialog.tsx:327,376`), as `device.rs:1095-1097` states. The assertions on
-`"unknown_pass_color"` in `device.rs:1331-1340,1403-1409` and `plan.rs:213-216,297-303` are the
+`"unknown_pass_color"` in `device.rs:1331-1340,1403-1409` and `plan.rs:213-216,292-303` are the
 whole cost.
 
 ## One grammar for a key, in every language
@@ -93,15 +95,27 @@ whole cost.
 |---|---|
 | `All` | `all` |
 | `Color(Some(0xFF0000FF))` | `color:ff0000ff` |
-| `Color(None)` | `color:none` |
-| `LineType(Cut)` | `line-type:cut` |
-| `LineType(NoCut)` | `line-type:no-cut` |
+| `Color(None)` | `no-color` |
 | `Preset(Some("cameo5-htv"))` | `preset:cameo5-htv` |
-| `Preset(None)` | `preset:none` |
+| `Preset(None)` | `no-preset` |
 
-`Display` and `FromStr` in Rust, plus `#[serde(into = "String", try_from = "String")]` so the JSON
-a DTO carries *is* that string. Three things follow, and they are the reason for choosing a string
-over a serde-tagged enum:
+**Absence is its own token, never a reserved value inside a mode's namespace.** This is the whole
+of the grammar's first rule, and it exists because the obvious spelling is broken: a preset id is
+an unrestricted operator-supplied string (`crates/cutplan/src/presets.rs:9-15`, written through
+`save_user_presets`), so `preset:none` for "no preset" would collide with a preset whose id is
+literally `none` — two distinct passes writing one string, which means duplicate React keys, and a
+`plan_mismatch` from `travel_for_order`'s exact-once check that no operator could clear. `no-color`
+is spelled the same way for one rule rather than two, even though an 8-hex-digit colour could not
+have collided.
+
+A colour is always 8 hex digits, parsed case-insensitively and written lowercase, so the round trip
+is a fixed point and two spellings of one key cannot both appear in a pass list. An **empty preset
+id is refused** (`preset:` does not parse): the grammar's tail is the id verbatim, so an empty tail
+is the one input that would make two keys indistinguishable from a truncation.
+
+The representation is `Display`/`FromStr` plus `#[serde(into = "String", try_from = "String")]`, so
+the JSON a DTO carries *is* that string. Three things follow, and they are the reason for choosing
+a string over a serde-tagged enum:
 
 - **No hand-mirrored union in TypeScript.** A tagged enum would need a discriminated union written
   by hand in `ipc.ts` and again in the e2e fake — the duplication #70 is open about.
@@ -110,38 +124,36 @@ over a serde-tagged enum:
 - **The CLI and the wire agree by construction.** `--skip-pass color:ff0000ff` and a DTO field
   hold identical bytes, so a pass named in a script and a pass named in the dialog cannot drift.
 
-Parsing splits on the **first** `:` only. Preset ids are kebab-case and machine-scoped
-(`presets.rs:53-167`), and the grammar tolerates a colon inside one rather than forbidding it.
-Colour is hex RRGGBBAA, the form `--order` already takes; parsed case-insensitively and always
-written lowercase, so a round trip is a fixed point and two spellings of one key cannot both
-appear in a pass list.
-
-TypeScript gets one `parsePassKey` — needed for the swatch, which must recover the RGBA the string
-carries — table-tested against the same examples as the Rust round-trip test. That table is the
+Parsing splits on the **first** `:` only, so a preset id may contain one. TypeScript gets one
+`parsePassKey` — needed for the swatch, which must recover the RGBA the string carries —
+table-tested against the same examples as the Rust round-trip test. That table is the
 cross-language pin, and both halves must list every variant.
 
 ### Verified, not assumed
 
-The wire mechanism was prototyped against the locked versions — `serde 1.0.229`, `serde_json
-1.0.151` — before this spec was approved, so the plan states these rather than hoping for them:
+Both wire mechanisms were prototyped against the locked versions — `serde 1.0.229`,
+`serde_json 1.0.151` — before this spec was approved, so the plan states these rather than hoping
+for them:
 
 - `#[serde(into = "String", try_from = "String")]` on an enum emits exactly the `Display` string
-  (`"color:ff0000ff"`, `"all"`) and accepts it back, nested in a struct field and in a `Vec`. It
-  requires `Clone` on the type, which `PassKey` needs anyway for its `String`.
-- A malformed key is a `serde` error, not a panic: `""`, `"all:1"`, `"color:"`, `"color:zz"`,
-  `"line-type:draw"` and `"colour:ff0000ff"` all deserialize to `Err`.
-- Uppercase hex parses and `Display` writes lowercase, so the round trip is a fixed point.
-- A wire struct can carry **two** absent-field rules at once: `cut_line_type` deriving from the
-  stroke and `material_preset` taking a plain `#[serde(default)]`. An explicit value on the wire
-  wins over both, and `Serialize` writes both, so a document round-trips once and is never
-  ambiguous again.
-- Splitting on the first `:` accepts a preset id containing one, so the grammar constrains ids no
-  further than they are constrained today.
+  and accepts it back, nested in a struct field and in a `Vec`. It requires `Clone` on the type,
+  which `PassKey` needs anyway for its `String`.
+- The grammar is **injective**: nine keys including `Preset(None)`, `Preset(Some("none"))`,
+  `Preset(Some("no-preset"))`, `Preset(Some("all"))`, an id containing `:` and an id containing `,`
+  all write distinct strings and round-trip. This is the property the first spelling lacked.
+- Malformed keys are `serde` errors, not panics: `""`, `"preset:"`, `"color:none"`, `"color:ff0000"`,
+  `"line-type:cut"`, `"no-material"` and `"all:1"` all deserialize to `Err`.
+- `PresetAssignment` (below) serializes as `{"state":"inherit"}`, `{"state":"unassigned"}` and
+  `{"state":"preset","id":"cameo5-htv"}`, `#[derive(Default)]` with `#[default]` on `Inherit`
+  works, and both an absent field and an explicit `null` decode to `Inherit` while `Serialize`
+  always writes a concrete value.
+- A wire struct carries **two** absent-field rules at once: `cut_line_type` deriving from the
+  stroke and `material_preset` defaulting to `Inherit`.
 
 ## Grouping
 
 ```rust
-pub enum Grouping { Single, Color, Stroke, Fill, LineType, Preset }
+pub enum Grouping { Single, Color, Stroke, Fill, Preset }
 ```
 
 `Color` keeps today's stroke-else-fill rule verbatim and stays what `plan_passes` defaults to
@@ -155,47 +167,121 @@ Illustrator export, and under strict `Stroke` all of it collapses into one unrec
 colourless pass. A default that leaves an operator unable to tell their passes apart is the
 behaviour the fallback exists to prevent.
 
-`LineType` **ships with one reachable key.** `CutLineType` is `{Cut, NoCut}`
-(`crates/document/src/node.rs:41-42`) and `NoCut` shapes never reach a pass — they are counted
-into `skipped_not_cut` (`passes.rs:129-131`) — so a line-type plan holds exactly one pass, keyed
-`line-type:cut`, until the enum gains a second cuttable member. This is deliberate and recorded
-rather than hidden: the mode, the key, the DTOs, the dialog control and the CLI value all become
-useful the moment #56 adds `CutEdge`, with no further change to any of them. Adding `Draw` or
-`Score` here instead was rejected — no driver can honour a pen or a scoring tool (#57), so a
-`Draw` pass would encode as ordinary blade movement and cut the material the operator asked it to
-draw on.
+Because `Color(None)` means something different in each colour mode, **the pass's label is
+grouping-aware**: "No visible paint" under `Color`, "No visible stroke" under `Stroke`, "No visible
+fill" under `Fill`. A shape with a bright fill and no stroke is in the `no-color` pass under
+`Stroke`, and calling that "no visible paint" in front of the operator would be false.
 
-`Single` is unchanged in behaviour and keys `All`.
+`Single`'s one pass is keyed `All` and labelled **"Every cut shape"** — not "every shape", because
+a `NoCut` shape is excluded from it (`passes.rs:129-131`) and counted into `skipped_not_cut`.
 
-## A material preset attaches to a Node, and inherits
+## Line type is not a mode yet
 
-`Node` gains `material_preset: Option<String>` — a `MaterialPreset::id` (`presets.rs:9-15`) —
-beside `cut_line_type`, and for the same reason it is not on `Style`: production intent is not
-paint (#68).
+`CutLineType` is `{Cut, NoCut}` (`crates/document/src/node.rs:41-42`) and a `NoCut` shape never
+reaches a pass — it is counted, not cut (`passes.rs:129-131`). A line-type grouping over today's
+enum therefore produces exactly one pass containing exactly what `Single` produces.
 
-`NodeWire` gains the field with `#[serde(default)]`. Unlike `cut_line_type` there is nothing to
-derive: a document written before this change had no way to assign a preset, so absent genuinely
-means `None`, and the migration is the default. Adding a field changes every document's serialized
-JSON and therefore its `doc_revision` (`passes.rs:61-65`), exactly as #144 did — harmless, because
-a revision is only ever compared against one taken in the same process run.
+An earlier revision of this spec shipped it anyway, keyed `line-type:cut`, on the argument that the
+plumbing would be ready for #56. That was wrong, and the Codex review named why: the mode would be
+**observably identical to `Single` while carrying different `--skip-pass`/`--order` semantics and a
+different label** — a second way to say one thing, which is the failure the repo's no-alias
+convention exists to prevent. An operator choosing between two modes that cut the same geometry
+learns nothing from the choice.
 
-**Inheritance happens in the walk, not in the document.** `plan_passes_with` already carries a
-world transform down its explicit stack (`passes.rs:106-160`); the nearest ancestor's preset rides
-alongside it, and a shape's own value overrides. So assigning a preset to a Layer covers every
-shape under it — #45's "object/layer" criterion with one field, no second attribute, and no stored
-derived state that could go stale when a node is reparented.
+So `Grouping::LineType` and `PassKey::LineType` are **not in this slice**. #56 adds `CutEdge`, and
+adds both of them with it — additively, as a variant plus its match arms, with no rename and no
+second wire migration. Adding `Draw`/`Score` here instead was rejected for a separate reason: no
+driver can honour a pen or scoring tool (#57), so a `Draw` pass would encode as ordinary blade
+movement and cut the material the operator asked it to draw on.
 
-**The planner does not validate the id.** Presets are machine-scoped and user entries can be
+## A material preset attaches to a Node, and resolves down the tree
+
+`Node` gains `material_preset: PresetAssignment` beside `cut_line_type`, and for the same reason it
+is not on `Style`: production intent is not paint (#68).
+
+```rust
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "state", content = "id", rename_all = "kebab-case")]
+pub enum PresetAssignment {
+    #[default]
+    Inherit,
+    Unassigned,
+    Preset(String),
+}
+```
+
+**Three states, not `Option<String>`.** The two-state spelling cannot say "deliberately no
+material, do not inherit": with `None` meaning inherit, a shape inside an HTV Layer can never reach
+the `no-preset` pass, even though that pass is a legitimate state which resolves to the operator's
+own settings (`crates/cutplan/src/presets.rs:31-49`). The mechanism costs one enum, one serde
+attribute, one arm in the walk and one option in a control; the alternative costs a second
+migration of `Node`'s wire format across Rust, JSON, TypeScript, the e2e fake and that control —
+and `manifest.json` is a bare `serde_json::to_string(&Document)` with no schema version, so every
+such migration is paid in "absence is the only signal" logic that never goes away. This is the
+Codex review's verdict, adopted; what would overturn it is a product invariant that every cuttable
+descendant of a preset-bearing Layer must share some preset, which nothing in #45 or #68
+establishes.
+
+`NodeWire` gains `#[serde(default)] material_preset: Option<PresetAssignment>` and resolves it with
+`unwrap_or_default()`, so an absent field — and an explicit `null` — mean `Inherit`. Adding a field
+changes every document's serialized JSON and therefore its `doc_revision` (`passes.rs:61-65`),
+exactly as #144 did — harmless, because a revision is only ever compared against one taken in the
+same process run.
+
+**Resolution happens in the walk; assignment does not descend.** `plan_passes_with` already carries
+a world transform down its explicit stack (`passes.rs:106-160`); the nearest ancestor's assignment
+rides alongside it, and a shape's own `Preset`/`Unassigned` wins over it. `set_material_preset`
+therefore writes **only the Nodes in the selection** — never their children.
+
+That is the opposite of `set_cut_line_type`, which descends (`crates/document/src/commands.rs:45-81`),
+and the difference is the point: `cut_line_type` does not inherit, so a value on a Group would be
+inert and descending is the only way to make the control mean anything. A preset *does* inherit, so
+descending would write today's shapes and leave the Layer itself unset — after which a shape added
+to or reparented into that Layer would disagree with its siblings, and the Layer would look
+assigned while holding nothing. Copying the neighbouring command would have cancelled out the
+inheritance it feeds.
+
+**The planner does not validate the id.** Presets are machine-scoped and a user entry can be
 deleted or shadowed (`presets.rs:170-210`), so an id that resolves to nothing is a real state, not
 a corruption. It keys a pass; the dialog renders it unresolved and falls back to the operator's
 settings. Refusing a cut inside the planner over a settings *lookup* would put a preset-file
 concern behind `plan_cut`, which exists to refuse geometry and machine mismatches.
 
-Setting it is `set_material_preset(ids, Option<String>)`, mirroring `set_cut_line_type`
-(`apps/desktop/src/ipc.rs:53-57`) — one method on `state.rs`, a thin command, a properties-panel
-control beside the cuttability one.
+### What the panel shows
 
-## The mode travels in the payload
+The properties panel reports the selection's **local assignment**, and the effective value it
+resolves to, as named states — extending the explicit `"mixed"` the cuttability control already
+uses (`apps/desktop/ui/src/panels/cutLineType.ts:6-27`):
+
+| Situation | State |
+|---|---|
+| `Inherit`, ancestor's id resolves | `Inherited — <preset name>` |
+| `Inherit`, ancestor's id resolves to nothing | `Inherited — Unresolved (<id>)` |
+| `Inherit`, no ancestor assignment | `Inherited — No preset` |
+| `Unassigned` | `No preset` |
+| `Preset(id)` | the preset's name, or `Unresolved (<id>)` |
+| selection disagrees on local assignment | `Mixed` |
+
+The control offers `Inherit`, `No preset`, and each preset by name. A Layer holding an explicit
+preset selected together with an inheriting child reads `Mixed` even though both resolve to the
+same id, because the command edits local assignments and saying otherwise would misreport what a
+click is about to overwrite.
+
+## A preset-keyed pass cuts with that preset's settings
+
+`prepare_cut` resolves a pass's `Settings` from `ConfiguredPassDto.preset_id` alone
+(`apps/desktop/src/device.rs:840-860`). So a pass keyed `preset:cameo5-htv` whose row carries
+`presetId: null` is cut with defaults — the operator groups by material and then gets none of that
+material's settings unless they re-select it by hand, once per pass. That is the feature failing at
+the only thing it exists for.
+
+The dialog therefore **initialises a preset-keyed row's `presetId` from its key**. An id that
+resolves to nothing stays on the row rather than being cleared: the request carries it, the row
+shows it unresolved, and `prepare_cut` finds no preset and falls back to the override-or-default
+path it already has. Every other key kind still starts with no preset, because no key kind other
+than `Preset` names one.
+
+## The mode travels in the payload, with the rows it produced
 
 Three call sites plan independently: `plan_cut_response` (`device.rs:1125-1134`),
 `travel_for_order` (`device.rs:1155-1180`), and `prepare_cut` (`device.rs:850-873`). They are three
@@ -205,9 +291,17 @@ something.
 
 So the mode is a parameter of each: `plan_cut(grouping)`, `travel_for_order(docRevision, grouping,
 passes)`, and `CutRequest::grouping`. **Not** stored in `AppState`: a stored mode can be changed
-between the plan and the cut, and the stale-plan check guards the *document*, not the mode. Passing
-it makes the request self-describing, which is what makes a mismatch impossible rather than
-unlikely.
+between the plan and the cut, and the stale-plan check guards the *document*, not the mode.
+
+Putting the mode in the payload is necessary and not sufficient. The dialog holds the mode, the
+rows and the plan revision as **one installed-plan state**, replaced atomically when a plan lands.
+Today they are three independent `useState` values (`CutDialog.tsx:105-109`) read separately by
+`startCut` (`:314-316`) and `refreshTravel` (`:363-368`); leaving them that way means a mode change
+makes the *old* rows sendable under the *new* mode for as long as the replan is in flight, and
+where the two key sets overlap the backend accepts them and cuts the wrong shapes. So: changing the
+mode clears travel, disables Cut and the row controls, and only the arriving plan re-enables them —
+the same discipline `planSeq`/`travelSeq` already apply to out-of-order replies (`:164-179`), which
+PR #142's review drove into existence.
 
 ## The CLI says pass, not colour
 
@@ -215,59 +309,88 @@ Clean cutover, no aliases:
 
 | Today | After |
 |---|---|
-| `--by-color` | `--group-by <single\|color\|stroke\|fill\|line-type\|preset>`, default `single` |
-| `--skip-color ff0000ff` | `--skip-pass color:ff0000ff` |
-| `--order ff0000ff,0000ffff` | `--order color:ff0000ff,color:0000ffff` |
+| `--by-color` | `--group-by <single\|color\|stroke\|fill\|preset>`, default `single` |
+| `--skip-color ff0000ff` | `--skip-pass color:ff0000ff`, repeatable |
+| `--order ff0000ff,0000ffff` | `--order color:ff0000ff --order color:0000ffff`, repeatable |
 
-Default `single` preserves what a bare `cuthulhu cut` does today (`cli/src/pipeline.rs:128-141`),
-and `--group-by color` is exactly the old `--by-color`. `check_color_flag_scope` becomes
-`check_pass_flag_scope` and keeps refusing rather than ignoring (`pipeline.rs:178-196`): under
-`--group-by single` there is one pass, so there is nothing to skip and nothing to order. Its two
-messages, and `check_interactive`'s (`pipeline.rs:198-205`), stop naming `--by-color`.
+**`--order` becomes repeatable instead of comma-separated.** A preset id may contain a comma, and a
+comma-separated list would make such a pass unnameable — an operator-supplied string deciding
+whether a flag can address a pass. Repeating the flag also matches `--skip-pass`, so the two read
+alike, and the cut order is the order the flags appear.
 
-Requiring the `color:` prefix on `--order` values is a breaking change for a script, and is the
-point: one grammar, no dialect where a bare hex string means a colour key only because colours
-happened to come first.
+Both flags **refuse a key that names no planned pass**, rather than ignoring it. `--order` used to
+drop an unknown colour silently and `--skip-color` still does (`crates/cli/src/pipeline.rs:81-94`);
+with four spellings of a key a typo is likelier than it was, and a silently ignored `--skip-pass`
+means cutting a colour the operator believed they had excluded. A key from another mode —
+`--group-by fill --skip-pass preset:cameo5-htv` — needs no rule of its own: it names no planned
+pass, so it is refused by the same check.
 
-A key from a mode other than the one selected — `--group-by fill --skip-pass line-type:cut` — is
-not a special case and needs no rule of its own: it names no planned pass, so `UnknownPass` refuses
-it by name, which is what already happens to a colour that is not in the document.
+`check_color_flag_scope` becomes `check_pass_flag_scope` and keeps refusing rather than ignoring
+(`pipeline.rs:178-196`): under `--group-by single` there is one pass, so there is nothing to skip
+and nothing to order. Its two messages, and `check_interactive`'s (`pipeline.rs:198-205`), stop
+naming `--by-color`.
+
+Two output details are deliberate, because the plain and grouped paths merge into one:
+
+- **`--group-by single --dry-run` prints raw bytes with no pass header**, exactly as a bare
+  `cuthulhu cut --dry-run` does today (`crates/cli/src/main.rs:121-129`). Every other mode prints
+  `-- pass i/n (<key>) --` before each pass, exactly as `--by-color` does today. The rule is "a
+  header names a pass among several; `single` has none to name", and it is what keeps a scripted
+  dry run parsing what it parsed before.
+- **"no cuttable paths in SVG" stops covering two different facts.** A file that planned no passes
+  keeps that sentence; a selection that skipped every pass it planned gets its own, because
+  `--skip-pass no-preset` on a file where nothing carries a material is an empty selection, not an
+  empty file.
 
 ## Verification
 
 Everything here is decided before a byte reaches a Transport, so nothing is added to
-`apps/desktop/MANUAL-CHECKLIST.md`.
+`apps/desktop/MANUAL-CHECKLIST.md` — but two of its live checks name flags this removes
+(`:91`, `:102`) and must be rewritten to the new ones.
 
-- **Planner** — one document with two strokes, two fills, a `NoCut` shape and a layer-assigned
-  preset, planned through all six modes with the expected key set for each; `PassKey` round trip
-  over every variant; preset inheritance (layer covers children, shape overrides, absent stays
-  `Preset(None)`).
+- **Planner** — one document with two strokes, two fills, a `NoCut` shape and a Layer-assigned
+  preset, planned through all five modes with the expected key set for each; `PassKey` round trip
+  over every variant plus the injectivity cases; preset resolution (`Inherit` takes the ancestor's,
+  `Unassigned` overrides it to `no-preset`, an explicit id overrides it, no ancestor means
+  `no-preset`).
+- **Document** — `Inherit` is what an absent field and an explicit `null` decode to, through a real
+  `.cut` file; `set_material_preset` writes only the selected Nodes; a shape reparented into an
+  assigned Layer picks that Layer's preset up on the next plan without being edited.
 - **Selection** — `UnknownPass` refused rather than dropped for each key kind, and its sentence per
-  variant, extending the table test at `plan.rs:290-305`.
-- **Document** — a node saved before the field loads with `material_preset: None`, through a real
-  `.cut` file, as `fileio`'s cuttability migration test does.
-- **Desktop** — a grouping chosen in the dialog reaches all three planner call sites; an
-  unresolved preset renders as a row; `parsePassKey` against the Rust table.
-- **CLI** — `--group-by` accepts every mode, `--skip-pass`/`--order` are refused under `single`,
-  and a pass key that names no pass is refused by name.
-- **e2e** — the fake's `planFromDoc`, travel and cut mirror keys and the grouping argument
-  (`smoke.spec.ts:275,302-337,473-505`). #143's stale `travel_for_order` comment is fixed in the
-  same change; it was filed as a ride-along for exactly this.
+  variant.
+- **Desktop** — a grouping chosen in the dialog reaches all three planner call sites; a mode change
+  makes Cut and travel unavailable until the new plan installs; a preset-keyed row carries that
+  preset's settings into the `Job`; an unresolved preset renders as a row and still cuts.
+- **CLI** — every mode accepted, `--skip-pass`/`--order` refused under `single` and refused for a
+  key that names no pass, `--order` repeatable and order-preserving, the dry-run header rule, and
+  the two distinct empty-cut sentences.
+- **e2e** — the fake honours the grouping in all three handlers and mirrors the backend's exact-once
+  identity check, so a frontend that sends stale keys fails the suite instead of passing it.
+  #143's stale `travel_for_order` comment is fixed here; it was filed as a ride-along for exactly
+  this change.
 
 ## Rejected alternatives
 
 **A colour-keyed slice first, generalising the key later.** Smaller, and it would have shipped
-`ByStroke`/`ByFill` without touching `PassSelection`. Rejected because the rename cascade is the
+`Stroke`/`Fill` without touching `PassSelection`. Rejected because the rename cascade is the
 expensive half either way, and doing it second means two passes over the same ten files, two sets
 of DTO churn, and an interim vocabulary in `CONTEXT.md` that is wrong the moment preset grouping
 lands.
 
 **A tagged enum on the wire.** Structurally honest, and it forces a hand-written discriminated
 union into `ipc.ts` plus the e2e fake — the duplication #70 already tracks — while the dialog still
-needs a flat string for a row key.
+needs a flat string for a row key. The collision that made a naive string grammar unusable is
+answered by making absence its own token, not by abandoning the string.
 
 **Grouping stored in `AppState`.** One fewer parameter on three commands, at the cost of a mode
 that can change between plan and cut with nothing to detect it.
+
+**`material_preset: Option<String>` with `None` meaning inherit.** See *Three states*: it cannot
+express a deliberate "no material" under an assigned Layer, and adding that later is a second wire
+migration.
+
+**Descending to shapes when assigning a preset.** Consistent with `set_cut_line_type`, and it
+cancels the inheritance out — see *Resolution happens in the walk*.
 
 **A second per-node enum for #45's "production role".** #68 settled that the role *is*
 `CutLineType`; a parallel attribute would be two answers to one question. Recorded here because
@@ -283,6 +406,28 @@ anything in this slice.
   grouping one.
 - **Colour-layer alignment marks in every enabled pass** (#150). Needs registration marks, which
   #25 owns.
-- **`CutEdge`** (#56), and `Draw`/`Score`/`PrintCutCut`/`PrintCutPrint`/`ColorLayerAlignment`
-  members — each needs a driver answer for the tool it implies.
+- **`Grouping::LineType` and `PassKey::LineType`** (#56), together with `CutEdge` — the member that
+  makes line-type grouping split anything. `Draw`/`Score`/`PrintCutCut`/`PrintCutPrint`/
+  `ColorLayerAlignment` each need a driver answer for the tool they imply.
 - **A configurable import default** for either attribute (#54).
+- **Per-pass settings on the CLI**, which would need a flag that names a pass key. One
+  `--speed`/`--force` pair still applies to every pass.
+
+## Revisions
+
+Revised 2026-08-16 after a Codex review of the first draft and its plan returned **BLOCKING** with
+fourteen findings, all accepted. The four that changed this document's decisions rather than its
+wording:
+
+1. **The grammar was not injective.** `preset:none` meant both "no preset" and a preset whose id is
+   literally `none`, since ids are unrestricted operator strings. Absence became its own token.
+2. **The preset command cancelled out the inheritance.** It copied `set_cut_line_type`'s descent,
+   which exists precisely because `CutLineType` does *not* inherit. Assignment now writes only the
+   selection, and the two-state `Option<String>` became `PresetAssignment` so "deliberately no
+   material" is representable at all.
+3. **A preset-keyed pass was cut with default settings**, because rows initialised `presetId` to
+   null while `prepare_cut` reads only that field.
+4. **`Grouping::LineType` shipped a mode identical to `Single`.** Removed; it returns with #56.
+
+The remaining ten were plan-level defects and stale citations, fixed in
+`docs/superpowers/plans/2026-08-16-pass-grouping.md`.

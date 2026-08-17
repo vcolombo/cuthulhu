@@ -165,20 +165,39 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
                         };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
-                        let key = match grouping {
-                            // One bucket, and a key that says so: `Color(None)` is the pass
-                            // of unpainted shapes, which is a different fact.
-                            Grouping::Single => PassKey::All,
-                            Grouping::Color | Grouping::Stroke | Grouping::Fill =>
-                                PassKey::Color(color_key(&node.style, grouping)),
-                            // Not checked against the preset file: a deleted user preset is a
-                            // real state, and refusing a cut over a settings lookup is not
-                            // `plan_cut`'s job.
-                            Grouping::Preset => PassKey::Preset(material.map(String::from)),
-                        };
-                        match passes.iter_mut().find(|p| p.key == key) {
-                            Some(pass) => pass.shapes.push(shape),
-                            None => passes.push(DocumentPass { key, shapes: vec![shape] }),
+                        match grouping {
+                            // Matched on the borrowed id, and owned only when a pass is
+                            // actually created: keying every shape would allocate a `String`
+                            // per cut shape, including each one that joins a pass already
+                            // there — per-shape heap churn on exactly the documents where
+                            // preset grouping is worth having.
+                            Grouping::Preset => {
+                                match passes.iter_mut()
+                                    .find(|p| matches!(&p.key, PassKey::Preset(id) if id.as_deref() == material))
+                                {
+                                    Some(pass) => pass.shapes.push(shape),
+                                    None => passes.push(DocumentPass {
+                                        // Not checked against the preset file: a deleted user
+                                        // preset is a real state, and refusing a cut over a
+                                        // settings lookup is not `plan_cut`'s job.
+                                        key: PassKey::Preset(material.map(String::from)),
+                                        shapes: vec![shape],
+                                    }),
+                                }
+                            }
+                            // Every other key is `Copy`-cheap to build, so build then match.
+                            _ => {
+                                let key = match grouping {
+                                    // One bucket, and a key that says so: `Color(None)` is the
+                                    // pass of unpainted shapes, which is a different fact.
+                                    Grouping::Single => PassKey::All,
+                                    _ => PassKey::Color(color_key(&node.style, grouping)),
+                                };
+                                match passes.iter_mut().find(|p| p.key == key) {
+                                    Some(pass) => pass.shapes.push(shape),
+                                    None => passes.push(DocumentPass { key, shapes: vec![shape] }),
+                                }
+                            }
                         }
                     }
                 }

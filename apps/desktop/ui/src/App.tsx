@@ -384,10 +384,16 @@ export function App() {
   // Across the whole selection, not just its first node: two shapes that both say `Inherit`
   // under different Layers agree on their *local* value and resolve differently, and labelling
   // that with the first one's material misreports what a bulk edit is about to replace.
+  // Memoized on the document: this walks the whole tree, and `App` re-renders for unrelated
+  // reasons — a device-status event arrives per progress tick during a live cut, and doing an
+  // O(nodes) walk on each of those is work nobody asked for.
+  const materialsByNode = useMemo(
+    () => (doc ? effectiveMaterials(doc.nodes, doc.root) : {}),
+    [doc],
+  );
   const effectiveMaterial = ((): string | null | "mixed" => {
     if (!doc || selected.length === 0) return null;
-    const resolved = effectiveMaterials(doc.nodes, doc.root);
-    const distinct = new Set(selected.map((id) => resolved[id] ?? null));
+    const distinct = new Set(selected.map((id) => materialsByNode[id] ?? null));
     if (distinct.size > 1) return "mixed";
     return [...distinct][0] ?? null;
   })();

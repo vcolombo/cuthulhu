@@ -2,11 +2,12 @@
 // One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
 // callers keep their import path without a second structurally-identical type drifting.
 import type { Bounds } from "../render/hittest";
+import type { Grouping, PassKey } from "../ipc";
 export type { Bounds };
 
 // View model types (UI representation)
 export type PassVm = {
-  color: number | null;
+  key: PassKey;
   shapeCount: number;
   enabled: boolean;
   presetId: string | null;
@@ -23,7 +24,7 @@ export type Caps = {
 
 // Wire types (match Rust ConfiguredPassDto and CutRequest)
 export type ConfiguredPassDto = {
-  color: number | null;
+  key: PassKey;
   enabled: boolean;
   preset_id: string | null;
   speed: number | null;
@@ -34,6 +35,7 @@ export type ConfiguredPassDto = {
 export type CutRequest = {
   device_instance_id: string;
   doc_revision: string;
+  grouping: Grouping;
   passes: ConfiguredPassDto[];
 };
 
@@ -157,16 +159,91 @@ export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] 
   return next === rows ? null : next;
 }
 
+/** What a `PassKey` says, for the two things the UI needs from inside one: a swatch needs the
+ *  RGBA, a row label and a row's settings need the preset id. The mirror of
+ *  `cutplan::PassKey::from_str`; the example table in `viewmodel.test.ts` keeps the two agreed. */
+export type ParsedPassKey =
+  | { kind: "all" }
+  | { kind: "color"; color: number | null }
+  | { kind: "preset"; presetId: string | null }
+  | { kind: "unknown"; raw: string };
+
+export function parsePassKey(key: PassKey): ParsedPassKey {
+  if (key === "all") return { kind: "all" };
+  if (key === "no-color") return { kind: "color", color: null };
+  if (key === "no-preset") return { kind: "preset", presetId: null };
+  // First separator only, so a preset id may contain one — same rule as the Rust parser.
+  const at = key.indexOf(":");
+  if (at === -1) return { kind: "unknown", raw: key };
+  const mode = key.slice(0, at);
+  const value = key.slice(at + 1);
+  if (mode === "color") {
+    // Eight digits exactly: anything shorter would parse to a colour no shape carries.
+    if (/^[0-9a-fA-F]{8}$/.test(value)) return { kind: "color", color: parseInt(value, 16) };
+    return { kind: "unknown", raw: key };
+  }
+  // An empty id is refused for the same reason the Rust grammar refuses it: it is the one
+  // tail that would make two keys indistinguishable from a truncation.
+  if (mode === "preset" && value !== "") return { kind: "preset", presetId: value };
+  return { kind: "unknown", raw: key };
+}
+
+/** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
+ *  Grouping-aware because `no-color` means something different per mode — under Stroke it can
+ *  hold brightly filled shapes, so calling it "no visible paint" would be false. */
+export function passRowLabel(
+  key: PassKey,
+  presets: Preset[],
+  grouping: Grouping,
+): { swatch: string | null; text: string | null } {
+  const parsed = parsePassKey(key);
+  switch (parsed.kind) {
+    case "color":
+      if (parsed.color !== null) {
+        // Drop the alpha byte: a swatch is a colour, and 0-alpha keys never reach here.
+        return { swatch: `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`, text: null };
+      }
+      return {
+        swatch: null,
+        text: grouping === "Stroke" ? "No visible stroke"
+            : grouping === "Fill" ? "No visible fill"
+            : "No visible paint",
+      };
+    // Not "every shape": a NoCut shape is excluded from it and counted as skipped.
+    case "all":
+      return { swatch: null, text: "Every cut shape" };
+    case "preset": {
+      if (parsed.presetId === null) return { swatch: null, text: "No preset" };
+      const preset = presets.find((p) => p.id === parsed.presetId);
+      // An id the preset file no longer resolves is a real state: presets are machine-scoped
+      // and a user entry can be deleted while a document still names it.
+      return { swatch: null, text: preset ? preset.name : `${parsed.presetId} (unknown preset)` };
+    }
+    case "unknown":
+      return { swatch: null, text: parsed.raw };
+  }
+}
+
+/** The preset a pass is keyed on, which is the preset it must be cut with. `prepare_cut`
+ *  resolves settings from `preset_id` alone, so a preset-keyed row that arrives without one is
+ *  cut with defaults — the operator groups by material and gets none of that material's
+ *  settings. Kept even when it resolves to nothing, so the request still says what the
+ *  document said. */
+export function presetIdForKey(key: PassKey): string | null {
+  const parsed = parsePassKey(key);
+  return parsed.kind === "preset" ? parsed.presetId : null;
+}
+
 /**
  * The pass list to ask the planner for travel in: every planned pass, in dialog order,
  * carrying whether it is cut. Disabled passes are named rather than dropped — the backend
  * skips them when routing the head but still checks that no pass went missing, which a
  * filtered list would make impossible to tell from a frontend bug.
  */
-export function toTravelPasses<T extends { color: number | null; enabled: boolean }>(
+export function toTravelPasses<T extends { key: PassKey; enabled: boolean }>(
   rows: T[],
-): { color: number | null; enabled: boolean }[] {
-  return rows.map((r) => ({ color: r.color, enabled: r.enabled }));
+): { key: PassKey; enabled: boolean }[] {
+  return rows.map((r) => ({ key: r.key, enabled: r.enabled }));
 }
 
 /**
@@ -224,21 +301,21 @@ export function fieldDisabled(
  * Convert PassVm[] to CutRequest for transmission to Rust backend.
  * Maps camelCase PassVm to snake_case ConfiguredPassDto fields.
  *
- * @param deviceInstanceId Device instance ID
- * @param docRevision Document revision
- * @param passes Array of passes
- * @returns CutRequest ready to send to backend
+ * The grouping travels with the rows because it is what named them: rows keyed under one mode
+ * sent under another would match passes holding different shapes.
  */
 export function toCutRequest(
   deviceInstanceId: string,
   docRevision: string,
+  grouping: Grouping,
   passes: PassVm[]
 ): CutRequest {
   return {
     device_instance_id: deviceInstanceId,
     doc_revision: docRevision,
+    grouping,
     passes: passes.map((p) => ({
-      color: p.color,
+      key: p.key,
       enabled: p.enabled,
       preset_id: p.presetId,
       speed: p.speed,

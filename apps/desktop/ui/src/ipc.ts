@@ -42,6 +42,10 @@ export async function setCutLineType(args: Args) {
   return invoke("set_cut_line_type", args);
 }
 
+export async function setMaterialPreset(args: Args) {
+  return invoke("set_material_preset", args);
+}
+
 export async function undo() {
   return invoke("undo", {});
 }
@@ -145,8 +149,23 @@ export type DeviceEventKind =
 
 export type DeviceEvent = { job_id: number; kind: DeviceEventKind; status: CutStatus };
 
+/** A pass's name, in the canonical form `cutplan::PassKey` writes: `all`, `color:ff0000ff`,
+ *  `no-color`, `preset:<id>`, `no-preset`. Sent back verbatim in a travel or cut request — the
+ *  string *is* the identity. Absence has its own token because a preset id is an unrestricted
+ *  operator string, so `preset:none` would collide with a preset called `none`. */
+export type PassKey = string;
+
+/** How the planner splits shapes into passes. Mirrors `cutplan::Grouping`. */
+export type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
+
+/** Mirrors `document::PresetAssignment`'s adjacently-tagged JSON. */
+export type PresetAssignmentJson =
+  | { state: "inherit" }
+  | { state: "unassigned" }
+  | { state: "preset"; id: string };
+
 export type PlanCutPassSummary = {
-  color: number | null;
+  key: PassKey;
   shape_count: number;
   node_ids: number[];
   /** Each shape's first world-space point, parallel to node_ids — where the blade lands.
@@ -206,22 +225,23 @@ export async function forceQuit(): Promise<void> {
   return invoke("force_quit", {});
 }
 
-export async function planCut(): Promise<PlanCutResponse> {
-  return invoke("plan_cut", {});
+export async function planCut(grouping: Grouping): Promise<PlanCutResponse> {
+  return invoke("plan_cut", { grouping });
 }
 
 /** A pass as the dialog has it configured: where it sits in the order, and whether it is cut. */
-export type TravelPass = { color: number | null; enabled: boolean };
+export type TravelPass = { key: PassKey; enabled: boolean };
 
-/** Travel replanned by the backend for the dialog's current pass list. Every planned pass
- *  must be named (disabled ones included — they are dropped from the travel, not from the
- *  list). Rejects with code "stale_plan" when the document has changed since `docRevision`
- *  was planned. */
+/** Travel replanned by the backend for the dialog's current pass list, under the grouping that
+ *  produced it. Every planned pass must be named (disabled ones included — they are dropped
+ *  from the travel, not from the list). Rejects with code "stale_plan" when the document has
+ *  changed since `docRevision` was planned. */
 export async function travelForOrder(
   docRevision: string,
+  grouping: Grouping,
   passes: TravelPass[],
 ): Promise<[number, number, number, number][]> {
-  return invoke("travel_for_order", { docRevision, passes });
+  return invoke("travel_for_order", { docRevision, grouping, passes });
 }
 
 /** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this

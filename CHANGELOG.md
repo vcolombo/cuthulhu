@@ -11,6 +11,22 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Changed
 
+- **Cut passes can be grouped by stroke colour, fill colour, or material preset**, chosen in the
+  cut dialog and with `cuthulhu cut --group-by <single|color|stroke|fill|preset>`. `color` is the
+  previous rule — stroke where visible, else fill — and stays what the dialog opens on; `single`
+  is one pass over every cut shape, and stays what a bare `cuthulhu cut` does.
+
+- **A Node can carry a material preset, and a Layer passes it down.** The properties panel's new
+  Material control offers Inherit, No preset, or a named preset, and shows what an inherited
+  value resolves to. A pass grouped by material is cut with that material's own speed and force.
+
+- **`--by-color` and `--skip-color` are gone.** `--group-by color` replaces the first;
+  `--skip-pass` replaces the second and names passes by key (`color:ff0000ff`, `no-color`,
+  `preset:cameo5-htv`, `no-preset`, `all`) rather than by bare hex. `--order` takes the same keys
+  and is now **repeatable** instead of comma-separated, because a preset id may contain a comma.
+  Both flags now refuse a key that names no planned pass, where `--skip-color` ignored one
+  silently. A cut whose selection skipped every pass says so, instead of reporting an empty file.
+
 - `cuthulhu trace --detail` is now stated in the same units as the desktop's Detail slider: **higher
   means more detail**. It previously carried vtracer's `length_threshold` verbatim, which runs the
   other way, so the two interfaces used one word for opposite things and printed opposite advice for

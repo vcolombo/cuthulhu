@@ -13,6 +13,7 @@ const shape = (id: number, cut: "Cut" | "NoCut"): DocNode => ({
   transform: [1, 0, 0, 1, 0, 0],
   children: [],
   cut_line_type: cut,
+  material_preset: { state: "inherit" },
 });
 const group = (id: number, children: number[]): DocNode => ({
   id,
@@ -20,6 +21,7 @@ const group = (id: number, children: number[]): DocNode => ({
   transform: [1, 0, 0, 1, 0, 0],
   children,
   cut_line_type: "Cut",
+  material_preset: { state: "inherit" },
 });
 
 describe("selectionCutLineType", () => {

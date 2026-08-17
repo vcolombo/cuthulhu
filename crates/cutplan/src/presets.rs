@@ -203,6 +203,12 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
         for preset in &mut user_presets {
             preset.builtin = false;
         }
+        // An entry with no id names no material: nothing can select it deliberately, and letting
+        // one in means a pass keyed `preset:` resolves to real speed and force by accident. The
+        // file is hand-editable, so this is the boundary that keeps the state out — dropped
+        // rather than refused, because one malformed entry should not cost an operator the rest
+        // of their presets.
+        user_presets.retain(|p| !p.id.is_empty());
 
         // Remove builtin presets that are shadowed by user presets
         let user_ids: std::collections::HashSet<_> =
@@ -292,6 +298,27 @@ mod tests {
 
         save_user_presets(&user_file, &[]).unwrap();
         assert!(user_file.exists());
+    }
+
+    /// An entry with no id names no material. Codex's third gate on PR #152: with one in the
+    /// file, a pass keyed `preset:` resolved to that entry's real speed and force by accident,
+    /// while the dialog showed defaults — the machine and the screen disagreeing. The file is
+    /// hand-editable, so this is where the state is kept out.
+    #[test]
+    fn a_user_preset_with_no_id_is_dropped_rather_than_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::write(&user_file, r#"{"version":1,"presets":[
+            {"id":"","name":"Nameless","machine_id":"cameo5",
+             "settings":{"speed":1,"force":1,"repeat_count":1},"builtin":false},
+            {"id":"mine","name":"Mine","machine_id":"cameo5",
+             "settings":{"speed":2,"force":2,"repeat_count":1},"builtin":false}
+        ]}"#).unwrap();
+
+        let loaded = load_presets(&user_file).unwrap();
+        assert!(!loaded.iter().any(|p| p.id.is_empty()), "an id-less entry must not load");
+        assert!(loaded.iter().any(|p| p.id == "mine"),
+            "and one malformed entry must not cost the operator the rest of the file");
     }
 
     #[test]

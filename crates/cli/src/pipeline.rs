@@ -68,84 +68,86 @@ pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     Ok(doc)
 }
 
-/// The colours to cut, in cut order: apply `--order` (listed colours to the
-/// front, in listed sequence; the rest keep their relative order) and then
-/// `--skip-color`, in that order per the brief.
+/// The passes to cut, in cut order: apply `--order` (named passes to the front, in the order
+/// given; the rest keep their planned order) and then `--skip-pass`.
+///
+/// A key that names no planned pass is refused, for either flag. `--order` used to drop one
+/// silently and `--skip-color` still did, which made a typo indistinguishable from a colour
+/// the document did not contain — and a silently ignored skip means cutting a pass the
+/// operator believed they had excluded.
 pub fn pass_order(
-    planned: &[cutplan::ColorPass],
-    skip_colors: &[String],
-    order: Option<String>,
-) -> Result<Vec<Option<u32>>, String> {
-    let mut colors: Vec<Option<u32>> = planned.iter().map(|p| p.color).collect();
+    planned: &[cutplan::DocumentPass],
+    skip_passes: &[String],
+    order: &[String],
+) -> Result<Vec<cutplan::PassKey>, String> {
+    let mut keys: Vec<cutplan::PassKey> = planned.iter().map(|p| p.key.clone()).collect();
+    let parse = |s: &String| s.trim().parse::<cutplan::PassKey>();
 
-    if let Some(order) = order {
-        let wanted: Vec<u32> = order.split(',').map(|s| parse_hex_color(s.trim())).collect::<Result<_, _>>()?;
-        let mut front = vec![];
-        for color in wanted {
-            if let Some(i) = colors.iter().position(|c| *c == Some(color)) {
-                front.push(colors.remove(i));
-            }
-        }
-        front.extend(colors);
-        colors = front;
+    let mut front = vec![];
+    for key in order.iter().map(parse).collect::<Result<Vec<_>, _>>()? {
+        let Some(i) = keys.iter().position(|k| *k == key) else {
+            // A key already moved to the front is a repeat, not an unknown pass — the same
+            // distinction `travel_for_order` draws, and for the same reason: "not a pass this
+            // file plans" is a lie about a pass that plainly is.
+            return Err(if front.contains(&key) {
+                format!("--order names {key} twice; each pass can only be ordered once")
+            } else {
+                format!("--order names {key}, which is not a pass this file plans")
+            });
+        };
+        front.push(keys.remove(i));
     }
+    front.extend(keys);
+    keys = front;
 
-    let skip: Vec<u32> = skip_colors.iter().map(|s| parse_hex_color(s)).collect::<Result<_, _>>()?;
-    colors.retain(|c| !c.is_some_and(|c| skip.contains(&c)));
-    Ok(colors)
+    for key in skip_passes.iter().map(parse).collect::<Result<Vec<_>, _>>()? {
+        let Some(i) = keys.iter().position(|k| *k == key) else {
+            return Err(format!("--skip-pass names {key}, which is not a pass this file plans"));
+        };
+        keys.remove(i);
+    }
+    Ok(keys)
 }
 
-/// Plan a `--by-color` cut from an SVG: import, order, select, and validate
-/// through `cutplan::plan_cut` — the same entry point the desktop uses, so the
-/// CLI gets preflight rather than sending unchecked geometry at the machine.
+/// Plan a cut from an SVG: import, group, order, select, and validate through
+/// `cutplan::plan_cut` — the same entry point the desktop uses, so the CLI gets preflight
+/// rather than sending unchecked geometry at the machine.
+///
+/// One entry point for every mode. `Grouping::Single` used to have its own function because
+/// the plain path did its own planning; with the mode named explicitly there is nothing left
+/// for a second function to say.
 pub fn plan_cut_from_svg(
     svg: &[u8],
     driver: &dyn Driver,
     settings: &Settings,
-    skip_colors: &[String],
-    order: Option<String>,
+    grouping: cutplan::Grouping,
+    skip_passes: &[String],
+    order: &[String],
     allow_out_of_bounds: bool,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg(svg)?;
-    // Planned once: --order and --skip-color name colours, so the colours have
-    // to be known before a selection can be built, and plan_cut cuts the very
-    // passes handed to it here.
-    let planned = cutplan::plan_passes(&doc).map_err(|e| e.to_string())?;
-    let colors = pass_order(&planned.passes, skip_colors, order)?;
-
-    // One `--speed`/`--force` pair applies to every pass; the CLI has no
-    // per-pass settings and no presets.
-    let passes = colors
-        .into_iter()
-        .map(|color| cutplan::PassSelection { color, settings: settings.clone() })
-        .collect();
-
-    // No revision to be stale against: the document was imported a few lines ago.
-    let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
-    cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
-}
-
-/// Plan a plain cut: all geometry, one pass, validated through `plan_cut` — the
-/// same entry point the desktop and `--by-color` use.
-pub fn plan_plain_cut(
-    svg: &[u8],
-    driver: &dyn Driver,
-    settings: &Settings,
-    allow_out_of_bounds: bool,
-) -> Result<cutplan::CutPlan, String> {
-    let doc = doc_from_svg(svg)?;
-    // One pass, in document order, whatever each path is painted. Cuttability no longer
-    // rides on the stroke (#144), so there is nothing to overwrite to say "cut all of
-    // this" — the grouping mode says it, and the document keeps its real colours.
-    let planned = cutplan::plan_passes_with(&doc, cutplan::Grouping::Single)
-        .map_err(|e| e.to_string())?;
-    // Checked here rather than left to `plan_cut`: with no passes at all, asking for the
-    // colourless pass is an unmatched selection, and "no pass matches color" describes the
-    // request instead of the file.
+    // Planned once: the flags name passes, so the keys have to be known before a selection
+    // can be built, and `plan_cut` cuts the very passes handed to it here.
+    let planned = cutplan::plan_passes_with(&doc, grouping).map_err(|e| e.to_string())?;
+    // Two different empty cuts, told apart here because only this caller knows an SVG was
+    // imported and what the operator asked to skip. Left to `plan_cut`, both would arrive as
+    // an unmatched selection or `NothingToCut`, and one sentence would have to cover both.
     if planned.passes.is_empty() {
         return Err("no cuttable paths in SVG".into());
     }
-    let passes = vec![cutplan::PassSelection { color: None, settings: settings.clone() }];
+    let keys = pass_order(&planned.passes, skip_passes, order)?;
+    if keys.is_empty() {
+        return Err("every pass in this file was skipped; nothing is left to cut".into());
+    }
+
+    // ponytail: one `--speed`/`--force` pair applies to every pass; the CLI has no per-pass
+    // settings and no presets. Per-pass settings need a flag that names a pass key.
+    let passes = keys
+        .into_iter()
+        .map(|key| cutplan::PassSelection { key, settings: settings.clone() })
+        .collect();
+
+    // No revision to be stale against: the document was imported a few lines ago.
     let opts = cutplan::PlanOptions { passes, expect_revision: None, allow_out_of_bounds };
     cutplan::plan_cut(&planned, driver.profile(), &driver.caps(), &opts).map_err(describe_cut_error)
 }
@@ -165,41 +167,31 @@ fn describe_cut_error(e: cutplan::CutError) -> String {
     }
 }
 
-/// Parse an 8-hex-digit `RRGGBBAA` string into a `0xRRGGBBAA` color.
-/// Parses an 8-digit `RRGGBBAA` hex color. The length check is required: without
-/// it a 6-digit `RRGGBB` parses as `0x00RRGGBB` and silently matches nothing.
-pub fn parse_hex_color(s: &str) -> Result<u32, String> {
-    if s.len() != 8 {
-        return Err(format!("bad color '{s}': expected 8 hex digits (RRGGBBAA)"));
-    }
-    u32::from_str_radix(s, 16).map_err(|e| format!("bad color '{s}': {e}"))
-}
-
-/// `--skip-color` and `--order` select and sequence colours, which only a
-/// `--by-color` cut has. A plain cut puts every colour in one pass, so these
-/// flags cannot do anything there and are refused rather than ignored.
-pub fn check_color_flag_scope(
-    skip_colors: &[String],
-    order: &Option<String>,
-    by_color: bool,
+/// `--skip-pass` and `--order` name passes, which only a grouped cut has more than one of. A
+/// single-pass cut puts every cut shape in one pass, so these flags cannot do anything there
+/// and are refused rather than ignored.
+pub fn check_pass_flag_scope(
+    skip_passes: &[String],
+    order: &[String],
+    grouping: cutplan::Grouping,
 ) -> Result<(), String> {
-    if by_color {
+    if grouping != cutplan::Grouping::Single {
         return Ok(());
     }
-    if !skip_colors.is_empty() {
-        return Err("--skip-color applies to --by-color cuts; a plain cut is one pass over every colour".into());
+    if !skip_passes.is_empty() {
+        return Err("--skip-pass applies to a grouped cut; --group-by single is one pass over every shape".into());
     }
-    if order.is_some() {
-        return Err("--order applies to --by-color cuts; a plain cut is one pass over every colour".into());
+    if !order.is_empty() {
+        return Err("--order applies to a grouped cut; --group-by single is one pass over every shape".into());
     }
     Ok(())
 }
 
-/// `--by-color` needs a human at the keyboard between passes; a plan with
-/// only one pass never pauses, so it's allowed even without a TTY.
+/// More than one pass needs a human at the keyboard between passes; a plan with one pass
+/// never pauses, so it is allowed even without a TTY.
 pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> {
     if !is_tty && pass_count > 1 {
-        return Err("--by-color requires an interactive terminal".into());
+        return Err("a cut with more than one pass requires an interactive terminal".into());
     }
     Ok(())
 }
@@ -207,6 +199,7 @@ pub fn check_interactive(is_tty: bool, pass_count: usize) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cutplan::Grouping;
 
     fn two_color_svg() -> &'static [u8] {
         br##"<svg xmlns="http://www.w3.org/2000/svg">
@@ -223,14 +216,6 @@ mod tests {
         driver_for("cameo5").expect("the registry knows the Cameo")
     }
 
-    #[test]
-    fn by_color_plans_from_svg_respects_skip_and_order() {
-        let doc = doc_from_svg(two_color_svg()).unwrap();
-        let planned = cutplan::plan_passes(&doc).unwrap();
-        let colors = pass_order(&planned.passes, &["ff0000ff".into()], Some("0000ffff,ff0000ff".into())).unwrap();
-        assert_eq!(colors.len(), 1, "red skipped"); // order flag applied before skip filter
-        assert_eq!(colors[0], Some(0x0000FFFF));
-    }
 
     #[test]
     fn out_of_bounds_geometry_is_refused_unless_allowed() {
@@ -239,11 +224,11 @@ mod tests {
             <rect width="1512" height="10" stroke="#ff0000" fill="none"/>
         </svg>"##;
 
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap_err();
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap_err();
         assert!(err.contains("outside"), "expected an out-of-bounds refusal, got: {err}");
 
         assert!(
-            plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, true).is_ok(),
+            plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], true).is_ok(),
             "--allow-out-of-bounds must let it through",
         );
     }
@@ -251,12 +236,12 @@ mod tests {
     #[test]
     fn settings_out_of_range_are_refused_before_reaching_the_machine() {
         let bad = Settings { speed: Some(99), force: None, repeat_count: 1 };
-        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &bad, &[], None, false).unwrap_err();
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &bad, Grouping::Color, &[], &[], false).unwrap_err();
         assert!(err.contains("speed"), "expected a settings-range refusal, got: {err}");
     }
 
     /// A fill-only SVG used to be refused by name here, because `plan_passes` cut only stroked
-    /// shapes. Since #144 `--by-color` plans it, keyed on the fill, and the refusal it used to
+    /// shapes. Since #144 a colour grouping plans it, keyed on the fill, and the refusal it used to
     /// produce belongs to an SVG with no geometry at all — which
     /// `by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name` covers.
     #[test]
@@ -264,60 +249,39 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
             <rect width="5" height="5" fill="#ff0000"/>
         </svg>"##;
-        let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap();
+        let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap();
         assert_eq!(plan.passes.len(), 1);
-        assert_eq!(plan.passes[0].color, Some(0xFF0000FF));
+        assert_eq!(plan.passes[0].key, cutplan::PassKey::Color(Some(0xFF0000FF)));
     }
 
-    /// The `--by-color` route to "no cuttable paths in SVG": no geometry means no passes, so
-    /// preflight refuses the cut and `describe_cut_error` turns `NothingToCut` into that
-    /// operator-facing sentence. `plain_cut_of_an_empty_svg_says_nothing_to_cut` is not a
-    /// witness to it — `plan_plain_cut` returns the same words from its own early check and
-    /// never reaches `describe_cut_error` — and the fill-only SVG that used to arrive here
-    /// plans a pass since #144, so this is the only test holding that arm in place.
+    /// The grouped route to "no cuttable paths in SVG": no geometry means no passes, so the
+    /// early check reports the file rather than letting an unmatched selection describe the
+    /// request. Since #148 both modes take that same check, so this and its `Single`
+    /// counterpart pin one sentence rather than two implementations of it.
     #[test]
     fn by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), &[], None, false)
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false)
             .expect_err("an SVG with no geometry has nothing to cut");
         assert_eq!(err, "no cuttable paths in SVG");
     }
 
-    #[test]
-    fn noninteractive_multicolor_is_error() {
-        assert_eq!(
-            check_interactive(false, 2),
-            Err("--by-color requires an interactive terminal".into())
-        );
-        assert!(check_interactive(false, 1).is_ok());
-        assert!(check_interactive(true, 2).is_ok());
-    }
-
-    #[test]
-    fn parse_hex_color_requires_eight_digits() {
-        assert_eq!(parse_hex_color("ff0000ff"), Ok(0xFF0000FF));
-        assert!(parse_hex_color("ff0000").is_err(), "6-digit RRGGBB must be rejected, not zero-padded");
-        assert!(parse_hex_color("nothex12").is_err());
-    }
-
-    /// A plain cut means everything in the file in one pass, and since #144 it says so with a
-    /// grouping mode instead of by overwriting every path's stroke. The `--by-color` half is not
-    /// a witness to the overwrite being gone — nothing outside `plan_plain_cut` can see the
-    /// document it imports — it pins that a fill keys a pass at all, through the caller the CLI
-    /// actually uses.
+    /// A single-pass cut means everything in the file in one pass, and since #148 it says so
+    /// with a grouping mode rather than a separate planning function. The colour half pins
+    /// that a fill keys a pass at all, through the caller the CLI actually uses.
     #[test]
     fn plain_cut_plans_one_pass_and_by_color_still_sees_both_fills() {
         let two_fills = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
 
-        let plain = plan_plain_cut(two_fills, cameo5().as_ref(), &Settings::default(), false).unwrap();
+        let plain = plan_cut_from_svg(two_fills, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).unwrap();
         assert_eq!(plain.passes.len(), 1);
-        assert_eq!(plain.passes[0].color, None, "one pass by request names no colour");
+        assert_eq!(plain.passes[0].key, cutplan::PassKey::All, "one pass by request, named for that");
 
         let by_color =
-            plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(), &[], None, false).unwrap();
+            plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap();
         assert_eq!(by_color.passes.len(), 2, "the fixture's two fills survived the import");
-        assert!(by_color.passes.iter().all(|p| p.color != Some(0x000000FF)),
+        assert!(by_color.passes.iter().all(|p| p.key != cutplan::PassKey::Color(Some(0x000000FF))),
             "keyed on the fills, not on the black stroke a plain cut used to stamp");
     }
 
@@ -329,9 +293,9 @@ mod tests {
         let transparent_fill = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#00ff00" fill-opacity="0"/></svg>"##;
 
-        let plan = plan_plain_cut(transparent_fill, cameo5().as_ref(), &Settings::default(), false).unwrap();
+        let plan = plan_cut_from_svg(transparent_fill, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).unwrap();
         assert_eq!(plan.passes.len(), 1);
-        assert_eq!(plan.passes[0].color, None);
+        assert_eq!(plan.passes[0].key, cutplan::PassKey::All);
     }
 
     /// The whole point of the change: the plain path is preflighted. A shape past the
@@ -340,36 +304,130 @@ mod tests {
     fn plain_cut_refuses_out_of_bounds_geometry() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
             <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
-        let err = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false)
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false)
             .expect_err("out of bounds must be refused");
         assert!(err.contains("outside"), "unexpected message: {err}");
         // ...and the escape hatch works, now that there is a check to overrule.
-        assert!(plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), true).is_ok());
+        assert!(plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], true).is_ok());
     }
 
-    /// With no paths at all, `plan_passes` yields no passes, so the requested colour
-    /// matches nothing. Without the empty check that surfaces as `UnknownPassColor`,
-    /// which reads as an internal error rather than "there is nothing here".
+    /// With no paths at all there are no passes, so the early check reports the file rather
+    /// than letting an unmatched selection read as an internal error.
     #[test]
     fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
-        let err = plan_plain_cut(svg, cameo5().as_ref(), &Settings::default(), false).expect_err("empty");
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).expect_err("empty");
         assert_eq!(err, "no cuttable paths in SVG");
     }
 
-    /// `--skip-color` and `--order` name colours, and a plain cut deliberately
-    /// collapses every colour into one pass. Accepting them silently — which is what
-    /// happened before — reports success for a flag that did nothing.
+    fn planned_two_colours() -> cutplan::DocumentPasses {
+        cutplan::plan_passes(&doc_from_svg(two_color_svg()).unwrap()).unwrap()
+    }
+
+    /// `--order` puts named passes first in the order given, then everything else in planned
+    /// order; `--skip-pass` removes. Keys, not colours, so a preset-grouped cut can be
+    /// sequenced exactly as a colour-grouped one always could.
     #[test]
-    fn colour_flags_are_refused_without_by_color() {
-        let red = vec!["FF0000FF".to_string()];
-        let err = check_color_flag_scope(&red, &None, false).expect_err("must refuse");
-        assert!(err.contains("--skip-color"), "unexpected message: {err}");
-        let err = check_color_flag_scope(&[], &Some("FF0000FF".into()), false).expect_err("must refuse");
-        assert!(err.contains("--order"), "unexpected message: {err}");
-        // Both are fine with --by-color, and absence is fine either way.
-        assert!(check_color_flag_scope(&red, &Some("FF0000FF".into()), true).is_ok());
-        assert!(check_color_flag_scope(&[], &None, false).is_ok());
+    fn pass_order_sequences_and_skips_by_key() {
+        let planned = planned_two_colours();
+        let blue_first = pass_order(&planned.passes, &[], &["color:0000ffff".into()]).unwrap();
+        assert_eq!(blue_first,
+            vec![cutplan::PassKey::Color(Some(0x0000FFFF)), cutplan::PassKey::Color(Some(0xFF0000FF))]);
+
+        let without_red = pass_order(&planned.passes, &["color:ff0000ff".into()], &[]).unwrap();
+        assert_eq!(without_red, vec![cutplan::PassKey::Color(Some(0x0000FFFF))]);
+
+        // Order is applied before the skip filter, as it always was.
+        let both = pass_order(&planned.passes, &["color:ff0000ff".into()],
+            &["color:0000ffff".into(), "color:ff0000ff".into()]).unwrap();
+        assert_eq!(both, vec![cutplan::PassKey::Color(Some(0x0000FFFF))]);
+    }
+
+    /// `--order` is repeatable rather than comma-separated, because a preset id may contain a
+    /// comma and a split list would make such a pass unnameable — an operator's own string
+    /// deciding whether a flag can address a pass.
+    #[test]
+    fn order_is_repeatable_and_keeps_the_order_given() {
+        let planned = planned_two_colours();
+        let keys = pass_order(&planned.passes, &[],
+            &["color:0000ffff".into(), "color:ff0000ff".into()]).unwrap();
+        assert_eq!(keys,
+            vec![cutplan::PassKey::Color(Some(0x0000FFFF)), cutplan::PassKey::Color(Some(0xFF0000FF))]);
+    }
+
+    /// Both flags refuse a key that names no planned pass. `--order` used to drop one
+    /// silently and `--skip-color` still did: with four spellings of a key a typo is likelier
+    /// than it was, and a skipped pass that was never there means cutting a colour the
+    /// operator believed they had excluded. A key from another mode needs no rule of its own.
+    #[test]
+    fn a_key_that_names_no_planned_pass_is_refused() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &[], &["no-preset".into()]).unwrap_err();
+        assert!(err.contains("no-preset"), "{err}");
+
+        let err = pass_order(&planned.passes, &["preset:cameo5-htv".into()], &[]).unwrap_err();
+        assert!(err.contains("preset:cameo5-htv"), "{err}");
+    }
+
+    /// Naming one pass twice is a repeat, not an unknown pass. Copilot's point on PR #152:
+    /// "not a pass this file plans" is a lie about a pass that plainly is, and the operator
+    /// cannot tell a typo from a duplicate if both say the same thing.
+    #[test]
+    fn ordering_the_same_pass_twice_says_so() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &[],
+            &["color:ff0000ff".into(), "color:ff0000ff".into()]).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+        assert!(err.contains("color:ff0000ff"), "{err}");
+    }
+
+    /// A malformed key is `PassKey`'s own error, surfaced unchanged: one grammar means one
+    /// message, and the CLI is where a person types it.
+    #[test]
+    fn a_malformed_pass_key_is_refused_with_the_grammar() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &["ff0000ff".into()], &[]).unwrap_err();
+        assert!(err.contains("is not a pass key"), "{err}");
+    }
+
+    /// A single-pass cut has one pass whose name nobody needs, so these flags cannot do
+    /// anything and are refused rather than ignored.
+    #[test]
+    fn pass_flags_are_refused_for_a_single_pass_cut() {
+        assert_eq!(
+            check_pass_flag_scope(&["color:ff0000ff".into()], &[], Grouping::Single),
+            Err("--skip-pass applies to a grouped cut; --group-by single is one pass over every shape".into())
+        );
+        assert_eq!(
+            check_pass_flag_scope(&[], &["color:ff0000ff".into()], Grouping::Single),
+            Err("--order applies to a grouped cut; --group-by single is one pass over every shape".into())
+        );
+        for g in [Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
+            assert!(check_pass_flag_scope(&["color:ff0000ff".into()], &["color:ff0000ff".into()], g).is_ok());
+        }
+    }
+
+    /// Two different empty cuts, two different sentences. "no cuttable paths in SVG" used to
+    /// cover both, which told an operator their file was empty when in fact their own
+    /// `--skip-pass` had emptied the selection.
+    #[test]
+    fn an_empty_file_and_an_emptied_selection_read_differently() {
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &cut_settings(),
+            Grouping::Color, &["color:ff0000ff".into(), "color:0000ffff".into()], &[], false)
+            .unwrap_err();
+        assert_eq!(err, "every pass in this file was skipped; nothing is left to cut");
+    }
+
+    /// The TTY rule is about passes, not about a flag name: one pass never pauses, so it is
+    /// allowed unattended whichever mode produced it.
+    #[test]
+    fn an_unattended_multi_pass_cut_is_refused() {
+        assert_eq!(
+            check_interactive(false, 2),
+            Err("a cut with more than one pass requires an interactive terminal".into())
+        );
+        assert!(check_interactive(false, 1).is_ok());
+        assert!(check_interactive(true, 2).is_ok());
     }
 
     /// `--device` resolves through the registry rather than a list the CLI

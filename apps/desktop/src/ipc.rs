@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::PathBuf;
 use std::sync::Mutex;
-use document::{CutLineType, Delta, MachineProfile, NodeId, ShapeKind};
+use document::{CutLineType, Delta, MachineProfile, NodeId, PresetAssignment, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
 use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse, TravelPassDto};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
+use cutplan::Grouping;
 
 pub type AppStateHandle = Mutex<AppState>;
 
@@ -54,6 +55,12 @@ pub fn reorder(state: tauri::State<AppStateHandle>, id: NodeId, new_index: usize
 pub fn set_cut_line_type(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: CutLineType)
     -> Result<Delta, String> {
     state.lock().unwrap().set_cut_line_type(ids, value).map_err(|e| format!("{e:?}"))
+}
+
+#[tauri::command]
+pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: PresetAssignment)
+    -> Result<Delta, String> {
+    state.lock().unwrap().set_material_preset(ids, value).map_err(|e| format!("{e:?}"))
 }
 
 #[tauri::command]
@@ -135,13 +142,19 @@ pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Op
 }
 
 #[tauri::command]
-pub fn plan_cut(state: tauri::State<AppStateHandle>) -> Result<PlanCutResponse, IpcError> {
-    plan_cut_response(&state.lock().unwrap().editor.doc)
+pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping) -> Result<PlanCutResponse, IpcError> {
+    plan_cut_response(&state.lock().unwrap().editor.doc, grouping)
 }
 
 #[tauri::command]
-pub fn travel_for_order(state: tauri::State<AppStateHandle>, doc_revision: String, passes: Vec<TravelPassDto>) -> Result<Vec<[f64; 4]>, IpcError> {
-    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, &passes)
+pub fn travel_for_order(
+    state: tauri::State<AppStateHandle>,
+    doc_revision: String,
+    grouping: Grouping,
+    passes: Vec<TravelPassDto>,
+) -> Result<Vec<[f64; 4]>, IpcError> {
+    // Fully qualified because the command and the function it forwards to share a name.
+    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, &passes)
 }
 
 // async: prepare_cut briefly locks the document (plan + preflight), then the

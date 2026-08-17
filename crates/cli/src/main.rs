@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{Parser, Subcommand};
-use cli::cut::{self, format_pass_color};
+use cli::cut;
 use cli::pipeline::{
-    check_color_flag_scope, check_interactive, driver_for, dry_run_pass_bytes, plan_cut_from_svg, plan_plain_cut,
+    check_interactive, check_pass_flag_scope, driver_for, dry_run_pass_bytes, plan_cut_from_svg,
     resolve_device_info,
 };
 use driver_registry::{machine_ids, HardwareBackendFactory};
@@ -15,6 +15,23 @@ use std::sync::Arc;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The `--group-by` spellings. Separate from `cutplan::Grouping` so the flag's vocabulary and
+/// the planner's are free to differ; the `From` below is the only place they meet.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum GroupBy { Single, Color, Stroke, Fill, Preset }
+
+impl From<GroupBy> for cutplan::Grouping {
+    fn from(g: GroupBy) -> cutplan::Grouping {
+        match g {
+            GroupBy::Single => cutplan::Grouping::Single,
+            GroupBy::Color => cutplan::Grouping::Color,
+            GroupBy::Stroke => cutplan::Grouping::Stroke,
+            GroupBy::Fill => cutplan::Grouping::Fill,
+            GroupBy::Preset => cutplan::Grouping::Preset,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -41,17 +58,18 @@ enum Command {
         /// Serial baud rate
         #[arg(long, default_value_t = 9600)]
         baud: u32,
-        /// Cut each color as a separate pass, pausing between passes for a tool swap
+        /// How to split the cut into passes: single (one pass over every cut shape), color
+        /// (stroke where visible, else fill), stroke, fill, or preset
+        #[arg(long, value_enum, default_value_t = GroupBy::Single)]
+        group_by: GroupBy,
+        /// Do not cut the pass with this key (all, color:RRGGBBAA, no-color, preset:<id>,
+        /// no-preset); may be repeated
+        #[arg(long = "skip-pass")]
+        skip_pass: Vec<String>,
+        /// Cut this pass first, by key; repeat to sequence more, and the rest follow in
+        /// planned order
         #[arg(long)]
-        by_color: bool,
-        /// Skip cutting shapes of this color (RRGGBBAA); may be repeated. Cannot name the
-        /// colorless pass, which is where shapes with no visible paint are cut
-        #[arg(long = "skip-color")]
-        skip_color: Vec<String>,
-        /// Comma-separated color order (RRGGBBAA,...) for --by-color passes; like
-        /// --skip-color, cannot name the colorless pass
-        #[arg(long)]
-        order: Option<String>,
+        order: Vec<String>,
         /// Send geometry that falls outside the machine's cutting area
         #[arg(long)]
         allow_out_of_bounds: bool,
@@ -112,23 +130,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Cut { file, device, dry_run, speed, force, port, baud, by_color, skip_color, order, allow_out_of_bounds } => {
+        Command::Cut { file, device, dry_run, speed, force, port, baud, group_by, skip_pass, order, allow_out_of_bounds } => {
             let driver = driver_for(&device)?;
-            check_color_flag_scope(&skip_color, &order, by_color)?;
+            let grouping: cutplan::Grouping = group_by.into();
+            check_pass_flag_scope(&skip_pass, &order, grouping)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
             let settings = Settings { speed, force, repeat_count: 1 };
-
-            if !by_color {
-                let plan = plan_plain_cut(&svg, driver.as_ref(), &settings, allow_out_of_bounds)?;
-                if dry_run {
-                    let bytes = dry_run_pass_bytes(driver.as_ref(), &plan.passes[0].job, 0, 1)?;
-                    print_hex_ascii(&bytes);
-                    return Ok(());
-                }
-                return drive_cut(&plan, &device, port.as_deref(), baud);
-            }
-
-            cut_by_color(&svg, driver.as_ref(), &device, &settings, &skip_color, order, dry_run, port, baud, allow_out_of_bounds)
+            cut_planned(&svg, driver.as_ref(), &device, &settings, grouping, &skip_pass, &order,
+                        dry_run, port, baud, allow_out_of_bounds)
         }
         Command::ListDevices => {
             for id in machine_ids() {
@@ -153,13 +162,14 @@ fn run() -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cut_by_color(
+fn cut_planned(
     svg: &[u8],
     driver: &dyn Driver,
     machine_id: &str,
     settings: &Settings,
-    skip_color: &[String],
-    order: Option<String>,
+    grouping: cutplan::Grouping,
+    skip_pass: &[String],
+    order: &[String],
     dry_run: bool,
     port: Option<String>,
     baud: u32,
@@ -167,12 +177,17 @@ fn cut_by_color(
 ) -> Result<(), String> {
     // Preflight runs here, before the dry-run branch, so a dry run and a real
     // cut always agree on whether the job is acceptable at all.
-    let plan = plan_cut_from_svg(svg, driver, settings, skip_color, order, allow_out_of_bounds)?;
+    let plan = plan_cut_from_svg(svg, driver, settings, grouping, skip_pass, order, allow_out_of_bounds)?;
     let passes = &plan.passes;
 
     if dry_run {
         for (i, pass) in passes.iter().enumerate() {
-            println!("-- pass {}/{} (color {}) --", i + 1, passes.len(), format_pass_color(pass.color));
+            // A header names a pass among several. `single` has none to name, and a bare
+            // `cuthulhu cut --dry-run` has always printed bytes and nothing else — scripts
+            // parse that output, so merging the two paths must not add a line to it.
+            if grouping != cutplan::Grouping::Single {
+                println!("-- pass {}/{} ({}) --", i + 1, passes.len(), pass.key);
+            }
             let bytes = dry_run_pass_bytes(driver, &pass.job, i, passes.len())?;
             print_hex_ascii(&bytes);
         }

@@ -3,24 +3,26 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use document::{shape_outline, CutLineType, Document, NodeId, NodeKind, Style};
+use document::{shape_outline, CutLineType, Document, NodeId, NodeKind, PresetAssignment, Style};
 use geometry::{Affine, Point, Polyline};
 use serde::{Deserialize, Serialize};
+
+use crate::pass_key::PassKey;
 
 /// A single shape's flattened, world-transformed outline, ready to cut.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct PlannedShape { pub node_id: NodeId, pub polylines: Vec<Polyline> }
 
-/// All shapes cut together as one pass. Under `Grouping::ByColor` they share the colour the
-/// pass is keyed on (0xRRGGBBAA) — their stroke where they have a visible one, else their
-/// fill — and `None` is the pass of shapes with no visible paint at all. Under
-/// `Grouping::Single` there is one pass keyed `None` holding every cut shape whatever its
-/// paint: one pass by request rather than by colour, so `None` there says nothing about the
-/// paint of what is in it.
+/// All shapes cut together as one pass, and the key that says which pass it is. What the key
+/// means is the `Grouping`'s business: a colour, a material preset, or `All` for the single
+/// pass a `Grouping::Single` plan holds.
+///
+/// Named for the Document rather than for a colour because a colour is now one of three
+/// things a pass can be keyed on — the type was `ColorPass` while it was the only one.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
+pub struct DocumentPass { pub key: PassKey, pub shapes: Vec<PlannedShape> }
 
-/// Every `ColorPass` a document contains, in first-seen order — an inventory of
+/// Every `DocumentPass` a document contains, in first-seen order — an inventory of
 /// what *could* be cut. Nothing here is selected, configured or checked; that is
 /// `plan_cut`'s job, and what it returns is a `CutPlan`.
 ///
@@ -29,7 +31,7 @@ pub struct ColorPass { pub color: Option<u32>, pub shapes: Vec<PlannedShape> }
 /// gets validated is the geometry that gets cut, and nobody plans twice.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct DocumentPasses {
-    pub passes: Vec<ColorPass>,
+    pub passes: Vec<DocumentPass>,
     pub skipped_not_cut: usize,
     pub doc_revision: u64,
     /// The machine the document targets, if it names one. Carried here because
@@ -64,51 +66,71 @@ pub fn doc_revision(doc: &Document) -> u64 {
     hasher.finish()
 }
 
-/// The colour a cut shape's pass is keyed on: its stroke if it has a visible one, else its
-/// fill. Alpha-0 counts as absent in both, exactly as a 0-alpha stroke did when the stroke
-/// decided cuttability.
+/// The colour a shape's pass is keyed on under a colour-ish `Grouping`. Alpha-0 counts as
+/// absent, exactly as a 0-alpha stroke did when the stroke decided cuttability.
 ///
-/// A fallback is needed because a shape with no stroke can be cut since #144 — traced and
-/// fill-only art is the common case — and a pass with no colour at all is something an
-/// operator cannot recognise in a pass list. `None` remains possible for a shape with no
-/// visible paint whatsoever.
-fn pass_key(style: &Style) -> Option<u32> {
-    style.stroke.filter(|c| c & 0xFF != 0).or(style.fill.filter(|c| c & 0xFF != 0))
+/// `Color` falls back from stroke to fill because a shape with no stroke can be cut since
+/// #144 — traced and fill-only art is the common case — and a pass with no colour at all is
+/// something an operator cannot recognise in a pass list. `Stroke` and `Fill` are strict by
+/// request: an operator who asked to split by one paint does not want the other silently
+/// standing in for it.
+fn color_key(style: &Style, grouping: Grouping) -> Option<u32> {
+    let visible = |c: Option<u32>| c.filter(|c| c & 0xFF != 0);
+    match grouping {
+        Grouping::Color => visible(style.stroke).or(visible(style.fill)),
+        Grouping::Stroke => visible(style.stroke),
+        Grouping::Fill => visible(style.fill),
+        // Not reachable: the caller asks for a colour only under a colour mode.
+        Grouping::Single | Grouping::Preset => None,
+    }
 }
 
 /// How `plan_passes` splits cut shapes into passes.
 ///
-/// `ByColor` is what every caller wants and stays the default. `Single` is one pass in
-/// document order, which is what `cuthulhu cut` without `--by-color` has always meant — it
-/// used to say it by giving every path the same stroke, which also destroyed the document's
-/// real colours for no other purpose.
+/// `Color` is today's rule — stroke where visible, else fill — and stays the default, so a
+/// caller that names no mode plans exactly what it planned before #148. `Single` is one pass
+/// in document order, which is what `cuthulhu cut` without `--group-by` has always meant.
 ///
-/// #45 extends this with fill, layer-preset and line-type modes.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Grouping { ByColor, Single }
+/// There is no line-type mode: `CutLineType` is `{Cut, NoCut}` and a `NoCut` shape never
+/// reaches a pass, so such a mode would be `Single` under another name while carrying
+/// different skip/order semantics. #56 adds it with `CutEdge`, the member that makes it split
+/// anything.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Grouping { Single, Color, Stroke, Fill, Preset }
 
 /// Walk the document in preorder from `doc.root`, group the shapes whose `CutLineType` is
-/// `Cut` by the colour `pass_key` gives them, and flatten each shape's outline under its
+/// `Cut` by the key `grouping` asks for, and flatten each shape's outline under its
 /// accumulated world transform. A `NoCut` shape is counted, not cut. Iterative (explicit
 /// stack) so depth is not bounded by the Rust call stack; a `visited` set catches cycles in
 /// malformed docs.
 pub fn plan_passes(doc: &Document) -> Result<DocumentPasses, PlanError> {
-    plan_passes_with(doc, Grouping::ByColor)
+    plan_passes_with(doc, Grouping::Color)
 }
 
 /// `plan_passes` with the grouping named explicitly. See `Grouping`.
 pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPasses, PlanError> {
     let mut visited: HashSet<NodeId> = HashSet::new();
-    let mut stack: Vec<(NodeId, Affine)> = vec![(doc.root, Affine::identity())];
-    let mut passes: Vec<ColorPass> = vec![];
+    // The nearest assigned ancestor's material rides down the walk beside the world
+    // transform. Storing a resolved value on each shape instead would go stale the moment a
+    // node is reparented — silently, and only visible as the wrong settings on real material.
+    let mut stack: Vec<(NodeId, Affine, Option<&str>)> = vec![(doc.root, Affine::identity(), None)];
+    let mut passes: Vec<DocumentPass> = vec![];
     let mut skipped_not_cut = 0usize;
 
-    while let Some((id, parent_world)) = stack.pop() {
+    while let Some((id, parent_world, inherited)) = stack.pop() {
         if !visited.insert(id) {
             return Err(PlanError::CycleDetected);
         }
         let node = doc.get(id).ok_or(PlanError::MissingNode(id))?;
         let world = node.transform.then(&parent_world);
+
+        // Resolved for this node and everything under it. `Unassigned` is what stops the
+        // chain — the state an `Option<String>` could not express.
+        let material: Option<&str> = match &node.material_preset {
+            PresetAssignment::Inherit => inherited,
+            PresetAssignment::Unassigned => None,
+            PresetAssignment::Preset(id) => Some(id.as_str()),
+        };
 
         // Descend on the node's own kind, not on `shape_outline` returning `None`. The two
         // agree, but reading it from `NodeKind` is what lets the outline stay unresolved
@@ -118,7 +140,7 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
             NodeKind::Group | NodeKind::Layer => {
                 // Push in reverse so preorder visits children left-to-right.
                 for &child in node.children.iter().rev() {
-                    stack.push((child, world));
+                    stack.push((child, world, material));
                 }
             }
             NodeKind::Shape(_) => {
@@ -143,16 +165,39 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
                         };
                         let polylines = path.transformed(&world).flatten(0.1);
                         let shape = PlannedShape { node_id: id, polylines };
-                        let color = match grouping {
-                            Grouping::ByColor => pass_key(&node.style),
-                            // One bucket: `None` because a pass of mixed paint has no colour
-                            // to name, and the caller asked for one pass rather than for a
-                            // colour's pass.
-                            Grouping::Single => None,
-                        };
-                        match passes.iter_mut().find(|p| p.color == color) {
-                            Some(pass) => pass.shapes.push(shape),
-                            None => passes.push(ColorPass { color, shapes: vec![shape] }),
+                        match grouping {
+                            // Matched on the borrowed id, and owned only when a pass is
+                            // actually created: keying every shape would allocate a `String`
+                            // per cut shape, including each one that joins a pass already
+                            // there — per-shape heap churn on exactly the documents where
+                            // preset grouping is worth having.
+                            Grouping::Preset => {
+                                match passes.iter_mut()
+                                    .find(|p| matches!(&p.key, PassKey::Preset(id) if id.as_deref() == material))
+                                {
+                                    Some(pass) => pass.shapes.push(shape),
+                                    None => passes.push(DocumentPass {
+                                        // Not checked against the preset file: a deleted user
+                                        // preset is a real state, and refusing a cut over a
+                                        // settings lookup is not `plan_cut`'s job.
+                                        key: PassKey::Preset(material.map(String::from)),
+                                        shapes: vec![shape],
+                                    }),
+                                }
+                            }
+                            // Every other key is `Copy`-cheap to build, so build then match.
+                            _ => {
+                                let key = match grouping {
+                                    // One bucket, and a key that says so: `Color(None)` is the
+                                    // pass of unpainted shapes, which is a different fact.
+                                    Grouping::Single => PassKey::All,
+                                    _ => PassKey::Color(color_key(&node.style, grouping)),
+                                };
+                                match passes.iter_mut().find(|p| p.key == key) {
+                                    Some(pass) => pass.shapes.push(shape),
+                                    None => passes.push(DocumentPass { key, shapes: vec![shape] }),
+                                }
+                            }
                         }
                     }
                 }
@@ -172,7 +217,7 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
 /// in the given order: end of one shape's last polyline -> start of the next shape's
 /// first polyline. `configured` lets the caller reorder/subset passes (e.g. by machine
 /// color-change cost) independently of `plan_passes`' first-seen grouping order.
-pub fn travel_moves(configured: &[&ColorPass]) -> Vec<(Point, Point)> {
+pub fn travel_moves(configured: &[&DocumentPass]) -> Vec<(Point, Point)> {
     let mut moves = vec![];
     let mut prev_end: Option<Point> = None;
     for pass in configured {
@@ -314,11 +359,11 @@ mod tests {
         assert_eq!(planned.passes.len(), 2, "red + blue; the not-cut rect excluded");
         assert_eq!(planned.skipped_not_cut, 1);
         let red = &planned.passes[0]; // first-seen order
-        assert_eq!(red.color, Some(RED));
+        assert_eq!(red.key, PassKey::Color(Some(RED)));
         assert_eq!(red.shapes.len(), 2);
         // the grouped child's polyline reflects the group's translate (world transform applied)
         assert!(red.shapes.iter().any(|s| s.polylines[0][0].x >= 10.0));
-        assert_eq!(planned.passes[1].color, Some(BLUE));
+        assert_eq!(planned.passes[1].key, PassKey::Color(Some(BLUE)));
     }
 
     #[test]
@@ -460,15 +505,15 @@ mod tests {
 
     #[test]
     fn travel_moves_follow_configured_order() {
-        let pass_a = ColorPass {
-            color: Some(1),
+        let pass_a = DocumentPass {
+            key: PassKey::Color(Some(1)),
             shapes: vec![
                 shape(1, vec![vec![pt(0.0, 0.0), pt(1.0, 0.0)]]),
                 shape(2, vec![vec![pt(2.0, 0.0), pt(3.0, 0.0)]]),
             ],
         };
-        let pass_b = ColorPass {
-            color: Some(2),
+        let pass_b = DocumentPass {
+            key: PassKey::Color(Some(2)),
             shapes: vec![shape(3, vec![vec![pt(10.0, 0.0), pt(11.0, 0.0)]])],
         };
         // reversed order: pass_b before pass_a
@@ -491,7 +536,7 @@ mod tests {
         let planned = plan_passes(&doc).unwrap();
         assert_eq!(planned.skipped_not_cut, 0);
         assert_eq!(planned.passes.len(), 1);
-        assert_eq!(planned.passes[0].color, Some(0x00FF00FF));
+        assert_eq!(planned.passes[0].key, PassKey::Color(Some(0x00FF00FF)));
     }
 
     /// The other direction, which the old rule could not express at all: a shape with a
@@ -509,9 +554,9 @@ mod tests {
         assert_eq!(planned.skipped_not_cut, 1);
     }
 
-    /// Neither paint, and cut anyway. `ColorPass::color` has always been `Option<u32>`;
-    /// this is the first thing that can make it `None`, so every consumer that renders a
-    /// swatch or prints a header now has a case that reaches it.
+    /// Neither paint, and cut anyway. A pass has always been able to carry no colour;
+    /// #144 made that reachable, so every consumer that renders a swatch or prints a header
+    /// has a case for it — which is now `PassKey::Color(None)`, written `no-color`.
     #[test]
     fn a_cut_shape_with_no_paint_lands_in_the_colorless_pass() {
         let mut doc = Document::new();
@@ -521,7 +566,7 @@ mod tests {
 
         let planned = plan_passes(&doc).unwrap();
         assert_eq!(planned.passes.len(), 1);
-        assert_eq!(planned.passes[0].color, None);
+        assert_eq!(planned.passes[0].key, PassKey::Color(None));
     }
 
     /// Alpha-0 paint is not a colour to group by, in either channel — a fully transparent
@@ -535,7 +580,7 @@ mod tests {
 
         let planned = plan_passes(&doc).unwrap();
         assert_eq!(planned.passes.len(), 1);
-        assert_eq!(planned.passes[0].color, None, "both paints are invisible, so neither keys the pass");
+        assert_eq!(planned.passes[0].key, PassKey::Color(None), "both paints are invisible, so neither keys the pass");
     }
 
     /// The fill is a FALLBACK, not a co-equal key: a shape carrying both visible paints is
@@ -552,7 +597,7 @@ mod tests {
 
         let planned = plan_passes(&doc).unwrap();
         assert_eq!(planned.passes.len(), 1);
-        assert_eq!(planned.passes[0].color, Some(0xFF0000FF), "the stroke wins over the fill");
+        assert_eq!(planned.passes[0].key, PassKey::Color(Some(0xFF0000FF)), "the stroke wins over the fill");
     }
 
     /// `Single` exists so the plain CLI cut can stop overwriting the document's colours to
@@ -570,13 +615,162 @@ mod tests {
             doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
         }
 
-        let by_color = plan_passes_with(&doc, Grouping::ByColor).unwrap();
+        let by_color = plan_passes_with(&doc, Grouping::Color).unwrap();
         assert_eq!(by_color.passes.len(), 2, "premise: two fills, so colour grouping splits");
 
         let single = plan_passes_with(&doc, Grouping::Single).unwrap();
         assert_eq!(single.passes.len(), 1);
-        assert_eq!(single.passes[0].color, None, "one pass of mixed paint has no colour to name");
+        assert_eq!(single.passes[0].key, PassKey::All, "one pass by request, not the colourless pass");
         let planned: Vec<_> = single.passes[0].shapes.iter().map(|s| s.node_id).collect();
         assert_eq!(planned, ids, "document order, not colour-grouped order");
+    }
+
+    /// One document, five modes, and the key set each produces. The point of the table is
+    /// that the modes differ only in what they key on: the same shapes are cut, in the same
+    /// document order, and only the split changes.
+    #[test]
+    fn every_grouping_keys_the_same_shapes_differently() {
+        const GREEN: u32 = 0x00FF00FF;
+        const RED: u32 = 0xFF0000FF;
+        const BLUE: u32 = 0x0000FFFF;
+        let mut doc = Document::new();
+        for style in [
+            Style { stroke: Some(RED), fill: Some(GREEN) },
+            Style { stroke: Some(GREEN), fill: Some(GREEN) },
+            Style { stroke: None, fill: Some(BLUE) },
+            Style { stroke: None, fill: None },
+        ] {
+            let mut node = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+            node.style = style;
+            doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node, index: usize::MAX }]));
+        }
+
+        let keys = |g: Grouping| -> Vec<String> {
+            plan_passes_with(&doc, g).unwrap().passes.iter().map(|p| p.key.to_string()).collect()
+        };
+
+        assert_eq!(keys(Grouping::Single), vec!["all"]);
+        // Stroke where visible, else fill: the rule #144 shipped, unchanged.
+        assert_eq!(keys(Grouping::Color),
+            vec!["color:ff0000ff", "color:00ff00ff", "color:0000ffff", "no-color"]);
+        // Strict: a shape with no visible stroke keys on no colour at all, which is the same
+        // bucket a shape with no paint whatsoever lands in.
+        assert_eq!(keys(Grouping::Stroke), vec!["color:ff0000ff", "color:00ff00ff", "no-color"]);
+        assert_eq!(keys(Grouping::Fill), vec!["color:00ff00ff", "color:0000ffff", "no-color"]);
+        assert_eq!(keys(Grouping::Preset), vec!["no-preset"]);
+
+        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
+            let planned = plan_passes_with(&doc, g).unwrap();
+            let shapes: usize = planned.passes.iter().map(|p| p.shapes.len()).sum();
+            assert_eq!(shapes, 4, "{g:?} dropped a shape");
+            assert_eq!(planned.skipped_not_cut, 0);
+        }
+    }
+
+    /// `plan_passes` is what every caller that does not name a mode gets, and #148 must not
+    /// move it: `Color` is verbatim the stroke-else-fill rule those callers already had.
+    #[test]
+    fn the_default_grouping_is_unchanged_colour_grouping() {
+        let mut doc = Document::new();
+        let mut shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        shape.style = Style { stroke: None, fill: Some(0xFF0000FF) };
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        assert_eq!(plan_passes(&doc).unwrap().passes,
+            plan_passes_with(&doc, Grouping::Color).unwrap().passes);
+        assert_eq!(plan_passes(&doc).unwrap().passes[0].key, PassKey::Color(Some(0xFF0000FF)));
+    }
+
+    /// The three assignment states, resolved down the tree. `Unassigned` is the one that
+    /// earns the enum: without it the second shape could not leave its Layer's pass.
+    #[test]
+    fn a_material_resolves_from_the_nearest_assigned_ancestor() {
+        let mut doc = Document::new();
+        let mut layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        layer.material_preset = PresetAssignment::Preset("cameo5-htv".into());
+        let layer_id = layer.id;
+        let inherits = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let mut refuses = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        refuses.material_preset = PresetAssignment::Unassigned;
+        let mut overrides = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        overrides.material_preset = PresetAssignment::Preset("cameo5-vinyl-adhesive".into());
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: inherits, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: refuses, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: overrides, index: usize::MAX },
+        ]));
+
+        let keys: Vec<String> = plan_passes_with(&doc, Grouping::Preset).unwrap()
+            .passes.iter().map(|p| p.key.to_string()).collect();
+        assert_eq!(keys, vec!["preset:cameo5-htv", "no-preset", "preset:cameo5-vinyl-adhesive"]);
+    }
+
+    /// Resolution lives in the walk, so a shape moved into an assigned Layer picks that
+    /// Layer's material up with no edit of its own. A stored resolved value would have gone
+    /// stale here, silently, and only shown up as the wrong settings on real material.
+    #[test]
+    fn a_reparented_shape_inherits_without_being_edited() {
+        let mut doc = Document::new();
+        let mut layer = Node::container(doc.ids.next(), NodeKind::Layer);
+        layer.material_preset = PresetAssignment::Preset("cameo5-htv".into());
+        let layer_id = layer.id;
+        // A shape already inside the Layer, so its material's pass exists before the move —
+        // an empty container contributes no pass at all.
+        let resident = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![
+            NodeOp::Add { parent: doc.root, node: layer, index: usize::MAX },
+            NodeOp::Add { parent: layer_id, node: resident, index: usize::MAX },
+            NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX },
+        ]));
+        let before: Vec<String> = plan_passes_with(&doc, Grouping::Preset).unwrap()
+            .passes.iter().map(|p| p.key.to_string()).collect();
+        assert_eq!(before, vec!["preset:cameo5-htv", "no-preset"],
+            "premise: outside the Layer it resolves to no material");
+
+        // Remove carries only the id; the node itself comes back through the Add, which is
+        // exactly how a reparent is expressed (`document::NodeOp`).
+        let moved = doc.get(shape_id).unwrap().clone();
+        doc.apply(Delta(vec![
+            NodeOp::Remove { parent: doc.root, id: shape_id },
+            NodeOp::Add { parent: layer_id, node: moved, index: usize::MAX },
+        ]));
+
+        let keys: Vec<String> = plan_passes_with(&doc, Grouping::Preset).unwrap()
+            .passes.iter().map(|p| p.key.to_string()).collect();
+        assert_eq!(keys, vec!["preset:cameo5-htv"]);
+    }
+
+    /// An id no preset file resolves still keys a pass. Refusing here would put a
+    /// settings-file concern behind `plan_cut`, and a user preset can be deleted while a
+    /// document still names it.
+    #[test]
+    fn an_unknown_preset_id_still_keys_a_pass() {
+        let mut doc = Document::new();
+        let mut shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        shape.material_preset = PresetAssignment::Preset("deleted-by-the-operator".into());
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        assert_eq!(plan_passes_with(&doc, Grouping::Preset).unwrap().passes[0].key,
+            PassKey::Preset(Some("deleted-by-the-operator".into())));
+    }
+
+    /// The predicate is still `cut_line_type`, still checked before the outline is resolved
+    /// (#139) — a grouping mode changes the key, never that order.
+    #[test]
+    fn a_no_cut_shape_is_counted_under_every_grouping() {
+        let mut doc = Document::new();
+        let mut shape = Node::shape(doc.ids.next(), ShapeKind::Text {
+            family: "no such family".into(), size_mm: 10.0, text: "x".into() });
+        shape.cut_line_type = CutLineType::NoCut;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        for g in [Grouping::Single, Grouping::Color, Grouping::Stroke, Grouping::Fill, Grouping::Preset] {
+            let planned = plan_passes_with(&doc, g).unwrap();
+            assert_eq!(planned.skipped_not_cut, 1, "{g:?}");
+            assert!(planned.passes.is_empty(), "{g:?}");
+        }
     }
 }

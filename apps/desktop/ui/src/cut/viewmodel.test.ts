@@ -110,11 +110,14 @@ import {
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
+  parsePassKey,
+  passRowLabel,
+  presetIdForKey,
   type PassVm,
   type Caps,
   type Preset,
 } from "./viewmodel";
-import type { DeviceInfo } from "../ipc";
+import type { DeviceInfo, Grouping } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
   instance_id: "usb:mock",
@@ -128,7 +131,7 @@ describe("reorderPass", () => {
   it("swaps adjacent passes when within bounds", () => {
     const passes: PassVm[] = [
       {
-        color: 0xff0000,
+        key: "color:ff0000ff",
         shapeCount: 5,
         enabled: true,
         presetId: "p1",
@@ -137,7 +140,7 @@ describe("reorderPass", () => {
         repeatCount: 1,
       },
       {
-        color: 0x00ff00,
+        key: "color:00ff00ff",
         shapeCount: 3,
         enabled: true,
         presetId: "p2",
@@ -155,7 +158,7 @@ describe("reorderPass", () => {
   it("clamps at the start (index=0, dir=-1)", () => {
     const passes: PassVm[] = [
       {
-        color: 0xff0000,
+        key: "color:ff0000ff",
         shapeCount: 5,
         enabled: true,
         presetId: "p1",
@@ -164,7 +167,7 @@ describe("reorderPass", () => {
         repeatCount: 1,
       },
       {
-        color: 0x00ff00,
+        key: "color:00ff00ff",
         shapeCount: 3,
         enabled: true,
         presetId: "p2",
@@ -181,7 +184,7 @@ describe("reorderPass", () => {
   it("clamps at the end (index=length-1, dir=1)", () => {
     const passes: PassVm[] = [
       {
-        color: 0xff0000,
+        key: "color:ff0000ff",
         shapeCount: 5,
         enabled: true,
         presetId: "p1",
@@ -190,7 +193,7 @@ describe("reorderPass", () => {
         repeatCount: 1,
       },
       {
-        color: 0x00ff00,
+        key: "color:00ff00ff",
         shapeCount: 3,
         enabled: true,
         presetId: "p2",
@@ -207,9 +210,9 @@ describe("reorderPass", () => {
 
 describe("reorderForReplan", () => {
   const rows = [
-    { color: 0xff0000ff, label: "red", enabled: true },
-    { color: 0x00ff00ff, label: "green", enabled: true },
-    { color: null, label: "uncolored", enabled: true },
+    { key: "color:ff0000ff", label: "red", enabled: true },
+    { key: "color:00ff00ff", label: "green", enabled: true },
+    { key: "no-color", label: "uncolored", enabled: true },
   ];
 
   it("returns the swapped rows", () => {
@@ -226,8 +229,8 @@ describe("reorderForReplan", () => {
   it("sends the swapped order to the planner, not the original", () => {
     // Read from the swapped rows: taking the order off the originals replans travel
     // for a list the dialog no longer shows.
-    expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.color)).toEqual([
-      0x00ff00ff, 0xff0000ff, null,
+    expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.key)).toEqual([
+      "color:00ff00ff", "color:ff0000ff", "no-color",
     ]);
   });
 });
@@ -237,12 +240,12 @@ describe("toTravelPasses", () => {
     // Dropping the disabled pass here would leave the backend unable to tell a pass the
     // operator switched off from one a frontend bug lost.
     const rows = [
-      { color: 0xff0000ff, enabled: false },
-      { color: 0x00ff00ff, enabled: true },
+      { key: "color:ff0000ff", enabled: false },
+      { key: "color:00ff00ff", enabled: true },
     ];
     expect(toTravelPasses(rows)).toEqual([
-      { color: 0xff0000ff, enabled: false },
-      { color: 0x00ff00ff, enabled: true },
+      { key: "color:ff0000ff", enabled: false },
+      { key: "color:00ff00ff", enabled: true },
     ]);
   });
 });
@@ -250,7 +253,7 @@ describe("toTravelPasses", () => {
 describe("effectiveSettings", () => {
   it("uses pass override over preset", () => {
     const pass: PassVm = {
-      color: 0xff0000,
+      key: "color:ff0000ff",
       shapeCount: 5,
       enabled: true,
       presetId: "preset1",
@@ -267,7 +270,7 @@ describe("effectiveSettings", () => {
 
   it("falls back to preset when pass fields are null", () => {
     const pass: PassVm = {
-      color: 0xff0000,
+      key: "color:ff0000ff",
       shapeCount: 5,
       enabled: true,
       presetId: "preset1",
@@ -294,7 +297,7 @@ describe("effectiveSettings", () => {
 
   it("uses default repeatCount=1 when no preset match and pass is null", () => {
     const pass: PassVm = {
-      color: 0xff0000,
+      key: "color:ff0000ff",
       shapeCount: 5,
       enabled: true,
       presetId: null,
@@ -311,7 +314,7 @@ describe("effectiveSettings", () => {
 
   it("handles partial overrides (speed override, force from preset)", () => {
     const pass: PassVm = {
-      color: 0xff0000,
+      key: "color:ff0000ff",
       shapeCount: 5,
       enabled: true,
       presetId: "preset1",
@@ -383,7 +386,7 @@ describe("toCutRequest", () => {
   it("serializes PassVm to CutRequest with ConfiguredPassDto fields", () => {
     const passes: PassVm[] = [
       {
-        color: 0xff0000,
+        key: "color:ff0000ff",
         shapeCount: 5,
         enabled: true,
         presetId: "preset1",
@@ -393,13 +396,14 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", passes);
+    const result = toCutRequest("device123", "42", "Color", passes);
 
     expect(result.device_instance_id).toBe("device123");
     expect(result.doc_revision).toBe("42");
     expect(result.passes).toHaveLength(1);
+    expect(result.grouping).toBe("Color");
     expect(result.passes[0]).toEqual({
-      color: 0xff0000,
+      key: "color:ff0000ff",
       enabled: true,
       preset_id: "preset1",
       speed: 100,
@@ -411,7 +415,7 @@ describe("toCutRequest", () => {
   it("serializes null values explicitly in ConfiguredPassDto", () => {
     const passes: PassVm[] = [
       {
-        color: null,
+        key: "no-color",
         shapeCount: 3,
         enabled: false,
         presetId: null,
@@ -421,10 +425,10 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", passes);
+    const result = toCutRequest("device123", "42", "Color", passes);
 
     expect(result.passes[0]).toEqual({
-      color: null,
+      key: "no-color",
       enabled: false,
       preset_id: null,
       speed: null,
@@ -436,7 +440,7 @@ describe("toCutRequest", () => {
   it("handles multiple passes", () => {
     const passes: PassVm[] = [
       {
-        color: 0xff0000,
+        key: "color:ff0000ff",
         shapeCount: 5,
         enabled: true,
         presetId: "preset1",
@@ -445,7 +449,7 @@ describe("toCutRequest", () => {
         repeatCount: 1,
       },
       {
-        color: 0x00ff00,
+        key: "color:00ff00ff",
         shapeCount: 3,
         enabled: true,
         presetId: "preset2",
@@ -455,7 +459,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", passes);
+    const result = toCutRequest("device123", "42", "Color", passes);
 
     expect(result.passes).toHaveLength(2);
     expect(result.passes[0].preset_id).toBe("preset1");
@@ -463,11 +467,161 @@ describe("toCutRequest", () => {
   });
 });
 
+describe("parsePassKey", () => {
+  // The same table as crates/cutplan/src/pass_key.rs's round-trip test. These two tables are
+  // the only thing keeping the dialog and the planner agreed on what a pass is called.
+  it.each([
+    ["all", { kind: "all" }],
+    ["color:ff0000ff", { kind: "color", color: 0xff0000ff }],
+    ["no-color", { kind: "color", color: null }],
+    ["preset:cameo5-htv", { kind: "preset", presetId: "cameo5-htv" }],
+    ["no-preset", { kind: "preset", presetId: null }],
+  ])("parses %s", (key, expected) => {
+    expect(parsePassKey(key as string)).toEqual(expected);
+  });
+
+  // Codex's blocking finding on the gate re-run: Rust's parser accepts `preset:`, and a mirror
+  // that refused it turned a preset-keyed row into an unkeyed one — the request then carried no
+  // preset and the cut used default speed and force instead of being refused. The two grammars
+  // agree, so the refusal fires.
+  it("parses an empty preset id, as the Rust grammar does", () => {
+    expect(parsePassKey("preset:")).toEqual({ kind: "preset", presetId: "" });
+    expect(presetIdForKey("preset:")).toBe("");
+  });
+
+  it("keeps a colon inside a preset id", () => {
+    expect(parsePassKey("preset:vinyl:thin")).toEqual({ kind: "preset", presetId: "vinyl:thin" });
+  });
+
+  // The collision the grammar exists to avoid: a preset actually called "none" is not the
+  // absence of a preset.
+  it("tells a preset called none from no preset at all", () => {
+    expect(parsePassKey("preset:none")).toEqual({ kind: "preset", presetId: "none" });
+    expect(parsePassKey("no-preset")).toEqual({ kind: "preset", presetId: null });
+  });
+
+  // A key the backend produced that this cannot read is a version mismatch, not operator
+  // input: it renders as itself rather than throwing, because a dialog that crashes mid-cut is
+  // worse than one showing a string nobody recognises.
+  it("returns the raw key it cannot parse", () => {
+    expect(parsePassKey("line-type:cut")).toEqual({ kind: "unknown", raw: "line-type:cut" });
+    expect(parsePassKey("color:ff0000")).toEqual({ kind: "unknown", raw: "color:ff0000" });
+  });
+});
+
+describe("passRowLabel", () => {
+  const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+                     settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
+
+  it("names a colour pass by its swatch, not by words", () => {
+    expect(passRowLabel("color:ff0000ff", presets, "Color")).toEqual({ swatch: "#ff0000", text: null });
+  });
+
+  // Grouping-aware, because `no-color` means something different in each colour mode: under
+  // Stroke it can hold brightly filled shapes, so "no visible paint" would be false.
+  it.each([
+    ["Color", "No visible paint"],
+    ["Stroke", "No visible stroke"],
+    ["Fill", "No visible fill"],
+  ])("says what the colourless pass holds under %s", (grouping, text) => {
+    expect(passRowLabel("no-color", presets, grouping as Grouping)).toEqual({ swatch: null, text });
+  });
+
+  // Not "every shape": a NoCut shape is excluded and counted as skipped.
+  it("names the single pass for what it holds", () => {
+    expect(passRowLabel("all", presets, "Single")).toEqual({ swatch: null, text: "Every cut shape" });
+  });
+
+  it("resolves a preset to its name", () => {
+    expect(passRowLabel("preset:cameo5-htv", presets, "Preset")).toEqual({ swatch: null, text: "HTV" });
+  });
+
+  // A preset a document names but the file no longer has: the planner keys the pass anyway, so
+  // the dialog has to render one.
+  it("shows an unresolved preset id as unknown", () => {
+    expect(passRowLabel("preset:deleted", presets, "Preset"))
+      .toEqual({ swatch: null, text: "deleted (unknown preset)" });
+  });
+
+  it("names the pass that resolves to no material", () => {
+    expect(passRowLabel("no-preset", presets, "Preset")).toEqual({ swatch: null, text: "No preset" });
+  });
+});
+
+describe("presetIdForKey", () => {
+  // What makes grouping by material do the thing it exists for: the pass's own preset supplies
+  // its settings, instead of the operator re-picking it once per pass.
+  it("takes the preset a preset-keyed pass names", () => {
+    expect(presetIdForKey("preset:cameo5-htv")).toBe("cameo5-htv");
+  });
+
+  // Kept even when it resolves to nothing: prepare_cut falls back to the override-or-default
+  // path, and clearing it here would silently drop what the document said.
+  it("keeps an id that may not resolve", () => {
+    expect(presetIdForKey("preset:deleted")).toBe("deleted");
+  });
+
+  it.each(["all", "no-color", "no-preset", "color:ff0000ff"])("has nothing to take from %s", (key) => {
+    expect(presetIdForKey(key)).toBeNull();
+  });
+});
+
+describe("installed plan", () => {
+  // The rows and the mode that produced them travel together. A row list is only ever sent
+  // with the grouping of the plan it came from, which is what this shape enforces: there is no
+  // way to build a request from rows without naming their plan's grouping.
+  it("builds a request only from a plan's own grouping and rows", () => {
+    const plan = {
+      grouping: "Fill" as Grouping,
+      revision: "7",
+      skippedNotCut: 0,
+      rows: [
+        { key: "color:00ff00ff", shapeCount: 1, enabled: true, presetId: null,
+          speed: null, force: null, repeatCount: null },
+      ],
+    };
+    const request = toCutRequest("dev-1", plan.revision, plan.grouping, plan.rows);
+    expect(request.grouping).toBe("Fill");
+    expect(request.passes.map((p) => p.key)).toEqual(["color:00ff00ff"]);
+  });
+
+  // A preset-grouped plan's rows carry their own preset, which is what makes the pass cut with
+  // that material rather than with defaults.
+  it("carries each preset-keyed row's own preset into the request", () => {
+    const rows = ["preset:cameo5-htv", "no-preset"].map((key) => ({
+      key, shapeCount: 1, enabled: true, presetId: presetIdForKey(key),
+      speed: null, force: null, repeatCount: null,
+    }));
+    const request = toCutRequest("dev-1", "7", "Preset", rows);
+    expect(request.passes.map((p) => p.preset_id)).toEqual(["cameo5-htv", null]);
+  });
+});
+
+
 describe("DeviceInfo.host", () => {
   it("distinguishes a cutter on this computer from one on a Cut Host", () => {
     const local: DeviceInfo = { ...aDevice(), host: null };
     const remote: DeviceInfo = { ...aDevice(), instance_id: "usb:sn:PI", host: "host-1" };
     expect(local.host).toBeNull();
     expect(remote.host).toBe("host-1");
+  });
+});
+
+describe("effectiveSettings with an empty preset id", () => {
+  // Codex's third gate: an empty id is a *named* preset, and truthiness treated it as absent — so
+  // the dialog showed default speed and force while the cut path resolved the real entry. The
+  // dialog and the machine have to agree about what the blade will do.
+  it("resolves an empty id like any other, rather than showing defaults", () => {
+    const presets = [{ id: "", name: "Nameless", machine_id: "cameo5",
+                       settings: { speed: 7, force: 33, repeat_count: 2 }, builtin: false }];
+    const row: PassVm = { key: "preset:", shapeCount: 1, enabled: true, presetId: "",
+                          speed: null, force: null, repeatCount: null };
+    expect(effectiveSettings(row, presets)).toEqual({ speed: 7, force: 33, repeatCount: 2 });
+  });
+
+  it("still treats a genuinely absent preset as absent", () => {
+    const row: PassVm = { key: "no-preset", shapeCount: 1, enabled: true, presetId: null,
+                          speed: null, force: null, repeatCount: null };
+    expect(effectiveSettings(row, [])).toEqual({ speed: null, force: null, repeatCount: 1 });
   });
 });

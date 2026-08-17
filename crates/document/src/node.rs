@@ -41,6 +41,29 @@ pub enum NodeKind { Shape(ShapeKind), Group, Layer }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum CutLineType { Cut, NoCut }
 
+/// Which `MaterialPreset` a Node's geometry is cut with, or where to look for one.
+///
+/// A sibling of `cut_line_type`, and not on `Style`, for the reason #68 settled: production
+/// intent is not paint.
+///
+/// Three states rather than `Option<String>`, because the two-state spelling cannot say
+/// "deliberately no material, do not inherit". With absence meaning inherit, a shape inside an
+/// HTV Layer could never reach the no-preset pass — a pass that exists and resolves to the
+/// operator's own settings. `cutplan::plan_passes_with` resolves the chain; nothing stores a
+/// resolved value, so reparenting cannot leave a stale one.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "state", content = "id", rename_all = "kebab-case")]
+pub enum PresetAssignment {
+    /// Take the nearest ancestor's assignment; no ancestor means no material.
+    #[default]
+    Inherit,
+    /// No material, whatever any ancestor says.
+    Unassigned,
+    /// This `MaterialPreset::id`. Never validated here: presets are machine-scoped and a
+    /// user entry can be deleted, so an id that resolves to nothing is a real state.
+    Preset(String),
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(from = "NodeWire")]
 pub struct Node {
@@ -49,16 +72,19 @@ pub struct Node {
     pub transform: Affine,   // relative to parent
     pub style: Style,
     pub cut_line_type: CutLineType,
+    pub material_preset: PresetAssignment,
     pub children: Vec<NodeId>,
 }
 impl Node {
     pub fn shape(id: NodeId, kind: ShapeKind) -> Node {
         Node { id, kind: NodeKind::Shape(kind), transform: Affine::identity(),
-               style: Style::default(), cut_line_type: CutLineType::Cut, children: vec![] }
+               style: Style::default(), cut_line_type: CutLineType::Cut,
+               material_preset: PresetAssignment::Inherit, children: vec![] }
     }
     pub fn container(id: NodeId, kind: NodeKind) -> Node {
         Node { id, kind, transform: Affine::identity(),
-               style: Style::default(), cut_line_type: CutLineType::Cut, children: vec![] }
+               style: Style::default(), cut_line_type: CutLineType::Cut,
+               material_preset: PresetAssignment::Inherit, children: vec![] }
     }
 }
 
@@ -90,6 +116,11 @@ struct NodeWire {
     style: Style,
     #[serde(default)]
     cut_line_type: Option<CutLineType>,
+    /// A plain `#[serde(default)]`, unlike `cut_line_type` above: a document written before
+    /// this field existed had no way to assign a material, so absence *is* `Inherit`. There
+    /// is nothing to derive and no old behaviour to preserve.
+    #[serde(default)]
+    material_preset: Option<PresetAssignment>,
     children: Vec<NodeId>,
 }
 
@@ -110,7 +141,8 @@ impl From<NodeWire> for Node {
             },
         });
         Node { id: w.id, kind: w.kind, transform: w.transform, style: w.style,
-               cut_line_type, children: w.children }
+               cut_line_type, material_preset: w.material_preset.unwrap_or_default(),
+               children: w.children }
     }
 }
 
@@ -137,6 +169,63 @@ mod tests {
         let group = Node::container(ids.next(), NodeKind::Group);
         assert_eq!(shape.cut_line_type, CutLineType::Cut);
         assert_eq!(group.cut_line_type, CutLineType::Cut);
+    }
+
+    /// A new Node inherits. There is no import default to argue about: a material is the
+    /// operator's choice per shape or per Layer, and inheriting is the state that lets a
+    /// Layer's choice reach the shapes under it.
+    #[test]
+    fn a_new_node_inherits_its_material() {
+        let mut ids = IdGen::default();
+        assert_eq!(Node::shape(ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 }).material_preset,
+            PresetAssignment::Inherit);
+        assert_eq!(Node::container(ids.next(), NodeKind::Group).material_preset,
+            PresetAssignment::Inherit);
+    }
+
+    /// Three states, and the wire form each takes. `Unassigned` is the one the two-state
+    /// spelling could not express: a shape deliberately carrying no material *inside* an
+    /// assigned Layer, which is a pass an operator can otherwise never reach.
+    #[test]
+    fn a_material_assignment_round_trips_in_all_three_states() {
+        for (value, json) in [
+            (PresetAssignment::Inherit, r#"{"state":"inherit"}"#),
+            (PresetAssignment::Unassigned, r#"{"state":"unassigned"}"#),
+            (PresetAssignment::Preset("cameo5-htv".into()), r#"{"state":"preset","id":"cameo5-htv"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&value).unwrap(), json);
+            assert_eq!(serde_json::from_str::<PresetAssignment>(json).unwrap(), value);
+        }
+    }
+
+    /// A document written before the field existed had no way to assign a material, so
+    /// absence means inherit — and an explicit `null` means the same, which serde gives for
+    /// free and which is deliberate: nothing this workspace writes can produce one, so it
+    /// only ever arrives from a hand-edited file.
+    #[test]
+    fn a_node_saved_without_a_material_assignment_inherits() {
+        let json = r#"{"id":7,"kind":{"Shape":{"Rect":{"w":1.0,"h":1.0}}},
+                       "transform":[1.0,0.0,0.0,1.0,0.0,0.0],
+                       "style":{"stroke":255,"fill":null},
+                       "cut_line_type":"Cut","children":[]}"#;
+        let node: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(node.material_preset, PresetAssignment::Inherit);
+        assert_eq!(node.cut_line_type, CutLineType::Cut, "premise: the other attribute still decodes");
+
+        let nulled = json.replace(r#""cut_line_type":"Cut""#, r#""cut_line_type":"Cut","material_preset":null"#);
+        assert_eq!(serde_json::from_str::<Node>(&nulled).unwrap().material_preset,
+            PresetAssignment::Inherit);
+    }
+
+    /// Written on every save, so the field stops being absent the first time a document is
+    /// written by this version and is never ambiguous again.
+    #[test]
+    fn a_material_assignment_is_always_written() {
+        let mut node = Node::shape(NodeId(1), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        node.material_preset = PresetAssignment::Preset("cameo5-htv".into());
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains(r#""material_preset":{"state":"preset","id":"cameo5-htv"}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Node>(&json).unwrap(), node);
     }
 
     /// A document written before the attribute existed must cut exactly what it cut then.

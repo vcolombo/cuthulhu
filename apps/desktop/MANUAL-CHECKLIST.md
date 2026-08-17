@@ -88,7 +88,7 @@ real network can confirm the swap end to end.
 - [ ] `cuthulhu cut fill-only.svg --device cameo5 --dry-run` — a fill-only SVG still produces bytes (one pass).
 - [ ] `cuthulhu cut off-bed.svg --device cameo5` — refused with the out-of-bounds message, nothing sent.
 - [ ] `cuthulhu cut off-bed.svg --device cameo5 --allow-out-of-bounds` — sends.
-- [ ] `cuthulhu cut a.svg --skip-color FF0000FF` — refused, naming `--by-color`.
+- [ ] `cuthulhu cut a.svg --skip-pass color:FF0000FF` — refused, naming `--group-by single`.
 - [ ] On hardware: a plain cut on the Cameo 5 completes, and Ctrl-C mid-cut stops it.
 - [ ] Scripted (stdin redirected from /dev/null): `cuthulhu cut a.svg --device puma --port …` completes without blocking, and prints the completion-not-verified note.
 
@@ -99,4 +99,14 @@ real network can confirm the swap end to end.
 - [ ] Cancel mid-cut reports the cancelled ending, the dialog shows "Cancelled", and a second cut can be started straight after.
 - [ ] Unplug mid-cut shows the failure with its reason, and the dialog offers no dead buttons.
 - [ ] Closing the window mid-cut still prompts.
-- [ ] `cuthulhu cut --by-color` on the Puma still prompts per pass and completes.
+- [ ] `cuthulhu cut --group-by color` on the Puma still prompts per pass and completes.
+
+## Pass grouping (#148)
+
+- [ ] Cut dialog → Group passes by: each mode replans and the rows rename themselves; Cut is
+      unavailable until the new plan lands.
+- [ ] Assign a material to a Layer in the properties panel — every shape under it reads
+      `Inherited — <name>`, and one shape set to "No preset" leaves that Layer's pass.
+- [ ] On hardware: `--group-by preset` on a document with two materials cuts one pass per
+      material, **each with that preset's own speed and force**, prompting between them. Nothing
+      but real material settles that the settings followed the key.

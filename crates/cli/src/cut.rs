@@ -41,11 +41,16 @@ impl Operator {
     }
 }
 
-/// `#RRGGBB` for the operator prompt — drop the alpha byte.
-pub fn format_pass_color(color: Option<u32>) -> String {
-    match color {
-        Some(c) => format!("#{:06x}", c >> 8),
-        None => "none".into(),
+/// The pass the job is paused on, named as every other surface names it.
+///
+/// A bad index cannot happen on the normal path (the reported position indexes the same
+/// plan), but the prompt is cosmetic, so a mismatch degrades to a label rather than panicking
+/// a process mid-cut.
+pub fn format_pass_key(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
+    let index = status.pass.map(|p| p.index).unwrap_or(0);
+    match plan.passes.get(index) {
+        Some(pass) => pass.key.to_string(),
+        None => "unknown pass".into(),
     }
 }
 
@@ -87,22 +92,13 @@ fn pass_position(status: &CutStatus) -> (usize, usize) {
 /// denominator cannot come from two different accounts of the job.
 fn pause_prompt(pause: Pause, plan: &cutplan::CutPlan, status: &CutStatus) -> String {
     let (pass, total) = pass_position(status);
-    let color = pass_color(plan, status);
+    let key = format_pass_key(plan, status);
     match pause {
-        Pause::Swap => format!("Pass {pass}/{total} (color {color}): swap tool, press Enter to resume"),
+        Pause::Swap => format!("Pass {pass}/{total} ({key}): swap tool, press Enter to resume"),
         Pause::Confirm => {
-            format!("Pass {pass}/{total} (color {color}) cutting; press Enter once the machine finishes")
+            format!("Pass {pass}/{total} ({key}) cutting; press Enter once the machine finishes")
         }
     }
-}
-
-/// The colour of the pass the job is paused on — the reason the operator is being
-/// interrupted at all. A bad index can't happen on the normal path (the reported
-/// position indexes the same plan), but the prompt is cosmetic, so a mismatch
-/// degrades to "none" rather than panicking a process mid-cut.
-fn pass_color(plan: &cutplan::CutPlan, status: &CutStatus) -> String {
-    let index = status.pass.map(|p| p.index).unwrap_or(0);
-    format_pass_color(plan.passes.get(index).and_then(|p| p.color))
 }
 
 /// How the cut ended. Returned rather than printed so the wording is assertable
@@ -246,12 +242,14 @@ mod tests {
         CutStatus { phase, ended: None, actions, pass, sent: None, error: None }
     }
 
-    fn plan(colors: &[Option<u32>]) -> cutplan::CutPlan {
+    /// A plan of keyed passes. Takes keys because that is what a pass is named by since
+    /// #148, and the prompt reads that name back verbatim.
+    fn plan(keys: &[cutplan::PassKey]) -> cutplan::CutPlan {
         cutplan::CutPlan {
-            passes: colors
+            passes: keys
                 .iter()
-                .map(|&color| cutplan::PlannedPass {
-                    color,
+                .map(|key| cutplan::PlannedPass {
+                    key: key.clone(),
                     job: Job { polylines: vec![], settings: Settings::default() },
                 })
                 .collect(),
@@ -280,7 +278,8 @@ mod tests {
     /// number it counts towards cannot come from two different accounts of the job.
     #[test]
     fn a_prompt_takes_both_halves_of_the_position_from_the_status() {
-        let plan = plan(&[Some(0xff0000ff), Some(0x0000ffff), None]);
+        let plan = plan(&[cutplan::PassKey::Color(Some(0xff0000ff)),
+            cutplan::PassKey::Color(Some(0x0000ffff)), cutplan::PassKey::All]);
         let at_second = status(
             Actions { cancel: true, resume: true, ..Actions::default() },
             Phase::AwaitingColorSwap,
@@ -289,7 +288,7 @@ mod tests {
 
         let swap = pause_prompt(Pause::Swap, &plan, &at_second);
         assert!(swap.contains("Pass 2/3"), "counts from 1, out of the job's own total: {swap}");
-        assert!(swap.contains("#0000ff"), "names the colour being swapped to: {swap}");
+        assert!(swap.contains("color:0000ffff"), "names the pass being swapped to: {swap}");
         assert!(swap.contains("swap tool"), "says what to do: {swap}");
 
         let confirm = pause_prompt(Pause::Confirm, &plan, &at_second);
@@ -297,19 +296,18 @@ mod tests {
         assert!(confirm.contains("once the machine finishes"), "waits on the blade, not the queue: {confirm}");
     }
 
-    /// A plain cut's pass has no colour to name since #144 — it is one pass by request, not one
-    /// colour's worth of shapes. The prompt used to read `#000000`, which was the invented stroke
-    /// the plain path stamped on every path; nothing pinned it, so nothing would catch it
-    /// changing.
+    /// A single-pass cut's pass is named for what it is rather than for a colour it does not
+    /// have. The prompt read `#000000` before #144 (the invented stroke the plain path stamped
+    /// on every path), then `none`, which said nothing; `all` says which pass it is.
     #[test]
-    fn a_colourless_pass_is_named_none_in_the_prompt() {
-        let plan = plan(&[None]);
+    fn the_single_pass_is_named_all_in_the_prompt() {
+        let plan = plan(&[cutplan::PassKey::All]);
         let parked = status(
             Actions { cancel: true, confirm: true, ..Actions::default() },
             Phase::AwaitingConfirmation,
             Some(PassPosition { index: 0, total: 1 }),
         );
         let confirm = pause_prompt(Pause::Confirm, &plan, &parked);
-        assert!(confirm.contains("(color none)"), "{confirm}");
+        assert!(confirm.contains("(all)"), "{confirm}");
     }
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useRef } from "react";
 import type { Scene } from "../render/hittest";
-import { clippedEdges, contentBounds, fitViewport } from "./viewmodel";
+import { clippedEdges, contentBounds, fitViewport, parsePassKey } from "./viewmodel";
+import type { PassKey } from "../ipc";
 
 const FALLBACK_BORDER = "#2E2E34";
 const FALLBACK_PANEL = "#1F1F23";
@@ -17,7 +18,7 @@ export function cssColor(rgba: number): string {
 }
 
 export type PreviewPass = {
-  color: number | null;
+  key: PassKey;
   nodeIds: number[];
   /** Each shape's first world-space point from the plan, parallel to nodeIds. */
   starts: ([number, number] | null)[];
@@ -73,7 +74,10 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     const vpM = new DOMMatrix([vp.scale, 0, 0, vp.scale, vp.tx, vp.ty]);
     passes.forEach((pass) => {
-      const color = pass.color !== null ? cssColor(pass.color) : text;
+      // A pass with no colour to draw in — the colourless pass, the single pass, or a
+      // preset-keyed one — keeps the text colour it always had.
+      const parsed = parsePassKey(pass.key);
+      const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : text;
       for (const nodeId of pass.nodeIds) {
         const node = nodesById.get(nodeId);
         if (!node) continue;
@@ -116,7 +120,10 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     // Badges and clip markers draw in screen space — a badge that scaled with the
     // fit is exactly the illegibility this viewport exists to remove.
     passes.forEach((pass, passIndex) => {
-      const color = pass.color !== null ? cssColor(pass.color) : text;
+      // A pass with no colour to draw in — the colourless pass, the single pass, or a
+      // preset-keyed one — keeps the text colour it always had.
+      const parsed = parsePassKey(pass.key);
+      const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : text;
       pass.nodeIds.forEach((nodeId, shapeIndex) => {
         const node = nodesById.get(nodeId);
         if (!node) return;
@@ -159,5 +166,22 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     ctx.setLineDash([]);
   }, [scene, artboard, passes, travel]);
 
-  return <canvas ref={canvasRef} width={400} height={300} style={{ background: "var(--workspace)" }} />;
+  // A canvas has no accessible name of its own, and this one carries the answer to "what is about
+  // to be cut" — so it says what it drew: the passes that will run and the moves between them.
+  // Counted from the same two arrays the effect above draws, so the sentence cannot drift from
+  // the picture.
+  const cutting = passes.filter((p) => p.enabled).length;
+  const label =
+    `Cut preview: ${cutting} ${cutting === 1 ? "pass" : "passes"}, ` +
+    `${travel.length} travel ${travel.length === 1 ? "move" : "moves"}`;
+  return (
+    <canvas
+      ref={canvasRef}
+      role="img"
+      aria-label={label}
+      width={400}
+      height={300}
+      style={{ background: "var(--workspace)" }}
+    />
+  );
 }

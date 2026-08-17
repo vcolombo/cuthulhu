@@ -5,9 +5,11 @@ import { test, expect } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut" };
+  type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
+  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
+  type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -31,10 +33,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   const freshDoc = (): Doc => {
     const rootId = nextId++;
     return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut" } },
+      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } } },
       root: rootId,
       artboard: { x: 0, y: 0, w: 330, h: 3000 },
-      machine: null,
+      // Presets are machine-scoped, so a test that needs the Material control to offer anything
+      // has to name a machine: App reads the list for the document's machine.
+      machine: opts?.seedMachine
+        ? { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 }
+        : null,
     };
   };
   let doc = freshDoc();
@@ -52,6 +58,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       style: { stroke: 0xff0000ff, fill: null },
       children: [],
       cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
     };
     const greenId = nextId++;
     doc.nodes[greenId] = {
@@ -61,6 +68,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       style: { stroke: 0x00ff00ff, fill: null },
       children: [],
       cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, greenId);
   }
@@ -81,7 +89,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // Same test-only override as `a.stroke`: no UI control sets cuttability at creation, so
       // this is the only way to seed a NoCut shape without going through set_cut_line_type.
       const cutLineType = a.cut_line_type !== undefined ? (a.cut_line_type as "Cut" | "NoCut") : "Cut";
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType };
+      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType, material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -92,7 +100,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
       if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return {};
     },
@@ -133,6 +141,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }
       return {};
     },
+    // Mirrors commands::set_material_preset: writes the selection and nothing else, because a
+    // material inherits and the planner resolves it. Descending here would be the bug the real
+    // command was written to avoid.
+    set_material_preset: (a) => {
+      const value = a.value as PresetAssignment;
+      const ids = a.ids as number[];
+      if (ids.length === 0) throw new Error("set_material_preset: EmptySelection");
+      for (const id of ids) {
+        const n = doc.nodes[id];
+        if (!n) throw new Error("set_material_preset: NotFound");
+        n.material_preset = value;
+      }
+      return {};
+    },
     // Four commands the fake has never performed. They used to answer "ok" while leaving
     // `doc` untouched, which is the false green this file exists to avoid: each one edits
     // the document in the real backend, so a plan made before it goes stale and `plan_cut`
@@ -143,7 +165,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     boolean_op: () => unimplemented("boolean_op"),
     import_svg: (a) => {
       const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut" };
+      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
       doc.nodes[a.parent as number].children.push(id);
       return [{}, []];
     },
@@ -272,9 +294,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let listDeviceCalls = 0;
   let nextJobId = 1;
   let jobId: number | null = null;
-  let planPasses: { color: number | null; enabled: boolean }[] = [];
+  let planPasses: { key: string; enabled: boolean }[] = [];
   let failNextResume = false;
   let failNextCut = false;
+  let failNextPlan = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
   // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
   // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
@@ -299,37 +322,49 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     return { code, message };
   }
 
-  function planFromDoc() {
-    // Mirrors crates/cutplan/src/passes.rs's plan_passes: preorder walk, skip Shape leaf
-    // nodes whose CutLineType is NoCut, and key the rest on pass_key — stroke if visible,
-    // else fill, with 0-alpha counting as absent in both — in first-seen order. A shape
-    // with no visible paint keys on null, which is a colour the pass list carries.
-    const byColor = new Map<number | null, { color: number | null; node_ids: number[] }>();
+  function planFromDoc(grouping: Grouping = "Color") {
+    // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
+    // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
+    // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
+    // absent), the resolved material, or `all` for one pass. Absence is its own token
+    // (`no-color`, `no-preset`) because a preset id may be any string, so a preset called
+    // `none` must not write what no preset at all writes.
+    const byKey = new Map<string, { key: string; node_ids: number[] }>();
     let skipped = 0;
-    const walk = (id: number) => {
+    const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
+    const colorKey = (n: Node) => {
+      const stroke = visible(n.style.stroke);
+      const fill = visible(n.style.fill);
+      const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
+      return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
+    };
+    const walk = (id: number, inherited: string | null) => {
       const n = doc.nodes[id];
       if (!n) return;
+      const a = n.material_preset;
+      const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
       const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
       if (isShape) {
         if (n.cut_line_type === "NoCut") {
           skipped++;
         } else {
-          const key = ((n.style.stroke ?? 0) & 0xff) !== 0 ? n.style.stroke
-            : ((n.style.fill ?? 0) & 0xff) !== 0 ? n.style.fill
-            : null;
-          const existing = byColor.get(key);
+          const key =
+            grouping === "Single" ? "all"
+            : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
+            : colorKey(n);
+          const existing = byKey.get(key);
           if (existing) existing.node_ids.push(id);
-          else byColor.set(key, { color: key, node_ids: [id] });
+          else byKey.set(key, { key, node_ids: [id] });
         }
       }
-      for (const c of n.children) walk(c);
+      for (const c of n.children) walk(c, material);
     };
-    walk(doc.root);
+    walk(doc.root, null);
     // starts is all-null on purpose: the fake carries no geometry to flatten, and null
     // is the real backend's no-outline case — so e2e renders exercise the preview's
     // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
-    const passes = [...byColor.values()].map((p) => ({
-      color: p.color,
+    const passes = [...byKey.values()].map((p) => ({
+      key: p.key,
       shape_count: p.node_ids.length,
       node_ids: p.node_ids,
       starts: p.node_ids.map(() => null),
@@ -338,7 +373,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
     // bumped per command diverges on that, and silently goes stale-blind for any
     // command that mutates `doc` and forgets to bump (commit_transform did).
-    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel: [] as [number, number, number, number][] };
+    // Travel by the same rule `travel_for_order` uses below - one segment per adjacent pair of
+    // passes to be cut - because the real `plan_cut` returns the travel for the order it just
+    // planned, and a fake that plans passes but never any travel between them cannot show a
+    // preview going empty. Every pass a fresh plan produces is enabled.
+    const travel = passes.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel };
   }
 
   // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
@@ -457,30 +497,59 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return status;
     },
     get_connected_device: () => connected,
-    plan_cut: () => {
+    plan_cut: (a) => {
+      // A planner that refuses is an ordinary outcome — a font that will not resolve, a shape
+      // with no outline — and the dialog has to survive one without lying about what it will
+      // cut next.
+      if (failNextPlan) {
+        failNextPlan = false;
+        throw ipcError("plan_error", "shape #2: no fonts are installed on this system");
+      }
       // Answered from the document as it is *now*, like the real command, then parked if
       // the test has armed the hold: which of a replan and an older reorder settles first
       // is the whole subject of the race test, and a timing race cannot state it.
-      const plan = planFromDoc();
+      const plan = planFromDoc(a.grouping as Grouping);
       if (!holding) return plan;
       return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
     },
     // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
-    // refusal, then synthetic segments (one per adjacent pair, x encoding the position in
-    // the order). Received orders are recorded on `window.__travelOrders` so a test can
-    // assert what the dialog asked for — travel itself lands on a canvas Playwright
-    // cannot read.
+    // refusal, the same exact-once identity check over the requested keys, then synthetic
+    // segments (one per adjacent pair of *enabled* passes, x encoding the position in the
+    // order) — the real command does not route the head to a pass that will not be cut.
+    // Received lists are recorded on `window.__travelRequests` so a test can assert what the
+    // dialog asked for; travel itself lands on a canvas Playwright cannot read.
     travel_for_order: (a) => {
-      const passes = a.passes as { color: number | null; enabled: boolean }[];
-      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests ??= [];
-      (window as unknown as { __travelRequests: typeof passes[] }).__travelRequests.push(passes);
-      // Decided against the document at call time, like the real command — a request
-      // issued before a replan is stale even if it settles after one.
-      const stale = planFromDoc().doc_revision !== a.docRevision;
+      const passes = a.passes as { key: string; enabled: boolean }[];
+      const grouping = a.grouping as Grouping;
+      // The page's own hook object, which only this fake and the tests reading it touch. Named
+      // rather than cast inline at each use: `window` genuinely has no type for a property the
+      // test harness invents, and one reason beats two identical assertions.
+      const hooks = window as unknown as { __travelRequests?: typeof passes[] };
+      hooks.__travelRequests ??= [];
+      hooks.__travelRequests.push(passes);
       const settle = () => {
-        if (stale) throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-        // One segment between each pair of *cut* passes, mirroring the real command
-        // skipping the head-travel to a pass that will not be cut.
+        // Decided at settle time, like the real command — a request issued before a replan is
+        // stale even if it settles after one.
+        const plan = planFromDoc(grouping);
+        if (plan.doc_revision !== a.docRevision) {
+          throw ipcError("stale_plan", "document changed since the cut was planned; replan");
+        }
+        // The list must name each planned pass exactly once. Without this the fake accepts
+        // rows from a previous grouping and the suite stays green on a frontend that cannot
+        // work — which is the whole reason the dialog installs a plan atomically.
+        const remaining = plan.passes.map((p) => p.key);
+        for (const pass of passes) {
+          const i = remaining.indexOf(pass.key);
+          if (i === -1) {
+            throw plan.passes.some((p) => p.key === pass.key)
+              ? ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
+              : ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+          }
+          remaining.splice(i, 1);
+        }
+        if (remaining.length > 0) {
+          throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
+        }
         const cut = passes.filter((p) => p.enabled);
         return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
       };
@@ -490,17 +559,36 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }));
     },
     cut: (a) => {
-      const request = a.request as { device_instance_id: string; doc_revision: string; passes: { color: number | null; enabled: boolean }[] };
+      const request = a.request as { device_instance_id: string; doc_revision: string;
+        grouping: Grouping; passes: { key: string; enabled: boolean }[] };
       if (!connected) throw ipcError("not_connected", "no device connected");
       if (connected.instance_id !== request.device_instance_id) {
         throw ipcError("device_mismatch", "connected device changed since planning");
       }
-      const plan = planFromDoc();
+      const plan = planFromDoc(request.grouping);
       if (plan.doc_revision !== request.doc_revision) {
         throw ipcError("stale_plan", "document changed since the cut was planned; replan");
       }
       if (doc.machine && doc.machine.id !== connected.machine_id) {
         throw ipcError("machine_mismatch", "document is set up for a different machine");
+      }
+      // A key this plan does not have is refused here too, so rows from a previous grouping
+      // cannot cut the wrong shapes just because the fake was more forgiving than Rust.
+      for (const pass of request.passes) {
+        if (!plan.passes.some((p) => p.key === pass.key)) {
+          throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
+        }
+        // And a preset this machine cannot offer is refused rather than cut with defaults,
+        // mirroring prepare_cut. `list_presets` answers empty here, so any named preset is
+        // unavailable — which is the state the real refusal exists for.
+        const named = (pass as { preset_id?: string | null }).preset_id;
+        // Explicit rather than truthy: an empty id is a named preset too, and `&& named` would
+        // wave it through — the fake being more permissive than Rust is the false green this
+        // whole mirror exists to avoid.
+        if (pass.enabled && named !== undefined && named !== null) {
+          throw ipcError("unknown_preset",
+            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
+        }
       }
       planPasses = request.passes;
       jobId = nextJobId++;
@@ -578,6 +666,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     // Same, for a fault during the first pass of the next cut.
+    __test_fail_next_plan: () => {
+      failNextPlan = true;
+      return {};
+    },
     __test_fail_next_cut: () => {
       failNextCut = true;
       return null;
@@ -589,7 +681,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       return null;
     },
-    list_presets: () => [],
+    // One preset, so the properties panel's Material control has something to offer and the
+    // preset-grouping path is reachable through the UI. The fake owns no preset file, so any
+    // named preset is unavailable at cut time — which is the state `prepare_cut`'s refusal
+    // exists for, and what the cut handler below mirrors.
+    list_presets: () => [
+      { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+        settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
+    ],
     // Deliberately one constant, not a per-machine table: that mapping is pinned in
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
@@ -725,6 +824,232 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
+// The operator-facing half of #148: the picker, the replan it triggers, and a row named for
+// what it holds rather than for a colour it does not have. Nothing else in this suite selects a
+// grouping, so a picker wired to a mode the backend ignores would leave every other test green.
+test("changing the grouping replans and renames the passes", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByText("Every cut shape")).toBeVisible();
+
+  // And back again: switching modes replans each time rather than keeping the first answer.
+  await page.getByLabel("Group passes by").selectOption("Stroke");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+});
+
+// The race the dialog's installed-plan state exists to prevent: while a replan is parked, the
+// rows on screen still belong to the previous grouping, and sending them under the new one
+// would cut whatever that mode happens to key the same way. Cut has to be unavailable until
+// the new plan lands — a fact only a held reply can state.
+test("a cut cannot be sent with rows from the previous grouping", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  // Still showing the old mode's rows, which is exactly why Cut is unavailable.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// Greptile's P1 on this PR, with its own Playwright repro: a replan that fails leaves the previous
+// plan installed and cuttable, and the picker goes back to its mode - but travel was cleared on the
+// way out and nothing brought it back. The operator was then offered a cut whose preview showed no
+// travel at all, while the cut itself would travel exactly as before. The preview's accessible name
+// is what makes the two states tellable apart from outside.
+test("a rejected replan keeps the travel it was showing", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  // Two passes means one move between them - the travel this test is about.
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // The plan failed, so the previous one is still in force: same rows, same mode, still cuttable.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // ...and the preview still describes the arrangement that cut would use.
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+});
+
+// Codex's finding on the first fix for the test above: restoring travel from a value captured when
+// the replan started only works for one replan. A second replan beginning *while* the first is still
+// out captures the already-cleared travel and restores that empty value on failure - so the preview
+// went empty anyway, while the plan that was never replaced stayed installed and cuttable. Travel
+// now lives in the installed plan, so a failure has nothing to restore and cannot lose it.
+//
+// The picker is disabled during a replan, so the two overlapping replans arrive the way an operator
+// would actually produce them: through the stale-plan banner, whose Replan is deliberately still
+// pressable - the banner is how a wedged plan gets unwedged, and a second press must not make
+// things worse than the first.
+test("a replan failing while another is parked keeps the installed plan's travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // Stale the plan so the banner - and its Replan - are on screen.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+      "commit_transform",
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+    ),
+  );
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+
+  // First Replan is parked in flight: the window in which travel used to be cleared.
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByRole("button", { name: "Replan" }).click();
+
+  // Second Replan, pressed inside that window, fails at once - `failNextPlan` is read before the
+  // hold. Under the old design its rollback value was the cleared travel, not the installed one.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByRole("button", { name: "Replan" }).click();
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+
+  // Nothing was ever replaced, so the original plan is still the installed one - and the preview
+  // must still describe it rather than showing a cut with no travel at all.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // The parked reply lands last and is superseded, so it changes nothing either.
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+});
+
+// Codex's finding on the fix above, and the other half of it: moving travel into the plan removed
+// the need to orphan pending travel when a replan *starts*, and leaving that bump in place turned it
+// into the bug. A row edit's travel reply, orphaned on the way out of a replan that then fails, never
+// lands - and the plan keeps the edited rows, so one enabled pass is left showing the travel of two,
+// permanently. Orphaning belongs at installation, which is the one moment the rows a reply was
+// computed for stop being the rows on screen.
+test("a travel reply owed to a row edit still lands when a replan fails", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+
+  // Disable a pass and park the travel reply it asks for: one pass left to cut means no travel
+  // between passes, which is the answer this plan is owed.
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move");
+
+  // Now a replan fails. The edited rows stay installed - so the parked reply is still the right
+  // answer for them, and discarding it would leave the count above standing for good.
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  await page.evaluate(() => (window as unknown as { __releaseTravel: () => void }).__releaseTravel());
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+});
+
+// The whole material path through the real UI: the panel assigns a preset, preset grouping keys
+// the pass on it, the row carries that preset's id, and the cut is refused because this machine
+// cannot offer it. Nothing else drives preset grouping end to end, and without this the fake's
+// `unknown_preset` branch could be deleted with every test still green — which is exactly the
+// false green the fake's strictness exists to prevent.
+test("a pass grouped by a material this machine cannot offer is refused, not cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+
+  await page.getByTestId("layer-row").first().click();
+  await expect(page.getByLabel("Material preset")).toBeVisible();
+  await page.getByLabel("Material preset").selectOption("preset:cameo5-htv");
+  // The row's readout, not the option that was just picked: this is what tells an operator which
+  // material the blade will be set for.
+  await expect(page.getByLabel("Material preset")).toHaveValue("preset:cameo5-htv");
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Group passes by").selectOption("Preset");
+  // One pass for the assigned material, one for everything that resolves to none.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByTestId("cut-pass-row").first()).toContainText("HTV");
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText(/not available for this machine/)).toBeVisible();
+});
+
+// Greptile's P1 on the fifth push: a replan that *fails* leaves the previous plan in force —
+// rows, revision and mode — but the picker had already moved to the mode nobody managed to plan.
+// Cut then sent the old grouping while the operator read the new one off the screen. Nothing
+// miscuts, which is what makes it worth a test: the lie is only visible on the dialog.
+test("a grouping whose plan fails does not stay on the picker", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // The refusal is reported, the previous plan is still what would be cut, and the picker says
+  // so rather than advertising the mode that failed.
+  await expect(page.getByText(/no fonts are installed/)).toBeVisible();
+  await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+});
+
+// Greptile's P1 on PR #152, reproduced with a held reply: while a replacement plan is in flight
+// the rows on screen still belong to the previous grouping, so an edit accepted there is
+// discarded when the new plan installs — silently, with the operator's speed still on screen
+// until it vanishes. Every row control is unavailable in that window.
+test("row controls are unavailable while a replacement plan is in flight", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
+
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Group passes by").selectOption("Single");
+
+  // Still the old mode's two rows, and not one of their controls will take an edit.
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  await expect(page.getByLabel("Speed for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Force for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Repeat count for pass 1")).toBeDisabled();
+  await expect(page.getByLabel("Preset for pass 1")).toBeDisabled();
+  await expect(page.getByRole("checkbox", { name: "Enabled" }).first()).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Down" }).first()).toBeDisabled();
+
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
+  await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
+});
+
 // The whole operator-facing round trip: the properties panel's control, the real
 // set_cut_line_type command, and the plan that then leaves the shape out. Nothing else in this
 // suite reads the dialog's not-cut line, so a readout wired to a renamed field would render an
@@ -810,11 +1135,11 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
 
   // The wire is the contract under test: the replan request names the swapped order.
   const requests = await page.evaluate(
-    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
   );
   expect(requests).toEqual([[
-    { color: 0x00ff00ff, enabled: true },
-    { color: 0xff0000ff, enabled: true },
+    { key: "color:00ff00ff", enabled: true },
+    { key: "color:ff0000ff", enabled: true },
   ]]);
 });
 
@@ -829,13 +1154,13 @@ test("disabling a pass replans travel without it", async ({ page }) => {
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
 
   const requests = await page.evaluate(
-    () => (window as unknown as { __travelRequests?: { color: number | null; enabled: boolean }[][] }).__travelRequests,
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
   );
   // Both passes still named — the disabled one is dropped from the travel by the planner,
   // not from the list, so a pass going missing stays distinguishable from a frontend bug.
   expect(requests).toEqual([[
-    { color: 0xff0000ff, enabled: false },
-    { color: 0x00ff00ff, enabled: true },
+    { key: "color:ff0000ff", enabled: false },
+    { key: "color:00ff00ff", enabled: true },
   ]]);
 });
 
@@ -878,15 +1203,18 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(banner).toBeVisible();
 
-  // Replan is in flight (held) when the pass moves, so the move is sent with the revision
-  // the fresh plan is about to replace.
+  // The interleaving, without editing a row during a replan — which the dialog now refuses,
+  // because rows belonging to a plan being replaced must not accept edits the arriving plan
+  // discards. The reorder goes out *first* and is held, which is what the defect's own story
+  // says anyway: "a reorder issued before Replan carries the old revision".
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
-  await page.getByRole("button", { name: "Replan" }).click();
   await page.getByRole("button", { name: "Down" }).first().click();
+  await page.getByRole("button", { name: "Replan" }).click();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<unknown> }).__releasePlans());
   await expect(banner).toHaveCount(0);
 
+  // The late refusal for the revision the fresh plan replaced must not re-raise the banner.
   await page.evaluate(() => (window as unknown as { __releaseTravel: () => Promise<unknown> }).__releaseTravel());
   await expect(banner).toHaveCount(0);
 });

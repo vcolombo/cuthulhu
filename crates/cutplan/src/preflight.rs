@@ -2,10 +2,10 @@
 use driver_core::{MachineProfile, MachineCaps, Settings};
 use document::NodeId;
 use geometry::Point;
-use crate::passes::ColorPass;
+use crate::passes::DocumentPass;
 
 pub struct ConfiguredPass<'a> {
-    pub pass: &'a ColorPass,
+    pub pass: &'a DocumentPass,
     pub settings: Settings,
     pub enabled: bool,
 }
@@ -217,6 +217,7 @@ pub fn preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pass_key::PassKey;
     use crate::passes::PlannedShape;
     use geometry::Point;
 
@@ -224,8 +225,8 @@ mod tests {
         Point { x, y }
     }
 
-    fn make_pass(color: Option<u32>, shapes: Vec<PlannedShape>) -> ColorPass {
-        ColorPass { color, shapes }
+    fn make_pass(key: PassKey, shapes: Vec<PlannedShape>) -> DocumentPass {
+        DocumentPass { key, shapes }
     }
 
     fn make_shape(node_id: u64, polylines: Vec<Vec<Point>>) -> PlannedShape {
@@ -235,7 +236,7 @@ mod tests {
         }
     }
 
-    fn make_configured_pass<'a>(pass: &'a ColorPass, settings: Settings, enabled: bool) -> ConfiguredPass<'a> {
+    fn make_configured_pass<'a>(pass: &'a DocumentPass, settings: Settings, enabled: bool) -> ConfiguredPass<'a> {
         ConfiguredPass { pass, settings, enabled }
     }
 
@@ -266,7 +267,7 @@ mod tests {
 
     #[test]
     fn nothing_to_cut_when_all_enabled_passes_empty() {
-        let pass = make_pass(Some(0xFF0000FF), vec![]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::NothingToCut));
@@ -275,7 +276,7 @@ mod tests {
     #[test]
     fn nothing_to_cut_ignores_disabled_passes_with_content() {
         let shape = make_shape(1, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), false)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::NothingToCut));
@@ -284,7 +285,7 @@ mod tests {
     #[test]
     fn non_finite_geometry_detects_nan() {
         let shape = make_shape(1, vec![vec![pt(10.0, 10.0), pt(f64::NAN, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::NonFiniteGeometry(NodeId(1))));
@@ -293,7 +294,7 @@ mod tests {
     #[test]
     fn non_finite_geometry_detects_inf() {
         let shape = make_shape(2, vec![vec![pt(10.0, 10.0), pt(f64::INFINITY, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::NonFiniteGeometry(NodeId(2))));
@@ -302,7 +303,7 @@ mod tests {
     #[test]
     fn degenerate_polyline_single_point() {
         let shape = make_shape(3, vec![vec![pt(10.0, 10.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::DegeneratePolyline(NodeId(3))));
@@ -311,7 +312,7 @@ mod tests {
     #[test]
     fn degenerate_polyline_empty() {
         let shape = make_shape(4, vec![vec![]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::DegeneratePolyline(NodeId(4))));
@@ -323,7 +324,7 @@ mod tests {
         // job with early degenerate polyline + later NaN → NonFiniteGeometry wins
         let shape1 = make_shape(100, vec![vec![pt(10.0, 10.0)]]);  // degenerate: 1 point
         let shape2 = make_shape(101, vec![vec![pt(20.0, 20.0), pt(f64::NAN, 30.0)]]); // has NaN
-        let pass = make_pass(Some(0xFF0000FF), vec![shape1, shape2]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape1, shape2]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(result, Err(PreflightError::NonFiniteGeometry(NodeId(101))));
@@ -332,7 +333,7 @@ mod tests {
     #[test]
     fn out_of_bounds_x_negative() {
         let shape = make_shape(5, vec![vec![pt(-1.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(
@@ -347,7 +348,7 @@ mod tests {
     #[test]
     fn out_of_bounds_x_exceeds_width() {
         let shape = make_shape(6, vec![vec![pt(10.0, 10.0), pt(110.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(
@@ -362,7 +363,7 @@ mod tests {
     #[test]
     fn out_of_bounds_y_negative() {
         let shape = make_shape(7, vec![vec![pt(10.0, -5.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(
@@ -377,7 +378,7 @@ mod tests {
     #[test]
     fn out_of_bounds_y_exceeds_height() {
         let shape = make_shape(8, vec![vec![pt(10.0, 10.0), pt(20.0, 110.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
         assert_eq!(
@@ -392,7 +393,7 @@ mod tests {
     #[test]
     fn allow_out_of_bounds_flag_permits_geometry_outside_bounds() {
         let shape = make_shape(9, vec![vec![pt(-10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, true);
         assert!(result.is_ok());
@@ -401,7 +402,7 @@ mod tests {
     #[test]
     fn repeat_count_below_1_rejected() {
         let shape = make_shape(10, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: None, repeat_count: 0 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
@@ -411,7 +412,7 @@ mod tests {
     #[test]
     fn repeat_count_above_10_rejected() {
         let shape = make_shape(11, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: None, repeat_count: 11 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
@@ -422,7 +423,7 @@ mod tests {
     fn speed_unsupported_by_device_ignored() {
         // Unsupported speed is ignored (drivers skip it); should pass preflight
         let shape = make_shape(12, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: Some(15), force: None, repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
@@ -432,7 +433,7 @@ mod tests {
     #[test]
     fn speed_below_1_rejected() {
         let shape = make_shape(13, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: Some(0), force: None, repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);
@@ -442,7 +443,7 @@ mod tests {
     #[test]
     fn speed_above_30_rejected() {
         let shape = make_shape(14, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: Some(31), force: None, repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);
@@ -453,7 +454,7 @@ mod tests {
     fn force_unsupported_by_device_ignored() {
         // Unsupported force is ignored (drivers skip it); should pass preflight
         let shape = make_shape(15, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: Some(15), repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
@@ -463,7 +464,7 @@ mod tests {
     #[test]
     fn force_below_1_rejected() {
         let shape = make_shape(16, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: Some(0), repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);
@@ -473,7 +474,7 @@ mod tests {
     #[test]
     fn force_above_33_rejected() {
         let shape = make_shape(17, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: Some(34), repeat_count: 1 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);
@@ -483,7 +484,7 @@ mod tests {
     #[test]
     fn machine_mismatch_doc_id_differs() {
         let shape = make_shape(18, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(
             &configured,
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn machine_match_doc_id_same() {
         let shape = make_shape(19, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
         let result = preflight(
             &configured,
@@ -528,7 +529,7 @@ mod tests {
             points.push(pt(x, y));
         }
         let shape = make_shape(20, vec![points]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: None, force: None, repeat_count: 10 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false);
@@ -544,8 +545,8 @@ mod tests {
         for i in 0..500000 {
             points.push(pt((i % 100) as f64, ((i / 100) % 100) as f64));
         }
-        let big = make_pass(Some(0xFF0000FF), vec![make_shape(20, vec![points])]);
-        let tiny = make_pass(Some(0x00FF00FF), vec![make_shape(21, vec![vec![pt(0.0, 0.0); 10]])]);
+        let big = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![make_shape(20, vec![points])]);
+        let tiny = make_pass(PassKey::Color(Some(0x00FF00FF)), vec![make_shape(21, vec![vec![pt(0.0, 0.0); 10]])]);
         let configured = vec![
             make_configured_pass(&big, Settings { speed: None, force: None, repeat_count: 1 }, true),
             make_configured_pass(&tiny, Settings { speed: None, force: None, repeat_count: 10 }, true),
@@ -557,7 +558,7 @@ mod tests {
     #[test]
     fn happy_path_valid_cut() {
         let shape = make_shape(21, vec![vec![pt(10.0, 10.0), pt(20.0, 20.0), pt(30.0, 10.0)]]);
-        let pass = make_pass(Some(0xFF0000FF), vec![shape]);
+        let pass = make_pass(PassKey::Color(Some(0xFF0000FF)), vec![shape]);
         let settings = Settings { speed: Some(15), force: Some(20), repeat_count: 3 };
         let configured = vec![make_configured_pass(&pass, settings, true)];
         let result = preflight(&configured, &profile_100x100(), &caps_with_speed_force(), None, false);

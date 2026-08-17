@@ -11,6 +11,8 @@ import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
+import { effectiveMaterials, selectionAssignment } from "./panels/materialPreset";
+import type { Preset } from "./cut/viewmodel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
 import { TraceDialog } from "./trace/TraceDialog";
@@ -41,6 +43,7 @@ export type DocNode = {
   kind: NodeKindJson;
   transform: Affine6;
   cut_line_type: CutLineTypeJson;
+  material_preset: ipc.PresetAssignmentJson;
   children: number[];
 };
 
@@ -156,6 +159,12 @@ export function App() {
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
   const [status, setStatus] = useState<ipc.CutStatus>(ipc.DISCONNECTED_STATUS);
+  /** The machine's material presets, for the properties panel's control. Loaded here rather
+   *  than in the panel because the document names the machine, and read for the *document's*
+   *  machine rather than the connected one: a preset assigned to a Node is saved in the
+   *  project, so the choice must not depend on which cutter happens to be plugged in. The cut
+   *  dialog keeps its own list for the connected machine, which is what its settings apply to. */
+  const [presets, setPresets] = useState<Preset[]>([]);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
 
@@ -202,6 +211,21 @@ export function App() {
       .then((m) => setMachines(m as MachineProfile[]))
       .catch((e) => setError(ipc.ipcErrorMessage(e)));
   }, [refresh]);
+
+  // Re-read when the document's machine changes, because presets are machine-scoped: a project
+  // converted from a Cameo to a Puma must not keep offering Cameo materials. No machine set
+  // means no list — there is nothing for a preset id to be scoped to yet.
+  const docMachineId = doc?.machine?.id ?? null;
+  useEffect(() => {
+    if (docMachineId === null) {
+      setPresets([]);
+      return;
+    }
+    ipc
+      .listPresets(docMachineId)
+      .then((p) => setPresets(p as Preset[]))
+      .catch((e) => setError(ipc.ipcErrorMessage(e)));
+  }, [docMachineId]);
 
   // Mount-once device-event listener. Every event carries the status that held when it
   // was sent, so keeping the latest is the whole job — no event-kind interpreting, no
@@ -354,6 +378,17 @@ export function App() {
     run(() => ipc.setCutLineType({ ids: selected, value }));
   };
 
+  // The selection's own assignment, and what it resolves to. Both, because `Inherit` alone
+  // does not tell an operator which material the blade will be set for.
+  const materialPreset = doc ? selectionAssignment(doc.nodes, selected) : undefined;
+  const effectiveMaterial =
+    doc && selected.length > 0 ? effectiveMaterials(doc.nodes, doc.root)[selected[0]] ?? null : null;
+
+  const setMaterialPreset = (value: ipc.PresetAssignmentJson) => {
+    if (selected.length === 0) return;
+    run(() => ipc.setMaterialPreset({ ids: selected, value }));
+  };
+
   // A successful boolean op removes the source nodes and adds a result node — selecting
   // the removed ids would error the next transform with NotFound, so read the result id
   // straight out of the returned Delta's Add op and select that instead (or clear
@@ -472,6 +507,10 @@ export function App() {
           onChangeH={(v) => commitScale("h", v)}
           cutLineType={cutLineType}
           onChangeCutLineType={setCutLineType}
+          materialPreset={materialPreset}
+          effectiveMaterial={effectiveMaterial}
+          presets={presets}
+          onChangeMaterialPreset={setMaterialPreset}
         />
       </div>
       <div style={{ gridColumn: "1 / -1" }}>

@@ -164,10 +164,11 @@ mod tests {
     }
 
     /// Refused rather than coerced, and quoting the input: these arrive from a person typing
-    /// `--skip-pass`. `preset:` is refused because an empty tail is the one id that would be
-    /// indistinguishable from a truncated key; `color:none` and `line-type:cut` are refused
-    /// because they are the retired spellings, and accepting them quietly would resurrect the
-    /// collision and a mode that no longer exists.
+    /// `--skip-pass`. `color:none` and `line-type:cut` are refused because they are the retired
+    /// spellings, and accepting them quietly would resurrect a collision and a mode that no
+    /// longer exists. `preset:` is *not* here: it parses as an empty id, because this grammar has
+    /// to be total in both languages and the ways an empty id could mean something are closed
+    /// where they live — assignment, the preset file, and the cut path's own refusal.
     #[test]
     fn a_malformed_key_is_refused_by_name() {
         for bad in ["", "all:1", "color:", "color:zz", "color:ff0000",

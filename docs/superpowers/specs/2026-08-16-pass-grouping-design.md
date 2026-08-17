@@ -109,9 +109,20 @@ is spelled the same way for one rule rather than two, even though an 8-hex-digit
 have collided.
 
 A colour is always 8 hex digits, parsed case-insensitively and written lowercase, so the round trip
-is a fixed point and two spellings of one key cannot both appear in a pass list. An **empty preset
-id is refused** (`preset:` does not parse): the grammar's tail is the id verbatim, so an empty tail
-is the one input that would make two keys indistinguishable from a truncation.
+is a fixed point and two spellings of one key cannot both appear in a pass list.
+
+**`preset:` parses, as an empty id.** The first draft refused it, reasoning that an empty tail was
+ambiguous — true when absence was spelled `preset:none`, and false once absence became its own
+token. Refusing it made the grammar *non-total*: `Display` writes `preset:` for
+`Preset(Some(String::new()))`, which is constructible, so serde could emit a string its own parser
+rejected. Worse, the two languages disagreed about it, and that disagreement fails open: the
+TypeScript mirror dropped the id, the request named no preset, and `prepare_cut` skipped its lookup
+and produced default speed and force where deserialization had previously refused the request.
+
+An empty id is therefore *parsed* everywhere and *rejected everywhere it could mean something*:
+`commands::set_material_preset` refuses to assign one, `presets::load_presets` drops a file entry
+that carries one, and a pass that still reaches `prepare_cut` with one is refused as
+`unknown_preset` like any other id that resolves to nothing.
 
 The representation is `Display`/`FromStr` plus `#[serde(into = "String", try_from = "String")]`, so
 the JSON a DTO carries *is* that string. Three things follow, and they are the reason for choosing
@@ -276,10 +287,13 @@ material's settings unless they re-select it by hand, once per pass. That is the
 the only thing it exists for.
 
 The dialog therefore **initialises a preset-keyed row's `presetId` from its key**. An id that
-resolves to nothing stays on the row rather than being cleared: the request carries it, the row
-shows it unresolved, and `prepare_cut` finds no preset and falls back to the override-or-default
-path it already has. Every other key kind still starts with no preset, because no key kind other
-than `Preset` names one.
+resolves to nothing stays on the row rather than being cleared: the request carries it and the row
+shows it unresolved. **`prepare_cut` then refuses the cut** (`unknown_preset`) rather than falling
+back to the override-or-default path — the first draft said it should fall back, and that was
+wrong. The operator asked for that material's speed and force; a machine-scoped preset disappears
+for ordinary reasons (the project was converted, the entry was deleted), and cutting real material
+with settings unrelated to the pass's own name is what the silence cost. Every other key kind still
+starts with no preset, because no key kind other than `Preset` names one.
 
 ## The mode travels in the payload, with the rows it produced
 

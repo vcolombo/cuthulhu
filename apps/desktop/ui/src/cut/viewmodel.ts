@@ -265,8 +265,10 @@ export function effectiveSettings(
   force: number | null;
   repeatCount: number;
 } {
-  // Find matching preset
-  const preset = p.presetId ? presets.find((pr) => pr.id === p.presetId) : null;
+  // Explicit null, not truthiness: an empty id is a *named* preset, and treating it as absent
+  // showed the operator default speed and force while the cut path resolved the real entry — the
+  // dialog and the machine disagreeing about what the blade would do.
+  const preset = p.presetId !== null ? presets.find((pr) => pr.id === p.presetId) : null;
 
   // Speed: pass override > preset > null
   const speed =

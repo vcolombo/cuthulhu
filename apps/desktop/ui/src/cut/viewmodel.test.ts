@@ -606,3 +606,22 @@ describe("DeviceInfo.host", () => {
     expect(remote.host).toBe("host-1");
   });
 });
+
+describe("effectiveSettings with an empty preset id", () => {
+  // Codex's third gate: an empty id is a *named* preset, and truthiness treated it as absent — so
+  // the dialog showed default speed and force while the cut path resolved the real entry. The
+  // dialog and the machine have to agree about what the blade will do.
+  it("resolves an empty id like any other, rather than showing defaults", () => {
+    const presets = [{ id: "", name: "Nameless", machine_id: "cameo5",
+                       settings: { speed: 7, force: 33, repeat_count: 2 }, builtin: false }];
+    const row: PassVm = { key: "preset:", shapeCount: 1, enabled: true, presetId: "",
+                          speed: null, force: null, repeatCount: null };
+    expect(effectiveSettings(row, presets)).toEqual({ speed: 7, force: 33, repeatCount: 2 });
+  });
+
+  it("still treats a genuinely absent preset as absent", () => {
+    const row: PassVm = { key: "no-preset", shapeCount: 1, enabled: true, presetId: null,
+                          speed: null, force: null, repeatCount: null };
+    expect(effectiveSettings(row, [])).toEqual({ speed: null, force: null, repeatCount: 1 });
+  });
+});

@@ -4,7 +4,7 @@ use geometry::{boolean, ellipse_path, rect_path, text_to_path, Affine, BoolOp, P
 use crate::{node::*, delta::*};
 
 #[derive(Debug, PartialEq)]
-pub enum CmdError { NotFound, EmptySelection, Geometry(String) }
+pub enum CmdError { NotFound, EmptySelection, Geometry(String), EmptyPresetId }
 
 /// Build a delta that appends a new primitive under `parent`. Mints the id from `ids`.
 pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result<Delta, CmdError> {
@@ -91,6 +91,12 @@ pub fn set_cut_line_type(doc: &Document, ids: &[NodeId], value: CutLineType)
 pub fn set_material_preset(doc: &Document, ids: &[NodeId], value: PresetAssignment)
     -> Result<Delta, CmdError> {
     if ids.is_empty() { return Err(CmdError::EmptySelection); }
+    // An empty id names no material. `PassKey` parses `preset:` so that its grammar is total in
+    // both languages, which means such an assignment would reach the cut path and be refused
+    // there; refusing it at the edit is where an operator can still act on it.
+    if matches!(&value, PresetAssignment::Preset(id) if id.is_empty()) {
+        return Err(CmdError::EmptyPresetId);
+    }
     let mut ops = vec![];
     let mut seen = HashSet::new();
     for &id in ids {
@@ -715,6 +721,27 @@ mod tests {
         let d = set_material_preset(&doc, &[shape_id], PresetAssignment::Inherit).unwrap();
         doc.apply(d);
         assert_eq!(doc.get(shape_id).unwrap().material_preset, PresetAssignment::Inherit);
+    }
+
+    /// An empty id names no material, so it is refused at the edit rather than at the cut.
+    /// Codex found the path this closes: `PassKey` parses `preset:` (its grammar has to be total
+    /// in both languages), so an empty assignment would key a pass, the row would carry an empty
+    /// preset id, and `prepare_cut` would refuse it — correct, but only after the operator had
+    /// already committed the edit and pressed Cut.
+    #[test]
+    fn set_material_preset_refuses_an_empty_id() {
+        let mut doc = Document::new();
+        let shape = Node::shape(doc.ids.next(), ShapeKind::Rect { w: 1.0, h: 1.0 });
+        let shape_id = shape.id;
+        doc.apply(Delta(vec![NodeOp::Add { parent: doc.root, node: shape, index: usize::MAX }]));
+
+        assert_eq!(
+            set_material_preset(&doc, &[shape_id], PresetAssignment::Preset(String::new())),
+            Err(CmdError::EmptyPresetId)
+        );
+        // ...and a real id still lands.
+        assert!(set_material_preset(&doc, &[shape_id],
+            PresetAssignment::Preset("cameo5-htv".into())).is_ok());
     }
 
     /// Re-picking the value a selection already has emits nothing, so it cannot land an undo

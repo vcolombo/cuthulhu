@@ -480,6 +480,15 @@ describe("parsePassKey", () => {
     expect(parsePassKey(key as string)).toEqual(expected);
   });
 
+  // Codex's blocking finding on the gate re-run: Rust's parser accepts `preset:`, and a mirror
+  // that refused it turned a preset-keyed row into an unkeyed one — the request then carried no
+  // preset and the cut used default speed and force instead of being refused. The two grammars
+  // agree, so the refusal fires.
+  it("parses an empty preset id, as the Rust grammar does", () => {
+    expect(parsePassKey("preset:")).toEqual({ kind: "preset", presetId: "" });
+    expect(presetIdForKey("preset:")).toBe("");
+  });
+
   it("keeps a colon inside a preset id", () => {
     expect(parsePassKey("preset:vinyl:thin")).toEqual({ kind: "preset", presetId: "vinyl:thin" });
   });
@@ -496,7 +505,6 @@ describe("parsePassKey", () => {
   // worse than one showing a string nobody recognises.
   it("returns the raw key it cannot parse", () => {
     expect(parsePassKey("line-type:cut")).toEqual({ kind: "unknown", raw: "line-type:cut" });
-    expect(parsePassKey("preset:")).toEqual({ kind: "unknown", raw: "preset:" });
     expect(parsePassKey("color:ff0000")).toEqual({ kind: "unknown", raw: "color:ff0000" });
   });
 });

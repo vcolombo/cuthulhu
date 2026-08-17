@@ -1600,6 +1600,33 @@ mod tests {
         assert!(err.message.contains("deleted-by-hand"), "names the preset it cannot find: {}", err.message);
     }
 
+    /// The fail-open Codex found on the gate re-run, from the other end: a pass keyed `preset:`
+    /// carries an *empty* preset id, and an empty id resolves to no preset. The refusal has to
+    /// fire — before this, the TypeScript mirror dropped the id, the request named no preset at
+    /// all, and `prepare_cut` skipped its lookup and produced default speed and force.
+    #[test]
+    fn a_pass_keyed_on_an_empty_preset_id_is_refused_not_defaulted() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0);
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                // What the dialog sends for a `preset:` row now that both grammars parse it.
+                key: PassKey::Preset(Some(String::new())),
+                enabled: true,
+                preset_id: Some(String::new()),
+                speed: None, force: None, repeat_count: None }],
+        };
+        let err = dev.prepare_cut(&app, request).unwrap_err();
+        assert_eq!(err.code, "unknown_preset",
+            "an empty id names no material, so the cut is refused rather than defaulted");
+    }
+
     /// A preset belonging to another cutter is not this cut's preset. Greptile's P1 on the third
     /// push: `load_presets` returns every machine's entries, and while builtin ids are
     /// machine-prefixed, a *user* preset's id is the operator's own string — so a Puma entry

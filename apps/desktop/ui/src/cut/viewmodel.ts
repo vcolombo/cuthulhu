@@ -182,9 +182,12 @@ export function parsePassKey(key: PassKey): ParsedPassKey {
     if (/^[0-9a-fA-F]{8}$/.test(value)) return { kind: "color", color: parseInt(value, 16) };
     return { kind: "unknown", raw: key };
   }
-  // An empty id is refused for the same reason the Rust grammar refuses it: it is the one
-  // tail that would make two keys indistinguishable from a truncation.
-  if (mode === "preset" && value !== "") return { kind: "preset", presetId: value };
+  // An empty id parses, because `cutplan::PassKey`'s parser accepts it and the two grammars have
+  // to agree: rejecting it here turned a preset-keyed row into an unkeyed one, `presetIdForKey`
+  // returned null, the request carried no preset, and `prepare_cut` skipped its lookup and cut
+  // with default speed and force. A grammar that fails open on a knife is worse than one that
+  // accepts a silly id and lets the refusal fire.
+  if (mode === "preset") return { kind: "preset", presetId: value };
   return { kind: "unknown", raw: key };
 }
 

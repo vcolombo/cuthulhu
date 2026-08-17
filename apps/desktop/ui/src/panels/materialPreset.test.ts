@@ -102,3 +102,20 @@ describe("effective material across a selection", () => {
     expect(distinct.size).toBe(2);
   });
 });
+
+describe("a preset called mixed", () => {
+  // Greptile's P1 on the fourth push, and the same class as the pass-key grammar's `preset:none`
+  // collision: a preset id is the operator's own string, so the "these disagree" marker must not
+  // live inside the same namespace. Tagged out of band, one value cannot be read as the other.
+  it("resolves like any other id, distinct from the mixed marker", () => {
+    const nodes = {
+      "1": layer(1, { state: "preset", id: "mixed" }, [2]),
+      "2": shape(2, INHERIT),
+    };
+    expect(effectiveMaterials(nodes, 1)[2]).toBe("mixed");
+    // The union keeps them apart: this is `{kind:"one", id:"mixed"}`, never `{kind:"mixed"}`.
+    const distinct = new Set([2].map((id) => effectiveMaterials(nodes, 1)[id] ?? null));
+    expect(distinct.size).toBe(1);
+    expect([...distinct][0]).toBe("mixed");
+  });
+});

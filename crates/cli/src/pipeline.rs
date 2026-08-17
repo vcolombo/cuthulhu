@@ -86,7 +86,14 @@ pub fn pass_order(
     let mut front = vec![];
     for key in order.iter().map(parse).collect::<Result<Vec<_>, _>>()? {
         let Some(i) = keys.iter().position(|k| *k == key) else {
-            return Err(format!("--order names {key}, which is not a pass this file plans"));
+            // A key already moved to the front is a repeat, not an unknown pass — the same
+            // distinction `travel_for_order` draws, and for the same reason: "not a pass this
+            // file plans" is a lie about a pass that plainly is.
+            return Err(if front.contains(&key) {
+                format!("--order names {key} twice; each pass can only be ordered once")
+            } else {
+                format!("--order names {key}, which is not a pass this file plans")
+            });
         };
         front.push(keys.remove(i));
     }
@@ -360,6 +367,18 @@ mod tests {
 
         let err = pass_order(&planned.passes, &["preset:cameo5-htv".into()], &[]).unwrap_err();
         assert!(err.contains("preset:cameo5-htv"), "{err}");
+    }
+
+    /// Naming one pass twice is a repeat, not an unknown pass. Copilot's point on PR #152:
+    /// "not a pass this file plans" is a lie about a pass that plainly is, and the operator
+    /// cannot tell a typo from a duplicate if both say the same thing.
+    #[test]
+    fn ordering_the_same_pass_twice_says_so() {
+        let planned = planned_two_colours();
+        let err = pass_order(&planned.passes, &[],
+            &["color:ff0000ff".into(), "color:ff0000ff".into()]).unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+        assert!(err.contains("color:ff0000ff"), "{err}");
     }
 
     /// A malformed key is `PassKey`'s own error, surfaced unchanged: one grammar means one

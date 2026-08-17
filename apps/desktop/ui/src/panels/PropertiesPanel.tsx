@@ -5,15 +5,18 @@ import type { PresetAssignmentJson } from "../ipc";
 import type { Preset } from "../cut/viewmodel";
 import { NumberField } from "./NumberField";
 
+/** What a selection's material resolves to: one value — an id, or `null` for no material — or
+ *  more than one, when the selected Nodes inherit from ancestors that disagree. Tagged rather
+ *  than a reserved string, because a preset id is the operator's own and one called `mixed`
+ *  would collide with the marker. */
+export type EffectiveMaterial = { kind: "one"; id: string | null } | { kind: "mixed" };
+
 type Props = {
   bounds: Bounds | null;
   cutLineType: CutLineTypeJson | "mixed" | null;
   /** The selection's own assignment; `undefined` when there is no selection. */
   materialPreset: PresetAssignmentJson | "mixed" | undefined;
-  /** What that selection resolves to: an id, `null` for "no material", or `"mixed"` when the
-   *  selected Nodes inherit from ancestors that disagree. Distinct from a preset id, which is
-   *  why it is a literal and not a widened string. */
-  effectiveMaterial: string | null | "mixed";
+  effectiveMaterial: EffectiveMaterial;
   presets: Preset[];
   onChangeX: (v: number) => void;
   onChangeY: (v: number) => void;
@@ -27,7 +30,7 @@ type Props = {
  *  "inherit" alone does not tell an operator which material the blade will be set for. */
 function materialLabel(
   assignment: PresetAssignmentJson | "mixed",
-  effective: string | null | "mixed",
+  effective: EffectiveMaterial,
   presets: Preset[],
 ): string {
   const name = (id: string) => presets.find((p) => p.id === id)?.name ?? `Unresolved (${id})`;
@@ -36,9 +39,9 @@ function materialLabel(
     case "preset": return name(assignment.id);
     case "unassigned": return "No preset";
     case "inherit":
-      return effective === "mixed" ? "Inherited — Mixed"
-           : effective === null ? "Inherited — No preset"
-           : `Inherited — ${name(effective)}`;
+      return effective.kind === "mixed" ? "Inherited — Mixed"
+           : effective.id === null ? "Inherited — No preset"
+           : `Inherited — ${name(effective.id)}`;
   }
 }
 

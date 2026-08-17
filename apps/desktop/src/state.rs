@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::Path;
-use document::{commands, CmdError, CutLineType, Delta, Editor, MachineProfile, NodeId, ShapeKind};
+use document::{CmdError, CutLineType, Delta, Editor, MachineProfile, NodeId, PresetAssignment, ShapeKind, commands};
 use fileio::IoError;
 use geometry::{Affine, BoolOp};
 
@@ -68,6 +68,15 @@ impl AppState {
         let d = commands::set_cut_line_type(&self.editor.doc, &ids, value)?;
         // An empty delta is a no-op the operator asked for; committing it would clear the
         // redo stack and add an undo step that does nothing.
+        if d.0.is_empty() { return Ok(d); }
+        Ok(self.editor.commit(d))
+    }
+
+    pub fn set_material_preset(&mut self, ids: Vec<NodeId>, value: PresetAssignment)
+        -> Result<Delta, CmdError> {
+        let d = commands::set_material_preset(&self.editor.doc, &ids, value)?;
+        // Same rule as `set_cut_line_type`: an empty delta is a no-op the operator asked for,
+        // and committing it would clear the redo stack and add an undo step that does nothing.
         if d.0.is_empty() { return Ok(d); }
         Ok(self.editor.commit(d))
     }

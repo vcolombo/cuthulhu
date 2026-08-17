@@ -8,7 +8,7 @@ use cutplan::presets::{
     default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
     SettingsOverride,
 };
-use cutplan::{plan_cut, plan_passes, ColorPass, CutError, PassSelection, PlanOptions};
+use cutplan::{plan_cut, plan_passes_with, DocumentPass, CutError, Grouping, PassKey, PassSelection, PlanOptions};
 use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
 use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, HostId, MachineCaps};
 use serde::{Deserialize, Serialize};
@@ -51,12 +51,16 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
 pub struct CutRequest {
     pub device_instance_id: String,
     pub doc_revision: String,
+    /// How the dialog grouped the passes it is naming. Sent rather than remembered: the plan,
+    /// the travel and the cut are three round trips, and a mode kept in `AppState` could be
+    /// changed between them while the stale-plan check only guards the document.
+    pub grouping: Grouping,
     pub passes: Vec<ConfiguredPassDto>,
 }
 
 #[derive(Deserialize)]
 pub struct ConfiguredPassDto {
-    pub color: Option<u32>,
+    pub key: PassKey,
     pub enabled: bool,
     pub preset_id: Option<String>,
     pub speed: Option<u32>,
@@ -855,7 +859,7 @@ impl DeviceManagerHandle {
                     force: dto.force,
                     repeat_count: dto.repeat_count,
                 };
-                PassSelection { color: dto.color, settings: resolve_settings(preset, &override_) }
+                PassSelection { key: dto.key.clone(), settings: resolve_settings(preset, &override_) }
             })
             .collect();
 
@@ -868,7 +872,7 @@ impl DeviceManagerHandle {
 
         // Planned here, at cut time, against the live document — `expect_revision`
         // is what refuses the cut if that is no longer the document the UI planned.
-        let planned = plan_passes(&app.editor.doc)
+        let planned = plan_passes_with(&app.editor.doc, request.grouping)
             .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
         let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
         Ok((connected, plan.cut_passes()))
@@ -1110,7 +1114,10 @@ pub struct PlanCutResponse {
 
 #[derive(Debug, Serialize)]
 pub struct PlanCutPassSummary {
-    pub color: Option<u32>,
+    /// The pass's key, as the canonical string the dialog keys its rows on and sends back. A
+    /// string rather than a tagged object so the CLI, this DTO and the dialog hold one
+    /// spelling.
+    pub key: PassKey,
     pub shape_count: usize,
     pub node_ids: Vec<document::NodeId>,
     /// Each shape's first world-space point, parallel to `node_ids` — where the blade
@@ -1120,15 +1127,20 @@ pub struct PlanCutPassSummary {
     pub starts: Vec<Option<[f64; 2]>>,
 }
 
-/// Summarizes `plan_passes` output for the UI — not the raw `DocumentPasses`
+/// Summarizes `plan_passes_with` output for the UI — not the raw `DocumentPasses`
 /// (which carries full flattened polylines the cut dialog doesn't need).
-pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, IpcError> {
-    let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", e.to_string()))?;
-    let refs: Vec<&ColorPass> = planned.passes.iter().collect();
+///
+/// Takes the grouping rather than defaulting it: unlike `cutplan::plan_passes`, this has no
+/// caller that means "whatever the default is" — the dialog always has a mode selected.
+pub fn plan_cut_response(doc: &document::Document, grouping: Grouping)
+    -> Result<PlanCutResponse, IpcError> {
+    let planned = plan_passes_with(doc, grouping)
+        .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
+    let refs: Vec<&DocumentPass> = planned.passes.iter().collect();
     let travel = cutplan::travel_moves(&refs);
     Ok(PlanCutResponse {
         passes: planned.passes.iter().map(|p| PlanCutPassSummary {
-            color: p.color,
+            key: p.key.clone(),
             shape_count: p.shapes.len(),
             node_ids: p.shapes.iter().map(|s| s.node_id).collect(),
             starts: p.shapes.iter().map(|s| {
@@ -1146,7 +1158,7 @@ pub fn plan_cut_response(doc: &document::Document) -> Result<PlanCutResponse, Ip
 /// about what "configured" means.
 #[derive(Debug, Deserialize)]
 pub struct TravelPassDto {
-    pub color: Option<u32>,
+    pub key: PassKey,
     pub enabled: bool,
 }
 
@@ -1159,6 +1171,7 @@ pub struct TravelPassDto {
 pub fn travel_for_order(
     doc: &document::Document,
     doc_revision: &str,
+    grouping: Grouping,
     configured: &[TravelPassDto],
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Same rule as `prepare_cut`: a revision string that isn't a u64 was never
@@ -1166,7 +1179,8 @@ pub fn travel_for_order(
     let Ok(expected) = doc_revision.parse::<u64>() else {
         return Err(IpcError::new("stale_plan", "travel request carries an unrecognized plan revision"));
     };
-    let planned = plan_passes(doc).map_err(|e| IpcError::new("plan_error", e.to_string()))?;
+    let planned = plan_passes_with(doc, grouping)
+        .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
     if planned.doc_revision != expected {
         return Err(map_cut_error(CutError::StalePlan { expected, actual: planned.doc_revision }));
     }
@@ -1175,17 +1189,17 @@ pub fn travel_for_order(
     // quietly missing from the list would misdraw the machine's motion as surely as a wrong
     // order would. Disabled passes are named too, which is what keeps that check available:
     // they are dropped here rather than by omitting them.
-    let mut remaining: Vec<&ColorPass> = planned.passes.iter().collect();
-    let mut refs: Vec<&ColorPass> = Vec::with_capacity(configured.len());
+    let mut remaining: Vec<&DocumentPass> = planned.passes.iter().collect();
+    let mut refs: Vec<&DocumentPass> = Vec::with_capacity(configured.len());
     for pass in configured {
-        let Some(i) = remaining.iter().position(|p| p.color == pass.color) else {
-            // A color planned but already consumed is a duplicate in the list — a
-            // mismatch, not an unknown color; "no planned pass has color X" would be
-            // a lie about a pass that exists.
-            return Err(if planned.passes.iter().any(|p| p.color == pass.color) {
+        let Some(i) = remaining.iter().position(|p| p.key == pass.key) else {
+            // A key planned but already consumed is a duplicate in the list — a mismatch,
+            // not an unknown pass; "no planned pass is called X" would be a lie about a
+            // pass that exists.
+            return Err(if planned.passes.iter().any(|p| p.key == pass.key) {
                 IpcError::new("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
             } else {
-                map_cut_error(CutError::UnknownPassColor(pass.color))
+                map_cut_error(CutError::UnknownPass(pass.key.clone()))
             });
         };
         let planned_pass = remaining.remove(i);
@@ -1293,17 +1307,34 @@ mod tests {
     }
 
     fn plan_for(app: &AppState) -> DocumentPasses {
-        plan_passes(&app.editor.doc).unwrap()
+        plan_passes_with(&app.editor.doc, Grouping::Color).unwrap()
     }
 
     fn request_from(plan: DocumentPasses) -> CutRequest {
         CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: plan.doc_revision.to_string(),
+            // The mode the passes were planned under. `plan_for` uses colour grouping, so
+            // this must too, or every request here would be refused as an unknown key.
+            grouping: Grouping::Color,
             passes: plan.passes.iter().map(|p| ConfiguredPassDto {
-                color: p.color, enabled: true, preset_id: None, speed: None, force: None, repeat_count: None,
+                key: p.key.clone(), enabled: true, preset_id: None,
+                speed: None, force: None, repeat_count: None,
             }).collect(),
         }
+    }
+
+    fn colour(c: u32) -> PassKey { PassKey::Color(Some(c)) }
+
+    const GREEN: u32 = 0x00FF00FF;
+
+    /// Paint an existing shape, so a fixture can carry a stroke and a fill that key
+    /// differently under `Stroke` and `Fill`.
+    fn paint(app: &mut AppState, id: document::NodeId, stroke: Option<u32>, fill: Option<u32>) {
+        let before = app.editor.doc.get(id).unwrap().clone();
+        let mut after = before.clone();
+        after.style = document::Style { stroke, fill };
+        app.editor.doc.apply(document::Delta(vec![document::NodeOp::Update { id, before, after }]));
     }
 
     #[test]
@@ -1322,21 +1353,22 @@ mod tests {
         let app = AppState::new();
         let dev = test_device_setup();
         let revision = cutplan::doc_revision(&app.editor.doc);
-        let request = CutRequest { device_instance_id: test_instance().instance_id, doc_revision: revision.to_string(), passes: vec![] };
+        let request = CutRequest { device_instance_id: test_instance().instance_id,
+            doc_revision: revision.to_string(), grouping: Grouping::Color, passes: vec![] };
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "nothing_to_cut");
     }
 
     #[test]
-    fn unknown_pass_color_is_rejected_not_dropped() {
+    fn an_unknown_pass_is_rejected_not_dropped() {
         let mut app = AppState::new();
         let dev = test_device_setup();
         app.add_rect(10.0, 10.0);
         let plan = plan_for(&app);
         let mut request = request_from(plan);
-        request.passes[0].color = Some(0xDEADBEEF); // doesn't match any planned pass
+        request.passes[0].key = colour(0xDEADBEEF); // doesn't match any planned pass
         let err = dev.cut_from_request(&app, request).unwrap_err();
-        assert_eq!(err.code, "unknown_pass_color");
+        assert_eq!(err.code, "unknown_pass");
     }
 
     const RED: u32 = 0xFF0000FF;
@@ -1360,20 +1392,20 @@ mod tests {
         (app, revision)
     }
 
-    fn on(color: u32) -> TravelPassDto { TravelPassDto { color: Some(color), enabled: true } }
-    fn off(color: u32) -> TravelPassDto { TravelPassDto { color: Some(color), enabled: false } }
+    fn on(key: PassKey) -> TravelPassDto { TravelPassDto { key, enabled: true } }
+    fn off(key: PassKey) -> TravelPassDto { TravelPassDto { key, enabled: false } }
 
     #[test]
     fn travel_for_order_follows_the_requested_order() {
         let (app, revision) = two_color_doc();
 
         // The plan's own first-seen order reproduces exactly what plan_cut_response sent.
-        let planned = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(BLUE)]).unwrap();
-        assert_eq!(planned, plan_cut_response(&app.editor.doc).unwrap().travel);
+        let planned = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(BLUE))]).unwrap();
+        assert_eq!(planned, plan_cut_response(&app.editor.doc, Grouping::Color).unwrap().travel);
         assert_eq!(planned.len(), 1);
         assert!(planned[0][2] >= 100.0, "red first: travel lands on the blue rect at x=100, got {planned:?}");
 
-        let reversed = travel_for_order(&app.editor.doc, &revision, &[on(BLUE), on(RED)]).unwrap();
+        let reversed = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(BLUE)), on(colour(RED))]).unwrap();
         assert_eq!(reversed.len(), 1);
         assert!(reversed[0][0] >= 100.0 && reversed[0][2] <= 10.0,
             "blue first: travel leaves x=100 for the red rect at the origin, got {reversed:?}");
@@ -1384,11 +1416,11 @@ mod tests {
     #[test]
     fn travel_for_order_skips_a_disabled_pass() {
         let (app, revision) = two_color_doc();
-        let travel = travel_for_order(&app.editor.doc, &revision, &[on(RED), off(BLUE)]).unwrap();
+        let travel = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), off(colour(BLUE))]).unwrap();
         assert!(travel.is_empty(), "nothing to travel to with only one pass cut, got {travel:?}");
 
         // And with everything off there is no motion at all.
-        let none = travel_for_order(&app.editor.doc, &revision, &[off(RED), off(BLUE)]).unwrap();
+        let none = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[off(colour(RED)), off(colour(BLUE))]).unwrap();
         assert!(none.is_empty(), "no pass is cut, so the head does not move: {none:?}");
     }
 
@@ -1396,16 +1428,16 @@ mod tests {
     fn travel_for_order_with_a_stale_revision_is_refused() {
         let (mut app, revision) = two_color_doc();
         app.add_rect(5.0, 5.0);
-        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(BLUE)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(BLUE))]).unwrap_err();
         assert_eq!(err.code, "stale_plan");
     }
 
     #[test]
-    fn travel_for_order_with_an_unknown_color_is_refused() {
+    fn travel_for_order_with_an_unknown_key_is_refused() {
         let (app, revision) = two_color_doc();
-        let unknown = TravelPassDto { color: Some(0xDEADBEEF), enabled: true };
-        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), unknown]).unwrap_err();
-        assert_eq!(err.code, "unknown_pass_color");
+        let unknown = TravelPassDto { key: colour(0xDEADBEEF), enabled: true };
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), unknown]).unwrap_err();
+        assert_eq!(err.code, "unknown_pass");
     }
 
     /// Disabling a pass drops it from the travel, never from the list — a pass genuinely
@@ -1413,29 +1445,107 @@ mod tests {
     #[test]
     fn travel_for_order_missing_a_planned_pass_is_refused() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED))]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 
     #[test]
-    fn travel_for_order_naming_a_pass_twice_is_a_mismatch_not_an_unknown_color() {
+    fn travel_for_order_naming_a_pass_twice_is_a_mismatch_not_an_unknown_pass() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, &[on(RED), on(RED)]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(RED))]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 
     #[test]
     fn plan_cut_response_carries_each_shapes_first_world_point() {
         let (app, _) = two_color_doc();
-        let response = plan_cut_response(&app.editor.doc).unwrap();
+        let response = plan_cut_response(&app.editor.doc, Grouping::Color).unwrap();
         for pass in &response.passes {
             assert_eq!(pass.starts.len(), pass.node_ids.len(), "starts is parallel to node_ids");
         }
         // The blue rect's translate must show in its start — a local-space point here
         // would put the badge at the origin instead of on the shape.
-        let blue = response.passes.iter().find(|p| p.color == Some(BLUE)).unwrap();
+        let blue = response.passes.iter().find(|p| p.key == colour(BLUE)).unwrap();
         let start = blue.starts[0].unwrap();
         assert!(start[0] >= 100.0, "world-space start, got {start:?}");
+    }
+
+    /// The grouping the dialog asked for is the grouping that gets cut. Without it the
+    /// operator could preview a fill-grouped plan and cut a stroke-grouped one, because each
+    /// command plans the document itself.
+    #[test]
+    fn a_cut_honours_the_grouping_it_was_sent() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        // A red stroke over a green fill: the two colour modes key this shape differently,
+        // so the request's grouping is observable in what matches.
+        let id = app.add_rect(10.0, 10.0);
+        paint(&mut app, id, Some(RED), Some(GREEN));
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Fill,
+            passes: vec![ConfiguredPassDto {
+                key: colour(RED), enabled: true, preset_id: None,
+                speed: None, force: None, repeat_count: None }],
+        };
+        // Fill grouping keys that shape on its fill, so the stroke's key names nothing.
+        assert_eq!(dev.cut_from_request(&app, request).unwrap_err().code, "unknown_pass");
+    }
+
+    /// Travel is replanned with the same grouping, for the same reason.
+    #[test]
+    fn travel_honours_the_grouping_it_was_sent() {
+        let mut app = AppState::new();
+        let id = app.add_rect(10.0, 10.0);
+        paint(&mut app, id, Some(RED), Some(GREEN));
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
+
+        assert!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
+            &[on(colour(GREEN))]).is_ok());
+        assert_eq!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
+            &[on(colour(RED))]).unwrap_err().code, "unknown_pass");
+    }
+
+    /// The response names its passes in the spelling a request must send back.
+    #[test]
+    fn a_plan_response_names_its_passes_by_key() {
+        let mut app = AppState::new();
+        app.add_rect(10.0, 10.0);
+        let response = plan_cut_response(&app.editor.doc, Grouping::Single).unwrap();
+        assert_eq!(response.passes[0].key, PassKey::All);
+    }
+
+    /// A preset-keyed pass is cut with that preset's settings. This is the whole point of
+    /// grouping by material: `prepare_cut` reads only `preset_id`, so a row that arrives with
+    /// none is cut with defaults no matter what its key says.
+    #[test]
+    fn a_preset_keyed_pass_cuts_with_that_presets_settings() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        let id = app.add_rect(10.0, 10.0);
+        app.set_material_preset(vec![id], document::PresetAssignment::Preset("cameo5-htv".into()))
+            .expect("assignable");
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+
+        let request = CutRequest {
+            device_instance_id: test_instance().instance_id,
+            doc_revision: revision,
+            grouping: Grouping::Preset,
+            passes: vec![ConfiguredPassDto {
+                key: PassKey::Preset(Some("cameo5-htv".into())),
+                enabled: true,
+                // What the dialog sends for a preset-keyed row: the key's own id.
+                preset_id: Some("cameo5-htv".into()),
+                speed: None, force: None, repeat_count: None }],
+        };
+        let (_, passes) = dev.prepare_cut(&app, request).expect("planned");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.id == "cameo5-htv").expect("premise: the builtin exists");
+        assert_eq!(passes[0].job.settings.speed, builtin.settings.speed);
+        assert_eq!(passes[0].job.settings.force, builtin.settings.force);
     }
 
     /// The bridge used to synthesize `Transmitting` from `Progress` because the

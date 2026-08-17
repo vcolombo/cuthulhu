@@ -12,6 +12,23 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-16-pass-grouping-design.md` — read it first. It holds the reference-application research, why absence is its own grammar token, why `PresetAssignment` has three states, why assignment does not descend, why line-type grouping is *not* in this slice, and the alternatives that were rejected. Its *Revisions* section lists the four decisions a Codex review overturned; this plan implements the revised ones.
 
+> **Two of this plan's contracts were overturned during review, after it was written. The task
+> bodies below still state the original ones and are deliberately left as they were** — this file is
+> a record of the instructions the implementation was given, not a description of what shipped. Read
+> the spec's *Revisions* section for the reasoning; the shipped contract is:
+>
+> 1. **`preset:` parses, as an empty preset id.** Tasks 1, 3 and 10 say it is malformed and must be
+>    refused (`:147`, `:153`, `:240`, `:1746`, `:1951`). Refusing it made the grammar non-total —
+>    `Display` wrote a string `FromStr` rejected — and the first fix for *that* let an empty id
+>    reach a blade with default settings. The class is closed where an empty id could act instead:
+>    assignment refuses it (`crates/document/src/commands.rs:91`), preset loading drops it
+>    (`crates/cutplan/src/presets.rs:198`), and `prepare_cut` refuses it
+>    (`apps/desktop/src/device.rs:865`).
+> 2. **An unresolved preset is refused at Cut, not cut with fallback settings.** Task 5 says it falls
+>    back to override-or-default (`:1796`). `prepare_cut` does a machine-scoped lookup and returns
+>    `unknown_preset` (`apps/desktop/src/device.rs:844`): cutting real material with settings
+>    unrelated to the pass's own name is not a safe default.
+
 ## Global Constraints
 
 **Reading the code blocks in this plan:** a block is the complete text of what it introduces unless it contains a bare `…` line. A `…` appears only inside a block quoting an *existing* function this plan modifies, and means "the surrounding lines are unchanged — do not retype them". Every such block names the file and line range it edits. There are no placeholders: nothing here is left for the implementer to invent.

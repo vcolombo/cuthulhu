@@ -120,13 +120,22 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
 /// bytes by chance about one time in fifty) and would turn ordinary Save As targets into
 /// refusals:
 ///
-/// - The **leading signature**, which every archive that has nothing prepended begins with.
-/// - The **end-of-central-directory record**, which the format puts within 22 bytes plus a 64 KiB
-///   comment of the end. This is where `zip` itself looks, and it is what still identifies an
-///   archive whose front has been clobbered — a single damaged byte there stops `ZipArchive::new`
-///   from finding anything while leaving `manifest.json` fully recoverable.
+/// - The **leading signature**, which every archive with nothing prepended begins with: a local
+///   file header (`0x04034b50`), a bare end-of-central-directory record for an empty archive
+///   (`0x06054b50`), or the spanning marker that starts a split archive's first segment
+///   (`0x08074b50`).
+/// - The **end-of-central-directory record**, which the format puts within its own 22 bytes plus
+///   a `.ZIP file comment` of at most 64 KiB of the end. That is where `zip` itself looks, and it
+///   is what still identifies an archive whose front has been clobbered — four damaged bytes
+///   there stop `ZipArchive::new` from finding anything (it reports "Could not find EOCD", as of
+///   the pinned `zip 2.4.2`) while leaving `manifest.json` fully recoverable.
+///
+/// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
+/// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header,
+/// §4.3.16 end of central directory record, §8.5.4 spanning marker]`
 fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
     use std::io::{Read, Seek, SeekFrom};
+    // The record itself, plus the largest comment its 2-byte length field can describe.
     const TRAILER: u64 = 22 + u16::MAX as u64;
     let mut file = std::fs::File::open(path)?;
     let mut signature = [0u8; 4];
@@ -346,10 +355,13 @@ mod tests {
         assert_eq!(load_project(&path).unwrap(), doc);
     }
 
-    /// One clobbered byte at the front stops `zip` from finding anything — it reports
+    /// Overwriting the local file header signature stops `zip` from finding anything — it reports
     /// "Could not find EOCD" even though the central directory and `manifest.json` are intact —
-    /// so the leading signature alone cannot decide whether there is a project here. The trailer
-    /// still says there is.
+    /// so the leading signature alone cannot decide whether there is a project here. The
+    /// end-of-central-directory record at the other end still says there is.
+    ///
+    /// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
+    /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header]`
     #[test]
     fn saving_over_an_archive_whose_leading_bytes_are_damaged_is_refused() {
         let dir = tempfile::tempdir().unwrap();

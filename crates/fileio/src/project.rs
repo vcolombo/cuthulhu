@@ -64,10 +64,30 @@ fn refuse_writing_what_we_could_not_read(what: &str, len: u64, limit: u64)
 /// advertise gigabytes of such distance while occupying almost no storage, so the logical length is
 /// what has to be bounded, and it has to be bounded before the archive is opened rather than after.
 ///
-/// 256 MiB for the same reason `trace::MAX_INPUT_FILE_BYTES` is: two orders of magnitude above any
-/// real project, since the manifest of a hundred-thousand-node design compresses to single-digit
-/// megabytes.
-const MAX_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
+/// **64 MiB, chosen from the amplification rather than from taste.** `zip` reserves capacity for
+/// the entry count the trailer claims before validating a single entry, and it only requires that
+/// those entries' 46-byte on-disk headers would fit — so the claim a container of size `C` can
+/// carry is `C / 46`. Measured on this machine against a real 200 000-entry archive, that capacity
+/// costs **232 bytes per entry** (44.3 MiB for 200 000), a 5× amplification of the file itself:
+///
+/// | ceiling | claimable entries | capacity request |
+/// |---|---|---|
+/// | 16 MiB | 364 722 | 81 MiB |
+/// | 64 MiB | 1 458 888 | 323 MiB |
+/// | 256 MiB | 5 835 553 | 1 291 MiB |
+///
+/// A gigabyte-scale reservation is not a slow save; `Vec` reservation failure **aborts** the
+/// process, which on a small machine costs the operator the document they had open — the exact
+/// loss the rest of this module exists to prevent. 64 MiB puts the worst case at 323 MiB, between
+/// `trace::MAX_INPUT_FILE_BYTES` (256 MiB) and `MAX_DECODE_ALLOC` (512 MiB), which is the
+/// tolerance this codebase already accepts elsewhere.
+///
+/// It costs nothing real: a 100 000-node design measures 0.9 MiB on disk (its manifest is 20.9 MiB
+/// of JSON, compressing ~23×), so this is ~70× the largest project anyone plausibly has, with room
+/// for the `assets/` member the design anticipates. The amplification is *bounded* here, not
+/// removed — a true fix needs a bound on allocation, and `zip 2.4.2` exposes none (`Config` carries
+/// only `archive_offset`). Recorded on #262.
+const MAX_PROJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn project_too_large() -> String {
     format!("the file is larger than {} MiB", MAX_PROJECT_BYTES / (1024 * 1024))

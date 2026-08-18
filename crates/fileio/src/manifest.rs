@@ -58,6 +58,35 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
         .expect("a Document that serializes for snapshot_json serializes inside the envelope")
 }
 
+/// Ceiling on a manifest's *decompressed* size, mirroring `trace::MAX_INPUT_FILE_BYTES` — the
+/// same quarter gigabyte, for the same reason: a bound on what reading an untrusted file may
+/// allocate. A manifest is JSON text, and a design with a hundred thousand nodes writes tens of
+/// megabytes, so this clears every real project while refusing a member that inflates without
+/// bound. It matters most on the *save* path, where the archive being inspected is one the
+/// operator merely aimed at rather than opened.
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads a manifest member under `limit` bytes. `None` means it exceeded it and nothing more is
+/// known about the member.
+///
+/// One byte past the limit is read on purpose: a member's declared uncompressed size is a header
+/// field a crafted archive can put anything in, so the read itself has to be the bound rather
+/// than a check made before it. `limit` is a parameter so the boundary is testable without moving
+/// a quarter gigabyte through the suite; every caller passes `MAX_MANIFEST_BYTES`.
+pub(crate) fn read_capped(member: &mut impl std::io::Read, limit: u64)
+    -> std::io::Result<Option<Vec<u8>>>
+{
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    member.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
+/// The message a caller reports when `read_capped` returns `None`.
+pub(crate) fn too_large() -> String {
+    format!("manifest.json is larger than {} MiB", MAX_MANIFEST_BYTES / (1024 * 1024))
+}
+
 /// The version a manifest declares, read before any of its document is deserialized. An absent
 /// `version` key is what identifies a pre-envelope manifest, and it is unambiguous: `Document`'s
 /// fields are `nodes`/`root`/`ids`/`artboard`/`machine`, so no such manifest can carry one.
@@ -116,6 +145,22 @@ fn legacy_machine_ids(doc: &mut Document) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundary, exercised at a limit small enough to keep the suite honest about what it
+    /// moves. `read_capped`'s own limit is the parameter; `MAX_MANIFEST_BYTES` is what callers
+    /// pass, and `saving_over_an_archive_whose_manifest_inflates_without_bound_is_refused` in
+    /// `project.rs` covers the wiring against a real compression bomb.
+    #[test]
+    fn a_capped_read_stops_one_byte_past_its_limit() {
+        use std::io::Read;
+        let mut at_limit = std::io::repeat(b'x').take(8);
+        assert_eq!(read_capped(&mut at_limit, 8).unwrap(), Some(vec![b'x'; 8]),
+            "a member exactly at the limit is returned whole");
+        let mut over = std::io::repeat(b'x').take(9);
+        assert_eq!(read_capped(&mut over, 8).unwrap(), None, "one byte past it is refused");
+        let mut empty = std::io::empty();
+        assert_eq!(read_capped(&mut empty, 8).unwrap(), Some(Vec::new()));
+    }
 
     /// The table test that makes "adding a migration requires an explicit version step"
     /// mechanical: a bump with no step, or a step with no bump, fails here first.

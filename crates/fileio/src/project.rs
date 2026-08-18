@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::Path;
-use std::io::{Write, Read};
+use std::io::Write;
 use document::Document;
 use crate::IoError;
 
@@ -28,13 +28,17 @@ pub fn save_project(path: &Path, doc: &Document) -> Result<(), IoError> {
     Ok(())
 }
 
+/// Reads the manifest under `manifest::MAX_MANIFEST_BYTES`: a `.cut` is a zip, and a zip member's
+/// decompressed size is bounded by nothing but the reader's willingness to allocate.
 pub fn load_project(path: &Path) -> Result<Document, IoError> {
     let file = std::fs::File::open(path).map_err(|e| IoError::Io(e.to_string()))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| IoError::Parse(e.to_string()))?;
-    let mut s = String::new();
-    zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?
-        .read_to_string(&mut s).map_err(|e| IoError::Io(e.to_string()))?;
-    crate::manifest::read_manifest(&s)
+    let mut member = zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?;
+    let bytes = crate::manifest::read_capped(&mut member, crate::manifest::MAX_MANIFEST_BYTES)
+        .map_err(|e| IoError::Io(e.to_string()))?
+        .ok_or_else(|| IoError::Io(crate::manifest::too_large()))?;
+    let text = String::from_utf8(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
+    crate::manifest::read_manifest(&text)
 }
 
 /// The one way a project this build refused to open can still be destroyed is a Save As aimed
@@ -86,21 +90,27 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
             Err(io) => uninspectable(&io),
         },
     };
-    let mut bytes = Vec::new();
-    match zip.by_name("manifest.json") {
+    let bytes = match zip.by_name("manifest.json") {
         // Read to bytes rather than to a `String`: `read_to_string` reports a failed CRC check
         // and a non-UTF-8 member with the same `InvalidData` kind, and those are opposite
         // answers — one is an archive this build could not read, the other is not a manifest.
+        //
+        // Capped, because this is the one path that inflates a member of a file the operator
+        // only *aimed* at: a crafted archive whose manifest decompresses without bound would
+        // otherwise exhaust memory before the guard could refuse anything.
         Ok(mut member) => {
-            if let Err(e) = member.read_to_end(&mut bytes) {
-                return uninspectable(&e);
+            match crate::manifest::read_capped(&mut member, crate::manifest::MAX_MANIFEST_BYTES) {
+                Ok(Some(bytes)) => bytes,
+                // Too large to inspect is still not evidence that there is nothing to protect.
+                Ok(None) => return uninspectable(&crate::manifest::too_large()),
+                Err(e) => return uninspectable(&e),
             }
         }
         // Only `FileNotFound` proves the member is absent; anything else means it is there and
         // could not be reached.
         Err(ZipError::FileNotFound) => return Ok(()),
         Err(e) => return uninspectable(&e),
-    }
+    };
     let Ok(text) = String::from_utf8(bytes) else { return Ok(()) };
     match crate::manifest::probe_version(&text) {
         Ok(found) if found > crate::manifest::MANIFEST_VERSION => {
@@ -163,6 +173,34 @@ fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    /// The cap, end to end, against a member that inflates a thousandfold: a quarter gigabyte of
+    /// zeros deflates to a few hundred kilobytes, so an archive an operator merely aims at can ask
+    /// this build to allocate without bound. Refused as uninspectable — too large to read is not
+    /// evidence that there is nothing to protect — and the destination is left alone.
+    #[test]
+    fn saving_over_an_archive_whose_manifest_inflates_without_bound_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.cut");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        let zeros = vec![0u8; 1024 * 1024];
+        let mut written = 0u64;
+        while written <= crate::manifest::MAX_MANIFEST_BYTES {
+            zip.write_all(&zeros).unwrap();
+            written += zeros.len() as u64;
+        }
+        zip.finish().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(before.len() < 4 * 1024 * 1024, "premise: it is small on disk, huge inflated");
+
+        match save_project(&path, &document::Document::new()) {
+            Err(IoError::Io(m)) => assert!(m.contains("larger than"), "{m}"),
+            other => panic!("expected a refusal naming the size, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     /// The legacy step at the archive level. It must be a hand-built pre-envelope manifest: a
     /// project this build saves declares the current version, whose steps correctly skip this

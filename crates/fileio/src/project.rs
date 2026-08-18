@@ -57,11 +57,12 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// replace, not a project to keep, or a corrupt `.cut` would become a path that can never be
 /// saved to again.
 ///
-/// The residue is an archive that neither opens nor looks like one — its leading signature buried
-/// behind prepended data *and* its end-of-central-directory record destroyed. Nothing short of
-/// scanning the whole file for a signature would see it, and that starts refusing ordinary
-/// binaries that merely contain those four bytes by chance. Recorded on #262 with the rest of the
-/// crafted-archive family.
+/// The residue is an archive that neither opens **nor** shows its shape to either bounded check:
+/// its leading marker gone — buried behind prepended data, or damaged outright — *and* no
+/// end-of-central-directory signature within the last 64 KiB, whether because that record was
+/// destroyed or because non-conforming trailing data pushed it out of the window. Seeing those
+/// takes a scan of the whole file, which starts refusing ordinary binaries that merely contain
+/// four such bytes by chance. Recorded on #262 with the rest of the crafted-archive family.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
     use zip::result::ZipError;
     let uninspectable = |e: &dyn std::fmt::Display| {
@@ -122,17 +123,20 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
 ///
 /// - The **leading signature**, which every archive with nothing prepended begins with: a local
 ///   file header (`0x04034b50`), a bare end-of-central-directory record for an empty archive
-///   (`0x06054b50`), or the spanning marker that starts a split archive's first segment
-///   (`0x08074b50`).
+///   (`0x06054b50`), the spanning signature that starts a split archive's first segment
+///   (`0x08074b50`), or the temporary spanning marker that replaces it when the split turned out
+///   to need only one segment (`0x30304b50`, the bytes `PK00`).
 /// - The **end-of-central-directory record**, which the format puts within its own 22 bytes plus
-///   a `.ZIP file comment` of at most 64 KiB of the end. That is where `zip` itself looks, and it
-///   is what still identifies an archive whose front has been clobbered — four damaged bytes
-///   there stop `ZipArchive::new` from finding anything (it reports "Could not find EOCD", as of
-///   the pinned `zip 2.4.2`) while leaving `manifest.json` fully recoverable.
+///   a `.ZIP file comment` of at most 64 KiB of the end. That is the *format's* bound, not the
+///   pinned `zip 2.4.2`'s, which scans the whole file for the record; a conforming window is the
+///   narrower question on purpose. It is what still identifies an archive whose front has been
+///   clobbered — four damaged bytes there stop `ZipArchive::new` from finding anything (it
+///   reports "Could not find EOCD") while leaving `manifest.json` fully recoverable.
 ///
 /// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
 /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header,
-/// §4.3.16 end of central directory record, §8.5.4 spanning marker]`
+/// §4.3.16 end of central directory record, §8.5.3 spanning signature, §8.5.4 temporary
+/// spanning marker]`
 fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
     use std::io::{Read, Seek, SeekFrom};
     // The record itself, plus the largest comment its 2-byte length field can describe.
@@ -140,7 +144,8 @@ fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
     let mut file = std::fs::File::open(path)?;
     let mut signature = [0u8; 4];
     match file.read_exact(&mut signature) {
-        Ok(()) if matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08") => {
+        Ok(()) if matches!(&signature,
+            b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08" | b"PK00") => {
             return Ok(true)
         }
         Ok(()) => {}
@@ -361,7 +366,8 @@ mod tests {
     /// end-of-central-directory record at the other end still says there is.
     ///
     /// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
-    /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header]`
+    /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header,
+    /// §4.3.16 end of central directory record]`
     #[test]
     fn saving_over_an_archive_whose_leading_bytes_are_damaged_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -372,6 +378,35 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).is_err(),
             "premise: the archive no longer opens");
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The other bounded check, on its own: a split archive that needed only one segment begins
+    /// with the temporary spanning marker instead of a local file header, so a file that starts
+    /// `PK00` and has lost its trailer is still an archive — recognisable by nothing but that
+    /// marker.
+    ///
+    /// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
+    /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §8.5.4 temporary spanning
+    /// marker]`
+    #[test]
+    fn saving_over_a_split_marked_archive_with_no_trailer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pk00.cut");
+        save_project(&path, &document::Document::new()).unwrap();
+        let mut bytes = b"PK00".to_vec();
+        bytes.extend_from_slice(&std::fs::read(&path).unwrap());
+        let end = bytes.len();
+        bytes.truncate(end - 24); // the end-of-central-directory record, gone
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).is_err(),
+            "premise: the archive no longer opens");
+        assert!(!std::fs::read(&path).unwrap().windows(4).rev().take(65557)
+            .any(|w| w == b"PK\x05\x06"),
+            "premise: no trailer is left, so only the leading marker can identify it");
         let before = std::fs::read(&path).unwrap();
 
         assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));

@@ -8,7 +8,9 @@ use crate::IoError;
 /// `crate::manifest`) + `design.svg` (interchange copy) into a zip container at `path`,
 /// atomically: build in a temp file in the same directory, then rename over the destination.
 ///
-/// Refuses up front if `path` already holds a project this build cannot read.
+/// Refuses up front if `path` holds a project written by a newer build, or one this build cannot
+/// inspect well enough to rule that out — see `refuse_overwriting_a_newer_project`. A malformed
+/// manifest it *can* read is not protected: that is a file to replace, not a project to keep.
 pub fn save_project(path: &Path, doc: &Document) -> Result<(), IoError> {
     refuse_overwriting_a_newer_project(path)?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
@@ -40,37 +42,51 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// offer the file again. So the refusal lives at the write itself rather than in a caller's
 /// bookkeeping, which also covers any future non-desktop writer.
 ///
-/// It fails *open* on anything it can positively identify as not a project — an absent file,
-/// bytes that are not a zip, an archive with no `manifest.json`, a manifest that is not text.
-/// The guard exists to protect a project this build admits it cannot read, not to make saving
-/// over an arbitrary file impossible.
+/// It fails *open* only where it can name the reason the destination is **not** a project it
+/// must protect: no file there, bytes that are not a zip, an archive that has no
+/// `manifest.json`, a manifest that is not UTF-8, a manifest whose version does not parse. The
+/// guard exists to protect a project this build admits it cannot read, not to make saving over
+/// an arbitrary file impossible.
 ///
-/// A destination that *exists and cannot be inspected* is neither: an I/O failure is not
-/// evidence that the file is not a project, so it fails **closed**. Reading a file the operator
-/// cannot read is unusual; replacing one on the strength of a check that never ran is worse.
+/// Every other outcome fails **closed**, because "I could not inspect it" is not evidence that
+/// there is nothing to protect: an unreadable file, an archive this build of `zip` cannot
+/// handle, a member it cannot decompress, a manifest whose CRC does not check out. Each of
+/// those is a *present* manifest this build cannot read — the exact case the guard exists for —
+/// and replacing one on the strength of a check that never ran is the outcome it must prevent.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
+    use zip::result::ZipError;
+    let uninspectable = |e: &dyn std::fmt::Display| {
+        Err(IoError::Io(format!("the file being replaced could not be inspected ({e})")))
+    };
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(IoError::Io(e.to_string())),
+        Err(e) => return uninspectable(&e),
     };
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(zip) => zip,
-        Err(zip::result::ZipError::Io(e)) => return Err(IoError::Io(e.to_string())),
-        Err(_) => return Ok(()),
+        // Only `InvalidArchive` says these bytes are not a zip. `UnsupportedArchive` says the
+        // opposite: it is one, and this build cannot open it.
+        Err(ZipError::InvalidArchive(_)) => return Ok(()),
+        Err(e) => return uninspectable(&e),
     };
-    let mut s = String::new();
+    let mut bytes = Vec::new();
     match zip.by_name("manifest.json") {
-        Ok(mut member) => match member.read_to_string(&mut s) {
-            Ok(_) => {}
-            // Bytes that are not UTF-8 are not a manifest this build ever wrote.
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
-            Err(e) => return Err(IoError::Io(e.to_string())),
-        },
-        Err(zip::result::ZipError::Io(e)) => return Err(IoError::Io(e.to_string())),
-        Err(_) => return Ok(()),
+        // Read to bytes rather than to a `String`: `read_to_string` reports a failed CRC check
+        // and a non-UTF-8 member with the same `InvalidData` kind, and those are opposite
+        // answers — one is an archive this build could not read, the other is not a manifest.
+        Ok(mut member) => {
+            if let Err(e) = member.read_to_end(&mut bytes) {
+                return uninspectable(&e);
+            }
+        }
+        // Only `FileNotFound` proves the member is absent; anything else means it is there and
+        // could not be reached.
+        Err(ZipError::FileNotFound) => return Ok(()),
+        Err(e) => return uninspectable(&e),
     }
-    match crate::manifest::probe_version(&s) {
+    let Ok(text) = String::from_utf8(bytes) else { return Ok(()) };
+    match crate::manifest::probe_version(&text) {
         Ok(found) if found > crate::manifest::MANIFEST_VERSION => {
             Err(IoError::UnsupportedProjectVersion {
                 found,
@@ -277,6 +293,55 @@ mod tests {
         assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
     }
 
+    /// The other half of the same policy, and the one an error *kind* cannot decide: `zip`
+    /// reports both a failed CRC check and a non-UTF-8 member as `InvalidData`, so a corrupted
+    /// archive would otherwise read as "not a manifest" and be replaced. The member's stored
+    /// bytes are edited in place, so the local header still describes what they used to be.
+    #[test]
+    fn saving_over_an_archive_whose_manifest_does_not_check_out_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.cut");
+        save_project(&path, &document::Document::new()).unwrap();
+        let (at, len) = {
+            let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+            let member = zip.by_name("manifest.json").unwrap();
+            (member.data_start() as usize, member.compressed_size() as usize)
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(len > 8, "premise: the manifest has stored bytes to corrupt");
+        // Late in the deflate stream, so the member still decompresses to the wrong content
+        // rather than failing to decompress at all — the case whose error kind is ambiguous.
+        bytes[at + len - 4] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        match save_project(&path, &document::Document::new()) {
+            // A present manifest this build cannot read: refused, whichever way the corruption
+            // surfaces — a broken CRC, or a stream that no longer inflates.
+            Err(IoError::Io(_)) => {}
+            other => panic!("expected a refusal to replace an archive it could not inspect, \
+                got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The positive counterpart: a manifest member whose bytes are intact but not text. `zip`
+    /// gives the same `InvalidData` kind as the corrupt archive above, and the answer is the
+    /// opposite — nothing this build ever wrote is non-UTF-8, so there is no project to protect.
+    #[test]
+    fn saving_over_an_archive_whose_manifest_is_not_text_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary-manifest.cut");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(&[0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
+        zip.finish().unwrap();
+
+        let doc = document::Document::new();
+        save_project(&path, &doc).unwrap();
+        assert_eq!(load_project(&path).unwrap(), doc);
+    }
+
     /// A byte-frozen version-1 manifest: exactly what the last pre-envelope build wrote — a bare
     /// `Document` snapshot with no `version` key, a rect inside a translated group, and the
     /// retired `puma_iv` machine id.
@@ -297,23 +362,19 @@ mod tests {
         zip.write_all(FROZEN_V1_MANIFEST.as_bytes()).unwrap();
         zip.finish().unwrap();
 
-        let mut doc = load_project(&path).unwrap();
-        assert_eq!(doc.machine.as_ref().unwrap().id, "puma", "the legacy step ran");
-        let root = doc.get(doc.root).unwrap();
-        assert_eq!(root.kind, document::NodeKind::Layer);
-        assert_eq!(root.children.len(), 1);
-        let group = doc.get(root.children[0]).unwrap();
-        assert_eq!(group.kind, document::NodeKind::Group);
-        assert_eq!(group.transform.apply(0.0, 0.0), (3.0, 4.0));
-        let rect = doc.get(group.children[0]).unwrap();
-        assert_eq!(rect.kind,
-            document::NodeKind::Shape(document::ShapeKind::Rect { w: 10.0, h: 20.0 }));
-        assert_eq!(rect.style.stroke, Some(0xFF0000FF));
-        assert_eq!(rect.cut_line_type, document::CutLineType::Cut);
-        assert_eq!(rect.material_preset, document::PresetAssignment::Inherit);
-        assert_eq!((doc.artboard.w, doc.artboard.h), (330.0, 3000.0));
-        assert_eq!(doc.ids.next(), document::NodeId(4),
-            "the id generator resumed where the file left it, so a new node cannot collide");
+        // The whole document, not a sample of it: re-serialize what loaded and compare against
+        // the frozen bytes with the one intended difference applied. `serde_json::Value`
+        // compares structurally, so map order does not enter into it. A future version-specific
+        // wire conversion that dropped any field — machine dimensions, artboard origin, a node
+        // id, a fill — fails here, which a hand-picked list of assertions would not.
+        let doc = load_project(&path).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&FROZEN_V1_MANIFEST.replace("puma_iv", "puma")).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&doc.snapshot_json()).unwrap();
+        assert_eq!(actual, expected);
+        assert!(FROZEN_V1_MANIFEST.contains("puma_iv"),
+            "premise: the frozen file carries the retired id, so the comparison above proves \
+             the legacy step rewrote it");
     }
 
     /// An archive whose manifest declares a version no build has ever written.

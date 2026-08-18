@@ -64,30 +64,40 @@ fn refuse_writing_what_we_could_not_read(what: &str, len: u64, limit: u64)
 /// advertise gigabytes of such distance while occupying almost no storage, so the logical length is
 /// what has to be bounded, and it has to be bounded before the archive is opened rather than after.
 ///
-/// **64 MiB, chosen from the amplification rather than from taste.** `zip` reserves capacity for
+/// **32 MiB, chosen from the amplification rather than from taste.** `zip` reserves capacity for
 /// the entry count the trailer claims before validating a single entry, and it only requires that
 /// those entries' 46-byte on-disk headers would fit — so the claim a container of size `C` can
-/// carry is `C / 46`. Measured on this machine against a real 200 000-entry archive, that capacity
-/// costs **232 bytes per entry** (44.3 MiB for 200 000), a 5× amplification of the file itself:
+/// carry is `C / 46`.
 ///
-/// | ceiling | claimable entries | capacity request |
+/// What that costs has to be measured as **peak live** bytes, not as the largest single allocation:
+/// `zip` builds an `IndexMap` with capacity from the entry count *before* consuming its
+/// `Vec<ZipFileData>`, so both arrays are resident at once. Measured with a counting allocator
+/// against real archives, the peak is **508 bytes per entry** (48.3 MiB for 100 000, 96.9 MiB for
+/// 200 000 — the largest single allocation is only 232 bytes per entry, which is the number that
+/// misled an earlier revision of this constant). That is an 11× amplification of the container:
+///
+/// | ceiling | claimable entries | peak while opening |
 /// |---|---|---|
-/// | 16 MiB | 364 722 | 81 MiB |
-/// | 64 MiB | 1 458 888 | 323 MiB |
-/// | 256 MiB | 5 835 553 | 1 291 MiB |
+/// | 16 MiB | 364 722 | 177 MiB |
+/// | 32 MiB | 729 444 | 353 MiB |
+/// | 48 MiB | 1 094 166 | 530 MiB |
+/// | 64 MiB | 1 458 888 | 707 MiB |
 ///
-/// A gigabyte-scale reservation is not a slow save; `Vec` reservation failure **aborts** the
-/// process, which on a small machine costs the operator the document they had open — the exact
-/// loss the rest of this module exists to prevent. 64 MiB puts the worst case at 323 MiB, between
-/// `trace::MAX_INPUT_FILE_BYTES` (256 MiB) and `MAX_DECODE_ALLOC` (512 MiB), which is the
-/// tolerance this codebase already accepts elsewhere.
+/// A reservation this size is not a slow save; allocation failure **aborts** the process, which on
+/// a small machine costs the operator the document they had open — the exact loss the rest of this
+/// module exists to prevent. 32 MiB is the largest ceiling whose peak (353 MiB) stays clear of
+/// `MAX_DECODE_ALLOC` (512 MiB), the most this codebase already tolerates; 48 MiB reaches 530 MiB
+/// and exceeds it.
 ///
 /// It costs nothing real: a 100 000-node design measures 0.9 MiB on disk (its manifest is 20.9 MiB
-/// of JSON, compressing ~23×), so this is ~70× the largest project anyone plausibly has, with room
-/// for the `assets/` member the design anticipates. The amplification is *bounded* here, not
-/// removed — a true fix needs a bound on allocation, and `zip 2.4.2` exposes none (`Config` carries
-/// only `archive_offset`). Recorded on #262.
-const MAX_PROJECT_BYTES: u64 = 64 * 1024 * 1024;
+/// of JSON, compressing ~23×), so this is ~35× the largest project anyone plausibly has. Revisit it
+/// when the `assets/` member the design anticipates actually lands, since embedded images are the
+/// one thing that could approach it.
+///
+/// The amplification is *bounded* here, not removed — a true fix needs a bound on allocation, and
+/// `zip 2.4.2` exposes none (`read::Config` carries only `archive_offset`). That, and the fact that
+/// this is a one-time `fstat` a concurrent writer could race, are recorded on #262.
+const MAX_PROJECT_BYTES: u64 = 32 * 1024 * 1024;
 
 fn project_too_large() -> String {
     format!("the file is larger than {} MiB", MAX_PROJECT_BYTES / (1024 * 1024))

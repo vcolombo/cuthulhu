@@ -40,15 +40,36 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// offer the file again. So the refusal lives at the write itself rather than in a caller's
 /// bookkeeping, which also covers any future non-desktop writer.
 ///
-/// It fails *open* on anything it cannot positively identify as a newer project — an absent file,
-/// bytes that are not a zip, an archive with no manifest. The guard exists to protect a project
-/// this build admits it cannot read, not to make saving over an arbitrary file impossible.
+/// It fails *open* on anything it can positively identify as not a project — an absent file,
+/// bytes that are not a zip, an archive with no `manifest.json`, a manifest that is not text.
+/// The guard exists to protect a project this build admits it cannot read, not to make saving
+/// over an arbitrary file impossible.
+///
+/// A destination that *exists and cannot be inspected* is neither: an I/O failure is not
+/// evidence that the file is not a project, so it fails **closed**. Reading a file the operator
+/// cannot read is unusual; replacing one on the strength of a check that never ran is worse.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
-    let Ok(file) = std::fs::File::open(path) else { return Ok(()) };
-    let Ok(mut zip) = zip::ZipArchive::new(file) else { return Ok(()) };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(IoError::Io(e.to_string())),
+    };
+    let mut zip = match zip::ZipArchive::new(file) {
+        Ok(zip) => zip,
+        Err(zip::result::ZipError::Io(e)) => return Err(IoError::Io(e.to_string())),
+        Err(_) => return Ok(()),
+    };
     let mut s = String::new();
-    let Ok(mut member) = zip.by_name("manifest.json") else { return Ok(()) };
-    if member.read_to_string(&mut s).is_err() { return Ok(()); }
+    match zip.by_name("manifest.json") {
+        Ok(mut member) => match member.read_to_string(&mut s) {
+            Ok(_) => {}
+            // Bytes that are not UTF-8 are not a manifest this build ever wrote.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
+            Err(e) => return Err(IoError::Io(e.to_string())),
+        },
+        Err(zip::result::ZipError::Io(e)) => return Err(IoError::Io(e.to_string())),
+        Err(_) => return Ok(()),
+    }
     match crate::manifest::probe_version(&s) {
         Ok(found) if found > crate::manifest::MANIFEST_VERSION => {
             Err(IoError::UnsupportedProjectVersion {
@@ -86,12 +107,15 @@ mod tests {
         assert_eq!(back.machine.unwrap().id, "puma");
     }
 
-    /// The migration through a real project file, which is the level it matters at:
-    /// a legacy *value* can be planted straight into a live
-    /// `Document`, but an absent field cannot be planted that way — `save_project` always
-    /// writes it. So the manifest is pruned rather than hand-written: everything except
-    /// `cut_line_type` is exactly what `save_project` emits today, so the fixture cannot
-    /// drift from `Document`'s real shape.
+    /// The absent-field migration through a real project file, which is the level it matters
+    /// at: a legacy *value* can be planted straight into a live `Document`, but an absent field
+    /// cannot be — `save_project` always writes every field. So this fixture is a current
+    /// snapshot with `cut_line_type` pruned back out of it, which is the only way to express
+    /// "written before that field existed" without hand-maintaining a whole manifest.
+    ///
+    /// Being generated, it tracks `Document`'s current shape: a field added later appears here
+    /// too, so this test says nothing about whether a *real* old file still loads.
+    /// `a_frozen_version_one_project_still_loads_with_equivalent_state` is the one that does.
     #[test]
     fn a_project_saved_before_cuttability_derives_it_from_stroke() {
         let mut doc = document::Document::new();
@@ -231,6 +255,65 @@ mod tests {
         let doc = document::Document::new();
         save_project(&path, &doc).unwrap();
         assert_eq!(load_project(&path).unwrap(), doc);
+    }
+
+    /// The counterpart to the guard's fail-open, and the reason that policy is a judgement
+    /// rather than a shortcut: a destination that exists but cannot be read is not evidence of
+    /// anything, so the save is refused instead of proceeding on an inspection that never
+    /// happened. Unix-only because there is no portable way to make a file unreadable while
+    /// leaving its directory writable, which is the shape that makes the overwrite possible.
+    #[cfg(unix)]
+    #[test]
+    fn saving_over_a_destination_that_cannot_be_inspected_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unreadable.cut");
+        save_project(&path, &document::Document::new()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as a user who ignores the mode bits (root); the premise cannot be set up.
+            return;
+        }
+        assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
+    }
+
+    /// A byte-frozen version-1 manifest: exactly what the last pre-envelope build wrote — a bare
+    /// `Document` snapshot with no `version` key, a rect inside a translated group, and the
+    /// retired `puma_iv` machine id.
+    ///
+    /// Frozen as a literal rather than regenerated from `Document::snapshot_json()`, which is
+    /// what the two absent-field fixtures above must do to prune a field. A generated fixture
+    /// silently acquires every field a later feature adds, so it stops being an old file at the
+    /// exact moment the legacy path could break: a real version-1 file lacks that field, and a
+    /// generated one does not. This is the fixture that keeps failing when that happens.
+    const FROZEN_V1_MANIFEST: &str = r#"{"nodes":{"2":{"id":2,"kind":{"Shape":{"Rect":{"w":10.0,"h":20.0}}},"transform":[1.0,0.0,0.0,1.0,0.0,0.0],"style":{"stroke":4278190335,"fill":null},"cut_line_type":"Cut","material_preset":{"state":"inherit"},"children":[]},"1":{"id":1,"kind":"Layer","transform":[1.0,0.0,0.0,1.0,0.0,0.0],"style":{"stroke":255,"fill":null},"cut_line_type":"Cut","material_preset":{"state":"inherit"},"children":[3]},"3":{"id":3,"kind":"Group","transform":[1.0,0.0,0.0,1.0,3.0,4.0],"style":{"stroke":255,"fill":null},"cut_line_type":"Cut","material_preset":{"state":"inherit"},"children":[2]}},"root":1,"ids":3,"artboard":{"x":0.0,"y":0.0,"w":330.0,"h":3000.0},"machine":{"id":"puma_iv","name":"GCC Puma IV","width_mm":600.0,"height_mm":5000.0}}"#;
+
+    #[test]
+    fn a_frozen_version_one_project_still_loads_with_equivalent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.cut");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(FROZEN_V1_MANIFEST.as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        let mut doc = load_project(&path).unwrap();
+        assert_eq!(doc.machine.as_ref().unwrap().id, "puma", "the legacy step ran");
+        let root = doc.get(doc.root).unwrap();
+        assert_eq!(root.kind, document::NodeKind::Layer);
+        assert_eq!(root.children.len(), 1);
+        let group = doc.get(root.children[0]).unwrap();
+        assert_eq!(group.kind, document::NodeKind::Group);
+        assert_eq!(group.transform.apply(0.0, 0.0), (3.0, 4.0));
+        let rect = doc.get(group.children[0]).unwrap();
+        assert_eq!(rect.kind,
+            document::NodeKind::Shape(document::ShapeKind::Rect { w: 10.0, h: 20.0 }));
+        assert_eq!(rect.style.stroke, Some(0xFF0000FF));
+        assert_eq!(rect.cut_line_type, document::CutLineType::Cut);
+        assert_eq!(rect.material_preset, document::PresetAssignment::Inherit);
+        assert_eq!((doc.artboard.w, doc.artboard.h), (330.0, 3000.0));
+        assert_eq!(doc.ids.next(), document::NodeId(4),
+            "the id generator resumed where the file left it, so a new node cannot collide");
     }
 
     /// An archive whose manifest declares a version no build has ever written.

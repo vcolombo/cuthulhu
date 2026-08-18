@@ -89,11 +89,13 @@ impl Node {
 }
 
 /// `Node` as it may appear on disk. `manifest.json` does carry a schema version now (`fileio`
-/// wraps the document in a versioned envelope), but a `Node` is also deserialized from
-/// `Document::snapshot_json()` across IPC, which carries none — so on those paths a missing
-/// field is still the only migration signal there is, and `#[serde(default)]` cannot serve as
-/// one twice over: it cannot tell an absent field from an explicit `Cut`, and it cannot see the
-/// node's stroke, which is the only thing that says what an old document used to cut.
+/// wraps the document in a versioned envelope), and that version is where a *shape* change is
+/// migrated. Absence still has to be handled here, one layer below: by the time `fileio`'s
+/// migration steps run they hold a fully deserialized `Document`, so an absent field has
+/// already been resolved into a value and nothing downstream can tell which it was. Nor can
+/// `#[serde(default)]` serve as the signal on its own: it cannot tell an absent field from an
+/// explicit `Cut`, and it cannot see the node's stroke, which is the only thing that says what
+/// an old document used to cut.
 ///
 /// An explicit `"cut_line_type": null` is treated as absence, which serde gives for free and
 /// which is deliberate rather than incidental. Nothing this workspace writes can produce it —
@@ -104,9 +106,9 @@ impl Node {
 /// turning a recoverable file into one the operator cannot open at all.
 ///
 /// This sits on `Node` rather than in `fileio`'s versioned migration table, where the
-/// legacy-machine-id step lives, because a `Node` is also deserialized through
-/// `Document::snapshot_json` and across IPC; confining it to project load would leave those
-/// paths to guess.
+/// legacy-machine-id step lives, because the two act at different layers: a step there can only
+/// rewrite values serde has already produced, while these rules are what serde does *while*
+/// producing them. A field is absent exactly once, during deserialization.
 ///
 /// ponytail: exists only for documents written before the attribute did. Once no such file
 /// is expected in the wild, delete this and derive `Deserialize` on `Node` again.

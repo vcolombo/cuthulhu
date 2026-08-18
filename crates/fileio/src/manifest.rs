@@ -18,6 +18,15 @@ pub(crate) const LEGACY_UNVERSIONED: u32 = 1;
 /// version can skip one. That ordering is the whole difference between this and the absent-field
 /// defaults inside `Document`'s own serde (`NodeWire`): those cannot say *when* a field appeared,
 /// only that it is missing now.
+///
+/// A step takes an already-deserialized `Document`, so it can rewrite **values** and nothing
+/// else. A version that changes the payload's *shape* — renames a field, restructures an enum,
+/// makes a new field required — cannot be repaired here, because `read_manifest` would have
+/// failed before reaching this loop. That version diverges at the version-keyed parse instead,
+/// where the legacy-bare and envelope arms already split: it gets its own wire type, converted
+/// into the current `Document` before these steps run. Nothing pre-builds that arm, because a
+/// speculative wire type would freeze a guess about a schema nobody has designed yet; what is
+/// pre-built is the version that tells you which arm to write.
 const STEPS: &[fn(&mut Document)] = &[legacy_machine_ids];
 
 /// What `save_project` writes. The document is serialized straight from the borrow rather than

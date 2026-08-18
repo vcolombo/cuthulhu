@@ -126,11 +126,18 @@ pub(crate) fn read_capped(member: &mut impl std::io::Read, limit: u64)
         }
         bytes.extend_from_slice(&chunk[..n]);
     }
+    // Interrupted retried here too: the probe decides whether a manifest is refused, so treating a
+    // signal as "no more data" would accept an over-limit member, and treating it as an error would
+    // fail a save for a reason that has nothing to do with the file.
     let mut past_the_limit = [0u8; 1];
-    if member.read(&mut past_the_limit)? > 0 {
-        return Ok(None);
+    loop {
+        match member.read(&mut past_the_limit) {
+            Ok(0) => return Ok(Some(bytes)),
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
-    Ok(Some(bytes))
 }
 
 /// The message a caller reports when `read_capped` returns `None`.

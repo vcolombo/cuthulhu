@@ -28,10 +28,33 @@ pub fn save_project(path: &Path, doc: &Document) -> Result<(), IoError> {
     Ok(())
 }
 
-/// Reads the manifest under `manifest::MAX_MANIFEST_BYTES`: a `.cut` is a zip, and a zip member's
-/// decompressed size is bounded by nothing but the reader's willingness to allocate.
+/// Ceiling on a `.cut` container's own *logical* size, checked before `zip` parses any of it.
+///
+/// `zip 2.4.2` sizes two allocations from header fields whose only bound is a distance inside the
+/// file: the ZIP64 end-of-central-directory record's extensible data sector, a
+/// `vec![0u8; record_size - 44]` bounded only by the gap to its locator (`spec.rs`
+/// `Zip64CentralDirectoryEnd::parse`), and the central directory's entry-count preallocation,
+/// bounded only by `directory_start` (`read.rs` `read_central_header`). A **sparse** file can
+/// advertise gigabytes of such distance while occupying almost no storage, so the logical length is
+/// what has to be bounded, and it has to be bounded before the archive is opened rather than after.
+///
+/// 256 MiB for the same reason `trace::MAX_INPUT_FILE_BYTES` is: two orders of magnitude above any
+/// real project, since the manifest of a hundred-thousand-node design compresses to single-digit
+/// megabytes.
+const MAX_PROJECT_BYTES: u64 = 256 * 1024 * 1024;
+
+fn project_too_large() -> String {
+    format!("the file is larger than {} MiB", MAX_PROJECT_BYTES / (1024 * 1024))
+}
+
+/// Reads the manifest under `manifest::MAX_MANIFEST_BYTES`, out of a container under
+/// `MAX_PROJECT_BYTES`: a `.cut` is a zip, and neither a member's decompressed size nor the
+/// metadata `zip` allocates from is bounded by anything the file has to actually contain.
 pub fn load_project(path: &Path) -> Result<Document, IoError> {
     let file = std::fs::File::open(path).map_err(|e| IoError::Io(e.to_string()))?;
+    if file.metadata().map_err(|e| IoError::Io(e.to_string()))?.len() > MAX_PROJECT_BYTES {
+        return Err(IoError::Io(project_too_large()));
+    }
     let mut zip = zip::ZipArchive::new(file).map_err(|e| IoError::Parse(e.to_string()))?;
     let mut member = zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?;
     let bytes = crate::manifest::read_capped(&mut member, crate::manifest::MAX_MANIFEST_BYTES)
@@ -77,6 +100,14 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
+    // Before `zip` parses anything: the metadata it sizes allocations from is bounded only by
+    // distances inside the file, and a sparse destination can advertise gigabytes of those. An
+    // fstat that fails is not a fast path here but the bound itself, so it fails closed too.
+    match file.metadata() {
+        Ok(m) if m.len() > MAX_PROJECT_BYTES => return uninspectable(&project_too_large()),
+        Ok(_) => {}
+        Err(e) => return uninspectable(&e),
+    }
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(zip) => zip,
         // It did not open, and `ZipError::InvalidArchive` cannot settle why: `zip` returns it
@@ -174,6 +205,35 @@ fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// The container bound, exercised on the real constant the way `trace`'s file-size test is:
+    /// the file is *extended* rather than written, so no quarter gigabyte moves through the suite
+    /// and — on a filesystem that leaves the range unallocated — none is stored either. That is
+    /// also exactly the shape of the attack: `zip` sizes allocations from distances inside a file,
+    /// and a sparse file can advertise them for free.
+    #[test]
+    fn saving_over_a_destination_too_large_to_be_a_project_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.cut");
+        std::fs::File::create(&path).unwrap().set_len(MAX_PROJECT_BYTES + 1).unwrap();
+
+        match save_project(&path, &document::Document::new()) {
+            Err(IoError::Io(m)) => assert!(m.contains("larger than"), "{m}"),
+            other => panic!("expected a refusal naming the size, got {other:?}"),
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_PROJECT_BYTES + 1,
+            "the destination is untouched");
+    }
+
+    /// The same bound on the way in. Opening is the operator's explicit act, so this is an error
+    /// rather than a refusal to write, but the allocation it prevents is the same one.
+    #[test]
+    fn opening_a_file_too_large_to_be_a_project_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.cut");
+        std::fs::File::create(&path).unwrap().set_len(MAX_PROJECT_BYTES + 1).unwrap();
+        assert!(matches!(load_project(&path), Err(IoError::Io(m)) if m.contains("larger than")));
+    }
 
     /// The cap, end to end, against a member that inflates a thousandfold: a quarter gigabyte of
     /// zeros deflates to a few hundred kilobytes, so an archive an operator merely aims at can ask

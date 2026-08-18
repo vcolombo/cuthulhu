@@ -63,29 +63,24 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
 /// on the *save* path, where the archive being inspected is one the operator merely aimed at
 /// rather than opened.
 ///
-/// **64 MiB, set from the worst *shape* a manifest may take rather than the worst project.** JSON
-/// is not a fixed expansion: `Node::children` is an unconstrained `Vec<NodeId>`, so `children`
-/// entries cost two bytes as text (`1,`) and eight in memory — 4×, before the vector's own doubling
-/// — and nothing validates a document's structure before it is allocated. Measured peaks for
-/// `load_project`, with a counting allocator:
+/// **32 MiB, set from the worst composite shape a manifest may take rather than the worst real
+/// project.** JSON is not a fixed expansion: `Node::children` is an unconstrained `Vec<NodeId>`.
+/// A completed children vector can retain almost eight bytes of allocation per byte of JSON, and
+/// several completed nodes remain live while a later vector doubles.
 ///
-/// | manifest | shape | peak live |
-/// |---|---|---|
-/// | 21 MiB | 100 000-node design | 69 MiB |
-/// | 63 MiB | 300 000-node design | 213 MiB |
-/// | 64 MiB | one node, 33 M `children` | **448 MiB** |
-/// | 128 MiB | one node, 67 M `children` | 896 MiB |
+/// Measured through `load_project` with a counting allocator, a schema-valid 32 MiB manifest with
+/// one retained dense vector and one growing dense vector consumed **320 MiB** under the former
+/// 64 MiB read cap (the half-full input buffer retained 64 MiB of capacity). At this cap the input
+/// buffer cannot exceed 32 MiB, so the same components are bounded around 288 MiB: 32 MiB of input,
+/// a retained 64 MiB vector, and the growing vector's 64 + 128 MiB old/new allocations. The
+/// remaining 224 MiB under `trace::MAX_DECODE_ALLOC`'s 512 MiB covers nodes, maps, and allocator
+/// overhead. The reading phase is smaller: a 48 MiB buffer-growth peak alongside the ~192 MiB ZIP
+/// index `project::MAX_PROJECT_BYTES` admits, with the index freed before deserialization.
 ///
-/// The last row is why this is 64 and not 128: 896 MiB is not a slow load, it is an abort that
-/// costs the operator the document they had open. 448 MiB stays under the 512 MiB this codebase
-/// already tolerates in `trace::MAX_DECODE_ALLOC`, and the reading phase is smaller still — this
-/// limit's buffer peaks at 1.5× itself (96 MiB, see `read_capped`) alongside the ~192 MiB index
-/// `project::MAX_PROJECT_BYTES` admits, and that index is freed before parsing begins.
-///
-/// It still admits ~3× the largest manifest a real design has produced here (20.9 MiB for a
-/// hundred-thousand-node project), so roughly 300 000 nodes. Raising it needs a structural bound
-/// on the document — a limit on `children`, say — not a bigger number here.
-pub(crate) const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+/// A 21 MiB manifest represented a real hundred-thousand-node design; 32 MiB leaves about 50%
+/// headroom. Raising this limit requires an aggregate structural bound enforced before allocation,
+/// not another extrapolation from ordinary projects.
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Reads a manifest member under `limit` bytes. `None` means it exceeded it and nothing more is
 /// known about the member.
@@ -225,6 +220,19 @@ mod tests {
         let mut empty = std::io::empty();
         assert_eq!(read_capped(&mut empty, 8).unwrap(), Some(Vec::new()));
     }
+
+    /// Dense children account for about nine manifest-sized units at peak. Reserving another seven
+    /// units for maps, nodes, and allocator overhead keeps the configured cap conservative and
+    /// makes any later increase fail until its allocation evidence is updated.
+    #[test]
+    fn the_manifest_cap_fits_the_composite_children_allocation_budget() {
+        const MAX_LOAD_ALLOCATION: u64 = 512 * 1024 * 1024;
+        const MANIFEST_SHARE_OF_LOAD_BUDGET: u64 = 16;
+        assert!(MAX_MANIFEST_BYTES * MANIFEST_SHARE_OF_LOAD_BUDGET <= MAX_LOAD_ALLOCATION,
+            "{} MiB manifest cap exceeds its share of the 512 MiB load budget",
+            MAX_MANIFEST_BYTES / (1024 * 1024));
+    }
+
 
     /// The table test that makes "adding a migration requires an explicit version step"
     /// mechanical: a bump with no step, or a step with no bump, fails here first.

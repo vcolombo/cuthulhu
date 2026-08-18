@@ -14,18 +14,43 @@ use crate::IoError;
 /// protected: that is a file to replace, not a project to keep.
 pub fn save_project(path: &Path, doc: &Document) -> Result<(), IoError> {
     refuse_overwriting_a_newer_project(path)?;
+    let manifest = crate::manifest::write_manifest(doc);
+    refuse_writing_what_we_could_not_read("manifest", manifest.len() as u64,
+        crate::manifest::MAX_MANIFEST_BYTES)?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| IoError::Io(e.to_string()))?;
     let mut zip = zip::ZipWriter::new(tmp.reopen().map_err(|e| IoError::Io(e.to_string()))?);
     let opts = zip::write::SimpleFileOptions::default();
     zip.start_file("manifest.json", opts).map_err(|e| IoError::Io(e.to_string()))?;
-    zip.write_all(crate::manifest::write_manifest(doc).as_bytes())
-        .map_err(|e| IoError::Io(e.to_string()))?;
+    zip.write_all(manifest.as_bytes()).map_err(|e| IoError::Io(e.to_string()))?;
     zip.start_file("design.svg", opts).map_err(|e| IoError::Io(e.to_string()))?;
     zip.write_all(crate::doc_to_svg(doc).as_bytes()).map_err(|e| IoError::Io(e.to_string()))?;
     zip.finish().map_err(|e| IoError::Io(e.to_string()))?;
+    let written = tmp.as_file().metadata().map_err(|e| IoError::Io(e.to_string()))?.len();
+    refuse_writing_what_we_could_not_read("archive", written, MAX_PROJECT_BYTES)?;
     tmp.persist(path).map_err(|e| IoError::Io(e.to_string()))?;   // atomic rename
+    Ok(())
+}
+
+/// Applies a *read* ceiling to what this build is about to write, so that a project it saves is
+/// always a project it can reopen.
+///
+/// Without this the two ends disagree: the reader refuses an oversized archive to bound what `zip`
+/// allocates from it, and a save with no matching limit would produce exactly such a file — which
+/// this build would then refuse to open, and refuse to save over, leaving the operator's work in a
+/// file only some other program can read. Refusing before the temp file is renamed means the
+/// destination is untouched and the operator is told while the document is still in front of them.
+fn refuse_writing_what_we_could_not_read(what: &str, len: u64, limit: u64)
+    -> Result<(), IoError>
+{
+    if len > limit {
+        return Err(IoError::Io(format!(
+            "this project is too large to save: its {what} is over {} MiB, which this build \
+             would refuse to reopen",
+            limit / (1024 * 1024)
+        )));
+    }
     Ok(())
 }
 
@@ -206,6 +231,27 @@ fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// The write limits, at their boundary and at the limits the *read* paths use — the property
+    /// Greptile found violated: a project this build saves must be one it can reopen. Exercised
+    /// through the predicate rather than a real oversized project, because building a
+    /// quarter-gigabyte document costs minutes; the two call sites pass the same constants
+    /// `load_project` and the guard enforce.
+    #[test]
+    fn a_save_refuses_output_this_build_would_not_read_back() {
+        for limit in [crate::manifest::MAX_MANIFEST_BYTES, MAX_PROJECT_BYTES] {
+            assert!(refuse_writing_what_we_could_not_read("manifest", limit, limit).is_ok(),
+                "exactly at the limit is writable, since the reader accepts it");
+            match refuse_writing_what_we_could_not_read("archive", limit + 1, limit) {
+                Err(IoError::Io(m)) => {
+                    assert!(m.contains("too large to save"), "{m}");
+                    assert!(m.contains(&format!("{} MiB", limit / (1024 * 1024))), "{m}");
+                    assert!(m.contains("refuse to reopen"), "{m}");
+                }
+                other => panic!("expected a refusal naming the ceiling, got {other:?}"),
+            }
+        }
+    }
 
     /// The container bound, exercised on the real constant the way `trace`'s file-size test is:
     /// the file is *extended* rather than written, so no quarter gigabyte moves through the suite

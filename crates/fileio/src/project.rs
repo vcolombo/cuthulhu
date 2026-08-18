@@ -44,58 +44,46 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 ///
 /// What it guarantees: a destination that **opens as an archive** and declares a version above
 /// this build's is refused, whatever else is wrong with the file and whatever is prepended to
-/// it; and a destination that opens, or that at least *begins* with a zip signature, is never
-/// replaced on the strength of an inspection that failed. So an unreadable file, a damaged
-/// central directory, an archive this build of `zip` cannot handle, a member it cannot
+/// it; and a destination that opens, or that still *looks* like an archive, is never replaced on
+/// the strength of an inspection that failed. So an unreadable file, a damaged central directory,
+/// clobbered leading bytes, an archive this build of `zip` cannot handle, a member it cannot
 /// decompress and a manifest whose CRC does not check out all fail **closed** — each may be a
 /// present manifest this build cannot read, which is the case the guard exists for.
 ///
 /// It fails *open* only where it can name the reason the destination is **not** such a project:
-/// no file there, bytes that neither open as an archive nor begin with a zip signature, an
-/// archive with no `manifest.json`, a manifest that is not UTF-8, a manifest whose version does
-/// not parse. The last two are deliberate: a manifest this build can read and cannot make sense
-/// of is a file to replace, not a project to keep, or a corrupt `.cut` would become a path that
-/// can never be saved to again.
+/// no file there, bytes that neither open as an archive nor look like one, an archive with no
+/// `manifest.json`, a manifest that is not UTF-8, a manifest whose version does not parse. The
+/// last two are deliberate: a manifest this build can read and cannot make sense of is a file to
+/// replace, not a project to keep, or a corrupt `.cut` would become a path that can never be
+/// saved to again.
 ///
-/// The one container it cannot classify is a prefixed archive whose directory is *also*
-/// destroyed: with the signature buried behind the prefix and `zip` unable to open what is left,
-/// no evidence remains that the bytes were ever an archive, and it takes the fail-open arm.
-/// Detecting that needs a byte scan for a signature anywhere in the file, which would start
-/// refusing ordinary binaries that merely contain one — a worse trade than the corner it closes.
-/// Recorded on #262 with the rest of the crafted-archive family.
+/// The residue is an archive that neither opens nor looks like one — its leading signature buried
+/// behind prepended data *and* its end-of-central-directory record destroyed. Nothing short of
+/// scanning the whole file for a signature would see it, and that starts refusing ordinary
+/// binaries that merely contain those four bytes by chance. Recorded on #262 with the rest of the
+/// crafted-archive family.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
     use zip::result::ZipError;
     let uninspectable = |e: &dyn std::fmt::Display| {
         Err(IoError::Io(format!("the file being replaced could not be inspected ({e})")))
     };
-    let mut file = match std::fs::File::open(path) {
+    let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
-    // Kept for the failure arm below, not used to decide anything on its own: `zip` finds an
-    // archive by scanning back for its central directory, so it opens containers with arbitrary
-    // data prepended — a self-extracting stub, a concatenated file — whose first bytes are not a
-    // zip signature at all. Deciding on the signature *first* would classify such a project as
-    // "not a container" and replace a file `load_project` can read perfectly well.
-    let mut signature = [0u8; 4];
-    let signed_like_a_zip = match std::io::Read::read_exact(&mut file, &mut signature) {
-        Ok(()) => matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08"),
-        // Too short to hold a signature, so too short to be an archive.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
-        Err(e) => return uninspectable(&e),
-    };
-    if let Err(e) = std::io::Seek::rewind(&mut file) {
-        return uninspectable(&e);
-    }
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(zip) => zip,
-        // It did not open. `ZipError::InvalidArchive` cannot settle why — `zip` returns it both
-        // for bytes that are not an archive and for a real one whose bookkeeping is damaged,
-        // whose `manifest.json` may still be sitting there intact. So the signature decides
-        // here, where it is the only evidence left: bytes that never claimed to be a zip are
-        // replaceable, and bytes that did are a container this build could not inspect.
-        Err(e) => return if signed_like_a_zip { uninspectable(&e) } else { Ok(()) },
+        // It did not open, and `ZipError::InvalidArchive` cannot settle why: `zip` returns it
+        // both for bytes that are not an archive and for a real one whose bookkeeping is damaged,
+        // whose `manifest.json` may still be sitting there intact. So the question becomes
+        // whether the file still looks like an archive at all.
+        Err(e) => return match looks_like_an_archive(path) {
+            Ok(true) => uninspectable(&e),
+            Ok(false) => Ok(()),
+            // Could not even re-read it to decide. Fail closed for the same reason as above.
+            Err(io) => uninspectable(&io),
+        },
     };
     let mut bytes = Vec::new();
     match zip.by_name("manifest.json") {
@@ -122,6 +110,40 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a file `zip` could not open still carries the shape of an archive, asked only in that
+/// failure arm and only to decide whether replacing it would destroy something.
+///
+/// Two pieces of evidence, both bounded, because the alternative — searching the whole file for a
+/// signature — has a real collision rate on large files (a 100 MB binary hits any given four
+/// bytes by chance about one time in fifty) and would turn ordinary Save As targets into
+/// refusals:
+///
+/// - The **leading signature**, which every archive that has nothing prepended begins with.
+/// - The **end-of-central-directory record**, which the format puts within 22 bytes plus a 64 KiB
+///   comment of the end. This is where `zip` itself looks, and it is what still identifies an
+///   archive whose front has been clobbered — a single damaged byte there stops `ZipArchive::new`
+///   from finding anything while leaving `manifest.json` fully recoverable.
+fn looks_like_an_archive(path: &Path) -> Result<bool, std::io::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TRAILER: u64 = 22 + u16::MAX as u64;
+    let mut file = std::fs::File::open(path)?;
+    let mut signature = [0u8; 4];
+    match file.read_exact(&mut signature) {
+        Ok(()) if matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08") => {
+            return Ok(true)
+        }
+        Ok(()) => {}
+        // Too short to hold a signature, so too short to be an archive.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TRAILER)))?;
+    let mut trailer = Vec::new();
+    file.take(TRAILER).read_to_end(&mut trailer)?;
+    Ok(trailer.windows(4).any(|w| w == b"PK\x05\x06"))
 }
 
 #[cfg(test)]
@@ -322,6 +344,26 @@ mod tests {
         let doc = document::Document::new();
         save_project(&path, &doc).unwrap();
         assert_eq!(load_project(&path).unwrap(), doc);
+    }
+
+    /// One clobbered byte at the front stops `zip` from finding anything — it reports
+    /// "Could not find EOCD" even though the central directory and `manifest.json` are intact —
+    /// so the leading signature alone cannot decide whether there is a project here. The trailer
+    /// still says there is.
+    #[test]
+    fn saving_over_an_archive_whose_leading_bytes_are_damaged_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("head-damaged.cut");
+        save_project(&path, &document::Document::new()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(b"XY\0\0");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).is_err(),
+            "premise: the archive no longer opens");
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     /// The counterpart to the guard's fail-open, and the reason that policy is a judgement

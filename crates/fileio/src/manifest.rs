@@ -63,16 +63,22 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
 /// on the *save* path, where the archive being inspected is one the operator merely aimed at
 /// rather than opened.
 ///
-/// **128 MiB, set from a measured peak rather than from the number this reads.** `read_to_end`
-/// grows a `Vec` by doubling, and during the last growth the old buffer and the new one are both
-/// live — measured at 384 MiB peak for a 250 MiB manifest (a 256 MiB buffer alongside the 128 MiB
-/// it replaced). Since this limit is a power of two, the peak it admits is 1.5× itself: 192 MiB.
-/// That has to coexist with whatever `zip` allocated to open the archive, which
-/// `project::MAX_PROJECT_BYTES` bounds at ~192 MiB more, and 384 MiB total stays under the 512 MiB
-/// this codebase already tolerates in `trace::MAX_DECODE_ALLOC`.
+/// **128 MiB, set from a measured whole-path peak rather than from the number this reads.** Two
+/// phases have to fit, and with the archive freed before the document is deserialized
+/// (`project::load_project`) they no longer stack:
 ///
-/// Still ~6× the largest real manifest measured (20.9 MiB for a hundred-thousand-node design), so
-/// roughly 600 000 nodes.
+/// - *Reading*: this limit's buffer, peaking at 1.5× itself (192 MiB — see `read_capped`),
+///   alongside the ~192 MiB index `project::MAX_PROJECT_BYTES` admits. 384 MiB.
+/// - *Parsing*: the JSON plus the `Document` built from it, measured end to end at **418 MiB** for
+///   a 600 000-node project whose manifest is 127 MiB — roughly 3.3× the manifest, and the larger
+///   of the two phases.
+///
+/// 418 MiB stays under the 512 MiB this codebase already tolerates in `trace::MAX_DECODE_ALLOC`.
+/// Measured peaks at smaller sizes, for the shape of the curve: 69 MiB for 100 000 nodes (21 MiB
+/// manifest), 213 MiB for 300 000 (63 MiB).
+///
+/// So this ceiling is ~6× the largest manifest a real design has produced here (20.9 MiB for a
+/// hundred-thousand-node project) and admits ~600 000 nodes.
 pub(crate) const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Reads a manifest member under `limit` bytes. `None` means it exceeded it and nothing more is
@@ -98,14 +104,20 @@ pub(crate) fn read_capped(member: &mut impl std::io::Read, limit: u64)
     -> std::io::Result<Option<Vec<u8>>>
 {
     const CHUNK: usize = 64 * 1024;
-    let limit = limit as usize;
+    // Narrowing, not truncating: a limit this platform cannot address is a caller error, not a
+    // silently smaller cap.
+    let limit = usize::try_from(limit).map_err(|e| std::io::Error::other(e))?;
     let mut bytes: Vec<u8> = Vec::new();
     let mut chunk = [0u8; CHUNK];
     while bytes.len() < limit {
-        let n = member.read(&mut chunk[..(limit - bytes.len()).min(CHUNK)])?;
-        if n == 0 {
-            break;
-        }
+        let n = match member.read(&mut chunk[..(limit - bytes.len()).min(CHUNK)]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // Retried rather than propagated, matching what `read_to_end` does: an interrupted
+            // read is not a failed one, and failing here would turn a signal into a refused save.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if bytes.len() + n > bytes.capacity() {
             let grown = bytes.capacity().saturating_mul(2).max(CHUNK).min(limit)
                 .max(bytes.len() + n);

@@ -106,17 +106,24 @@ fn project_too_large() -> String {
 /// Reads the manifest under `manifest::MAX_MANIFEST_BYTES`, out of a container under
 /// `MAX_PROJECT_BYTES`: a `.cut` is a zip, and neither a member's decompressed size nor the
 /// metadata `zip` allocates from is bounded by anything the file has to actually contain.
+///
+/// The archive is scoped to the read, not to the function, so its central-directory index — up to
+/// ~192 MiB of it, at what `MAX_PROJECT_BYTES` admits — is freed before the document is
+/// deserialized. Deserializing is itself the largest allocation on this path (a `Document` plus the
+/// JSON it came from), and holding the index across it would stack the two peaks for no reason.
 pub fn load_project(path: &Path) -> Result<Document, IoError> {
     let file = std::fs::File::open(path).map_err(|e| IoError::Io(e.to_string()))?;
     if file.metadata().map_err(|e| IoError::Io(e.to_string()))?.len() > MAX_PROJECT_BYTES {
         return Err(IoError::Io(project_too_large()));
     }
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| IoError::Parse(e.to_string()))?;
-    let mut member = zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?;
-    let bytes = crate::manifest::read_capped(&mut member, crate::manifest::MAX_MANIFEST_BYTES)
-        .map_err(|e| IoError::Io(e.to_string()))?
-        .ok_or_else(|| IoError::Io(crate::manifest::too_large()))?;
-    let text = String::from_utf8(bytes).map_err(|e| IoError::Parse(e.to_string()))?;
+    let text = {
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| IoError::Parse(e.to_string()))?;
+        let mut member = zip.by_name("manifest.json").map_err(|e| IoError::Parse(e.to_string()))?;
+        let bytes = crate::manifest::read_capped(&mut member, crate::manifest::MAX_MANIFEST_BYTES)
+            .map_err(|e| IoError::Io(e.to_string()))?
+            .ok_or_else(|| IoError::Io(crate::manifest::too_large()))?;
+        String::from_utf8(bytes).map_err(|e| IoError::Parse(e.to_string()))?
+    };
     crate::manifest::read_manifest(&text)
 }
 
@@ -198,6 +205,9 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
         Err(ZipError::FileNotFound) => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
+    // The archive index is not needed past this point, and the probe below allocates too: `zip`'s
+    // is freed first, for the same reason `load_project` scopes it to its read.
+    drop(zip);
     let Ok(text) = String::from_utf8(bytes) else { return Ok(()) };
     match crate::manifest::probe_version(&text) {
         Ok(found) if found > crate::manifest::MANIFEST_VERSION => {

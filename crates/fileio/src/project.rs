@@ -8,9 +8,10 @@ use crate::IoError;
 /// `crate::manifest`) + `design.svg` (interchange copy) into a zip container at `path`,
 /// atomically: build in a temp file in the same directory, then rename over the destination.
 ///
-/// Refuses up front if `path` holds a project written by a newer build, or one this build cannot
-/// inspect well enough to rule that out — see `refuse_overwriting_a_newer_project`. A malformed
-/// manifest it *can* read is not protected: that is a file to replace, not a project to keep.
+/// Refuses up front if `path` holds a project written by a newer build, or one that still looks
+/// like an archive this build could not inspect — the exact guarantee, with its residue, is on
+/// `refuse_overwriting_a_newer_project`. A malformed manifest it *can* read is deliberately not
+/// protected: that is a file to replace, not a project to keep.
 pub fn save_project(path: &Path, doc: &Document) -> Result<(), IoError> {
     refuse_overwriting_a_newer_project(path)?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));

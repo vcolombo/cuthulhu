@@ -58,28 +58,67 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
         .expect("a Document that serializes for snapshot_json serializes inside the envelope")
 }
 
-/// Ceiling on a manifest's *decompressed* size, mirroring `trace::MAX_INPUT_FILE_BYTES` — the
-/// same quarter gigabyte, for the same reason: a bound on what reading an untrusted file may
-/// allocate. A manifest is JSON text, and a design with a hundred thousand nodes writes tens of
-/// megabytes, so this clears every real project while refusing a member that inflates without
-/// bound. It matters most on the *save* path, where the archive being inspected is one the
-/// operator merely aimed at rather than opened.
-pub(crate) const MAX_MANIFEST_BYTES: u64 = 256 * 1024 * 1024;
+/// Ceiling on a manifest's *decompressed* size: a bound on what reading an untrusted file may
+/// allocate, mirroring `trace::MAX_INPUT_FILE_BYTES`'s purpose if not its number. It matters most
+/// on the *save* path, where the archive being inspected is one the operator merely aimed at
+/// rather than opened.
+///
+/// **128 MiB, set from a measured peak rather than from the number this reads.** `read_to_end`
+/// grows a `Vec` by doubling, and during the last growth the old buffer and the new one are both
+/// live — measured at 384 MiB peak for a 250 MiB manifest (a 256 MiB buffer alongside the 128 MiB
+/// it replaced). Since this limit is a power of two, the peak it admits is 1.5× itself: 192 MiB.
+/// That has to coexist with whatever `zip` allocated to open the archive, which
+/// `project::MAX_PROJECT_BYTES` bounds at ~192 MiB more, and 384 MiB total stays under the 512 MiB
+/// this codebase already tolerates in `trace::MAX_DECODE_ALLOC`.
+///
+/// Still ~6× the largest real manifest measured (20.9 MiB for a hundred-thousand-node design), so
+/// roughly 600 000 nodes.
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Reads a manifest member under `limit` bytes. `None` means it exceeded it and nothing more is
 /// known about the member.
 ///
-/// One byte past the limit is read on purpose: a member's declared uncompressed size is a header
-/// field a crafted archive can put anything in, so the read itself has to be the bound rather
-/// than a check made before it. `limit` is a parameter so the boundary is testable without moving
-/// a quarter gigabyte through the suite; every caller passes `MAX_MANIFEST_BYTES`.
+/// The buffer is grown here rather than by `read_to_end`, which reserves one doubling *past* the
+/// data before it discovers the end: measured, a 128 MiB read through it produced a 256 MiB buffer
+/// and a 384 MiB peak. Growing geometrically with a hard stop at `limit` keeps the peak at 1.5×
+/// `limit` — the final buffer plus the half-sized one it replaces — and, more to the point, keeps
+/// it a property of this function rather than of std's growth heuristics, which are not a
+/// stability guarantee.
+///
+/// Exactly `limit` bytes are read, then a single byte is asked for separately: reading `limit + 1`
+/// in one go is how the cap would allocate what it exists to refuse, since one byte past a
+/// power-of-two limit takes the buffer to twice it. A one-byte probe on the stack answers the same
+/// question — is there more? — for nothing.
+///
+/// The member's declared uncompressed size is deliberately not consulted: it is a header field a
+/// crafted archive can put anything in, so the read itself has to be the bound. `limit` is a
+/// parameter so the boundary is testable without moving a hundred megabytes through the suite;
+/// every caller passes `MAX_MANIFEST_BYTES`.
 pub(crate) fn read_capped(member: &mut impl std::io::Read, limit: u64)
     -> std::io::Result<Option<Vec<u8>>>
 {
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    member.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+    const CHUNK: usize = 64 * 1024;
+    let limit = limit as usize;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; CHUNK];
+    while bytes.len() < limit {
+        let n = member.read(&mut chunk[..(limit - bytes.len()).min(CHUNK)])?;
+        if n == 0 {
+            break;
+        }
+        if bytes.len() + n > bytes.capacity() {
+            let grown = bytes.capacity().saturating_mul(2).max(CHUNK).min(limit)
+                .max(bytes.len() + n);
+            bytes.try_reserve_exact(grown - bytes.len())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    let mut past_the_limit = [0u8; 1];
+    if member.read(&mut past_the_limit)? > 0 {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// The message a caller reports when `read_capped` returns `None`.

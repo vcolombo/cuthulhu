@@ -5,10 +5,11 @@ use document::{Document, NodeId, NodeKind, ShapeKind};
 pub mod import;
 pub use import::import_svg;
 pub mod project;
+mod manifest;
 pub use project::{save_project, load_project};
 
 /// Minimal scene-tree → SVG serializer for the interchange `design.svg`.
-/// The manifest (`Document::snapshot_json`) is the source of truth on load;
+/// `manifest.json`'s versioned envelope (see `manifest`) is the source of truth on load;
 /// this is a best-effort visual copy, so unsupported node kinds are skipped
 /// with a comment rather than causing an error.
 pub fn doc_to_svg(doc: &Document) -> String {
@@ -83,7 +84,31 @@ fn shape_kind_name(kind: &ShapeKind) -> &'static str {
 const PX_TO_MM: f64 = 25.4 / 96.0;
 
 #[derive(Debug)]
-pub enum IoError { Parse(String), Io(String) }
+pub enum IoError {
+    Parse(String),
+    Io(String),
+    /// A project written by a newer build. Named before any of its document is deserialized, and
+    /// named again when a save is aimed at it, because the two are the same fact: this build
+    /// cannot read the file, so it must not be the one to replace it.
+    UnsupportedProjectVersion { found: u32, supported: u32 },
+}
+
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoError::Parse(m) => write!(f, "the file could not be understood ({m})"),
+            IoError::Io(m) => write!(f, "the file could not be read or written ({m})"),
+            IoError::UnsupportedProjectVersion { found, supported } => write!(
+                f,
+                "this project was saved by a newer Cuthulhu \
+                 (manifest version {found}; this build reads {supported})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IoError {}
+
 #[derive(Clone, Debug)]
 pub struct StyleHint { pub stroke: Option<u32>, pub fill: Option<u32> }
 pub struct SvgImport { pub paths: Vec<(Path, StyleHint)>, pub skipped: Vec<String> }
@@ -159,6 +184,16 @@ fn paint_rgba(paint: &usvg::Paint, opacity: usvg::Opacity) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal is operator-facing, so its wording is pinned rather than just its variant.
+    #[test]
+    fn the_unsupported_version_error_names_both_versions() {
+        let e = IoError::UnsupportedProjectVersion { found: 99, supported: 2 };
+        assert_eq!(e.to_string(),
+            "this project was saved by a newer Cuthulhu \
+             (manifest version 99; this build reads 2)");
+    }
+
     #[test]
     fn group_transforms_are_applied() {
         // 250px rect scaled 0.32 by an ancestor <g> → 80px → 80*25.4/96 mm.

@@ -148,9 +148,12 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   one `Delta`.
 - `cutplan::doc_revision(doc)` is what "stale plan" compares against — a cut planned against a
   document that has since changed is refused, not cut.
-- Project file is a zip: `manifest.json` (the source of truth, `Document::snapshot_json()`) plus
-  `design.svg` (a best-effort interchange copy; unsupported node kinds become comments). Saves
-  are atomic — temp file in the destination directory, then rename.
+- Project file is a zip: `manifest.json` (the source of truth — a `{ version, document }`
+  envelope, currently version 2) plus `design.svg` (a best-effort interchange copy; unsupported
+  node kinds become comments). Load probes `version` before deserializing the document, migrates
+  through `fileio`'s ordered step table, and refuses a project from a newer build by name on both
+  open and save-over. `Document::snapshot_json()` stays the bare, unversioned IPC shape. Saves are
+  atomic — temp file in the destination directory, then rename.
 - Material presets: builtins ship in `cutplan::presets`; user presets live in
   `<config_dir>/cuthulhu/presets.json` and the on-disk contract is *user entries only*
   (`builtin: false` forced on write, user entries shadow builtins by id).

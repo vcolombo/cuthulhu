@@ -124,6 +124,21 @@ impl AppState {
 mod tests {
     use super::*;
 
+    /// Pins the ordering in `load_project` — parse, *then* replace the editor — which is what
+    /// keeps a refused open (a newer project, or corrupt bytes) from costing the operator the
+    /// document they already had open.
+    #[test]
+    fn app_state_keeps_its_document_when_a_load_fails() {
+        let mut app = AppState::new();
+        let id = app.add_rect(10.0, 10.0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-project.cut");
+        std::fs::write(&path, b"not a zip").unwrap();
+        assert!(app.load_project(&path).is_err());
+        assert!(app.editor.doc.get(id).is_some(),
+            "a failed load must not replace the open document");
+    }
+
     #[test]
     fn app_state_commit_transform_moves_node() {
         let mut app = AppState::new();

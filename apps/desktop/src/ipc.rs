@@ -75,17 +75,17 @@ pub fn redo(state: tauri::State<AppStateHandle>) -> Result<Option<Delta>, String
 
 #[tauri::command]
 pub fn import_svg(state: tauri::State<AppStateHandle>, bytes: Vec<u8>, parent: NodeId) -> Result<(Delta, Vec<String>), String> {
-    state.lock().unwrap().import_svg(bytes, parent).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().import_svg(bytes, parent).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn save_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Result<(), String> {
-    state.lock().unwrap().save_project(&path).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().save_project(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn load_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Result<String, String> {
-    state.lock().unwrap().load_project(&path).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().load_project(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

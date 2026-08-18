@@ -58,9 +58,15 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
         .expect("a Document that serializes for snapshot_json serializes inside the envelope")
 }
 
-/// The version a manifest declares, read before any of its document is deserialized. No
-/// `version` key is the one unambiguous legacy signal: `Document`'s fields are
-/// `nodes`/`root`/`ids`/`artboard`/`machine`, so no pre-envelope manifest can carry one.
+/// The version a manifest declares, read before any of its document is deserialized. An absent
+/// `version` key is what identifies a pre-envelope manifest, and it is unambiguous: `Document`'s
+/// fields are `nodes`/`root`/`ids`/`artboard`/`machine`, so no such manifest can carry one.
+///
+/// An explicit `"version": null` reads as absent too, which `Option` gives for free and which is
+/// the same call `NodeWire` makes for a null attribute: nothing here writes one, a null cannot
+/// name a schema, and "unversioned" is the only non-arbitrary reading left. It costs nothing
+/// either way — an envelope whose version is null still fails the bare-`Document` parse that
+/// version 1 implies.
 pub(crate) fn probe_version(json: &str) -> Result<u32, IoError> {
     let probe: VersionProbe =
         serde_json::from_str(json).map_err(|e| IoError::Parse(e.to_string()))?;

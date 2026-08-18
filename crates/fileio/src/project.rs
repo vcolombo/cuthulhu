@@ -43,10 +43,10 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// bookkeeping, which also covers any future non-desktop writer.
 ///
 /// It fails *open* only where it can name the reason the destination is **not** a project it
-/// must protect: no file there, bytes that are not a zip container at all, an archive with no
-/// `manifest.json`, a manifest that is not UTF-8, a manifest whose version does not parse. The
-/// guard exists to protect a project this build admits it cannot read, not to make saving over
-/// an arbitrary file impossible.
+/// must protect: no file there, bytes that neither open as an archive nor even begin with a zip
+/// signature, an archive with no `manifest.json`, a manifest that is not UTF-8, a manifest whose
+/// version does not parse. The guard exists to protect a project this build admits it cannot
+/// read, not to make saving over an arbitrary file impossible.
 ///
 /// Every other outcome fails **closed**, because "I could not inspect it" is not evidence that
 /// there is nothing to protect: an unreadable file, an archive whose central directory is
@@ -64,29 +64,29 @@ fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
-    // The signature, not `ZipArchive::new`'s verdict, is what says whether these bytes even
-    // claim to be a zip. `ZipError::InvalidArchive` is not that claim: `zip` returns it for a
-    // damaged central directory, a bad entry offset, a multi-disk archive — files that are zips,
-    // whose `manifest.json` may still be sitting there intact behind broken bookkeeping. Reading
-    // four bytes distinguishes "not a container" from "a container I could not read", and once
-    // the signature is there, every failure below is the second kind.
+    // Kept for the failure arm below, not used to decide anything on its own: `zip` finds an
+    // archive by scanning back for its central directory, so it opens containers with arbitrary
+    // data prepended — a self-extracting stub, a concatenated file — whose first bytes are not a
+    // zip signature at all. Deciding on the signature *first* would classify such a project as
+    // "not a container" and replace a file `load_project` can read perfectly well.
     let mut signature = [0u8; 4];
-    match std::io::Read::read_exact(&mut file, &mut signature) {
-        Ok(()) => {}
-        // Too short to be a zip at all, so there is nothing here to protect.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+    let signed_like_a_zip = match std::io::Read::read_exact(&mut file, &mut signature) {
+        Ok(()) => matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08"),
+        // Too short to hold a signature, so too short to be an archive.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
         Err(e) => return uninspectable(&e),
-    }
-    // Local file header, empty archive (bare end-of-central-directory), spanned marker.
-    if !matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08") {
-        return Ok(());
-    }
+    };
     if let Err(e) = std::io::Seek::rewind(&mut file) {
         return uninspectable(&e);
     }
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(zip) => zip,
-        Err(e) => return uninspectable(&e),
+        // It did not open. `ZipError::InvalidArchive` cannot settle why — `zip` returns it both
+        // for bytes that are not an archive and for a real one whose bookkeeping is damaged,
+        // whose `manifest.json` may still be sitting there intact. So the signature decides
+        // here, where it is the only evidence left: bytes that never claimed to be a zip are
+        // replaceable, and bytes that did are a container this build could not inspect.
+        Err(e) => return if signed_like_a_zip { uninspectable(&e) } else { Ok(()) },
     };
     let mut bytes = Vec::new();
     match zip.by_name("manifest.json") {
@@ -275,6 +275,30 @@ mod tests {
             parent: other.root, index: 0,
             node: document::Node::shape(id, document::ShapeKind::Rect { w: 5.0, h: 5.0 }) }]));
         assert!(matches!(save_project(&path, &other),
+            Err(IoError::UnsupportedProjectVersion { found: 99, .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// `zip` locates an archive by scanning back for its central directory, so a container with
+    /// arbitrary bytes prepended — a self-extracting stub, or two files concatenated — opens
+    /// normally. `load_project` therefore reads such a project and names its version, and the
+    /// guard has to agree: a destination whose first bytes are not a zip signature is not
+    /// automatically a destination with nothing to protect.
+    #[test]
+    fn saving_over_a_prefixed_archive_from_a_newer_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("future.cut");
+        write_future_project(&plain);
+        let path = dir.path().join("prefixed.cut");
+        let mut prefixed = b"MZ this is a self-extracting stub".to_vec();
+        prefixed.extend_from_slice(&std::fs::read(&plain).unwrap());
+        std::fs::write(&path, &prefixed).unwrap();
+        assert!(matches!(load_project(&path),
+            Err(IoError::UnsupportedProjectVersion { found: 99, .. })),
+            "premise: prepended data does not stop this build from reading the project");
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(save_project(&path, &document::Document::new()),
             Err(IoError::UnsupportedProjectVersion { found: 99, .. })));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }

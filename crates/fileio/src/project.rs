@@ -42,18 +42,27 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// offer the file again. So the refusal lives at the write itself rather than in a caller's
 /// bookkeeping, which also covers any future non-desktop writer.
 ///
-/// It fails *open* only where it can name the reason the destination is **not** a project it
-/// must protect: no file there, bytes that neither open as an archive nor even begin with a zip
-/// signature, an archive with no `manifest.json`, a manifest that is not UTF-8, a manifest whose
-/// version does not parse. The guard exists to protect a project this build admits it cannot
-/// read, not to make saving over an arbitrary file impossible.
+/// What it guarantees: a destination that **opens as an archive** and declares a version above
+/// this build's is refused, whatever else is wrong with the file and whatever is prepended to
+/// it; and a destination that opens, or that at least *begins* with a zip signature, is never
+/// replaced on the strength of an inspection that failed. So an unreadable file, a damaged
+/// central directory, an archive this build of `zip` cannot handle, a member it cannot
+/// decompress and a manifest whose CRC does not check out all fail **closed** — each may be a
+/// present manifest this build cannot read, which is the case the guard exists for.
 ///
-/// Every other outcome fails **closed**, because "I could not inspect it" is not evidence that
-/// there is nothing to protect: an unreadable file, an archive whose central directory is
-/// damaged, one this build of `zip` cannot handle, a member it cannot decompress, a manifest
-/// whose CRC does not check out. Each of those may be a *present* manifest this build cannot
-/// read — the exact case the guard exists for — and replacing one on the strength of a check
-/// that never ran is the outcome it must prevent.
+/// It fails *open* only where it can name the reason the destination is **not** such a project:
+/// no file there, bytes that neither open as an archive nor begin with a zip signature, an
+/// archive with no `manifest.json`, a manifest that is not UTF-8, a manifest whose version does
+/// not parse. The last two are deliberate: a manifest this build can read and cannot make sense
+/// of is a file to replace, not a project to keep, or a corrupt `.cut` would become a path that
+/// can never be saved to again.
+///
+/// The one container it cannot classify is a prefixed archive whose directory is *also*
+/// destroyed: with the signature buried behind the prefix and `zip` unable to open what is left,
+/// no evidence remains that the bytes were ever an archive, and it takes the fail-open arm.
+/// Detecting that needs a byte scan for a signature anywhere in the file, which would start
+/// refusing ordinary binaries that merely contain one — a worse trade than the corner it closes.
+/// Recorded on #262 with the rest of the crafted-archive family.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
     use zip::result::ZipError;
     let uninspectable = |e: &dyn std::fmt::Display| {

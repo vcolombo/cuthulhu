@@ -43,31 +43,49 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// bookkeeping, which also covers any future non-desktop writer.
 ///
 /// It fails *open* only where it can name the reason the destination is **not** a project it
-/// must protect: no file there, bytes that are not a zip, an archive that has no
+/// must protect: no file there, bytes that are not a zip container at all, an archive with no
 /// `manifest.json`, a manifest that is not UTF-8, a manifest whose version does not parse. The
 /// guard exists to protect a project this build admits it cannot read, not to make saving over
 /// an arbitrary file impossible.
 ///
 /// Every other outcome fails **closed**, because "I could not inspect it" is not evidence that
-/// there is nothing to protect: an unreadable file, an archive this build of `zip` cannot
-/// handle, a member it cannot decompress, a manifest whose CRC does not check out. Each of
-/// those is a *present* manifest this build cannot read — the exact case the guard exists for —
-/// and replacing one on the strength of a check that never ran is the outcome it must prevent.
+/// there is nothing to protect: an unreadable file, an archive whose central directory is
+/// damaged, one this build of `zip` cannot handle, a member it cannot decompress, a manifest
+/// whose CRC does not check out. Each of those may be a *present* manifest this build cannot
+/// read — the exact case the guard exists for — and replacing one on the strength of a check
+/// that never ran is the outcome it must prevent.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
     use zip::result::ZipError;
     let uninspectable = |e: &dyn std::fmt::Display| {
         Err(IoError::Io(format!("the file being replaced could not be inspected ({e})")))
     };
-    let file = match std::fs::File::open(path) {
+    let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
+    // The signature, not `ZipArchive::new`'s verdict, is what says whether these bytes even
+    // claim to be a zip. `ZipError::InvalidArchive` is not that claim: `zip` returns it for a
+    // damaged central directory, a bad entry offset, a multi-disk archive — files that are zips,
+    // whose `manifest.json` may still be sitting there intact behind broken bookkeeping. Reading
+    // four bytes distinguishes "not a container" from "a container I could not read", and once
+    // the signature is there, every failure below is the second kind.
+    let mut signature = [0u8; 4];
+    match std::io::Read::read_exact(&mut file, &mut signature) {
+        Ok(()) => {}
+        // Too short to be a zip at all, so there is nothing here to protect.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return uninspectable(&e),
+    }
+    // Local file header, empty archive (bare end-of-central-directory), spanned marker.
+    if !matches!(&signature, b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08") {
+        return Ok(());
+    }
+    if let Err(e) = std::io::Seek::rewind(&mut file) {
+        return uninspectable(&e);
+    }
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(zip) => zip,
-        // Only `InvalidArchive` says these bytes are not a zip. `UnsupportedArchive` says the
-        // opposite: it is one, and this build cannot open it.
-        Err(ZipError::InvalidArchive(_)) => return Ok(()),
         Err(e) => return uninspectable(&e),
     };
     let mut bytes = Vec::new();
@@ -293,35 +311,78 @@ mod tests {
         assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
     }
 
-    /// The other half of the same policy, and the one an error *kind* cannot decide: `zip`
-    /// reports both a failed CRC check and a non-UTF-8 member as `InvalidData`, so a corrupted
-    /// archive would otherwise read as "not a manifest" and be replaced. The member's stored
-    /// bytes are edited in place, so the local header still describes what they used to be.
+    /// The case no error *kind* can decide: `zip` reports a failed CRC check and a non-UTF-8
+    /// member with the same `InvalidData`, and those are opposite answers — one is a present
+    /// manifest this build could not read, the other is not a manifest. The member is **stored**
+    /// rather than deflated and corrupted in the middle, so the failure is specifically the
+    /// checksum: a deflated member could fail to inflate instead, which is a different error and
+    /// would let this test pass without covering the ambiguous one. The premise is asserted, not
+    /// assumed.
     #[test]
     fn saving_over_an_archive_whose_manifest_does_not_check_out_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corrupt.cut");
-        save_project(&path, &document::Document::new()).unwrap();
-        let (at, len) = {
-            let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
-            let member = zip.by_name("manifest.json").unwrap();
-            (member.data_start() as usize, member.compressed_size() as usize)
+        let stored_current_project = |path: &std::path::Path| {
+            let manifest = crate::manifest::write_manifest(&document::Document::new());
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            zip.start_file("manifest.json", stored).unwrap();
+            zip.write_all(manifest.as_bytes()).unwrap();
+            zip.finish().unwrap();
         };
-        let mut bytes = std::fs::read(&path).unwrap();
-        assert!(len > 8, "premise: the manifest has stored bytes to corrupt");
-        // Late in the deflate stream, so the member still decompresses to the wrong content
-        // rather than failing to decompress at all — the case whose error kind is ambiguous.
-        bytes[at + len - 4] ^= 0xFF;
-        std::fs::write(&path, &bytes).unwrap();
-        let before = std::fs::read(&path).unwrap();
 
+        // The same fixture twice: one copy proves it is replaceable while intact, so the refusal
+        // below can only come from the corruption. Proving that on the corrupted copy's own path
+        // would replace the fixture before it could be corrupted.
+        let intact = dir.path().join("intact.cut");
+        stored_current_project(&intact);
+        assert!(save_project(&intact, &document::Document::new()).is_ok(),
+            "premise: intact, this destination is a current-version project and replaceable");
+
+        let path = dir.path().join("corrupt.cut");
+        stored_current_project(&path);
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let at = archive.by_name("manifest.json").unwrap().data_start() as usize;
+        drop(archive);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Inside the stored JSON, so the member still reads back byte-for-byte — just not the
+        // bytes its CRC was computed over.
+        bytes[at + 8] ^= 0x20;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut probe = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let read = probe.by_name("manifest.json").unwrap().read_to_end(&mut Vec::new());
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::InvalidData,
+            "premise: the corruption surfaces as the same kind a non-UTF-8 member does");
+        drop(probe);
+
+        let before = std::fs::read(&path).unwrap();
         match save_project(&path, &document::Document::new()) {
-            // A present manifest this build cannot read: refused, whichever way the corruption
-            // surfaces — a broken CRC, or a stream that no longer inflates.
             Err(IoError::Io(_)) => {}
             other => panic!("expected a refusal to replace an archive it could not inspect, \
                 got {other:?}"),
         }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A zip whose bookkeeping is broken but whose `manifest.json` may still be intact behind
+    /// it. `ZipError::InvalidArchive` covers this as well as bytes that are not a zip, which is
+    /// why the signature — not that error — is what the guard reads to tell the two apart.
+    #[test]
+    fn saving_over_a_zip_whose_directory_is_damaged_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged.cut");
+        save_project(&path, &document::Document::new()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let end = bytes.len();
+        bytes.truncate(end - 8); // the end-of-central-directory record, gone
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).is_err(),
+            "premise: the archive no longer opens");
+        assert!(bytes.starts_with(b"PK\x03\x04"), "premise: it still says it is a zip");
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(save_project(&path, &document::Document::new()), Err(IoError::Io(_))));
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 

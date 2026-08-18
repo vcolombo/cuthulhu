@@ -275,7 +275,7 @@ mod tests {
     /// The write limits, at their boundary and at the limits the *read* paths use — the property
     /// Greptile found violated: a project this build saves must be one it can reopen. Exercised
     /// through the predicate rather than a real oversized project, because building a
-    /// quarter-gigabyte document costs minutes; the two call sites pass the same constants
+    /// 32 MiB document would add no evidence; the two call sites pass the same constants
     /// `load_project` and the guard enforce.
     #[test]
     fn a_save_refuses_output_this_build_would_not_read_back() {
@@ -294,10 +294,10 @@ mod tests {
     }
 
     /// The container bound, exercised on the real constant the way `trace`'s file-size test is:
-    /// the file is *extended* rather than written, so no quarter gigabyte moves through the suite
-    /// and — on a filesystem that leaves the range unallocated — none is stored either. That is
-    /// also exactly the shape of the attack: `zip` sizes allocations from distances inside a file,
-    /// and a sparse file can advertise them for free.
+    /// the 32 MiB file is *extended* rather than written, so the suite moves no payload and — on a
+    /// filesystem that leaves the range unallocated — stores none either. That is also exactly the
+    /// shape of the attack: `zip` sizes allocations from distances inside a file, and a sparse file
+    /// can advertise them for free.
     #[test]
     fn saving_over_a_destination_too_large_to_be_a_project_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -321,11 +321,10 @@ mod tests {
         std::fs::File::create(&path).unwrap().set_len(MAX_PROJECT_BYTES + 1).unwrap();
         assert!(matches!(load_project(&path), Err(IoError::Io(m)) if m.contains("larger than")));
     }
-
-    /// The cap, end to end, against a member that inflates a thousandfold: a quarter gigabyte of
-    /// zeros deflates to a few hundred kilobytes, so an archive an operator merely aims at can ask
-    /// this build to allocate without bound. Refused as uninspectable — too large to read is not
-    /// evidence that there is nothing to protect — and the destination is left alone.
+    /// The cap, end to end, against a member that inflates a thousandfold: 32 MiB of zeros deflates
+    /// to a few dozen kilobytes, so an archive an operator merely aims at can ask this build to
+    /// allocate without bound. Refused as uninspectable — too large to read is not evidence that
+    /// there is nothing to protect — and the destination is left alone.
     #[test]
     fn saving_over_an_archive_whose_manifest_inflates_without_bound_is_refused() {
         let dir = tempfile::tempdir().unwrap();

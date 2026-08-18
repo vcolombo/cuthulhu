@@ -68,14 +68,17 @@ pub(crate) fn write_manifest(doc: &Document) -> String {
 /// A completed children vector can retain almost eight bytes of allocation per byte of JSON, and
 /// several completed nodes remain live while a later vector doubles.
 ///
-/// Measured through `load_project` with a counting allocator, a schema-valid 32 MiB manifest with
-/// one retained dense vector and one growing dense vector consumed **320 MiB** under the former
-/// 64 MiB read cap (the half-full input buffer retained 64 MiB of capacity). At this cap the input
-/// buffer cannot exceed 32 MiB, so the same components are bounded around 288 MiB: 32 MiB of input,
-/// a retained 64 MiB vector, and the growing vector's 64 + 128 MiB old/new allocations. The
-/// remaining 224 MiB under `trace::MAX_DECODE_ALLOC`'s 512 MiB covers nodes, maps, and allocator
-/// overhead. The reading phase is smaller: a 48 MiB buffer-growth peak alongside the ~192 MiB ZIP
-/// index `project::MAX_PROJECT_BYTES` admits, with the index freed before deserialization.
+/// Measured through `load_project` with a counting allocator, a schema-valid just-over-32 MiB
+/// manifest with one retained dense vector and one growing dense vector consumed **320 MiB** under
+/// the former 64 MiB read cap: 64 MiB of input capacity + 64 MiB retained + 64/128 MiB old/new.
+///
+/// At this 32 MiB cap, the largest attainable vector-growth threshold consumes about half the JSON
+/// budget and holds 64 + 128 MiB; completed dense vectors can consume the other half and retain
+/// almost 128 MiB. With the 32 MiB input, those known components total about **352 MiB** (eleven
+/// manifest-sized units). The remaining 160 MiB under `trace::MAX_DECODE_ALLOC`'s 512 MiB covers
+/// nodes, maps, and allocator overhead. The reading phase is smaller: a 48 MiB buffer-growth peak
+/// alongside the ~192 MiB ZIP index `project::MAX_PROJECT_BYTES` admits, with the index freed
+/// before deserialization.
 ///
 /// A 21 MiB manifest represented a real hundred-thousand-node design; 32 MiB leaves about 50%
 /// headroom. Raising this limit requires an aggregate structural bound enforced before allocation,
@@ -221,9 +224,9 @@ mod tests {
         assert_eq!(read_capped(&mut empty, 8).unwrap(), Some(Vec::new()));
     }
 
-    /// Dense children account for about nine manifest-sized units at peak. Reserving another seven
-    /// units for maps, nodes, and allocator overhead keeps the configured cap conservative and
-    /// makes any later increase fail until its allocation evidence is updated.
+    /// Dense children can account for about eleven manifest-sized units at peak. Reserving another
+    /// five units for maps, nodes, and allocator overhead keeps the configured cap conservative
+    /// and makes any later increase fail until its allocation evidence is updated.
     #[test]
     fn the_manifest_cap_fits_the_composite_children_allocation_budget() {
         const MAX_LOAD_ALLOCATION: u64 = 512 * 1024 * 1024;

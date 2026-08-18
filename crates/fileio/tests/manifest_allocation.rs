@@ -47,8 +47,9 @@ fn write_children(zip: &mut zip::ZipWriter<std::fs::File>, count: usize) {
 
 /// This is valid against the serialized schema even though its graph is nonsense. The first node
 /// retains a 64 MiB `children` vector; the second then grows another from 64 to 128 MiB. The arrays
-/// occupy only just over 32 MiB of JSON, so a 64 MiB manifest cap admitted a ~289 MiB parse. The
-/// configured cap must reject it during the bounded read, before either vector is allocated.
+/// occupy just over 32 MiB of JSON; under the former 64 MiB cap the input kept 64 MiB of capacity,
+/// so the measured parse peak was 320 MiB. The configured cap must reject it during the bounded
+/// read, before either vector is allocated.
 #[test]
 fn a_composite_dense_children_manifest_is_refused_before_deserialization() {
     const FIRST_CHILDREN: usize = 4_194_305;

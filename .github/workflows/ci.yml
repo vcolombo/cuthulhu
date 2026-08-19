@@ -27,8 +27,11 @@ jobs:
   python-tools:
     runs-on: ubuntu-latest
     # Bounded well under the six-hour default: a stall that a re-run clears in a minute should
-    # cost minutes and say so, not hold a required check all day (#269). Every ceiling here is
-    # several times the job's observed runtime, so it fires for a wedge and never for a slow run.
+    # cost minutes and say so, not hold a required check all day (#269). Each ceiling is several
+    # times the slowest run measured across sixteen successful runs of this workflow — python-tools
+    # 0.3 min, cross-pi 3.0, rust 7.2, ui 11.5 — so it fires for a wedge and never for a cold
+    # cache. The measurements live here rather than only in the pull request that chose them,
+    # because the next person to move a ceiling needs to know what the old one was set against.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

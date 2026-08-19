@@ -137,7 +137,12 @@ export function CutDialog({
   // in-flight fetch resolves, and showing one machine's capability against another
   // is the exact defect this fetch was added to remove.
   const [capsFor, setCapsFor] = useState<{ machineId: string; caps: Caps } | null>(null);
-  const [presets, setPresets] = useState<Preset[]>([]);
+  // The machine id rides along with the presets for the same reason it does with the caps above: a
+  // list read for one cutter must never be shown against another. A write leaves a `list_presets`
+  // out, and an operator who aims elsewhere while it is in flight would otherwise get the previous
+  // cutter's entries — and a save would then write that draft under the new machine's id (Greptile
+  // on PR #264).
+  const [presetsFor, setPresetsFor] = useState<{ machineId: string; presets: Preset[] } | null>(null);
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
    *  cut over them. Held rather than defaulted: with no answer there is nothing to validate a
    *  preset against, and guessed bounds would offer saves the cut path then refuses. */
@@ -208,13 +213,14 @@ export function CutDialog({
       .then((info) => {
         setConnected(info);
         if (!info) return;
+        aimPresetsAt(info.machine_id);
         // Separate chains on purpose: a corrupt presets file must not leave caps
         // unfetched, and an unknown machine must not blank the preset dropdown.
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id).then((p) => setPresets(p as Preset[]));
+        return ipc.listPresets(info.machine_id).then((p) => installPresets(info.machine_id, p));
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -325,17 +331,16 @@ export function CutDialog({
       .then(() => {
         setConnected(info);
         // A preset belongs to one machine, so nothing about the previous cutter's entry survives
-        // aiming at another. Reached only past `guardUnsaved`, which is what asks about an unsaved
-        // draft before it is dropped here.
-        clearPresetDraft();
+        // aiming at another — including a `list_presets` still owed to it. Reached only past
+        // `guardUnsaved`, which is what asks about an unsaved draft before it is dropped here.
+        aimPresetsAt(info.machine_id);
         refreshDeviceState();
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id);
+        return ipc.listPresets(info.machine_id).then((p) => installPresets(info.machine_id, p));
       })
-      .then((p) => setPresets(p as Preset[]))
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
@@ -346,7 +351,7 @@ export function CutDialog({
       .disconnectDevice()
       .then(() => {
         setConnected(null);
-        clearPresetDraft();
+        aimPresetsAt(null);
         refreshDeviceState();
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
@@ -399,6 +404,16 @@ export function CutDialog({
 
   // --- material presets: the operator's own entries for the cutter this dialog is aimed at ---
 
+  /** Which cutter the section below is editing, as a ref rather than read off `connected`: a reply
+   *  still owed to a `list_presets` asked for before the operator aimed elsewhere has to be
+   *  recognised from inside its own callback, where `connected` is the value it captured. */
+  const presetMachine = useRef<string | null>(null);
+  /** Nothing of another cutter's is ever shown: a list read for one machine is held with its id, so
+   *  a late reply is inert rather than installed. Empty, not the previous entries, while the aimed
+   *  cutter's own list is still being read. */
+  const presets =
+    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : [];
+
   const presetMode = editorMode(draft, presets);
   const presetDirty = draft !== null && baseline !== null && isDirty(draft, baseline);
   /** A builtin is never faulted because it is never written: its fields are read-only, and Save as
@@ -408,11 +423,22 @@ export function CutDialog({
       ? null
       : draftFault(draft, presets, ranges);
 
-  const clearPresetDraft = () => {
+  /** Aims the section at a cutter, or at none. A preset belongs to one machine, so the draft goes
+   *  with the aim — and every reply owed to the previous one stops being wanted here. */
+  const aimPresetsAt = (machineId: string | null) => {
+    presetMachine.current = machineId;
     setDraft(null);
     setBaseline(null);
     setPresetError(null);
     setPendingAfterDecision(null);
+  };
+
+  /** The list, installed only while it is still this cutter's. Answers whether it was, because a
+   *  caller that also re-derives the draft from it must not do that either. */
+  const installPresets = (machineId: string, list: unknown) => {
+    if (presetMachine.current !== machineId) return false;
+    setPresetsFor({ machineId, presets: list as Preset[] });
+    return true;
   };
 
   /** Every action that replaces or drops the draft goes through here: selecting another preset,
@@ -451,16 +477,21 @@ export function CutDialog({
       .savePreset(preset)
       .then(() => ipc.listPresets(preset.machine_id))
       .then((list) => {
-        const stored = list as Preset[];
-        setPresets(stored);
-        const saved = stored.find((p) => p.id === preset.id);
-        if (saved) {
-          setDraft(draftOf(saved));
-          setBaseline(draftOf(saved));
+        // The draft is re-derived only while this is still the aimed cutter's list. `then` runs
+        // either way: the write happened, and what was waiting on it — a close, or the very aim
+        // change that made this list stale — is still owed its turn.
+        if (installPresets(preset.machine_id, list)) {
+          const saved = (list as Preset[]).find((p) => p.id === preset.id);
+          if (saved) {
+            setDraft(draftOf(saved));
+            setBaseline(draftOf(saved));
+          }
         }
         then?.();
       })
       .catch((e) => {
+        // Named against the draft it refused, which is only on screen while the aim has not moved.
+        if (presetMachine.current !== preset.machine_id) return;
         setPresetError(ipc.ipcErrorMessage(e));
         setPendingAfterDecision(null);
       })
@@ -494,13 +525,15 @@ export function CutDialog({
       .deletePreset(machineId, draft.id)
       .then(() => ipc.listPresets(machineId))
       .then((list) => {
-        const stored = list as Preset[];
-        setPresets(stored);
-        const next = nextId === null ? undefined : stored.find((p) => p.id === nextId);
+        if (!installPresets(machineId, list)) return;
+        const next = (list as Preset[]).find((p) => p.id === nextId);
         setDraft(next === undefined ? null : draftOf(next));
         setBaseline(next === undefined ? null : draftOf(next));
       })
-      .catch((e) => setPresetError(ipc.ipcErrorMessage(e)))
+      .catch((e) => {
+        if (presetMachine.current !== machineId) return;
+        setPresetError(ipc.ipcErrorMessage(e));
+      })
       .finally(() => setPresetBusy(false));
   };
 
@@ -510,11 +543,18 @@ export function CutDialog({
     savePresetDraft(() => waiting?.run());
   };
 
+  /** Back to the stored entry, and the refusal goes with it: a rejected write is about numbers that
+   *  are no longer on screen, so leaving it up blames the entry the operator kept (Copilot on
+   *  PR #264). */
+  const discardDraft = () => {
+    setDraft(baseline);
+    setPresetError(null);
+  };
+
   const discardThenContinue = () => {
     const waiting = pendingAfterDecision;
     setPendingAfterDecision(null);
-    setDraft(baseline);
-    setPresetError(null);
+    discardDraft();
     waiting?.run();
   };
 
@@ -759,7 +799,7 @@ export function CutDialog({
             onCopy={() => guardUnsaved(copyPreset)}
             onChange={(patch) => setDraft((prev) => (prev === null ? prev : { ...prev, ...patch }))}
             onSave={() => savePresetDraft()}
-            onDiscard={() => setDraft(baseline)}
+            onDiscard={discardDraft}
             onDelete={deletePresetDraft}
           />
         ) : rangesError !== null ? (

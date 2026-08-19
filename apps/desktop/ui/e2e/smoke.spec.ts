@@ -331,6 +331,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // `evaluate` resolves and it can assert on what they did (or did not) change.
     return new Promise((r) => setTimeout(r, 0));
   };
+  // Presets hold on their own switch. The race they exist for is a list read for one cutter landing
+  // after the operator aimed at another, and arming the plan hold with it would leave the dialog
+  // without rows for the whole test.
+  let holdingPresets = false;
+  const heldPresets: (() => void)[] = [];
   Object.assign(window, {
     __armHold: () => { holding = true; },
     __releasePlans: () => release(heldPlans),
@@ -711,7 +716,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const shipped = BUILTIN_PRESETS.filter(
         (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
       );
-      return [...shipped, ...mine];
+      const list = [...shipped, ...mine];
+      if (!holdingPresets) return list;
+      // Executor form, like the parked plan and travel replies above: the UI's `lib` is older than
+      // `Promise.withResolvers`, and widening it for a fake is the wrong end of the trade.
+      return new Promise<MaterialPreset[]>((resolve) => heldPresets.push(() => resolve(list)));
     },
     // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
     // to answer something; the casing and the numbers are pinned on the Rust side.
@@ -771,6 +780,19 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     __test_fail_next_preset_save: () => {
       failNextPresetSave = true;
       return null;
+    },
+    // Test hooks (no production counterpart): park every `list_presets` reply from here, then let
+    // them all land — the only way to state that a list read for one cutter arrives after the
+    // operator has aimed at another.
+    __test_hold_presets: () => {
+      holdingPresets = true;
+      return null;
+    },
+    // Releasing ends the window as well as draining it: a test that carries on aiming at cutters
+    // afterwards wants their lists answered, not parked behind a switch nobody turned off.
+    __test_release_presets: () => {
+      holdingPresets = false;
+      return release(heldPresets);
     },
     // Deliberately one constant, not a per-machine table: that mapping is pinned in
     // Rust by each Driver's own caps test, and restating it here would recreate the
@@ -1294,6 +1316,46 @@ test("a preset belongs to one cutter: aiming at another shows that machine's ent
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 7");
+});
+
+// Greptile's P1 on the first push: a write leaves a `list_presets` out, and its reply installed the
+// list *and* re-derived the draft from it with nothing asking which cutter it was read for. Aim at
+// another cutter in that window and the editor showed the previous machine's entry — and a save
+// would then have written that draft under the new machine's id.
+//
+// Reached through a delete rather than a save: a save leaves the draft dirty until its reply lands,
+// so the unsaved-changes guard holds the cutter change back. A delete leaves nothing unsaved, so
+// the aim really can move while the list is still out.
+test("a preset list still owed to the previous cutter is not shown against this one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  for (const name of ["My Vinyl", "Card"]) {
+    await page.getByLabel("New preset").click();
+    await page.getByLabel("Preset name").fill(name);
+    await page.getByLabel("Save preset", { exact: true }).click();
+    await expect(page.getByLabel("Preset name")).toHaveValue(name);
+  }
+
+  // Park every list reply, delete the Cameo's entry, then aim at the Puma while that list is still
+  // out. The Puma's own read parks behind it, so both land on release — the Cameo's first.
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Preset to manage").selectOption("my-vinyl");
+  await page.getByLabel("Delete preset").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await callFake(page, "__test_release_presets");
+
+  // The Cameo's reply is inert: no draft of its material, and none of its entries in the picker.
+  await expect(page.getByText("Choose a preset to edit")).toBeVisible();
+  await expect(page.getByLabel("Preset name")).toHaveCount(0);
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(0);
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
+
+  // And the delete that was in flight did reach the Cameo's file, where it belonged.
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
 });
 
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {

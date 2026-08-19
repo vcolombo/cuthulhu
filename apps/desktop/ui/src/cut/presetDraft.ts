@@ -55,9 +55,9 @@ export function isDirty(draft: PresetDraft, baseline: PresetDraft): boolean {
 
 /** Names are compared trimmed and case-folded: the picker is the only place a preset's name is
  *  read, and two entries differing by a space or a capital invite an operator to overwrite the
- *  wrong material. */
-const sameName = (a: string, b: string) =>
-  a.trim().toLocaleLowerCase() === b.trim().toLocaleLowerCase();
+ *  wrong material. Folded with `toLowerCase`, not the locale's rules: a Turkish `I` folds to `ı`
+ *  there, so the same two names would clash on one operator's machine and not on another's. */
+const sameName = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
 
 /**
  * What refuses this draft, or `null`. First fault wins, so the editor names one thing to fix.
@@ -104,9 +104,11 @@ export function draftFault(
  */
 export function freshPresetId(name: string, presets: Preset[]): string {
   // Latin letters and digits only: an id is a `PassKey`'s tail (`preset:<id>`) and travels through
-  // the CLI, so it stays in the character set every one of those spellings can carry.
+  // the CLI, so it stays in the character set every one of those spellings can carry. Lowered
+  // without the locale's rules for the same reason `sameName` is: a Turkish `I` lowers to `ı`,
+  // which this then strips, so one operator's `HTV` would be `htv` and another's `preset`.
   const base =
-    name.trim().toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "preset";
+    name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "preset";
   const taken = new Set(presets.map((p) => p.id));
   if (!taken.has(base)) return base;
   for (let n = 2; ; n++) {

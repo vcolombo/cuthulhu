@@ -653,11 +653,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
           throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
         }
       }
-      lastCutRequest = request;
       planPasses = request.passes;
       jobId = nextJobId++;
       const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
       if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
+      // Recorded once nothing can still refuse the request, so the hook answers the cut that was
+      // accepted rather than the last one attempted.
+      lastCutRequest = request;
       if (failNextCut) {
         // The opening write dies: Sending and then Failed both go out in this same
         // synchronous burst, so the only status the frontend ever commits is the failed
@@ -1236,7 +1238,7 @@ const openDialogOnCameo = async (page: Page) => {
   await expect(page.getByLabel("Preset to manage")).toBeVisible();
 };
 
-test("a preset created in the cut dialog is offered to a pass and cut with by its id", async ({ page }) => {
+test("a preset created in the cut dialog is offered to a pass and cut by its id", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await openDialogOnCameo(page);

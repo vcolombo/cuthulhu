@@ -1240,37 +1240,39 @@ pub fn travel_for_order(
     Ok(cutplan::travel_moves(&refs).into_iter().map(|(a, b)| [a.x, a.y, b.x, b.y]).collect())
 }
 
-/// Re-derives the on-disk *user-only* preset list (builtins always shadow-load
-/// with `builtin:false` forced onto user entries — see `cutplan::presets::load_presets`)
-/// so `save_preset`/`delete_preset` round-trip through `save_user_presets` correctly
-/// without ever writing a builtin back to disk.
-fn user_presets_path() -> Result<std::path::PathBuf, IpcError> {
-    default_presets_path().ok_or_else(|| IpcError::new("no_config_dir", "cannot resolve presets file location"))
-}
-
-pub fn list_presets(machine_id: &str) -> Result<Vec<MaterialPreset>, IpcError> {
-    let path = user_presets_path()?;
-    let all = load_presets(&path).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?;
+/// A preset's identity is the pair `(machine_id, id)`, not the id: an id is the operator's own
+/// string, so `my-vinyl` legitimately exists for a Cameo and a Puma, and keyed on the id alone one
+/// machine's save or delete destroyed the other's entry (#153).
+///
+/// Each operation re-derives the on-disk *user-only* list (builtins always shadow-load, with
+/// `builtin:false` forced onto user entries — see `cutplan::presets::load_presets`) so a round trip
+/// through `save_user_presets` never writes a builtin back to disk.
+///
+/// The presets file is a parameter rather than resolved here, the way `pair`/`forget` take
+/// `hosts.json`: the command layer resolves the default location, and a test can hand over a
+/// temporary file instead of the operator's real one.
+pub fn list_presets(path: &Path, machine_id: &str) -> Result<Vec<MaterialPreset>, IpcError> {
+    let all = load_presets(path).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?;
     Ok(all.into_iter().filter(|p| p.machine_id == machine_id).collect())
 }
 
-pub fn save_preset(preset: MaterialPreset) -> Result<(), IpcError> {
-    let path = user_presets_path()?;
-    let mut user: Vec<MaterialPreset> = load_presets(&path)
+fn user_entries(path: &Path) -> Result<Vec<MaterialPreset>, IpcError> {
+    Ok(load_presets(path)
         .map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
-        .into_iter().filter(|p| !p.builtin).collect();
-    user.retain(|p| p.id != preset.id);
-    user.push(MaterialPreset { builtin: false, ..preset });
-    save_user_presets(&path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
+        .into_iter().filter(|p| !p.builtin).collect())
 }
 
-pub fn delete_preset(id: &str) -> Result<(), IpcError> {
-    let path = user_presets_path()?;
-    let mut user: Vec<MaterialPreset> = load_presets(&path)
-        .map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
-        .into_iter().filter(|p| !p.builtin).collect();
-    user.retain(|p| p.id != id);
-    save_user_presets(&path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
+pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> {
+    let mut user = user_entries(path)?;
+    user.retain(|p| (&p.machine_id, &p.id) != (&preset.machine_id, &preset.id));
+    user.push(MaterialPreset { builtin: false, ..preset });
+    save_user_presets(path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
+}
+
+pub fn delete_preset(path: &Path, machine_id: &str, id: &str) -> Result<(), IpcError> {
+    let mut user = user_entries(path)?;
+    user.retain(|p| (p.machine_id.as_str(), p.id.as_str()) != (machine_id, id));
+    save_user_presets(path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
 }
 
 #[cfg(test)]
@@ -2936,5 +2938,89 @@ mod tests {
             },
             "a finished cut still held the window closed",
         );
+    }
+
+    // --- presets: identity is (machine_id, id), so one cutter's entry cannot destroy another's ---
+
+    fn a_user_preset(machine: &str, id: &str, force: u32) -> MaterialPreset {
+        MaterialPreset {
+            id: id.into(),
+            name: format!("{machine} {id}"),
+            machine_id: machine.into(),
+            settings: cutplan::presets::PresetSettings {
+                speed: Some(5), force: Some(force), repeat_count: 1,
+            },
+            builtin: false,
+        }
+    }
+
+    /// The whole of #153, against a temporary presets file: an operator's id is their own string,
+    /// so `my-vinyl` names one material on a Cameo and another on a Puma. Keyed on the id alone,
+    /// saving one overwrote the other and deleting one removed both — with the material profile
+    /// editor (#55) that is an operator watching their settings vanish.
+    #[test]
+    fn a_presets_id_belongs_to_one_machine_when_saved_deleted_or_shadowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+
+        save_preset(&path, a_user_preset("cameo5", "my-vinyl", 11)).expect("saved");
+        save_preset(&path, a_user_preset("puma", "my-vinyl", 22)).expect("the other machine's");
+
+        let force_of = |machine: &str| {
+            list_presets(&path, machine).unwrap().into_iter()
+                .find(|p| p.id == "my-vinyl").map(|p| p.settings.force)
+        };
+        assert_eq!(force_of("cameo5"), Some(Some(11)), "saving the Puma's entry overwrote it");
+        assert_eq!(force_of("puma"), Some(Some(22)));
+
+        // Editing one is a save over the same pair, and touches only that machine's entry.
+        save_preset(&path, a_user_preset("puma", "my-vinyl", 33)).expect("edited");
+        assert_eq!(force_of("cameo5"), Some(Some(11)), "an edit on one machine changed the other");
+        assert_eq!(force_of("puma"), Some(Some(33)));
+
+        // A delete names the machine, and cannot reach another's entry under the same id.
+        delete_preset(&path, "puma", "my-vinyl").expect("deleted");
+        assert_eq!(force_of("puma"), None);
+        assert_eq!(force_of("cameo5"), Some(Some(11)),
+            "deleting the Puma's preset removed the Cameo's");
+
+        // Shadowing keys on the pair too: an entry under one machine named with another's builtin
+        // id leaves that builtin listed.
+        let shadow = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins").id;
+        save_preset(&path, a_user_preset("puma", &shadow, 44)).expect("saved under the Puma");
+        let cameo = list_presets(&path, "cameo5").unwrap();
+        let listed: Vec<_> = cameo.iter().filter(|p| p.id == shadow).collect();
+        assert_eq!(listed.len(), 1, "one entry for {shadow} on the Cameo, got {listed:#?}");
+        assert!(listed[0].builtin, "the Cameo's builtin was shadowed by a Puma entry");
+    }
+
+    /// A `presets.json` written before #153 loads with the same entries afterwards — every entry
+    /// already carried its `machine_id`, so only the uniqueness key changed — and deleting a user
+    /// shadow still reveals that machine's builtin.
+    #[test]
+    fn a_presets_file_written_before_the_pair_key_loads_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+        std::fs::write(&path, format!(r#"{{"version":1,"presets":[
+            {{"id":"{}","name":"Mine","machine_id":"cameo5",
+             "settings":{{"speed":1,"force":99,"repeat_count":1}},"builtin":false}},
+            {{"id":"my-vinyl","name":"Vinyl","machine_id":"puma",
+             "settings":{{"speed":2,"force":2,"repeat_count":1}},"builtin":false}}
+        ]}}"#, builtin.id)).unwrap();
+
+        let cameo = list_presets(&path, "cameo5").unwrap();
+        let shadowing = cameo.iter().find(|p| p.id == builtin.id).expect("the shadow loads");
+        assert_eq!(shadowing.name, "Mine", "the user entry still shadows its own machine's builtin");
+        assert!(list_presets(&path, "puma").unwrap().iter().any(|p| p.id == "my-vinyl"),
+            "the other machine's entry loads unchanged");
+
+        delete_preset(&path, "cameo5", &builtin.id).expect("deleted");
+        let revealed = list_presets(&path, "cameo5").unwrap();
+        let after = revealed.iter().find(|p| p.id == builtin.id).expect("the builtin is back");
+        assert!(after.builtin, "deleting a user shadow must reveal the builtin it hid");
+        assert_eq!(after.name, builtin.name);
     }
 }

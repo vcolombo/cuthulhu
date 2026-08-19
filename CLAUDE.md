@@ -156,7 +156,8 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   atomic — temp file in the destination directory, then rename.
 - Material presets: builtins ship in `cutplan::presets`; user presets live in
   `<config_dir>/cuthulhu/presets.json` and the on-disk contract is *user entries only*
-  (`builtin: false` forced on write, user entries shadow builtins by id).
+  (`builtin: false` forced on write). A preset is keyed on `(machine_id, id)` everywhere —
+  shadowing, saving, deleting — because an operator's id is their own string (#153).
 
 ## Conventions
 

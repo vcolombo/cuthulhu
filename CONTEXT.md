@@ -105,7 +105,9 @@ _Avoid_: parameters, options, config
 
 **MaterialPreset**:
 Named Settings for a particular material on a particular machine — vinyl on a Cameo, card on a
-Puma. Some ship with the app; the rest are the operator's own.
+Puma. Some ship with the app; the rest are the operator's own. **Its identity is the machine plus
+the id**, since an operator's id is their own string: `my-vinyl` names one material on a Cameo and
+a different one on a Puma, and shadowing, saving and deleting all key on the pair (#153).
 _Avoid_: profile, material profile, recipe
 
 **SettingsOverride**:

@@ -452,10 +452,14 @@ export function CutDialog({
     setPendingAfterDecision(null);
   };
 
-  /** The list, installed only while it is still this cutter's. */
+  /** The list, installed only while it is still this cutter's. A list that arrives is also what
+   *  answers the previous read's failure: held past it, the section would say the presets cannot be
+   *  read while holding the ones it just read, and only a disconnect would clear it (Copilot on
+   *  PR #264). */
   const installPresets = (machineId: string, list: unknown) => {
     if (presetMachine.current !== machineId) return false;
     setPresetsFor({ machineId, presets: list as Preset[] });
+    setPresetListError(null);
     return true;
   };
 
@@ -512,13 +516,21 @@ export function CutDialog({
       .savePreset(preset)
       .then(
         () => {
-          // The write landed, so the file holds what was sent: the draft stops being unsaved here
-          // rather than at the re-read, or a refresh that failed afterwards would leave the operator
-          // holding an "unsaved" edit that is in fact saved — and every guard would keep asking
-          // about it. The re-read refines this with what the backend actually lists.
-          const written = draftOf(preset);
-          setDraft(written);
-          setBaseline(written);
+          // Only while this is still the cutter that was written to. `copyPreset` writes without the
+          // unsaved-changes guard, so an operator can press Save as Copy and then aim elsewhere
+          // before the reply lands — and a draft re-installed after `aimPresetsAt` cleared it would
+          // be the previous machine's entry, shown against this one and saved under its id
+          // (CodeRabbit on PR #264). The re-read and the continuation below still run: the write
+          // happened, and what moved the aim may be the continuation itself.
+          if (presetMachine.current === preset.machine_id) {
+            // The write landed, so the file holds what was sent: the draft stops being unsaved here
+            // rather than at the re-read, or a refresh that failed afterwards would leave the
+            // operator holding an "unsaved" edit that is in fact saved — and every guard would keep
+            // asking about it. The re-read refines this with what the backend actually lists.
+            const written = draftOf(preset);
+            setDraft(written);
+            setBaseline(written);
+          }
           return readPresets(preset.machine_id).then((stored) => {
             const saved = stored?.find((p) => p.id === preset.id);
             if (saved !== undefined) {

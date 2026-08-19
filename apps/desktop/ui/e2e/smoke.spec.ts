@@ -1245,26 +1245,34 @@ test("a write that landed is not reported as refused when the re-read after it f
   await expect(page.getByLabel("Preset to manage")).toHaveValue("card");
 
   // The save lands and the list read behind it does not: the section says the list could not be
-  // read, and never that the save was refused.
+  // read. What proves it was not read as a refused save is the draft — a refusal keeps it unsaved,
+  // and the next guarded action would be parked to ask about it. This Close is not parked
+  // (CodeRabbit: asserting on `preset-error` cannot fail here, since the editor is not rendered at
+  // all while the list is unavailable).
   await page.getByLabel("Preset force", { exact: true }).fill("18");
   await callFake(page, "__test_fail_next_preset_list");
   await page.getByLabel("Save preset", { exact: true }).click();
   await expect(page.getByText("Material presets are unavailable")).toContainText("could not be read");
-  await expect(page.getByTestId("preset-error")).toHaveCount(0);
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 
-  // And 18 is in the file: a fresh read of the same cutter's list has it.
-  await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  // And 18 is in the file: a fresh dialog reads the list again — no Connect, the cutter is still
+  // connected — and the failure the section was showing is answered by that read.
+  await page.getByRole("button", { name: "Cut" }).click();
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("force 18");
 
   // The same interleaving under the unsaved-changes decision: Save and continue writes, the read
-  // behind it fails, and the close it was blocking still happens.
+  // behind it fails, the close it was blocking still happens — and 19 reaches the file too.
   await page.getByLabel("Preset force", { exact: true }).fill("19");
   await callFake(page, "__test_fail_next_preset_list");
   await page.getByRole("button", { name: "Close" }).click();
   await page.getByLabel("Save preset and continue").click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("force 19");
 });
 
 test("deleting a preset selects a neighbour instead of showing settings that are gone", async ({ page }) => {

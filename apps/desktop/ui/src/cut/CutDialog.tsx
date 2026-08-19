@@ -515,30 +515,30 @@ export function CutDialog({
           // The write landed, so the file holds what was sent: the draft stops being unsaved here
           // rather than at the re-read, or a refresh that failed afterwards would leave the operator
           // holding an "unsaved" edit that is in fact saved — and every guard would keep asking
-          // about it. The re-read below refines this with what the backend actually lists.
+          // about it. The re-read refines this with what the backend actually lists.
           const written = draftOf(preset);
           setDraft(written);
           setBaseline(written);
-          // And what was waiting on the write is owed its turn — a close, or the very aim change
-          // that is about to make this list stale.
-          then?.();
-          return readPresets(preset.machine_id);
+          return readPresets(preset.machine_id).then((stored) => {
+            const saved = stored?.find((p) => p.id === preset.id);
+            if (saved !== undefined) {
+              setDraft(draftOf(saved));
+              setBaseline(draftOf(saved));
+            }
+            // Last, and whether or not that read landed: the continuation is what the operator
+            // asked for *next* — another preset, a blank one, a close. Run before the re-read, its
+            // selection was overwritten by this write's own (Codex on PR #264).
+            then?.();
+          });
         },
         (e) => {
           // Named against the draft it refused, which is on screen only while the aim has not moved.
-          if (presetMachine.current !== preset.machine_id) return null;
+          // The continuation does not run: nothing was written to continue from.
+          if (presetMachine.current !== preset.machine_id) return;
           setPresetError(ipc.ipcErrorMessage(e));
           setPendingAfterDecision(null);
-          return null;
         },
       )
-      .then((stored) => {
-        if (stored === null) return;
-        const saved = stored.find((p) => p.id === preset.id);
-        if (saved === undefined) return;
-        setDraft(draftOf(saved));
-        setBaseline(draftOf(saved));
-      })
       .finally(() => setPresetBusy(false));
   };
 

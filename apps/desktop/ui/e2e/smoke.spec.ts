@@ -1286,6 +1286,34 @@ test("deleting a preset selects a neighbour instead of showing settings that are
   await expect(page.getByLabel("Preset to manage").locator("option")).toHaveCount(2);
 });
 
+// Codex on the third push: the write's own re-read reselects what it just saved, so a Save and
+// continue whose continuation was "show me that other preset" landed on the saved one instead — the
+// operator's next act undone by the write they asked for. Every existing decision test continued
+// into a Close, where the dialog unmounts and the overwrite cannot be seen.
+test("save and continue lands on the preset the operator asked for, not the one just written", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  for (const name of ["Card", "Vinyl"]) {
+    await page.getByLabel("New preset").click();
+    await page.getByLabel("Preset name").fill(name);
+    await page.getByLabel("Save preset", { exact: true }).click();
+    await expect(page.getByLabel("Preset name")).toHaveValue(name);
+  }
+
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await page.getByLabel("Preset speed").fill("14");
+  await page.getByLabel("Preset to manage").selectOption("vinyl");
+  await page.getByLabel("Save preset and continue").click();
+
+  // Vinyl is what was asked for, and Card holds the 14 that was saved on the way there.
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("vinyl");
+  await expect(page.getByLabel("Preset name")).toHaveValue("Vinyl");
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed 14");
+});
+
 test("a write the backend refuses keeps the edit on screen and says why", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

@@ -107,7 +107,11 @@ _Avoid_: parameters, options, config
 Named Settings for a particular material on a particular machine — vinyl on a Cameo, card on a
 Puma. Some ship with the app; the rest are the operator's own. **Its identity is the machine plus
 the id**, since an operator's id is their own string: `my-vinyl` names one material on a Cameo and
-a different one on a Puma, and shadowing, saving and deleting all key on the pair (#153).
+a different one on a Puma, and shadowing, saving and deleting all key on the pair (#153). The id is
+minted from the name when the preset is created and never moves again: a rename changes the name
+alone, because a PresetAssignment and a `preset:<id>` PassKey both name a preset by its id. The
+ones that ship with the app are read-only, and copying one writes a new preset under a fresh id
+rather than shadowing what shipped.
 _Avoid_: profile, material profile, recipe
 
 **SettingsOverride**:

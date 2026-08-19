@@ -5,6 +5,18 @@ import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, st
 import { PairHostDialog } from "../hosts/PairHostDialog";
 import type { Scene } from "../render/hittest";
 import { CutPreview } from "./CutPreview";
+import { PresetEditor } from "./PresetEditor";
+import {
+  copyDraft,
+  draftFault,
+  draftOf,
+  editorMode,
+  isDirty,
+  newDraft,
+  selectAfterDelete,
+  toPreset,
+  type PresetDraft,
+} from "./presetDraft";
 import {
   reorderForReplan,
   toTravelPasses,
@@ -125,7 +137,35 @@ export function CutDialog({
   // in-flight fetch resolves, and showing one machine's capability against another
   // is the exact defect this fetch was added to remove.
   const [capsFor, setCapsFor] = useState<{ machineId: string; caps: Caps } | null>(null);
-  const [presets, setPresets] = useState<Preset[]>([]);
+  // The machine id rides along with the presets for the same reason it does with the caps above: a
+  // list read for one cutter must never be shown against another. A write leaves a `list_presets`
+  // out, and an operator who aims elsewhere while it is in flight would otherwise get the previous
+  // cutter's entries — and a save would then write that draft under the new machine's id (Greptile
+  // on PR #264).
+  const [presetsFor, setPresetsFor] = useState<{ machineId: string; presets: Preset[] } | null>(null);
+  /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
+   *  cut over them. Held rather than defaulted: with no answer there is nothing to validate a
+   *  preset against, and guessed bounds would offer saves the cut path then refuses. */
+  const [ranges, setRanges] = useState<ipc.SettingsRanges | null>(null);
+  const [rangesError, setRangesError] = useState<string | null>(null);
+  /** The preset being edited, and the stored entry it started as. Two values because the
+   *  difference is what "unsaved changes" means, and every guard below asks for it. */
+  const [draft, setDraft] = useState<PresetDraft | null>(null);
+  const [baseline, setBaseline] = useState<PresetDraft | null>(null);
+  /** A preset write the backend refused, in its own words, beside the draft it refused. */
+  const [presetError, setPresetError] = useState<string | null>(null);
+  /** Why the aimed cutter's own list could not be read, if it could not. Kept here rather than only
+   *  raised, because it is what the section says in place of the editor. */
+  const [presetListError, setPresetListError] = useState<string | null>(null);
+  /** A connect or disconnect is in flight, so which cutter this section is editing is about to
+   *  change. The controls are withheld for that window: `aimPresetsAt` drops the draft when the aim
+   *  lands, and an edit typed in the meantime would go with it (Codex on PR #264). */
+  const [aiming, setAiming] = useState(false);
+  const [presetBusy, setPresetBusy] = useState(false);
+  /** What the operator asked for while a draft was unsaved, held until they decide. Selecting
+   *  another preset, changing cutter and closing the dialog all replace the draft, so each one
+   *  arrives here first rather than discarding an edit on the way past. */
+  const [pendingAfterDecision, setPendingAfterDecision] = useState<{ run: () => void } | null>(null);
   /** A plan and everything derived from it, installed as one value. The mode belongs here
    *  rather than beside it: rows keyed under one grouping must never be sent under another,
    *  and the stale-plan check guards the document, not the mode. */
@@ -164,6 +204,12 @@ export function CutDialog({
 
   useEffect(() => {
     refreshList();
+    // Its own chain, and its failure is kept rather than raised: it withholds the preset editor
+    // (see below) instead of taking the dialog's other sections down with it.
+    ipc
+      .settingsRanges()
+      .then(setRanges)
+      .catch((e) => setRangesError(ipc.ipcErrorMessage(e)));
     // Reopening the dialog after a connect earlier in the session lost the local
     // `connected` state (it lives only in this component) even though the backend
     // is still connected — seed it from the manager's own cache so Start Cut isn't
@@ -174,13 +220,14 @@ export function CutDialog({
       .then((info) => {
         setConnected(info);
         if (!info) return;
+        const aim = aimPresetsAt(info.machine_id);
         // Separate chains on purpose: a corrupt presets file must not leave caps
         // unfetched, and an unknown machine must not blank the preset dropdown.
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id).then((p) => setPresets(p as Preset[]));
+        return readPresets(aim, info.machine_id);
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -286,31 +333,41 @@ export function CutDialog({
   }, [refreshList, refreshDeviceState, hosts.length]);
 
   const connect = (info: ipc.DeviceInfo) => {
+    // Marked before the request, not after it: the aim is already on its way to another cutter, and
+    // an edit typed while it travels would be dropped by `aimPresetsAt` when it lands.
+    setAiming(true);
     ipc
       .connectDevice(info)
       .then(() => {
         setConnected(info);
+        // A preset belongs to one machine, so nothing about the previous cutter's entry survives
+        // aiming at another — including a `list_presets` still owed to it. Reached only past
+        // `guardUnsaved`, which is what asks about an unsaved draft before it is dropped here.
+        const aim = aimPresetsAt(info.machine_id);
         refreshDeviceState();
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id);
+        return readPresets(aim, info.machine_id);
       })
-      .then((p) => setPresets(p as Preset[]))
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .finally(() => setAiming(false));
   };
 
   // Clears `connected` locally too: `disconnect_device` is what releases the local manager, and a
   // row still labelled "connected" would offer no way back to the Connect that clears the state.
   const disconnect = () => {
+    setAiming(true);
     ipc
       .disconnectDevice()
       .then(() => {
         setConnected(null);
+        aimPresetsAt(null);
         refreshDeviceState();
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .finally(() => setAiming(false));
   };
 
   // Keeps the aim on purpose, unlike `disconnect`: the cutter is still there and still this
@@ -357,6 +414,240 @@ export function CutDialog({
 
   const caps = connected && capsFor?.machineId === connected.machine_id ? capsFor.caps : ALL_ENABLED;
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
+
+  // --- material presets: the operator's own entries for the cutter this dialog is aimed at ---
+
+  /** Which aim the section is on: the cutter, and how many times the aim has moved. A ref rather
+   *  than state because a reply or a captured action has to recognise its own aim from inside its
+   *  callback, where `connected` is the value it closed over.
+   *
+   *  The count is the identity, not the machine id. **A machine id is not an aim**: two aims at the
+   *  same cutter share it, so a `list_presets` owed to a previous connection, and a continuation
+   *  captured under it, both passed a check on the id alone — a reconnect showed the cached list as
+   *  though it were freshly read, and a continuation restored the previous aim's entry as this
+   *  aim's draft, which the next save wrote under this machine's id. Every guard below is a
+   *  generation check now (round 6 on PR #264). */
+  const presetAim = useRef({ generation: 0, machineId: null as string | null });
+  const isCurrentAim = (generation: number) => presetAim.current.generation === generation;
+  /** Nothing of another aim's is ever shown: the list is cleared when the aim moves and installed
+   *  only under the aim that asked for it. Empty, not the previous entries, while this aim's own
+   *  list is still being read — the pass rows below want the honest answer. */
+  const presets =
+    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : [];
+  /** Whether that empty list means "this cutter has none" or "nobody has answered yet". The editor
+   *  is withheld until it is the former: `freshPresetId` and the name check both read the list to
+   *  avoid colliding with what is already stored, so a New pressed against a list that has not
+   *  arrived can mint an id that already exists and overwrite that entry (Codex on PR #264). */
+  const presetsLoaded = connected !== null && presetsFor?.machineId === connected.machine_id;
+
+  const presetMode = editorMode(draft, presets);
+  const presetDirty = draft !== null && baseline !== null && isDirty(draft, baseline);
+  /** A builtin is never faulted because it is never written: its fields are read-only, and Save as
+   *  Copy is what turns one into something editable. */
+  const presetFault =
+    draft === null || ranges === null || presetMode === "builtin"
+      ? null
+      : draftFault(draft, presets, ranges);
+
+  /** Aims the section at a cutter, or at none, and answers with the aim it opened so a caller can
+   *  hand it to the read that follows. A preset belongs to one machine, so the draft goes with the
+   *  aim — and so does the list, because "loaded" has to mean *this* aim's list and not the one a
+   *  previous connection to the same cutter left behind. */
+  const aimPresetsAt = (machineId: string | null) => {
+    const generation = presetAim.current.generation + 1;
+    presetAim.current = { generation, machineId };
+    setPresetsFor(null);
+    setDraft(null);
+    setBaseline(null);
+    setPresetError(null);
+    setPresetListError(null);
+    setPendingAfterDecision(null);
+    return generation;
+  };
+
+  /** The list, installed only under the aim that asked for it. A list that arrives is also what
+   *  answers the previous read's failure: held past it, the section would say the presets cannot be
+   *  read while holding the ones it just read, and only a disconnect would clear it (Copilot on
+   *  PR #264). */
+  const installPresets = (generation: number, machineId: string, list: unknown) => {
+    if (!isCurrentAim(generation)) return false;
+    setPresetsFor({ machineId, presets: list as Preset[] });
+    setPresetListError(null);
+    return true;
+  };
+
+  /** Reads a cutter's own list for one aim, and answers with what was installed — `null` when the
+   *  read failed or the aim moved past it, because a caller that re-derives the draft from the list
+   *  must not do that from either. A failure is kept rather than only raised: the editor is withheld
+   *  until a list arrives, so a read nobody reports leaves "reading" on screen for good. */
+  const readPresets = (generation: number, machineId: string): Promise<Preset[] | null> =>
+    ipc.listPresets(machineId).then(
+      (p) => (installPresets(generation, machineId, p) ? (p as Preset[]) : null),
+      (e) => {
+        if (isCurrentAim(generation)) setPresetListError(ipc.ipcErrorMessage(e));
+        return null;
+      },
+    );
+
+  /** Every action that replaces or drops the draft goes through here: selecting another preset,
+   *  aiming at another cutter, and closing the dialog. An operator who typed a force and pressed
+   *  Close deserves to be asked, and there is nowhere else those numbers exist. */
+  const guardUnsaved = (run: () => void) => {
+    if (presetDirty) setPendingAfterDecision({ run });
+    else run();
+  };
+
+  const editPreset = (id: string) => {
+    const stored = presets.find((p) => p.id === id);
+    if (!stored) return;
+    setDraft(draftOf(stored));
+    setBaseline(draftOf(stored));
+    setPresetError(null);
+  };
+
+  const newPreset = () => {
+    if (ranges === null) return;
+    setDraft(newDraft(ranges));
+    setBaseline(newDraft(ranges));
+    setPresetError(null);
+  };
+
+  /** The list is re-read from the backend after a write and the draft re-derived from it, the way
+   *  the device list is: the file is what a preset is, and an entry patched in here would be this
+   *  side's opinion of what was stored. `then` is whatever was waiting on this save.
+   *
+   *  A refusal keeps the draft exactly as typed and names itself beside it — a write the backend
+   *  refused is the one moment those numbers exist nowhere else.
+   *
+   *  The write's own failure and the re-read's are held apart. Caught together, a read that failed
+   *  after a write that did not reported a refused save, kept the draft as unsaved, and swallowed
+   *  whatever was waiting on it (CodeRabbit on PR #264). */
+  const writePreset = (preset: Preset, then?: () => void) => {
+    // The aim this write belongs to. Everything below is checked against it: a write outlives a
+    // cutter change, and so does whatever the operator asked for next.
+    const aim = presetAim.current.generation;
+    setPresetBusy(true);
+    setPresetError(null);
+    ipc
+      .savePreset(preset)
+      .then(
+        () => {
+          // Only while the section is still on the aim that was written to. `copyPreset` writes
+          // without the unsaved-changes guard, so an operator can press Save as Copy and then aim
+          // elsewhere before the reply lands — and a draft re-installed after `aimPresetsAt` cleared
+          // it would be the previous aim's entry, shown against this one and saved under its
+          // machine's id (CodeRabbit on PR #264).
+          if (isCurrentAim(aim)) {
+            // The write landed, so the file holds what was sent: the draft stops being unsaved here
+            // rather than at the re-read, or a refresh that failed afterwards would leave the
+            // operator holding an "unsaved" edit that is in fact saved — and every guard would keep
+            // asking about it. The re-read refines this with what the backend actually lists.
+            const written = draftOf(preset);
+            setDraft(written);
+            setBaseline(written);
+          }
+          return readPresets(aim, preset.machine_id).then((stored) => {
+            const saved = stored?.find((p) => p.id === preset.id);
+            if (saved !== undefined) {
+              setDraft(draftOf(saved));
+              setBaseline(draftOf(saved));
+            }
+            // Last, and whether or not that read landed: the continuation is what the operator
+            // asked for *next* — another preset, a blank one, a close. Run before the re-read, its
+            // selection was overwritten by this write's own (Codex on PR #264).
+            //
+            // And only under the aim it was captured on: `editPreset` closes over that aim's list,
+            // so run after a cutter change it restored the previous cutter's entry as this one's
+            // draft — which the next save wrote under this machine's id (Greptile on PR #264). An
+            // aim change *is* a legal continuation: the aim has not moved yet when it runs.
+            if (isCurrentAim(aim)) then?.();
+          });
+        },
+        (e) => {
+          // Named against the draft it refused, which is on screen only while the aim has not moved.
+          // The continuation does not run: nothing was written to continue from.
+          if (!isCurrentAim(aim)) return;
+          setPresetError(ipc.ipcErrorMessage(e));
+          setPendingAfterDecision(null);
+        },
+      )
+      .finally(() => setPresetBusy(false));
+  };
+
+  const savePresetDraft = (then?: () => void) => {
+    if (draft === null || connected === null || presetFault !== null) return;
+    writePreset(toPreset(draft, connected.machine_id, presets), then);
+  };
+
+  /** A copy is written at once rather than opened as a draft: copying is the only way to edit what
+   *  a builtin holds, and an unsaved copy would be a second unsaved thing to decide about. The id
+   *  is minted fresh, so nothing about the source is rewritten or shadowed. */
+  const copyPreset = () => {
+    const source = draft === null ? undefined : presets.find((p) => p.id === draft.id);
+    if (source === undefined || connected === null) return;
+    writePreset(toPreset(copyDraft(source, presets), connected.machine_id, presets));
+  };
+
+  const deletePresetDraft = () => {
+    if (draft === null || connected === null) return;
+    const machineId = connected.machine_id;
+    // Worked out before the delete, off the list that still holds the entry: afterwards there is
+    // no row to take a neighbour from, and an editor showing a deleted preset's settings is the
+    // one answer a delete must not give.
+    const nextId = selectAfterDelete(presets, draft.id);
+    const aim = presetAim.current.generation;
+    setPresetBusy(true);
+    setPresetError(null);
+    ipc
+      .deletePreset(machineId, draft.id)
+      // Same split as `writePreset`: the delete happened, so a re-read that fails afterwards is a
+      // read failure — reported as one, and never as a delete that left the entry in place.
+      .then(
+        () => {
+          // The entry is gone, so it stops being what the editor holds here rather than at the
+          // re-read: a refresh that failed afterwards would otherwise leave a deleted preset's
+          // settings on screen. Past an aim change there is nothing of this aim's left to clear, and
+          // the re-read below is what moves the selection to a neighbour.
+          if (isCurrentAim(aim)) {
+            setDraft(null);
+            setBaseline(null);
+          }
+          return readPresets(aim, machineId);
+        },
+        (e) => {
+          if (isCurrentAim(aim)) setPresetError(ipc.ipcErrorMessage(e));
+          return null;
+        },
+      )
+      .then((stored) => {
+        if (stored === null) return;
+        const next = stored.find((p) => p.id === nextId);
+        setDraft(next === undefined ? null : draftOf(next));
+        setBaseline(next === undefined ? null : draftOf(next));
+      })
+      .finally(() => setPresetBusy(false));
+  };
+
+  const saveThenContinue = () => {
+    const waiting = pendingAfterDecision;
+    setPendingAfterDecision(null);
+    savePresetDraft(() => waiting?.run());
+  };
+
+  /** Back to the stored entry, and the refusal goes with it: a rejected write is about numbers that
+   *  are no longer on screen, so leaving it up blames the entry the operator kept (Copilot on
+   *  PR #264). */
+  const discardDraft = () => {
+    setDraft(baseline);
+    setPresetError(null);
+  };
+
+  const discardThenContinue = () => {
+    const waiting = pendingAfterDecision;
+    setPendingAfterDecision(null);
+    discardDraft();
+    waiting?.run();
+  };
 
   const startCut = () => {
     // `replanning` guards the window a mode change opens: the rows on screen still belong to
@@ -457,7 +748,7 @@ export function CutDialog({
         <div style={{ display: "flex", alignItems: "center" }}>
           <strong>Cut</strong>
           <div style={{ flex: 1 }} />
-          <button aria-label="Close" style={btn} onClick={onClose}>
+          <button aria-label="Close" style={btn} onClick={() => guardUnsaved(onClose)}>
             Close
           </button>
         </div>
@@ -553,14 +844,23 @@ export function CutDialog({
                         <button
                           aria-label={`${control.label} ${d.instance_id}`}
                           style={btn}
-                          onClick={() => (control.verb === "reconnect" ? reconnect() : disconnect())}
+                          // One aim change at a time. Two in flight would have their replies install
+                          // in whatever order they land, and the first to finish would clear
+                          // `aiming` while the other was still moving the aim (CodeRabbit on
+                          // PR #264) — which is also what `DeviceManager` refuses as Busy.
+                          disabled={aiming}
+                          // Only the disconnect is guarded: a reconnect re-opens the same cutter's
+                          // transport, so the draft it is editing is still that machine's.
+                          onClick={() =>
+                            control.verb === "reconnect" ? reconnect() : guardUnsaved(disconnect)
+                          }
                         >
                           {control.label}
                         </button>
                       ) : null}
                     </>
                   ) : (
-                    <button style={btn} onClick={() => connect(d)}>
+                    <button style={btn} disabled={aiming} onClick={() => guardUnsaved(() => connect(d))}>
                       Connect
                     </button>
                   )}
@@ -575,6 +875,64 @@ export function CutDialog({
             Add a Cut Host…
           </button>
         </div>
+
+        {/* A preset belongs to one machine, so there is nothing to manage until this dialog is
+            aimed at one, and nothing to manage safely until that cutter's own list has arrived:
+            what is already stored is what a new entry's name and id have to avoid. Withheld
+            outright when the ranges could not be read — an editor that cannot say what a legal
+            force is would offer saves the cut path then refuses. */}
+        {connected === null ? null : rangesError !== null || presetListError !== null ? (
+          <div style={{ fontSize: 12, color: "var(--cut)" }}>
+            Material presets are unavailable: {rangesError ?? presetListError}
+          </div>
+        ) : ranges !== null && presetsLoaded ? (
+          <PresetEditor
+            presets={presets}
+            caps={caps}
+            ranges={ranges}
+            draft={draft}
+            mode={presetMode}
+            dirty={presetDirty}
+            fault={presetFault}
+            error={presetError}
+            // An aim change is as much a write as a save is, as far as this section is concerned:
+            // both end with the draft replaced by what the backend says.
+            busy={presetBusy || aiming}
+            onSelect={(id) => guardUnsaved(() => editPreset(id))}
+            onNew={() => guardUnsaved(newPreset)}
+            onCopy={copyPreset}
+            onChange={(patch) => setDraft((prev) => (prev === null ? prev : { ...prev, ...patch }))}
+            onSave={() => savePresetDraft()}
+            onDiscard={discardDraft}
+            onDelete={deletePresetDraft}
+          />
+        ) : (
+          <div style={{ fontSize: 12, color: "var(--muted)" }}>Reading this cutter's presets…</div>
+        )}
+
+        {/* The decision is the operator's, and nothing moves until they make it: Save writes and
+            then does what they asked for, Discard drops the edit and does it, Keep editing leaves
+            them where they were. Save is withheld while the draft is refused, with the reason
+            already on screen in the editor above. */}
+        {pendingAfterDecision !== null ? (
+          <div role="alert" style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
+            <span>Unsaved changes to the preset “{draft?.name}”.</span>
+            <button
+              aria-label="Save preset and continue"
+              style={btn}
+              disabled={presetBusy || presetFault !== null}
+              onClick={saveThenContinue}
+            >
+              Save and continue
+            </button>
+            <button aria-label="Discard preset changes and continue" style={btn} disabled={presetBusy} onClick={discardThenContinue}>
+              Discard changes
+            </button>
+            <button aria-label="Keep editing the preset" style={btn} onClick={() => setPendingAfterDecision(null)}>
+              Keep editing
+            </button>
+          </div>
+        ) : null}
 
         {machineMismatch && connected ? (
           <div style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>

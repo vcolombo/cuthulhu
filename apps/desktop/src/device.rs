@@ -1262,7 +1262,50 @@ fn user_entries(path: &Path) -> Result<Vec<MaterialPreset>, IpcError> {
         .into_iter().filter(|p| !p.builtin).collect())
 }
 
+/// Whether the pair names a preset that ships with the app. Keyed on the pair like everything
+/// else here: a builtin belongs to one machine, and the operator's own id may equal it on another.
+fn ships_with_the_app(machine_id: &str, id: &str) -> bool {
+    cutplan::presets::builtin_presets()
+        .iter()
+        .any(|p| p.machine_id == machine_id && p.id == id)
+}
+
 pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> {
+    // What the entry *is* is settled before what it holds. An id-less entry is a save the operator
+    // never gets back (`load_presets` drops those, so the editor closes, the file grows and the
+    // next listing shows nothing new); a pair that names a builtin can never be saved at all, so
+    // saying "force must be 1..=33" first sends the operator to repair settings on an entry that
+    // was refusable whatever they held (Codex on PR #264).
+    if preset.id.is_empty() {
+        return Err(IpcError::new("invalid_preset", "a material preset needs an id"));
+    }
+    // And the other half of the pair: `list_presets` answers per machine, so an entry naming none
+    // is written and then never listed again — the same unreachable save, one field along (Copilot
+    // on PR #264).
+    if preset.machine_id.is_empty() {
+        return Err(IpcError::new("invalid_preset", "a material preset needs the machine it is for"));
+    }
+    // A user entry saved under a builtin's pair shadows it, and nothing hands the shipped
+    // settings back afterwards — the material the app came with is gone for good.
+    if ships_with_the_app(&preset.machine_id, &preset.id) {
+        return Err(IpcError::new(
+            "builtin_preset",
+            format!(
+                "`{}` is a material preset that ships with the app; save your own under a different id",
+                preset.id
+            ),
+        ));
+    }
+    // The name is the whole of what the picker shows, so a blank one is a row naming no material.
+    if preset.name.trim().is_empty() {
+        return Err(IpcError::new("invalid_preset", "a material preset needs a name"));
+    }
+    // Preflight refuses these settings at the cut, so storing them makes a material the operator
+    // can pick from the dialog and never cut with.
+    if let Some(reason) = cutplan::preflight::preset_settings_out_of_range(&preset.settings) {
+        return Err(IpcError::new("invalid_preset", reason));
+    }
+
     let mut user = user_entries(path)?;
     user.retain(|p| (&p.machine_id, &p.id) != (&preset.machine_id, &preset.id));
     user.push(MaterialPreset { builtin: false, ..preset });
@@ -1271,7 +1314,25 @@ pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> 
 
 pub fn delete_preset(path: &Path, machine_id: &str, id: &str) -> Result<(), IpcError> {
     let mut user = user_entries(path)?;
+    let before = user.len();
     user.retain(|p| (p.machine_id.as_str(), p.id.as_str()) != (machine_id, id));
+    // Reporting success having removed nothing left the entry listed, which reads as the app
+    // ignoring the operator. What went wrong is decided from the entries actually on disk, not
+    // from the pair: a user entry shadowing a builtin's pair is the operator's to delete, and
+    // deleting it reveals the builtin again.
+    if user.len() == before {
+        return Err(if ships_with_the_app(machine_id, id) {
+            IpcError::new(
+                "builtin_preset",
+                format!("`{id}` ships with the app, so there is nothing of yours to delete"),
+            )
+        } else {
+            IpcError::new(
+                "unknown_preset",
+                format!("no material preset `{id}` is saved for `{machine_id}`"),
+            )
+        });
+    }
     save_user_presets(path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
 }
 
@@ -2988,7 +3049,7 @@ mod tests {
         // id leaves that builtin listed.
         let shadow = cutplan::presets::builtin_presets().into_iter()
             .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins").id;
-        save_preset(&path, a_user_preset("puma", &shadow, 44)).expect("saved under the Puma");
+        save_preset(&path, a_user_preset("puma", &shadow, 24)).expect("saved under the Puma");
         let cameo = list_presets(&path, "cameo5").unwrap();
         let listed: Vec<_> = cameo.iter().filter(|p| p.id == shadow).collect();
         assert_eq!(listed.len(), 1, "one entry for {shadow} on the Cameo, got {listed:#?}");
@@ -3022,5 +3083,107 @@ mod tests {
         let after = revealed.iter().find(|p| p.id == builtin.id).expect("the builtin is back");
         assert!(after.builtin, "deleting a user shadow must reveal the builtin it hid");
         assert_eq!(after.name, builtin.name);
+    }
+
+    /// A user entry under a builtin's own pair hides it, and the app offers no way back to the
+    /// settings it shipped with — so the save is refused rather than the material lost.
+    #[test]
+    fn saving_over_a_builtins_pair_is_refused_and_leaves_it_shipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+
+        let err = save_preset(&path, a_user_preset("cameo5", &builtin.id, 12)).unwrap_err();
+        assert_eq!(err.code, "builtin_preset",
+            "a save over a builtin's pair was allowed through: {}", err.message);
+        assert!(err.message.contains(&builtin.id),
+            "the refusal names no preset: {}", err.message);
+
+        assert!(user_entries(&path).unwrap().is_empty(),
+            "a refused save still wrote an entry to the file");
+        let listed = list_presets(&path, "cameo5").unwrap();
+        let after = listed.iter().find(|p| p.id == builtin.id).expect("the builtin is still listed");
+        assert!(after.builtin, "the refused save shadowed the builtin anyway");
+        assert_eq!(after.settings, builtin.settings, "the shipped settings were overwritten");
+    }
+
+    /// Each of these is a preset the operator cannot use afterwards: an id-less entry is dropped
+    /// on the next load, a blank name is a picker row naming no material, and settings past the
+    /// machine's edge are refused at the cut. All three are refused where they are typed.
+    #[test]
+    fn a_preset_the_operator_could_not_use_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+
+        let no_id = MaterialPreset { id: String::new(), ..a_user_preset("cameo5", "mine", 12) };
+        let no_machine = MaterialPreset { machine_id: String::new(), ..a_user_preset("cameo5", "mine", 12) };
+        let blank_name = MaterialPreset { name: "   ".into(), ..a_user_preset("cameo5", "mine", 12) };
+        let past_the_edge = a_user_preset("cameo5", "mine", 99);
+
+        for (preset, what) in [(no_id, "an empty id"), (no_machine, "no machine"),
+                               (blank_name, "a blank name"), (past_the_edge, "a force out of range")] {
+            let err = save_preset(&path, preset).unwrap_err();
+            assert_eq!(err.code, "invalid_preset", "{what} was saved: {}", err.message);
+        }
+        assert!(user_entries(&path).unwrap().is_empty(),
+            "a refused save still wrote an entry to the file");
+    }
+
+    /// An entry with two faults is named by the one the operator can act on. A pair that names a
+    /// builtin is unsavable whatever it holds, so reporting the force first sends them to fix a
+    /// number that was never what refused the save.
+    #[test]
+    fn what_a_preset_is_refuses_it_before_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+
+        let both_wrong = a_user_preset("cameo5", &builtin.id, 99);
+        let err = save_preset(&path, both_wrong).unwrap_err();
+        assert_eq!(err.code, "builtin_preset",
+            "a shipped pair was reported as a settings fault: {}", err.message);
+    }
+
+    /// A delete that removed nothing used to report success, leaving the entry listed — which
+    /// reads as the app ignoring the operator. Which nothing it was is worth saying: a builtin is
+    /// not theirs to delete, an unsaved id never existed.
+    #[test]
+    fn a_delete_that_removed_nothing_says_which_nothing_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        save_preset(&path, a_user_preset("cameo5", "my-vinyl", 12)).expect("saved");
+
+        let unknown = delete_preset(&path, "cameo5", "never-saved").unwrap_err();
+        assert_eq!(unknown.code, "unknown_preset",
+            "deleting an id nobody saved reported success: {}", unknown.message);
+
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+        let shipped = delete_preset(&path, "cameo5", &builtin.id).unwrap_err();
+        assert_eq!(shipped.code, "builtin_preset",
+            "deleting an unshadowed builtin reported success: {}", shipped.message);
+
+        assert!(list_presets(&path, "cameo5").unwrap().iter().any(|p| p.id == "my-vinyl"),
+            "a refused delete removed the operator's own entry");
+    }
+
+    /// The refusals above must not reach the ordinary case: the operator's own preset is still
+    /// saved, edited over its pair, and deleted.
+    #[test]
+    fn a_preset_of_the_operators_own_still_saves_edits_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+
+        save_preset(&path, a_user_preset("cameo5", "my-vinyl", 12)).expect("saved");
+        save_preset(&path, a_user_preset("cameo5", "my-vinyl", 21)).expect("edited");
+        let edited = list_presets(&path, "cameo5").unwrap().into_iter()
+            .find(|p| p.id == "my-vinyl").expect("the edit is listed");
+        assert_eq!(edited.settings.force, Some(21), "the edit did not reach the file");
+
+        delete_preset(&path, "cameo5", "my-vinyl").expect("deleted");
+        assert!(!list_presets(&path, "cameo5").unwrap().iter().any(|p| p.id == "my-vinyl"),
+            "the entry survived its delete");
     }
 }

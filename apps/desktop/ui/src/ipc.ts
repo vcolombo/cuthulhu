@@ -306,6 +306,16 @@ export async function machineCaps(machineId: string) {
   return invoke("machine_caps", { machineId });
 }
 
+/** Mirrors `cutplan::preflight::SettingsRanges`. Fetched rather than restated, the way
+ *  `traceControls` is: `cutplan::preflight` is what refuses a cut whose settings sit outside
+ *  these, so the preset editor asks it for the bounds instead of keeping a second copy to drift. */
+export type SettingRange = { min: number; max: number };
+export type SettingsRanges = { speed: SettingRange; force: SettingRange; repeatCount: SettingRange };
+
+export async function settingsRanges(): Promise<SettingsRanges> {
+  return invoke("settings_ranges", {});
+}
+
 export async function savePreset(p: Args) {
   return invoke("save_preset", { p });
 }

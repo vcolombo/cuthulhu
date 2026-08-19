@@ -2,6 +2,7 @@
 use driver_core::{MachineProfile, MachineCaps, Settings};
 use document::NodeId;
 use geometry::Point;
+use serde::Serialize;
 use crate::passes::DocumentPass;
 
 pub struct ConfiguredPass<'a> {
@@ -84,27 +85,77 @@ pub fn point_out_of_bounds(p: &Point, profile: &MachineProfile) -> bool {
     p.x < 0.0 || p.x > profile.width_mm || p.y < 0.0 || p.y > profile.height_mm
 }
 
+/// One bound pair, in the units the operator types.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct SettingRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl SettingRange {
+    const fn admits(&self, value: u32) -> bool {
+        value >= self.min && value <= self.max
+    }
+}
+
+/// Every bound a Settings value is refused against.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsRanges {
+    pub speed: SettingRange,
+    pub force: SettingRange,
+    pub repeat_count: SettingRange,
+}
+
+/// Public because the preset editor asks for these over IPC rather than restating them: a
+/// second copy of a bound in TypeScript offers the operator a speed this crate then refuses.
+/// Same arrangement as `trace::control_specs()` for the tracer's ranges (see
+/// `ipc::trace_controls`).
+///
+/// Cameo bounds from docs/protocol/silhouette-cameo5.md §Settings ranges.
+pub const SETTINGS_RANGES: SettingsRanges = SettingsRanges {
+    speed: SettingRange { min: 1, max: 30 },
+    force: SettingRange { min: 1, max: 33 },
+    repeat_count: SettingRange { min: 1, max: 10 },
+};
+
+/// The one comparison against `SETTINGS_RANGES`, so a cut's Settings and a stored preset's
+/// cannot disagree about where an edge is. A caller passes `None` for a value that is not to
+/// be judged at all.
+fn out_of_range(
+    speed: Option<u32>,
+    force: Option<u32>,
+    repeat_count: u32,
+) -> Option<&'static str> {
+    if !SETTINGS_RANGES.repeat_count.admits(repeat_count) {
+        return Some("repeat_count must be 1..=10");
+    }
+    if speed.is_some_and(|v| !SETTINGS_RANGES.speed.admits(v)) {
+        return Some("speed must be 1..=30");
+    }
+    if force.is_some_and(|v| !SETTINGS_RANGES.force.admits(v)) {
+        return Some("force must be 1..=33");
+    }
+    None
+}
+
 /// The setting that is out of range and the sentence saying so, or `None`.
 /// A setting the machine does not support is ignored rather than refused —
 /// the Drivers skip those values, so refusing them would reject a cut over a
 /// number that will never reach the wire.
-///
-/// Cameo bounds from docs/protocol/silhouette-cameo5.md §Settings ranges.
 pub fn settings_out_of_range(s: &Settings, caps: &MachineCaps) -> Option<&'static str> {
-    if s.repeat_count < 1 || s.repeat_count > 10 {
-        return Some("repeat_count must be 1..=10");
-    }
-    if let Some(speed) = s.speed {
-        if caps.supports_speed && !(1..=30).contains(&speed) {
-            return Some("speed must be 1..=30");
-        }
-    }
-    if let Some(force) = s.force {
-        if caps.supports_force && !(1..=33).contains(&force) {
-            return Some("force must be 1..=33");
-        }
-    }
-    None
+    out_of_range(
+        s.speed.filter(|_| caps.supports_speed),
+        s.force.filter(|_| caps.supports_force),
+        s.repeat_count,
+    )
+}
+
+/// The same bounds with no machine to ask. A stored preset is checked whole: the fields a
+/// machine ignores are still written to its file, and the operator who typed them there gets
+/// them back the next time it is edited.
+pub fn preset_settings_out_of_range(s: &crate::presets::PresetSettings) -> Option<&'static str> {
+    out_of_range(s.speed, s.force, s.repeat_count)
 }
 
 /// Validate a cut job before encoding. Rules checked in order (first violation wins):
@@ -613,5 +664,79 @@ mod tests {
             assert_eq!(error.code(), code, "code for {error:?}");
             assert_eq!(error.to_string(), message, "message for {error:?}");
         }
+    }
+
+    /// A bound moved in `SETTINGS_RANGES` and a sentence left behind names an edge that is no
+    /// longer the edge — the operator reads it, types that number, and is refused again. The
+    /// messages are `&'static str`, so only a test can hold the two together.
+    #[test]
+    fn every_range_refusal_names_the_bound_it_enforced() {
+        let caps = caps_with_speed_force();
+        let cases = [
+            (
+                Settings {
+                    speed: None,
+                    force: None,
+                    repeat_count: SETTINGS_RANGES.repeat_count.max + 1,
+                },
+                SETTINGS_RANGES.repeat_count,
+            ),
+            (
+                Settings { speed: Some(SETTINGS_RANGES.speed.max + 1), force: None, repeat_count: 1 },
+                SETTINGS_RANGES.speed,
+            ),
+            (
+                Settings { speed: None, force: Some(SETTINGS_RANGES.force.max + 1), repeat_count: 1 },
+                SETTINGS_RANGES.force,
+            ),
+        ];
+        for (settings, range) in cases {
+            let message = settings_out_of_range(&settings, &caps)
+                .expect("a value past the maximum is refused");
+            let stated = format!("{}..={}", range.min, range.max);
+            assert!(
+                message.contains(&stated),
+                "`{message}` does not state the range it enforced ({stated})",
+            );
+        }
+    }
+
+    /// The preset editor reads these keys off the wire. Renaming a field on either side leaves
+    /// it with no bounds at all, which reads as a field with no limits.
+    #[test]
+    fn settings_ranges_serialize_in_the_casing_the_ui_reads() {
+        assert_eq!(
+            serde_json::to_value(SETTINGS_RANGES).unwrap(),
+            serde_json::json!({
+                "speed": { "min": 1, "max": 30 },
+                "force": { "min": 1, "max": 33 },
+                "repeatCount": { "min": 1, "max": 10 },
+            }),
+        );
+    }
+
+    /// A machine that ignores speed is still handed a preset that states one, and that number
+    /// stays in its file for the next machine and the next edit. So a stored preset is checked
+    /// whole, where a cut's Settings is checked against what the machine honours.
+    #[test]
+    fn a_stored_preset_is_refused_a_speed_a_cut_would_have_ignored() {
+        let stored = crate::presets::PresetSettings {
+            speed: Some(SETTINGS_RANGES.speed.max + 1),
+            force: None,
+            repeat_count: 1,
+        };
+        assert_eq!(
+            settings_out_of_range(
+                &Settings { speed: stored.speed, force: None, repeat_count: stored.repeat_count },
+                &caps_no_speed_force(),
+            ),
+            None,
+            "premise: a machine without speed support has its speed ignored, not refused",
+        );
+        assert_eq!(
+            preset_settings_out_of_range(&stored),
+            Some("speed must be 1..=30"),
+            "a preset's out-of-range speed was let through to its file",
+        );
     }
 }

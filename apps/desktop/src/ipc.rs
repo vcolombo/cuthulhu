@@ -196,6 +196,13 @@ pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) 
     dev.caps_for(&machine_id)
 }
 
+/// The preset editor is told the bounds rather than restating them: a second copy in TypeScript
+/// offers the operator a speed `cutplan` then refuses (the arrangement `trace_controls` uses).
+#[tauri::command]
+pub fn settings_ranges() -> Result<cutplan::preflight::SettingsRanges, IpcError> {
+    Ok(cutplan::preflight::SETTINGS_RANGES)
+}
+
 #[tauri::command]
 pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
     crate::device::save_preset(&presets_path()?, p)

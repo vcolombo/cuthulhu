@@ -76,6 +76,7 @@ fn main() {
             ipc::confirm_pass_done,
             ipc::list_presets,
             ipc::machine_caps,
+            ipc::settings_ranges,
             ipc::save_preset,
             ipc::delete_preset,
             ipc::list_hosts,

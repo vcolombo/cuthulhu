@@ -1991,6 +1991,10 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
   // badge says so rather than offering a cut for a status nobody has asked for.
   await expect(page.getByText("Unknown")).toHaveCount(3);
+  // Nothing has been refused yet, so the warning is nowhere — including over the two local
+  // cutters, whose section has no host id at all for a refusal to match (#265).
+  const forceWarning = page.getByText(/A cut may still be running on this Cut Host/);
+  await expect(forceWarning).toHaveCount(0);
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
   // The Rust side's own words, and the row still there (#94).
@@ -1998,12 +2002,29 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   await expect(page.getByText("Workshop Pi")).toBeVisible();
 
   // Only now is the force on screen, and it says what is being accepted rather than asking
-  // whether the operator is sure.
-  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toBeVisible();
+  // whether the operator is sure. Once, against the host that refused: the local section is still
+  // listed below it and must not have grown a copy.
+  await expect(forceWarning).toHaveCount(1);
   await page.getByRole("button", { name: "Discard Workshop Pi anyway" }).click();
   // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
+});
+
+// The absence is its own test because every path to the warning goes through a host, and a desktop
+// with none paired has no Forget to press: the defect it covers (#265) needed no interaction at all,
+// so a test that starts by pairing something can never see it.
+test("a desktop with no Cut Host paired shows no force-forget warning", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+
+  // The local cutters are listed — the dialog is populated, so the warning's absence is about the
+  // guard rather than about an empty device section.
+  await expect(page.getByTestId("device-badge")).toHaveCount(2);
+  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /anyway$/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Keep / })).toHaveCount(0);
 });
 
 // Reaching a Pi starts here, and nothing drove it end to end while the fake refused the three

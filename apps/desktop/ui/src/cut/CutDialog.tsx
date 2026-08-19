@@ -794,8 +794,12 @@ export function CutDialog({
               ) : null}
               {/* Says what is being accepted rather than asking "are you sure": the risk is not
                   that the host is gone, it is that it is still cutting and this is the only
-                  desktop that could stop it. Shown only after the plain Forget was refused. */}
-              {forceHost === section.hostId ? (
+                  desktop that could stop it. Shown only after the plain Forget was refused —
+                  hence the explicit `null` check. The local section's `hostId` is `null` too, so
+                  bare equality also matched it with nothing refused: a desktop that had never
+                  paired a host carried this warning over its local cutters, and that
+                  `Discard anyway` called `forget_host` for no host (#265). */}
+              {forceHost !== null && forceHost === section.hostId ? (
                 <div style={{ fontSize: 12, color: "var(--cut)", display: "flex", alignItems: "center", gap: 8 }}>
                   <span>
                     A cut may still be running on this Cut Host. Forgetting it discards the

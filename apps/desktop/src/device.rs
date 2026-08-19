@@ -2956,8 +2956,8 @@ mod tests {
 
     /// The whole of #153, against a temporary presets file: an operator's id is their own string,
     /// so `my-vinyl` names one material on a Cameo and another on a Puma. Keyed on the id alone,
-    /// saving one overwrote the other and deleting one removed both — with the material profile
-    /// editor (#55) that is an operator watching their settings vanish.
+    /// saving one overwrote the other and deleting one removed both — with the preset editor (#55)
+    /// that is an operator watching their settings vanish.
     #[test]
     fn a_presets_id_belongs_to_one_machine_when_saved_deleted_or_shadowed() {
         let dir = tempfile::tempdir().unwrap();

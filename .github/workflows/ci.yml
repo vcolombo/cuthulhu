@@ -2,12 +2,37 @@
 name: CI
 
 on:
+  # A branch push and its pull request used to run the whole suite twice for one commit: two
+  # draws from the runner pool for one answer, and two chances to draw a runner whose apt mirror
+  # never responds (#269). The pull request run is the one a merge is gated on, so it is the one
+  # kept. `main` keeps a run of its own because a merge commit is a state no PR run ever tested.
   push:
+    branches: [main]
   pull_request:
+
+# A superseded run has nothing left to say, and a wedged one holds its runner until GitHub's
+# six-hour ceiling: four commits in half an hour once left seven live runs, three still burning a
+# runner hours later (#269). A pull request groups by ref, so a new commit retires the run for that
+# branch and nothing else.
+#
+# A `main` push takes a group of its own instead, keyed on the run. Sharing the ref group would
+# have quietly cost the very results this arrangement exists to keep: a group admits one running
+# and one *pending* run, so three merges in quick succession would see the middle one cancelled
+# while still queued, and the commit that broke `main` could be the one with no result at all.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   python-tools:
     runs-on: ubuntu-latest
+    # Bounded well under the six-hour default: a stall that a re-run clears in a minute should
+    # cost minutes and say so, not hold a required check all day (#269). Each ceiling is several
+    # times the slowest run measured across sixteen successful runs of this workflow — python-tools
+    # 0.3 min, cross-pi 3.0, rust 7.2, ui 11.5 — so it fires for a wedge and never for a cold
+    # cache. The measurements live here rather than only in the pull request that chose them,
+    # because the next person to move a ceiling needs to know what the old one was set against.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,11 +45,17 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Retried because a hosted runner's apt mirror can refuse or stall a single fetch, and one
+      # unlucky package should not fail a build that has nothing to do with it. Retries cover the
+      # mirror that answers slowly; the job timeout covers the one that never answers at all.
       - name: Install native deps (serialport needs libudev; Tauri 2 needs webkit2gtk/gtk3/rsvg2)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y libudev-dev pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
       # --locked is the Rust half of the discipline the ui job already gets from `npm ci`:
       # refuse to proceed when the lockfile disagrees with the manifests. Without it cargo
       # quietly rewrites Cargo.lock mid-build, so a dependency added without committing the
@@ -43,6 +74,7 @@ jobs:
   # slow the test job. `--locked` for the same reason the workspace test has it.
   cross-pi:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,6 +93,7 @@ jobs:
 
   ui:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: apps/desktop/ui
@@ -87,6 +120,10 @@ jobs:
           fi
       - name: Unit tests
         run: npm test
+      # `--with-deps` runs apt itself, so the retry the rust job passes on the command line has to
+      # live in apt's own config to reach it: this is the same stall, in the other job it wedged.
+      - name: Give apt the same retries before it installs the browser's system libraries
+        run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/99-cuthulhu-retries
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
       - name: E2E smoke test

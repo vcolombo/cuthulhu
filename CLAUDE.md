@@ -158,6 +158,13 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   `<config_dir>/cuthulhu/presets.json` and the on-disk contract is *user entries only*
   (`builtin: false` forced on write). A preset is keyed on `(machine_id, id)` everywhere —
   shadowing, saving, deleting — because an operator's id is their own string (#153).
+  The cut dialog manages them (`ui/src/cut/PresetEditor.tsx`, decisions in `presetDraft.ts`): every
+  write goes through `save_preset`/`delete_preset`, which refuse a builtin's pair, an id-less or
+  blank-named entry, a setting outside range, and a delete that removed nothing — the editor is a
+  caller, never the enforcement. An id is minted from the name at creation and never moves again,
+  because a `PresetAssignment` and a `preset:<id>` PassKey name a preset by it.
+- Setting ranges live once, in `cutplan::preflight::SETTINGS_RANGES`, and reach the UI over
+  `settings_ranges` — the arrangement `trace_controls` uses. Do not restate a bound in TypeScript.
 
 ## Conventions
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 
 // Minimal in-memory fake Tauri backend. Runs inside the page (via addInitScript, so it
 // can't close over anything outside itself) and mirrors the JSON shape produced by
@@ -298,6 +298,25 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let failNextResume = false;
   let failNextCut = false;
   let failNextPlan = false;
+  // Presets as `cutplan::presets` keeps them: builtins ship per machine, the operator's own
+  // entries live in one file beside them, and an entry replaces a builtin only when the whole pair
+  // `(machine_id, id)` matches — an id is the operator's own string, so `my-vinyl` names one
+  // material on a Cameo and another on a Puma (#153).
+  type MaterialPreset = {
+    id: string; name: string; machine_id: string;
+    settings: { speed: number | null; force: number | null; repeat_count: number };
+    builtin: boolean;
+  };
+  const BUILTIN_PRESETS: MaterialPreset[] = [
+    { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
+    // The Puma takes speed and force from its own panel, so its builtins name a material and
+    // nothing else — the state the editor's preview has to read back as the panel's.
+    { id: "puma-htv", name: "HTV", machine_id: "puma",
+      settings: { speed: null, force: null, repeat_count: 1 }, builtin: true },
+  ];
+  let userPresets: MaterialPreset[] = [];
+  let failNextPresetSave = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
   // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
   // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
@@ -579,8 +598,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
           throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
         }
         // And a preset this machine cannot offer is refused rather than cut with defaults,
-        // mirroring prepare_cut. `list_presets` answers empty here, so any named preset is
-        // unavailable — which is the state the real refusal exists for.
+        // mirroring prepare_cut. The cut path here stands in for a machine whose preset *file*
+        // holds nothing, so any named preset is unavailable — which is the state the real refusal
+        // exists for.
         const named = (pass as { preset_id?: string | null }).preset_id;
         // Explicit rather than truthy: an empty id is a named preset too, and `&& named` would
         // wave it through — the fake being more permissive than Rust is the false green this
@@ -681,14 +701,77 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       return null;
     },
-    // One preset, so the properties panel's Material control has something to offer and the
-    // preset-grouping path is reachable through the UI. The fake owns no preset file, so any
-    // named preset is unavailable at cut time — which is the state `prepare_cut`'s refusal
-    // exists for, and what the cut handler below mirrors.
-    list_presets: () => [
-      { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
-        settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
-    ],
+    // Mirrors `desktop::device::list_presets`: this machine's builtins, minus any the operator's
+    // own entries shadow by pair, plus those entries. The cut handler above is deliberately
+    // stricter — it stands in for a machine whose preset *file* holds none of this, which is the
+    // state `prepare_cut`'s refusal exists for.
+    list_presets: (a) => {
+      const machineId = a.machineId as string;
+      const mine = userPresets.filter((p) => p.machine_id === machineId);
+      const shipped = BUILTIN_PRESETS.filter(
+        (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
+      );
+      return [...shipped, ...mine];
+    },
+    // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
+    // to answer something; the casing and the numbers are pinned on the Rust side.
+    settings_ranges: () => ({
+      speed: { min: 1, max: 30 },
+      force: { min: 1, max: 33 },
+      repeatCount: { min: 1, max: 10 },
+    }),
+    // Every refusal `desktop::device::save_preset` makes, because the editor is what must never
+    // send one: an entry under a builtin's pair shadows a shipped material with no way back, an
+    // id-less entry is dropped on load (a save the operator never gets back), and a setting out of
+    // range is refused at cut time instead. A fake more forgiving than Rust would let the editor
+    // ship any of those green.
+    save_preset: (a) => {
+      const p = a.p as MaterialPreset;
+      if (failNextPresetSave) {
+        failNextPresetSave = false;
+        throw ipcError("preset_error", "Io(\"the presets file could not be written\")");
+      }
+      if (p.id === "" || p.name.trim() === "") {
+        throw ipcError("invalid_preset", "a material preset needs an id and a name");
+      }
+      if (BUILTIN_PRESETS.some((b) => b.machine_id === p.machine_id && b.id === p.id)) {
+        throw ipcError("builtin_preset",
+          `\`${p.id}\` is a material preset that ships with the app; save your own under a different id`);
+      }
+      const range = { speed: [1, 30], force: [1, 33], repeat_count: [1, 10] } as const;
+      for (const field of ["speed", "force", "repeat_count"] as const) {
+        const v = p.settings[field];
+        if (v !== null && (v < range[field][0] || v > range[field][1])) {
+          throw ipcError("invalid_preset", `${field} must be ${range[field][0]}..=${range[field][1]}`);
+        }
+      }
+      userPresets = [
+        ...userPresets.filter((u) => !(u.machine_id === p.machine_id && u.id === p.id)),
+        { ...p, builtin: false },
+      ];
+      return null;
+    },
+    // Named rather than silent when it removed nothing, as Rust is: a delete that reports success
+    // having deleted nothing is how the editor would come to show a preset that is still there.
+    delete_preset: (a) => {
+      const machineId = a.machineId as string;
+      const id = a.id as string;
+      const before = userPresets.length;
+      userPresets = userPresets.filter((u) => !(u.machine_id === machineId && u.id === id));
+      if (userPresets.length === before) {
+        if (BUILTIN_PRESETS.some((b) => b.machine_id === machineId && b.id === id)) {
+          throw ipcError("builtin_preset", `\`${id}\` ships with the app, so there is nothing of yours to delete`);
+        }
+        throw ipcError("unknown_preset", `no material preset \`${id}\` is saved for \`${machineId}\``);
+      }
+      return null;
+    },
+    // Test hook (no production counterpart): arms a one-shot failure for the next preset write, so
+    // a test can prove a refused save keeps the operator's edit on screen.
+    __test_fail_next_preset_save: () => {
+      failNextPresetSave = true;
+      return null;
+    },
     // Deliberately one constant, not a per-machine table: that mapping is pinned in
     // Rust by each Driver's own caps test, and restating it here would recreate the
     // copy this change removed — in a file nobody thinks of as production code.
@@ -737,8 +820,6 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       for (let i = devices.length - 1; i >= 0; i--) if (devices[i].host === a.id) devices.splice(i, 1);
       return null;
     },
-    save_preset: () => null,
-    delete_preset: () => null,
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.
     pick_image: () => "/tmp/fake.png",
   } as Record<string, (args: Record<string, unknown>) => unknown>);
@@ -999,6 +1080,243 @@ test("a pass grouped by a material this machine cannot offer is refused, not cut
 
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText(/not available for this machine/)).toBeVisible();
+});
+
+// --- managing the operator's own material presets, in the dialog that cuts with them (#244) ---
+//
+// Each of these drives the real editor against the fake's preset store, which mirrors every
+// refusal `desktop::device::save_preset` and `delete_preset` make. The invariants are the ones a
+// unit test cannot reach: what is written, what comes back, and what is selected afterwards.
+
+/** The fake's own hooks, reached through the channel the app itself invokes over. The cast is
+ *  named here rather than repeated inside a callback: `__TAURI_INTERNALS__` is installed by the
+ *  fake, so nothing in the page's own types knows about it. */
+const callFake = (page: Page, cmd: string) =>
+  page.evaluate((name) => {
+    const internals = window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } };
+    return internals.__TAURI_INTERNALS__.invoke(name);
+  }, cmd);
+
+/** Opens the Cut dialog on the local Cameo, which is the machine the presets below belong to. */
+const openDialogOnCameo = async (page: Page) => {
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByLabel("Preset to manage")).toBeVisible();
+};
+
+test("a preset created in the cut dialog is written, selected, and offered to a pass", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Thick Card");
+  await page.getByLabel("Preset speed").fill("7");
+  await page.getByLabel("Preset force", { exact: true }).fill("21");
+  await page.getByLabel("Preset repeat count").fill("2");
+  await page.getByLabel("Save preset", { exact: true }).click();
+
+  // Selected on what came back from the backend, not on what was typed: the file is what a preset
+  // is, and the editor re-reads it after every write.
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("thick-card");
+  await expect(page.getByTestId("preset-preview")).toHaveText("Cuts at speed 7, force 21, 2 passes.");
+  // And a pass can now be cut with it, which is the whole point of managing them here.
+  await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
+});
+
+test("a built-in preset is read-only, and Save as Copy leaves it shipped", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("Preset to manage").selectOption("cameo5-htv");
+  await expect(page.getByText("built-in — read-only")).toBeVisible();
+  await expect(page.getByLabel("Preset name")).toBeDisabled();
+  await expect(page.getByLabel("Delete preset")).toHaveCount(0);
+
+  await page.getByLabel("Save as Copy").click();
+  // A fresh id under a name of its own: an entry saved under `cameo5-htv` would shadow the shipped
+  // material, and the backend refuses that pair outright.
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("htv-copy");
+  await expect(page.getByLabel("Preset name")).toHaveValue("HTV (copy)");
+  await expect(page.getByLabel("Preset name")).toBeEnabled();
+  // The builtin is still listed, and still a builtin.
+  await page.getByLabel("Preset to manage").selectOption("cameo5-htv");
+  await expect(page.getByText("built-in — read-only")).toBeVisible();
+  await expect(page.getByTestId("preset-preview")).toHaveText("Cuts at speed 5, force 20, one pass.");
+});
+
+test("renaming a preset keeps the id a pass and a document name it by", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Thick Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("thick-card");
+
+  await page.getByLabel("Preset name").fill("Thin Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  // The name moved; the id did not. A PassKey is `preset:<id>` and a Node's assignment names the
+  // same string, so an id that followed the name would orphan every document holding it.
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("thick-card");
+  await expect(page.getByLabel("Preset to manage").locator("option")).toContainText(["HTV (built-in)", "Thin Card"]);
+});
+
+test("a name this cutter already uses is refused before anything is written", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("HTV");
+  await expect(page.getByTestId("preset-error")).toContainText("built-in");
+  await expect(page.getByLabel("Save preset", { exact: true })).toBeDisabled();
+
+  // A name of its own clears it, and the same press then writes.
+  await page.getByLabel("Preset name").fill("HTV, mine");
+  await expect(page.getByTestId("preset-error")).toHaveCount(0);
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("htv-mine");
+});
+
+test("deleting a preset selects a neighbour instead of showing settings that are gone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  for (const name of ["Card", "Vinyl"]) {
+    await page.getByLabel("New preset").click();
+    await page.getByLabel("Preset name").fill(name);
+    await page.getByLabel("Save preset", { exact: true }).click();
+    await expect(page.getByLabel("Preset name")).toHaveValue(name);
+  }
+
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await page.getByLabel("Delete preset").click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("vinyl");
+  await expect(page.getByLabel("Preset to manage").locator("option")).toContainText(["HTV (built-in)", "Vinyl"]);
+  await expect(page.getByLabel("Preset to manage").locator("option")).toHaveCount(2);
+});
+
+test("a write the backend refuses keeps the edit on screen and says why", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Thick Card");
+  await page.getByLabel("Preset force", { exact: true }).fill("30");
+  await callFake(page, "__test_fail_next_preset_save");
+  await page.getByLabel("Save preset", { exact: true }).click();
+
+  // The refusal is named, and the numbers are still there to try again with — they exist nowhere
+  // else, so a cleared form would be the operator retyping them from memory.
+  await expect(page.getByTestId("preset-error")).toContainText("presets file could not be written");
+  await expect(page.getByLabel("Preset name")).toHaveValue("Thick Card");
+  await expect(page.getByLabel("Preset force", { exact: true })).toHaveValue("30");
+
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("thick-card");
+  await expect(page.getByTestId("preset-error")).toHaveCount(0);
+});
+
+test("an unsaved preset edit has to be decided before the dialog closes", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card");
+  await page.getByLabel("Preset speed").fill("9");
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByText("Unsaved changes to the preset")).toBeVisible();
+
+  // Keep editing leaves them exactly where they were, dialog and draft alike.
+  await page.getByLabel("Keep editing the preset").click();
+  await expect(page.getByLabel("Preset speed")).toHaveValue("9");
+
+  // Save and continue does both: the entry is written, and then the close it was blocking happens.
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByLabel("Save preset and continue").click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  // Reopening proves the save reached the backend rather than the dialog's own memory. No Connect
+  // this time: the cutter is still connected, and the dialog seeds itself from the manager's cache
+  // — pressing the first Connect on screen would aim at the *other* local cutter.
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed 9");
+});
+
+test("discarding an unsaved edit writes nothing and lets the interrupted action through", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("card");
+
+  await page.getByLabel("Preset speed").fill("12");
+  // Selecting another preset is a discard just as closing is, so it is asked about the same way.
+  await page.getByLabel("Preset to manage").selectOption("cameo5-htv");
+  await expect(page.getByText("Unsaved changes to the preset")).toBeVisible();
+  await page.getByLabel("Discard preset changes and continue").click();
+
+  await expect(page.getByText("built-in — read-only")).toBeVisible();
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed from the cutter's panel");
+});
+
+test("a preset belongs to one cutter: aiming at another shows that machine's entries", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("My Vinyl");
+  await page.getByLabel("Preset speed").fill("7");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("my-vinyl");
+
+  // The aimed row offers a disconnect rather than a Connect, so the first Connect on screen is the
+  // other local cutter — the Puma. Its list is its own: an id is the operator's own string, so one
+  // machine's entry must not appear, or be editable, under another (#153).
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
+
+  // And the Cameo's entry is untouched by the trip, settings and all.
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Preset to manage").selectOption("my-vinyl");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed 7");
+});
+
+test("the whole editor is operable from the keyboard alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  // Focus, then keys only: nothing below is a div with a click handler, which is the failure this
+  // catches — an operator with the keyboard and no mouse can still reach every control.
+  await page.getByLabel("New preset").focus();
+  await page.keyboard.press("Enter");
+  await page.getByLabel("Preset name").focus();
+  await page.keyboard.type("Keyed Card");
+  // Tab reaches the settings in the order they are read.
+  await page.keyboard.press("Tab");
+  await page.keyboard.type("8");
+  await page.keyboard.press("Tab");
+  await page.keyboard.type("22");
+  await page.getByLabel("Save preset", { exact: true }).focus();
+  await page.keyboard.press("Enter");
+
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("keyed-card");
+  await expect(page.getByTestId("preset-preview")).toHaveText("Cuts at speed 8, force 22, one pass.");
 });
 
 // Greptile's P1 on the fifth push: a replan that *fails* leaves the previous plan in force —

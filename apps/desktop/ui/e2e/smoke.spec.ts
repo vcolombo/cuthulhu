@@ -1464,6 +1464,75 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
 });
 
+// Round 6 on PR #264: three findings, one cause. Every guard above was keyed on the machine id, and
+// a machine id is not an aim — two aims at the same cutter share it. So a list read for a previous
+// connection installed as though it were this one's (Copilot), and a continuation captured under
+// that aim restored its entry as this aim's draft, which the next save wrote under this machine's id
+// (Greptile, P1). The section is keyed on an aim generation now, the way the plan and the travel
+// already are.
+test("a preset list owed to a previous connection to the same cutter is not taken for this one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("card");
+
+  // Park every list reply, then let go of the Cameo and aim at it again. The reply still owed to the
+  // first connection names the same machine, so nothing but the aim tells them apart.
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+
+  // This aim has read nothing yet: the editor is withheld, whatever the previous connection left
+  // behind. Rendered from that cached list, New would mint an id against entries nobody re-read.
+  await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
+  await expect(page.getByLabel("New preset")).toHaveCount(0);
+
+  await callFake(page, "__test_release_presets");
+  await expect(page.getByLabel("New preset")).toBeEnabled();
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
+});
+
+test("a save's continuation is dropped when the cutter changed before it could run", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  for (const name of ["Card", "Vinyl"]) {
+    await page.getByLabel("New preset").click();
+    await page.getByLabel("Preset name").fill(name);
+    await page.getByLabel("Save preset", { exact: true }).click();
+    await expect(page.getByLabel("Preset name")).toHaveValue(name);
+  }
+
+  // Dirty on Card, ask for Vinyl, and answer Save and continue with the list replies parked: the
+  // write lands, the continuation is still owed, and the aim moves to the Puma before it can run.
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await page.getByLabel("Preset speed").fill("13");
+  await page.getByLabel("Preset to manage").selectOption("vinyl");
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Save preset and continue").click();
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await callFake(page, "__test_release_presets");
+
+  // Nothing of the Cameo's arrives on the Puma: no draft, and no Cameo entry in its picker. The
+  // continuation named Vinyl by the Cameo's list, and run here it would have become the Puma's
+  // draft — then the Puma's entry under the next save.
+  await expect(page.getByText("Choose a preset to edit")).toBeVisible();
+  await expect(page.getByLabel("Preset name")).toHaveCount(0);
+  await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Vinyl" })).toHaveCount(0);
+
+  // And the save that carried the continuation did land on the Cameo, where it was aimed.
+  await page.getByLabel("Disconnect serial:/dev/mock0").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed 13");
+});
+
 // Codex's findings on the second push, both about an action that replaces the draft without the
 // unsaved-changes decision: Duplicate writes from the *stored* entry (so it would drop the edit, or
 // copy a version that no longer exists), and Delete replaces the draft with a neighbour's. Neither

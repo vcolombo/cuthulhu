@@ -220,14 +220,14 @@ export function CutDialog({
       .then((info) => {
         setConnected(info);
         if (!info) return;
-        aimPresetsAt(info.machine_id);
+        const aim = aimPresetsAt(info.machine_id);
         // Separate chains on purpose: a corrupt presets file must not leave caps
         // unfetched, and an unknown machine must not blank the preset dropdown.
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return readPresets(info.machine_id);
+        return readPresets(aim, info.machine_id);
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -343,13 +343,13 @@ export function CutDialog({
         // A preset belongs to one machine, so nothing about the previous cutter's entry survives
         // aiming at another — including a `list_presets` still owed to it. Reached only past
         // `guardUnsaved`, which is what asks about an unsaved draft before it is dropped here.
-        aimPresetsAt(info.machine_id);
+        const aim = aimPresetsAt(info.machine_id);
         refreshDeviceState();
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return readPresets(info.machine_id);
+        return readPresets(aim, info.machine_id);
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)))
       .finally(() => setAiming(false));
@@ -417,13 +417,21 @@ export function CutDialog({
 
   // --- material presets: the operator's own entries for the cutter this dialog is aimed at ---
 
-  /** Which cutter the section below is editing, as a ref rather than read off `connected`: a reply
-   *  still owed to a `list_presets` asked for before the operator aimed elsewhere has to be
-   *  recognised from inside its own callback, where `connected` is the value it captured. */
-  const presetMachine = useRef<string | null>(null);
-  /** Nothing of another cutter's is ever shown: a list read for one machine is held with its id, so
-   *  a late reply is inert rather than installed. Empty, not the previous entries, while the aimed
-   *  cutter's own list is still being read — the pass rows below want the honest answer. */
+  /** Which aim the section is on: the cutter, and how many times the aim has moved. A ref rather
+   *  than state because a reply or a captured action has to recognise its own aim from inside its
+   *  callback, where `connected` is the value it closed over.
+   *
+   *  The count is the identity, not the machine id. **A machine id is not an aim**: two aims at the
+   *  same cutter share it, so a `list_presets` owed to a previous connection, and a continuation
+   *  captured under it, both passed a check on the id alone — a reconnect showed the cached list as
+   *  though it were freshly read, and a continuation restored the previous aim's entry as this
+   *  aim's draft, which the next save wrote under this machine's id. Every guard below is a
+   *  generation check now (round 6 on PR #264). */
+  const presetAim = useRef({ generation: 0, machineId: null as string | null });
+  const isCurrentAim = (generation: number) => presetAim.current.generation === generation;
+  /** Nothing of another aim's is ever shown: the list is cleared when the aim moves and installed
+   *  only under the aim that asked for it. Empty, not the previous entries, while this aim's own
+   *  list is still being read — the pass rows below want the honest answer. */
   const presets =
     connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : [];
   /** Whether that empty list means "this cutter has none" or "nobody has answered yet". The editor
@@ -441,37 +449,42 @@ export function CutDialog({
       ? null
       : draftFault(draft, presets, ranges);
 
-  /** Aims the section at a cutter, or at none. A preset belongs to one machine, so the draft goes
-   *  with the aim — and every reply owed to the previous one stops being wanted here. */
+  /** Aims the section at a cutter, or at none, and answers with the aim it opened so a caller can
+   *  hand it to the read that follows. A preset belongs to one machine, so the draft goes with the
+   *  aim — and so does the list, because "loaded" has to mean *this* aim's list and not the one a
+   *  previous connection to the same cutter left behind. */
   const aimPresetsAt = (machineId: string | null) => {
-    presetMachine.current = machineId;
+    const generation = presetAim.current.generation + 1;
+    presetAim.current = { generation, machineId };
+    setPresetsFor(null);
     setDraft(null);
     setBaseline(null);
     setPresetError(null);
     setPresetListError(null);
     setPendingAfterDecision(null);
+    return generation;
   };
 
-  /** The list, installed only while it is still this cutter's. A list that arrives is also what
+  /** The list, installed only under the aim that asked for it. A list that arrives is also what
    *  answers the previous read's failure: held past it, the section would say the presets cannot be
    *  read while holding the ones it just read, and only a disconnect would clear it (Copilot on
    *  PR #264). */
-  const installPresets = (machineId: string, list: unknown) => {
-    if (presetMachine.current !== machineId) return false;
+  const installPresets = (generation: number, machineId: string, list: unknown) => {
+    if (!isCurrentAim(generation)) return false;
     setPresetsFor({ machineId, presets: list as Preset[] });
     setPresetListError(null);
     return true;
   };
 
-  /** Reads the aimed cutter's own list, and answers with what was installed — `null` when the read
-   *  failed or the aim moved past it, because a caller that re-derives the draft from the list must
-   *  not do that from either. A failure is kept rather than only raised: the editor is withheld
+  /** Reads a cutter's own list for one aim, and answers with what was installed — `null` when the
+   *  read failed or the aim moved past it, because a caller that re-derives the draft from the list
+   *  must not do that from either. A failure is kept rather than only raised: the editor is withheld
    *  until a list arrives, so a read nobody reports leaves "reading" on screen for good. */
-  const readPresets = (machineId: string): Promise<Preset[] | null> =>
+  const readPresets = (generation: number, machineId: string): Promise<Preset[] | null> =>
     ipc.listPresets(machineId).then(
-      (p) => (installPresets(machineId, p) ? (p as Preset[]) : null),
+      (p) => (installPresets(generation, machineId, p) ? (p as Preset[]) : null),
       (e) => {
-        if (presetMachine.current === machineId) setPresetListError(ipc.ipcErrorMessage(e));
+        if (isCurrentAim(generation)) setPresetListError(ipc.ipcErrorMessage(e));
         return null;
       },
     );
@@ -510,19 +523,21 @@ export function CutDialog({
    *  after a write that did not reported a refused save, kept the draft as unsaved, and swallowed
    *  whatever was waiting on it (CodeRabbit on PR #264). */
   const writePreset = (preset: Preset, then?: () => void) => {
+    // The aim this write belongs to. Everything below is checked against it: a write outlives a
+    // cutter change, and so does whatever the operator asked for next.
+    const aim = presetAim.current.generation;
     setPresetBusy(true);
     setPresetError(null);
     ipc
       .savePreset(preset)
       .then(
         () => {
-          // Only while this is still the cutter that was written to. `copyPreset` writes without the
-          // unsaved-changes guard, so an operator can press Save as Copy and then aim elsewhere
-          // before the reply lands — and a draft re-installed after `aimPresetsAt` cleared it would
-          // be the previous machine's entry, shown against this one and saved under its id
-          // (CodeRabbit on PR #264). The re-read and the continuation below still run: the write
-          // happened, and what moved the aim may be the continuation itself.
-          if (presetMachine.current === preset.machine_id) {
+          // Only while the section is still on the aim that was written to. `copyPreset` writes
+          // without the unsaved-changes guard, so an operator can press Save as Copy and then aim
+          // elsewhere before the reply lands — and a draft re-installed after `aimPresetsAt` cleared
+          // it would be the previous aim's entry, shown against this one and saved under its
+          // machine's id (CodeRabbit on PR #264).
+          if (isCurrentAim(aim)) {
             // The write landed, so the file holds what was sent: the draft stops being unsaved here
             // rather than at the re-read, or a refresh that failed afterwards would leave the
             // operator holding an "unsaved" edit that is in fact saved — and every guard would keep
@@ -531,7 +546,7 @@ export function CutDialog({
             setDraft(written);
             setBaseline(written);
           }
-          return readPresets(preset.machine_id).then((stored) => {
+          return readPresets(aim, preset.machine_id).then((stored) => {
             const saved = stored?.find((p) => p.id === preset.id);
             if (saved !== undefined) {
               setDraft(draftOf(saved));
@@ -540,13 +555,18 @@ export function CutDialog({
             // Last, and whether or not that read landed: the continuation is what the operator
             // asked for *next* — another preset, a blank one, a close. Run before the re-read, its
             // selection was overwritten by this write's own (Codex on PR #264).
-            then?.();
+            //
+            // And only under the aim it was captured on: `editPreset` closes over that aim's list,
+            // so run after a cutter change it restored the previous cutter's entry as this one's
+            // draft — which the next save wrote under this machine's id (Greptile on PR #264). An
+            // aim change *is* a legal continuation: the aim has not moved yet when it runs.
+            if (isCurrentAim(aim)) then?.();
           });
         },
         (e) => {
           // Named against the draft it refused, which is on screen only while the aim has not moved.
           // The continuation does not run: nothing was written to continue from.
-          if (presetMachine.current !== preset.machine_id) return;
+          if (!isCurrentAim(aim)) return;
           setPresetError(ipc.ipcErrorMessage(e));
           setPendingAfterDecision(null);
         },
@@ -575,6 +595,7 @@ export function CutDialog({
     // no row to take a neighbour from, and an editor showing a deleted preset's settings is the
     // one answer a delete must not give.
     const nextId = selectAfterDelete(presets, draft.id);
+    const aim = presetAim.current.generation;
     setPresetBusy(true);
     setPresetError(null);
     ipc
@@ -585,13 +606,16 @@ export function CutDialog({
         () => {
           // The entry is gone, so it stops being what the editor holds here rather than at the
           // re-read: a refresh that failed afterwards would otherwise leave a deleted preset's
-          // settings on screen. The re-read below is what moves the selection to a neighbour.
-          setDraft(null);
-          setBaseline(null);
-          return readPresets(machineId);
+          // settings on screen. Past an aim change there is nothing of this aim's left to clear, and
+          // the re-read below is what moves the selection to a neighbour.
+          if (isCurrentAim(aim)) {
+            setDraft(null);
+            setBaseline(null);
+          }
+          return readPresets(aim, machineId);
         },
         (e) => {
-          if (presetMachine.current === machineId) setPresetError(ipc.ipcErrorMessage(e));
+          if (isCurrentAim(aim)) setPresetError(ipc.ipcErrorMessage(e));
           return null;
         },
       )

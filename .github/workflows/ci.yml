@@ -12,11 +12,15 @@ on:
 
 # A superseded run has nothing left to say, and a wedged one holds its runner until GitHub's
 # six-hour ceiling: four commits in half an hour once left seven live runs, three still burning a
-# runner hours later (#269). Grouped by ref, so a new commit retires the previous run for that
-# branch and nothing else. Cancelling is for pull requests only — every commit that lands on
-# `main` keeps a result of its own, which is what makes a red `main` attributable to one merge.
+# runner hours later (#269). A pull request groups by ref, so a new commit retires the run for that
+# branch and nothing else.
+#
+# A `main` push takes a group of its own instead, keyed on the run. Sharing the ref group would
+# have quietly cost the very results this arrangement exists to keep: a group admits one running
+# and one *pending* run, so three merges in quick succession would see the middle one cancelled
+# while still queued, and the commit that broke `main` could be the one with no result at all.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

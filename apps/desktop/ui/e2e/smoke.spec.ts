@@ -5,7 +5,7 @@ import { test, expect, type Page } from "@playwright/test";
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -58,7 +58,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       style: { stroke: 0xff0000ff, fill: null },
       children: [],
       cut_line_type: "Cut",
-      material_preset: { state: "inherit" },
+      material_preset: opts?.seedEmptyPresetAssignment
+        ? { state: "preset", id: "" }
+        : { state: "inherit" },
     };
     const greenId = nextId++;
     doc.nodes[greenId] = {
@@ -295,6 +297,22 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   let nextJobId = 1;
   let jobId: number | null = null;
   let planPasses: { key: string; enabled: boolean }[] = [];
+  type CutRequest = {
+    device_instance_id: string;
+    doc_revision: string;
+    grouping: Grouping;
+    passes: {
+      key: string;
+      enabled: boolean;
+      // Optional on the wire, not merely nullable: `ConfiguredPassDto::preset_id` is an
+      // `Option<String>`, and serde reads a field the caller left out as `None`.
+      preset_id?: string | null;
+      speed: number | null;
+      force: number | null;
+      repeat_count: number | null;
+    }[];
+  };
+  let lastCutRequest: CutRequest | null = null;
   let failNextResume = false;
   let failNextCut = false;
   let failNextPlan = false;
@@ -315,7 +333,17 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     { id: "puma-htv", name: "HTV", machine_id: "puma",
       settings: { speed: null, force: null, repeat_count: 1 }, builtin: true },
   ];
-  let userPresets: MaterialPreset[] = [];
+  let userPresets: MaterialPreset[] = opts?.seedUserPreset
+    ? [{ id: "card-stock", name: "Card Stock", machine_id: "cameo5",
+        settings: { speed: 6, force: 18, repeat_count: 1 }, builtin: false }]
+    : [];
+  const effectivePresets = (machineId: string): MaterialPreset[] => {
+    const mine = userPresets.filter((p) => p.machine_id === machineId);
+    const shipped = BUILTIN_PRESETS.filter(
+      (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
+    );
+    return [...shipped, ...mine];
+  };
   let failNextPresetSave = false;
   let failNextPresetList = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
@@ -596,11 +624,24 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }));
     },
     cut: (a) => {
-      const request = a.request as { device_instance_id: string; doc_revision: string;
-        grouping: Grouping; passes: { key: string; enabled: boolean }[] };
+      const request = a.request as CutRequest;
       if (!connected) throw ipcError("not_connected", "no device connected");
       if (connected.instance_id !== request.device_instance_id) {
         throw ipcError("device_mismatch", "connected device changed since planning");
+      }
+      // Refused before the revision, machine and pass-key checks below, mirroring `prepare_cut`,
+      // which resolves an enabled pass's preset before it parses the revision or plans. Named is
+      // spelled out rather than tested for truth, in both directions: an empty id names a preset
+      // and must be refused, while an omitted field is the `None` serde reads and must not be —
+      // a fake that diverges either way is a green test for a cut the backend does not make.
+      const available = effectivePresets(connected.machine_id);
+      for (const pass of request.passes) {
+        const named = pass.preset_id;
+        if (pass.enabled && named !== null && named !== undefined
+          && !available.some((p) => p.id === named)) {
+          throw ipcError("unknown_preset",
+            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
+        }
       }
       const plan = planFromDoc(request.grouping);
       if (plan.doc_revision !== request.doc_revision) {
@@ -615,23 +656,14 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         if (!plan.passes.some((p) => p.key === pass.key)) {
           throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
         }
-        // And a preset this machine cannot offer is refused rather than cut with defaults,
-        // mirroring prepare_cut. The cut path here stands in for a machine whose preset *file*
-        // holds nothing, so any named preset is unavailable — which is the state the real refusal
-        // exists for.
-        const named = (pass as { preset_id?: string | null }).preset_id;
-        // Explicit rather than truthy: an empty id is a named preset too, and `&& named` would
-        // wave it through — the fake being more permissive than Rust is the false green this
-        // whole mirror exists to avoid.
-        if (pass.enabled && named !== undefined && named !== null) {
-          throw ipcError("unknown_preset",
-            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
-        }
       }
       planPasses = request.passes;
       jobId = nextJobId++;
       const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
       if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
+      // Recorded once nothing can still refuse the request, so the hook answers the cut that was
+      // accepted rather than the last one attempted.
+      lastCutRequest = request;
       if (failNextCut) {
         // The opening write dies: Sending and then Failed both go out in this same
         // synchronous burst, so the only status the frontend ever commits is the failed
@@ -720,9 +752,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     // Mirrors `desktop::device::list_presets`: this machine's builtins, minus any the operator's
-    // own entries shadow by pair, plus those entries. The cut handler above is deliberately
-    // stricter — it stands in for a machine whose preset *file* holds none of this, which is the
-    // state `prepare_cut`'s refusal exists for.
+    // own entries shadow by pair, plus those entries. The cut handler resolves against this same
+    // list so a preset the dialog just saved can be cut.
     list_presets: (a) => {
       // Test hook: a read that fails *after* a write that did not is the interleaving the write and
       // the refresh are held apart for.
@@ -730,12 +761,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         failNextPresetList = false;
         throw ipcError("preset_error", "Corrupt(\"the presets file could not be read\")");
       }
-      const machineId = a.machineId as string;
-      const mine = userPresets.filter((p) => p.machine_id === machineId);
-      const shipped = BUILTIN_PRESETS.filter(
-        (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
-      );
-      const list = [...shipped, ...mine];
+      const list = effectivePresets(a.machineId as string);
       if (!holdingPresets) return list;
       // Executor form, like the parked plan and travel replies above: the UI's `lib` is older than
       // `Promise.withResolvers`, and widening it for a fake is the wrong end of the trade.
@@ -809,6 +835,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       failNextPresetList = true;
       return null;
     },
+    // Test hook (no production counterpart): the request the last accepted cut arrived with, so a
+    // test can state which preset id the dialog sent rather than which one it displayed.
+    __test_last_cut_request: () => lastCutRequest,
     // Test hooks (no production counterpart): park every `list_presets` reply from here, then let
     // them all land — the only way to state that a list read for one cutter arrives after the
     // operator has aimed at another.
@@ -1104,32 +1133,144 @@ test("a travel reply owed to a row edit still lands when a replan fails", async 
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
 });
 
-// The whole material path through the real UI: the panel assigns a preset, preset grouping keys
-// the pass on it, the row carries that preset's id, and the cut is refused because this machine
-// cannot offer it. Nothing else drives preset grouping end to end, and without this the fake's
-// `unknown_preset` branch could be deleted with every test still green — which is exactly the
-// false green the fake's strictness exists to prevent.
-test("a pass grouped by a material this machine cannot offer is refused, not cut", async ({ page }) => {
-  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+// The whole stale-material path through the real UI: the properties panel assigns a listed
+// user preset, the dialog deletes it, preset grouping keeps the document's id on the pass, and
+// the cut is refused because that id no longer resolves. Without this, `unknown_preset` could
+// disappear while every saved-preset cut still passed.
+test("a pass whose assigned preset was deleted is refused, not cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
   await page.goto("/");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
   await page.getByTestId("layer-row").first().click();
   await expect(page.getByLabel("Material preset")).toBeVisible();
-  await page.getByLabel("Material preset").selectOption("preset:cameo5-htv");
-  // The row's readout, not the option that was just picked: this is what tells an operator which
-  // material the blade will be set for.
-  await expect(page.getByLabel("Material preset")).toHaveValue("preset:cameo5-htv");
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+  await expect(page.getByLabel("Material preset")).toHaveValue("preset:card-stock");
 
   await page.getByRole("button", { name: "Cut" }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await page.getByLabel("Group passes by").selectOption("Preset");
   // One pass for the assigned material, one for everything that resolves to none.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  await expect(page.getByTestId("cut-pass-row").first()).toContainText("HTV");
+  // The pass resolves while the preset exists, and keeps the document's id once it is gone.
+  await expect(page.getByTestId("cut-pass-row").first()).toContainText("Card Stock");
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Delete preset").click();
+  await expect(page.getByTestId("cut-pass-row").first()).toContainText("card-stock (unknown preset)");
 
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText(/not available for this machine/)).toBeVisible();
+});
+
+// The same refusal for the one id that reads like no id at all. Nothing else pins the fake's
+// explicit null check: were it truthiness, an empty id would be cut with defaults here while
+// `prepare_cut` refused it — a green e2e for a cut the real backend rejects.
+test("an empty preset id is still named and refused", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedEmptyPresetAssignment: true,
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Group passes by").selectOption("Preset");
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText(/material preset ``.*not available for this machine/)).toBeVisible();
+});
+
+/** A `cut` sent straight at the fake, carrying the plan's own revision unless the caller wants a
+ *  stale one, with the refusal returned rather than thrown. These are requests the dialog cannot
+ *  compose — it never sends an unplanned key, another machine's preset, or no `preset_id` field —
+ *  so only a direct call can state what the backend would answer for one. `Single` plans one pass
+ *  keyed `all`, which is what the callers below name. */
+const cutDirect = (
+  page: Page,
+  request: { doc_revision?: string; grouping: string; passes: Record<string, unknown>[] },
+) =>
+  page.evaluate(async (req) => {
+    // The fake's own channel, as everywhere else in this file: `__TAURI_INTERNALS__` is installed
+    // by the fake, so the page's types do not know it.
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    const plan = await internals.__TAURI_INTERNALS__.invoke("plan_cut", { grouping: req.grouping }) as {
+      doc_revision: string;
+    };
+    try {
+      return await internals.__TAURI_INTERNALS__.invoke("cut", {
+        request: {
+          device_instance_id: "usb:mock",
+          doc_revision: req.doc_revision ?? plan.doc_revision,
+          grouping: req.grouping,
+          passes: req.passes,
+        },
+      });
+    } catch (reason) {
+      return reason;
+    }
+  }, request);
+
+// Precedence: this request is stale *and* names a pass no plan has *and* names a missing preset.
+// `no-preset` is a key the grammar accepts and a `Single` plan does not contain, so the payload is
+// one the backend would really deserialize — a key like `missing` would die in `PassKey`'s parser
+// before `prepare_cut` ran, and prove nothing about the order of its refusals. Were the preset
+// check to drift below them, `stale_plan` would answer here while every UI test stayed green.
+test("an unavailable preset is refused before later cut request checks", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+
+  const error = await cutDirect(page, {
+    doc_revision: "stale",
+    grouping: "Single",
+    passes: [{ key: "no-preset", enabled: true, preset_id: "gone", speed: null, force: null, repeat_count: null }],
+  });
+  expect(error).toMatchObject({ code: "unknown_preset" });
+});
+
+// A preset is machine-scoped, and `prepare_cut` filters the file to the connected cutter before it
+// looks an id up — an operator's id is their own string, so the same one names different materials
+// on two machines (#153). `puma-htv` is a material this Cameo cannot offer even though it is a
+// listed builtin, which is what fails if the cut path ever resolves against every machine's
+// entries: nothing else here would notice, since the tests above delete the entry outright.
+test("a preset belonging to another cutter is not available to this one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+
+  const error = await cutDirect(page, {
+    grouping: "Single",
+    passes: [{ key: "all", enabled: true, preset_id: "puma-htv", speed: null, force: null, repeat_count: null }],
+  });
+  expect(error).toMatchObject({
+    code: "unknown_preset",
+    message: expect.stringContaining("`puma-htv`"),
+  });
+});
+
+// The other half of the comparison the guard spells out: `ConfiguredPassDto::preset_id` is an
+// `Option<String>`, so serde reads a pass carrying no such field as `None` and the cut proceeds. A
+// fake that refused it would fail a request the backend accepts — the mirror wrong in the strict
+// direction, which no UI test can reach because the dialog always sends the field.
+test("a pass that carries no preset id at all is cut, not refused", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+
+  const outcome = await cutDirect(page, {
+    grouping: "Single",
+    passes: [{ key: "all", enabled: true, speed: null, force: null, repeat_count: null }],
+  });
+  expect(outcome).toMatchObject({ job_id: expect.any(Number) });
 });
 
 // --- managing the operator's own material presets, in the dialog that cuts with them (#244) ---
@@ -1154,7 +1295,7 @@ const openDialogOnCameo = async (page: Page) => {
   await expect(page.getByLabel("Preset to manage")).toBeVisible();
 };
 
-test("a preset created in the cut dialog is written, selected, and offered to a pass", async ({ page }) => {
+test("a preset created in the cut dialog is offered to a pass and cut by its id", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await openDialogOnCameo(page);
@@ -1172,6 +1313,19 @@ test("a preset created in the cut dialog is written, selected, and offered to a 
   await expect(page.getByTestId("preset-preview")).toHaveText("Cuts at speed 7, force 21, 2 passes.");
   // And a pass can now be cut with it, which is the whole point of managing them here.
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
+  await page.getByLabel("Preset for pass 1").selectOption("thick-card");
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+
+  // Which pass carries it, not merely that some pass does: the dialog attaching the preset to the
+  // wrong row is the regression this is here for, and the untouched row must still name none.
+  const request = await callFake(page, "__test_last_cut_request") as {
+    passes: { key: string; enabled: boolean; preset_id: string | null }[];
+  };
+  expect(request.passes.map((p) => [p.key, p.preset_id])).toEqual([
+    ["color:ff0000ff", "thick-card"],
+    ["color:00ff00ff", null],
+  ]);
 });
 
 test("a built-in preset is read-only, and Save as Copy leaves it shipped", async ({ page }) => {

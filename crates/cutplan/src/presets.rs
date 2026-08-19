@@ -210,10 +210,14 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
         // of their presets.
         user_presets.retain(|p| !p.id.is_empty());
 
-        // Remove builtin presets that are shadowed by user presets
-        let user_ids: std::collections::HashSet<_> =
-            user_presets.iter().map(|p| &p.id).collect();
-        all_presets.retain(|p| !user_ids.contains(&p.id));
+        // A preset is machine-scoped: its speed and force mean nothing on another cutter, so a
+        // user entry replaces a builtin only when both fields match. Keyed on the id alone, an
+        // entry named with another machine's builtin id deleted that builtin from the loaded set
+        // — and a user id is the operator's own string, so `my-vinyl` legitimately exists for a
+        // Cameo and a Puma (#153).
+        let user_keys: std::collections::HashSet<(&str, &str)> =
+            user_presets.iter().map(|p| (p.machine_id.as_str(), p.id.as_str())).collect();
+        all_presets.retain(|p| !user_keys.contains(&(p.machine_id.as_str(), p.id.as_str())));
 
         // Add user presets
         all_presets.extend(user_presets);
@@ -375,6 +379,45 @@ mod tests {
         assert_eq!(builtin_cardstock.settings.speed, Some(5)); // builtin values
         assert_eq!(builtin_cardstock.settings.force, Some(20));
         assert!(builtin_cardstock.builtin);
+    }
+
+    /// Shadowing is keyed on the machine as well as the id. A Puma entry named with a Cameo
+    /// builtin's id used to delete that builtin from the loaded set, and two machines' entries
+    /// sharing an operator-chosen id could not coexist at all (#153).
+    #[test]
+    fn a_user_entry_shadows_a_builtin_only_for_its_own_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        let entry = |machine: &str, id: &str, speed: u32| MaterialPreset {
+            id: id.into(),
+            name: format!("{machine} {id}"),
+            machine_id: machine.into(),
+            settings: PresetSettings { speed: Some(speed), force: Some(10), repeat_count: 1 },
+            builtin: false,
+        };
+
+        save_user_presets(&user_file, &[
+            // A Puma entry whose id is a Cameo builtin's.
+            entry("puma", "cameo5-cardstock-medium", 1),
+            // And the operator's own id, on both machines.
+            entry("cameo5", "my-vinyl", 2),
+            entry("puma", "my-vinyl", 3),
+        ]).unwrap();
+
+        let loaded = load_presets(&user_file).unwrap();
+        let one = |machine: &str, id: &str| {
+            let found: Vec<_> = loaded.iter()
+                .filter(|p| p.machine_id == machine && p.id == id).collect();
+            assert_eq!(found.len(), 1, "exactly one {machine}/{id}, got {found:#?}");
+            found[0]
+        };
+
+        assert!(one("cameo5", "cameo5-cardstock-medium").builtin,
+            "the Cameo's builtin survives a Puma entry that happens to share its id");
+        assert!(!one("puma", "cameo5-cardstock-medium").builtin, "and the Puma entry loads too");
+        assert_eq!(one("cameo5", "my-vinyl").settings.speed, Some(2));
+        assert_eq!(one("puma", "my-vinyl").settings.speed, Some(3),
+            "each machine keeps its own settings under the shared id");
     }
 
     #[test]

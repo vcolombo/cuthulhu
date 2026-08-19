@@ -310,8 +310,10 @@ export async function savePreset(p: Args) {
   return invoke("save_preset", { p });
 }
 
-export async function deletePreset(id: string) {
-  return invoke("delete_preset", { id });
+/** A preset is identified by its machine as well as its id: the same id can name a material on a
+ *  Cameo and on a Puma, and deleting by id alone removed both (#153). */
+export async function deletePreset(machineId: string, id: string) {
+  return invoke("delete_preset", { machineId, id });
 }
 
 const CUT_FILTER = [{ name: "cuthulhu project", extensions: ["cut"] }];

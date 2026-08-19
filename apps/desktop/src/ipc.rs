@@ -188,7 +188,7 @@ pub fn confirm_pass_done(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
 
 #[tauri::command]
 pub fn list_presets(machine_id: String) -> Result<Vec<MaterialPreset>, IpcError> {
-    crate::device::list_presets(&machine_id)
+    crate::device::list_presets(&presets_path()?, &machine_id)
 }
 
 #[tauri::command]
@@ -198,12 +198,20 @@ pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) 
 
 #[tauri::command]
 pub fn save_preset(p: MaterialPreset) -> Result<(), IpcError> {
-    crate::device::save_preset(p)
+    crate::device::save_preset(&presets_path()?, p)
 }
 
+/// Keyed on the machine as well as the id: a preset id is the operator's own string, so the same
+/// id can name a Cameo's material and a Puma's, and a delete that named only the id removed both
+/// (#153).
 #[tauri::command]
-pub fn delete_preset(id: String) -> Result<(), IpcError> {
-    crate::device::delete_preset(&id)
+pub fn delete_preset(machine_id: String, id: String) -> Result<(), IpcError> {
+    crate::device::delete_preset(&presets_path()?, &machine_id, &id)
+}
+
+fn presets_path() -> Result<PathBuf, IpcError> {
+    cutplan::presets::default_presets_path()
+        .ok_or_else(|| IpcError::new("no_config_dir", "cannot resolve presets file location"))
 }
 
 // async: reads each paired host's connection in the same order `list_devices` dials them, so

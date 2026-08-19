@@ -86,10 +86,14 @@ export function PresetEditor({
         {mode === "builtin" || mode === "user" ? (
           // A builtin is copied, never edited: an entry saved under its pair shadows it in
           // `load_presets`, and nothing in this dialog could hand the shipped settings back.
+          //
+          // Withheld while the draft is dirty, because a copy is written from the *stored* entry:
+          // offered there it would either silently drop the operator's edit or copy a version of
+          // the preset that no longer exists (Codex on PR #264). Save or Discard first.
           <button
             aria-label={mode === "builtin" ? "Save as Copy" : "Duplicate preset"}
             style={btn}
-            disabled={busy}
+            disabled={busy || dirty}
             onClick={onCopy}
           >
             {mode === "builtin" ? "Save as Copy" : "Duplicate"}
@@ -181,7 +185,10 @@ export function PresetEditor({
                 </button>
               ) : null}
               {mode === "user" ? (
-                <button aria-label="Delete preset" style={btn} disabled={busy} onClick={onDelete}>
+                // Also withheld while dirty: a delete replaces the draft with a neighbour's, and
+                // offered there it discards a typed edit without asking — the one thing the
+                // unsaved-changes decision exists to prevent (Codex on PR #264).
+                <button aria-label="Delete preset" style={btn} disabled={busy || dirty} onClick={onDelete}>
                   Delete
                 </button>
               ) : null}

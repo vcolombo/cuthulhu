@@ -489,6 +489,18 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     connect_device: (a) => {
       const info = a.info as DeviceInfo;
+      // Mirrors `DeviceManager`'s worker: a Connect is refused unless the manager is disconnected
+      // or failed (`crates/driver-core/src/manager.rs`), so aiming at a second *local* cutter means
+      // letting go of the first — while a failed one, which holds nothing, can be aimed away from
+      // directly. A fake that switched outright let tests exercise a sequence production refuses
+      // (Codex on PR #264). A cutter on a Cut Host is not that sequence:
+      // `DeviceManagerHandle::connect` releases the local manager and records the aim, with no
+      // transport of its own to open.
+      const holdsATransport = status.phase !== "Disconnected" && status.phase !== "Failed";
+      if (connected && connected.host === null && info.host === null
+          && connected.instance_id !== info.instance_id && holdsATransport) {
+        throw ipcError("device_error", "Busy");
+      }
       connected = info;
       // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
       // emitting them here (instead of silently mutating the status) is what lets
@@ -1305,14 +1317,17 @@ test("a preset belongs to one cutter: aiming at another shows that machine's ent
   await page.getByLabel("Save preset", { exact: true }).click();
   await expect(page.getByLabel("Preset to manage")).toHaveValue("my-vinyl");
 
-  // The aimed row offers a disconnect rather than a Connect, so the first Connect on screen is the
-  // other local cutter — the Puma. Its list is its own: an id is the operator's own string, so one
-  // machine's entry must not appear, or be editable, under another (#153).
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  // Aiming at a second local cutter means letting go of the first: `DeviceManager` refuses a
+  // Connect while it holds a transport, so the dialog's Disconnect is the way across. The Puma's
+  // list is its own — an id is the operator's own string, so one machine's entry must not appear,
+  // or be editable, under another (#153).
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
 
   // And the Cameo's entry is untouched by the trip, settings and all.
+  await page.getByLabel("Disconnect serial:/dev/mock0").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 7");
@@ -1338,12 +1353,14 @@ test("a preset list still owed to the previous cutter is not shown against this 
     await expect(page.getByLabel("Preset name")).toHaveValue(name);
   }
 
-  // Park every list reply, delete the Cameo's entry, then aim at the Puma while that list is still
-  // out. The Puma's own read parks behind it, so both land on release — the Cameo's first.
+  // Park every list reply, delete the Cameo's entry, then let go of the Cameo and aim at the Puma
+  // while that list is still out — the sequence production allows, since a Connect is refused while
+  // the manager holds a transport. The Puma's own read parks behind it, so both land on release.
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await page.getByLabel("Delete preset").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
   await callFake(page, "__test_release_presets");
 
   // The Cameo's reply is inert: no draft of its material, and none of its entries in the picker.
@@ -1353,9 +1370,47 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
 
   // And the delete that was in flight did reach the Cameo's file, where it belonged.
+  await page.getByLabel("Disconnect serial:/dev/mock0").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
+});
+
+// Codex's findings on the second push, both about an action that replaces the draft without the
+// unsaved-changes decision: Duplicate writes from the *stored* entry (so it would drop the edit, or
+// copy a version that no longer exists), and Delete replaces the draft with a neighbour's. Neither
+// is offered while there is an edit to lose. The editor itself is withheld until the aimed cutter's
+// own list has arrived, because that list is what a new entry's name and id have to avoid.
+test("an unsaved edit withholds the actions that would discard it, and an unread list withholds the editor", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Duplicate preset")).toBeEnabled();
+  await expect(page.getByLabel("Delete preset")).toBeEnabled();
+
+  await page.getByLabel("Preset force", { exact: true }).fill("18");
+  await expect(page.getByLabel("Duplicate preset")).toBeDisabled();
+  await expect(page.getByLabel("Delete preset")).toBeDisabled();
+
+  // Discarding is one of the two ways back, and both come back at once.
+  await page.getByLabel("Discard preset changes").click();
+  await expect(page.getByLabel("Duplicate preset")).toBeEnabled();
+  await expect(page.getByLabel("Delete preset")).toBeEnabled();
+
+  // With every list reply parked, aiming at the Puma leaves nothing to create against: no picker,
+  // no New, and a line saying why.
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
+  await expect(page.getByLabel("New preset")).toHaveCount(0);
+
+  await callFake(page, "__test_release_presets");
+  await expect(page.getByLabel("New preset")).toBeEnabled();
 });
 
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {

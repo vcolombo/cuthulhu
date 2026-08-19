@@ -42,10 +42,13 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   use. A preset that ships with the app is read-only and offers **Save as Copy**, which writes a
   fresh entry rather than shadowing the shipped one. A rename moves the name only — a preset's id
   is what a Node's assignment and a `preset:<id>` pass key name it by. An unsaved edit is decided
-  before it can be lost, and a write the backend refuses keeps the edit on screen with the reason
-  beside it. Saving over a built-in's pair, an entry with no id or a blank name, a setting out of
-  range, and a delete that would remove nothing are each refused by name rather than reported as
-  success.
+  before it can be lost: selecting another preset, aiming at another cutter and closing the dialog
+  each ask first, and duplicating or deleting — both of which work from the stored entry — wait for
+  that decision. A write the backend refuses keeps the edit on screen with the reason beside it.
+  Editing is offered only once the aimed cutter's own presets have been read, since they are what a
+  new entry's name and id have to avoid. Saving over a built-in's pair, an entry with no id or a
+  blank name, a setting out of range, and a delete that would remove nothing are each refused by
+  name rather than reported as success.
 
 - The desktop shell has an application icon. macOS and Windows bundles now get a real `.icns` and
   `.ico`, where `bundle.icon` previously listed only a 32 px placeholder PNG. Both containers are

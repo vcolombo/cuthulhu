@@ -154,6 +154,13 @@ export function CutDialog({
   const [baseline, setBaseline] = useState<PresetDraft | null>(null);
   /** A preset write the backend refused, in its own words, beside the draft it refused. */
   const [presetError, setPresetError] = useState<string | null>(null);
+  /** Why the aimed cutter's own list could not be read, if it could not. Kept here rather than only
+   *  raised, because it is what the section says in place of the editor. */
+  const [presetListError, setPresetListError] = useState<string | null>(null);
+  /** A connect or disconnect is in flight, so which cutter this section is editing is about to
+   *  change. The controls are withheld for that window: `aimPresetsAt` drops the draft when the aim
+   *  lands, and an edit typed in the meantime would go with it (Codex on PR #264). */
+  const [aiming, setAiming] = useState(false);
   const [presetBusy, setPresetBusy] = useState(false);
   /** What the operator asked for while a draft was unsaved, held until they decide. Selecting
    *  another preset, changing cutter and closing the dialog all replace the draft, so each one
@@ -220,7 +227,7 @@ export function CutDialog({
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id).then((p) => installPresets(info.machine_id, p));
+        return readPresets(info.machine_id);
       })
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -326,6 +333,9 @@ export function CutDialog({
   }, [refreshList, refreshDeviceState, hosts.length]);
 
   const connect = (info: ipc.DeviceInfo) => {
+    // Marked before the request, not after it: the aim is already on its way to another cutter, and
+    // an edit typed while it travels would be dropped by `aimPresetsAt` when it lands.
+    setAiming(true);
     ipc
       .connectDevice(info)
       .then(() => {
@@ -339,14 +349,16 @@ export function CutDialog({
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return ipc.listPresets(info.machine_id).then((p) => installPresets(info.machine_id, p));
+        return readPresets(info.machine_id);
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .finally(() => setAiming(false));
   };
 
   // Clears `connected` locally too: `disconnect_device` is what releases the local manager, and a
   // row still labelled "connected" would offer no way back to the Connect that clears the state.
   const disconnect = () => {
+    setAiming(true);
     ipc
       .disconnectDevice()
       .then(() => {
@@ -354,7 +366,8 @@ export function CutDialog({
         aimPresetsAt(null);
         refreshDeviceState();
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .finally(() => setAiming(false));
   };
 
   // Keeps the aim on purpose, unlike `disconnect`: the cutter is still there and still this
@@ -410,9 +423,14 @@ export function CutDialog({
   const presetMachine = useRef<string | null>(null);
   /** Nothing of another cutter's is ever shown: a list read for one machine is held with its id, so
    *  a late reply is inert rather than installed. Empty, not the previous entries, while the aimed
-   *  cutter's own list is still being read. */
+   *  cutter's own list is still being read — the pass rows below want the honest answer. */
   const presets =
     connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : [];
+  /** Whether that empty list means "this cutter has none" or "nobody has answered yet". The editor
+   *  is withheld until it is the former: `freshPresetId` and the name check both read the list to
+   *  avoid colliding with what is already stored, so a New pressed against a list that has not
+   *  arrived can mint an id that already exists and overwrite that entry (Codex on PR #264). */
+  const presetsLoaded = connected !== null && presetsFor?.machineId === connected.machine_id;
 
   const presetMode = editorMode(draft, presets);
   const presetDirty = draft !== null && baseline !== null && isDirty(draft, baseline);
@@ -430,6 +448,7 @@ export function CutDialog({
     setDraft(null);
     setBaseline(null);
     setPresetError(null);
+    setPresetListError(null);
     setPendingAfterDecision(null);
   };
 
@@ -440,6 +459,17 @@ export function CutDialog({
     setPresetsFor({ machineId, presets: list as Preset[] });
     return true;
   };
+
+  /** Reads the aimed cutter's own list. A failure is kept rather than only raised: the editor is
+   *  withheld until a list arrives, so a read nobody reports leaves "reading" on screen for good. */
+  const readPresets = (machineId: string) =>
+    ipc
+      .listPresets(machineId)
+      .then((p) => installPresets(machineId, p))
+      .catch((e) => {
+        if (presetMachine.current !== machineId) return;
+        setPresetListError(ipc.ipcErrorMessage(e));
+      });
 
   /** Every action that replaces or drops the draft goes through here: selecting another preset,
    *  aiming at another cutter, and closing the dialog. An operator who typed a force and pressed
@@ -781,9 +811,15 @@ export function CutDialog({
         </div>
 
         {/* A preset belongs to one machine, so there is nothing to manage until this dialog is
-            aimed at one. Withheld outright when the ranges could not be read: an editor that
-            cannot say what a legal force is would offer saves the cut path then refuses. */}
-        {connected === null ? null : ranges !== null ? (
+            aimed at one, and nothing to manage safely until that cutter's own list has arrived:
+            what is already stored is what a new entry's name and id have to avoid. Withheld
+            outright when the ranges could not be read — an editor that cannot say what a legal
+            force is would offer saves the cut path then refuses. */}
+        {connected === null ? null : rangesError !== null || presetListError !== null ? (
+          <div style={{ fontSize: 12, color: "var(--cut)" }}>
+            Material presets are unavailable: {rangesError ?? presetListError}
+          </div>
+        ) : ranges !== null && presetsLoaded ? (
           <PresetEditor
             presets={presets}
             caps={caps}
@@ -793,21 +829,20 @@ export function CutDialog({
             dirty={presetDirty}
             fault={presetFault}
             error={presetError}
-            busy={presetBusy}
+            // An aim change is as much a write as a save is, as far as this section is concerned:
+            // both end with the draft replaced by what the backend says.
+            busy={presetBusy || aiming}
             onSelect={(id) => guardUnsaved(() => editPreset(id))}
             onNew={() => guardUnsaved(newPreset)}
-            onCopy={() => guardUnsaved(copyPreset)}
+            onCopy={copyPreset}
             onChange={(patch) => setDraft((prev) => (prev === null ? prev : { ...prev, ...patch }))}
             onSave={() => savePresetDraft()}
             onDiscard={discardDraft}
             onDelete={deletePresetDraft}
           />
-        ) : rangesError !== null ? (
-          <div style={{ fontSize: 12, color: "var(--cut)" }}>
-            Material presets are unavailable: this cutter's setting ranges could not be read —{" "}
-            {rangesError}
-          </div>
-        ) : null}
+        ) : (
+          <div style={{ fontSize: 12, color: "var(--muted)" }}>Reading this cutter's presets…</div>
+        )}
 
         {/* The decision is the operator's, and nothing moves until they make it: Save writes and
             then does what they asked for, Discard drops the edit and does it, Keep editing leaves

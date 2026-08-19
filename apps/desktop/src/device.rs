@@ -1271,19 +1271,13 @@ fn ships_with_the_app(machine_id: &str, id: &str) -> bool {
 }
 
 pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> {
-    // `load_presets` drops an id-less entry, so an empty id is a save the operator never gets
-    // back: the editor closes, the file grew, and the next listing shows nothing new.
+    // What the entry *is* is settled before what it holds. An id-less entry is a save the operator
+    // never gets back (`load_presets` drops those, so the editor closes, the file grows and the
+    // next listing shows nothing new); a pair that names a builtin can never be saved at all, so
+    // saying "force must be 1..=33" first sends the operator to repair settings on an entry that
+    // was refusable whatever they held (Codex on PR #264).
     if preset.id.is_empty() {
         return Err(IpcError::new("invalid_preset", "a material preset needs an id"));
-    }
-    // The name is the whole of what the picker shows, so a blank one is a row naming no material.
-    if preset.name.trim().is_empty() {
-        return Err(IpcError::new("invalid_preset", "a material preset needs a name"));
-    }
-    // Preflight refuses these settings at the cut, so storing them makes a material the operator
-    // can pick from the dialog and never cut with.
-    if let Some(reason) = cutplan::preflight::preset_settings_out_of_range(&preset.settings) {
-        return Err(IpcError::new("invalid_preset", reason));
     }
     // A user entry saved under a builtin's pair shadows it, and nothing hands the shipped
     // settings back afterwards — the material the app came with is gone for good.
@@ -1295,6 +1289,15 @@ pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> 
                 preset.id
             ),
         ));
+    }
+    // The name is the whole of what the picker shows, so a blank one is a row naming no material.
+    if preset.name.trim().is_empty() {
+        return Err(IpcError::new("invalid_preset", "a material preset needs a name"));
+    }
+    // Preflight refuses these settings at the cut, so storing them makes a material the operator
+    // can pick from the dialog and never cut with.
+    if let Some(reason) = cutplan::preflight::preset_settings_out_of_range(&preset.settings) {
+        return Err(IpcError::new("invalid_preset", reason));
     }
 
     let mut user = user_entries(path)?;
@@ -3118,6 +3121,22 @@ mod tests {
         }
         assert!(user_entries(&path).unwrap().is_empty(),
             "a refused save still wrote an entry to the file");
+    }
+
+    /// An entry with two faults is named by the one the operator can act on. A pair that names a
+    /// builtin is unsavable whatever it holds, so reporting the force first sends them to fix a
+    /// number that was never what refused the save.
+    #[test]
+    fn what_a_preset_is_refuses_it_before_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+
+        let both_wrong = a_user_preset("cameo5", &builtin.id, 99);
+        let err = save_preset(&path, both_wrong).unwrap_err();
+        assert_eq!(err.code, "builtin_preset",
+            "a shipped pair was reported as a settings fault: {}", err.message);
     }
 
     /// A delete that removed nothing used to report success, leaving the entry listed — which

@@ -304,7 +304,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     passes: {
       key: string;
       enabled: boolean;
-      preset_id: string | null;
+      // Optional on the wire, not merely nullable: `ConfiguredPassDto::preset_id` is an
+      // `Option<String>`, and serde reads a field the caller left out as `None`.
+      preset_id?: string | null;
       speed: number | null;
       force: number | null;
       repeat_count: number | null;
@@ -628,13 +630,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         throw ipcError("device_mismatch", "connected device changed since planning");
       }
       // Refused before the revision, machine and pass-key checks below, mirroring `prepare_cut`,
-      // which resolves an enabled pass's preset before it parses the revision or plans. Against
-      // null rather than truthiness: an empty id names a preset too, and `&& named` would wave it
-      // through — a fake laxer than Rust is the false green this mirror exists to avoid.
+      // which resolves an enabled pass's preset before it parses the revision or plans. Named is
+      // spelled out rather than tested for truth, in both directions: an empty id names a preset
+      // and must be refused, while an omitted field is the `None` serde reads and must not be —
+      // a fake that diverges either way is a green test for a cut the backend does not make.
       const available = effectivePresets(connected.machine_id);
       for (const pass of request.passes) {
         const named = pass.preset_id;
-        if (pass.enabled && named !== null && !available.some((p) => p.id === named)) {
+        if (pass.enabled && named !== null && named !== undefined
+          && !available.some((p) => p.id === named)) {
           throw ipcError("unknown_preset",
             `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
         }
@@ -1214,6 +1218,49 @@ test("an unavailable preset is refused before later cut request checks", async (
     }],
   });
   expect(error).toMatchObject({ code: "unknown_preset" });
+});
+
+// The other half of that comparison, and the reason it is spelled out rather than a truth test:
+// `ConfiguredPassDto::preset_id` is an `Option<String>`, so serde reads a pass that carries no
+// such field as `None` and the cut proceeds. A fake that refused it would fail a request the
+// backend accepts — the mirror wrong in the strict direction, which no UI test can reach because
+// the dialog always sends the field.
+test("a pass that carries no preset id at all is cut, not refused", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+
+  const outcome = await page.evaluate(async () => {
+    // The fake's own channel, as everywhere else in this file: `__TAURI_INTERNALS__` is installed
+    // by the fake, so the page's types do not know it.
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    const plan = await internals.__TAURI_INTERNALS__.invoke("plan_cut", { grouping: "Single" }) as {
+      passes: { key: string }[];
+      doc_revision: string;
+    };
+    try {
+      return await internals.__TAURI_INTERNALS__.invoke("cut", {
+        request: {
+          device_instance_id: "usb:mock",
+          doc_revision: plan.doc_revision,
+          grouping: "Single",
+          passes: plan.passes.map((p) => ({
+            key: p.key,
+            enabled: true,
+            speed: null,
+            force: null,
+            repeat_count: null,
+          })),
+        },
+      });
+    } catch (reason) {
+      return reason;
+    }
+  });
+  expect(outcome).toMatchObject({ job_id: expect.any(Number) });
 });
 
 // --- managing the operator's own material presets, in the dialog that cuts with them (#244) ---

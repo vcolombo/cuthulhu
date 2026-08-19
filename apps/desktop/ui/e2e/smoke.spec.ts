@@ -317,6 +317,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   ];
   let userPresets: MaterialPreset[] = [];
   let failNextPresetSave = false;
+  let failNextPresetList = false;
   // Parked responses for the reorder/replan race, released from the test in the order it
   // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
   // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
@@ -723,6 +724,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // stricter — it stands in for a machine whose preset *file* holds none of this, which is the
     // state `prepare_cut`'s refusal exists for.
     list_presets: (a) => {
+      // Test hook: a read that fails *after* a write that did not is the interleaving the write and
+      // the refresh are held apart for.
+      if (failNextPresetList) {
+        failNextPresetList = false;
+        throw ipcError("preset_error", "Corrupt(\"the presets file could not be read\")");
+      }
       const machineId = a.machineId as string;
       const mine = userPresets.filter((p) => p.machine_id === machineId);
       const shipped = BUILTIN_PRESETS.filter(
@@ -752,12 +759,17 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         failNextPresetSave = false;
         throw ipcError("preset_error", "Io(\"the presets file could not be written\")");
       }
-      if (p.id === "" || p.name.trim() === "") {
-        throw ipcError("invalid_preset", "a material preset needs an id and a name");
+      // In the backend's order: what the entry *is* before what it holds, so a test cannot pass
+      // against a precedence production does not use (CodeRabbit on PR #264).
+      if (p.id === "" || p.machine_id === "") {
+        throw ipcError("invalid_preset", "a material preset needs an id and the machine it is for");
       }
       if (BUILTIN_PRESETS.some((b) => b.machine_id === p.machine_id && b.id === p.id)) {
         throw ipcError("builtin_preset",
           `\`${p.id}\` is a material preset that ships with the app; save your own under a different id`);
+      }
+      if (p.name.trim() === "") {
+        throw ipcError("invalid_preset", "a material preset needs a name");
       }
       const range = { speed: [1, 30], force: [1, 33], repeat_count: [1, 10] } as const;
       for (const field of ["speed", "force", "repeat_count"] as const) {
@@ -791,6 +803,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // a test can prove a refused save keeps the operator's edit on screen.
     __test_fail_next_preset_save: () => {
       failNextPresetSave = true;
+      return null;
+    },
+    __test_fail_next_preset_list: () => {
+      failNextPresetList = true;
       return null;
     },
     // Test hooks (no production counterpart): park every `list_presets` reply from here, then let
@@ -1213,6 +1229,42 @@ test("a name this cutter already uses is refused before anything is written", as
   await expect(page.getByTestId("preset-error")).toHaveCount(0);
   await page.getByLabel("Save preset", { exact: true }).click();
   await expect(page.getByLabel("Preset to manage")).toHaveValue("htv-mine");
+});
+
+// CodeRabbit on the second push: the write and the re-read that follows it were caught together, so
+// a read that failed after a write that did not reported a refused save, kept the draft as unsaved,
+// and swallowed whatever was waiting on it.
+test("a write that landed is not reported as refused when the re-read after it fails", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await openDialogOnCameo(page);
+
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByLabel("Preset to manage")).toHaveValue("card");
+
+  // The save lands and the list read behind it does not: the section says the list could not be
+  // read, and never that the save was refused.
+  await page.getByLabel("Preset force", { exact: true }).fill("18");
+  await callFake(page, "__test_fail_next_preset_list");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByText("Material presets are unavailable")).toContainText("could not be read");
+  await expect(page.getByTestId("preset-error")).toHaveCount(0);
+
+  // And 18 is in the file: a fresh read of the same cutter's list has it.
+  await page.getByLabel("Disconnect usb:mock").click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("force 18");
+
+  // The same interleaving under the unsaved-changes decision: Save and continue writes, the read
+  // behind it fails, and the close it was blocking still happens.
+  await page.getByLabel("Preset force", { exact: true }).fill("19");
+  await callFake(page, "__test_fail_next_preset_list");
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.getByLabel("Save preset and continue").click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
 test("deleting a preset selects a neighbour instead of showing settings that are gone", async ({ page }) => {

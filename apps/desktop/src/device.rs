@@ -1279,6 +1279,12 @@ pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> 
     if preset.id.is_empty() {
         return Err(IpcError::new("invalid_preset", "a material preset needs an id"));
     }
+    // And the other half of the pair: `list_presets` answers per machine, so an entry naming none
+    // is written and then never listed again — the same unreachable save, one field along (Copilot
+    // on PR #264).
+    if preset.machine_id.is_empty() {
+        return Err(IpcError::new("invalid_preset", "a material preset needs the machine it is for"));
+    }
     // A user entry saved under a builtin's pair shadows it, and nothing hands the shipped
     // settings back afterwards — the material the app came with is gone for good.
     if ships_with_the_app(&preset.machine_id, &preset.id) {
@@ -3111,11 +3117,12 @@ mod tests {
         let path = dir.path().join("presets.json");
 
         let no_id = MaterialPreset { id: String::new(), ..a_user_preset("cameo5", "mine", 12) };
+        let no_machine = MaterialPreset { machine_id: String::new(), ..a_user_preset("cameo5", "mine", 12) };
         let blank_name = MaterialPreset { name: "   ".into(), ..a_user_preset("cameo5", "mine", 12) };
         let past_the_edge = a_user_preset("cameo5", "mine", 99);
 
-        for (preset, what) in [(no_id, "an empty id"), (blank_name, "a blank name"),
-                               (past_the_edge, "a force out of range")] {
+        for (preset, what) in [(no_id, "an empty id"), (no_machine, "no machine"),
+                               (blank_name, "a blank name"), (past_the_edge, "a force out of range")] {
             let err = save_preset(&path, preset).unwrap_err();
             assert_eq!(err.code, "invalid_preset", "{what} was saved: {}", err.message);
         }

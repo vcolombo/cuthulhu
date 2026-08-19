@@ -1480,9 +1480,12 @@ test("a preset list owed to a previous connection to the same cutter is not take
   await page.getByLabel("Save preset", { exact: true }).click();
   await expect(page.getByLabel("Preset to manage")).toHaveValue("card");
 
-  // Park every list reply, then let go of the Cameo and aim at it again. The reply still owed to the
-  // first connection names the same machine, so nothing but the aim tells them apart.
+  // Park every list reply, then save — that write's own re-read is now owed to *this* connection —
+  // and let go of the Cameo and aim at it again. Both replies name the same machine, so nothing but
+  // the aim tells them apart, and the older one would re-derive the draft it was written for.
   await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Preset speed").fill("16");
+  await page.getByLabel("Save preset", { exact: true }).click();
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
 
@@ -1491,9 +1494,17 @@ test("a preset list owed to a previous connection to the same cutter is not take
   await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
   await expect(page.getByLabel("New preset")).toHaveCount(0);
 
+  // Released together, oldest first. The previous connection's reply is inert: the editor opens on
+  // this aim's list with nothing selected, rather than back on the entry that write had settled.
   await callFake(page, "__test_release_presets");
   await expect(page.getByLabel("New preset")).toBeEnabled();
+  await expect(page.getByText("Choose a preset to edit")).toBeVisible();
+  await expect(page.getByLabel("Preset name")).toHaveCount(0);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
+
+  // And the save that was in flight did land, so what is inert is the reply, not the write.
+  await page.getByLabel("Preset to manage").selectOption("card");
+  await expect(page.getByTestId("preset-preview")).toContainText("speed 16");
 });
 
 test("a save's continuation is dropped when the cutter changed before it could run", async ({ page }) => {

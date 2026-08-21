@@ -796,21 +796,25 @@ mod tests {
     /// How `zip 2.4.2` reads an archive that names `manifest.json` twice, pinned because it is the
     /// whole reason #262 is a recorded constraint rather than a fix: the crate collapses duplicate
     /// names before any caller sees them, keeping the **last**. `len()` is 1, `by_name` answers
-    /// once, and `by_index` stops at 1 — so the shadowed member is unaddressable by every reader in
-    /// this workspace, including any future Cuthulhu build, since they all read through this crate.
+    /// once, and `by_index` stops at 1 — the three ways anything in this workspace has of reaching a
+    /// member, so the shadowed one cannot be reached at all while this crate is what reads a `.cut`.
     /// Under the only reading available, such an archive *is* whatever its last member says, which
     /// is why replacing it is the ordinary open/edit/save flow rather than a violated invariant:
     /// the guarantee — a project this build refuses to open is not replaced by it — holds in both
     /// orders, which is what the second half of this test states.
     ///
     /// Nothing Cuthulhu can run writes such a file: `ZipWriter` refuses the second member outright,
-    /// asserted here because it is what forced the hand-patched fixture. A crate upgrade that
-    /// errors on duplicate names, or that exposes an entry count disagreeing with the name map,
-    /// fails this test — and that is the evidence #262 asks for before the decision is revisited,
-    /// since load could then refuse the ambiguous archive as malformed and the guard would follow.
+    /// asserted here because it is what forced the hand-patched fixture. What this test cannot see
+    /// is a future crate that keeps all three of those answers and *adds* a way to notice the
+    /// duplicate — an entry count beside the name map, a raw-entry iterator — so it fails on the
+    /// upgrades that remove the premise and stays quiet on the ones that would merely permit a fix.
+    /// Either way #262 is where the decision lives, since load could then refuse the ambiguous
+    /// archive as malformed and the guard would follow.
     #[test]
     fn a_duplicate_manifest_member_reads_as_the_last_one_and_hides_the_other() {
-        /// 13 bytes, exactly like `manifest.json`, and nothing a real archive would carry.
+        /// 13 bytes, exactly like `manifest.json`. Member names are unrestricted, so this is not a
+        /// name no archive could carry — what makes the patch safe is the occurrence count asserted
+        /// against it below.
         const PLACEHOLDER: &str = "second_member";
         let options = zip::write::SimpleFileOptions::default();
 
@@ -852,7 +856,7 @@ mod tests {
             // central-directory entry is inserted into an `IndexMap` keyed on its own name, so a
             // repeated name replaces the earlier entry's *value* while keeping its position — which
             // is why the count drops and the last member is what remains
-            // `[src: zip 2.4.2 src/read.rs, shared::SharedBuilder::build (MIT)]`, reported upstream
+            // `[src: zip 2.4.2 src/read.rs, zip_archive::SharedBuilder::build (MIT)]`, reported upstream
             // as zip-rs/zip2#841.
             let mut first_index = String::new();
             archive.by_index(0).unwrap().read_to_string(&mut first_index).unwrap();

@@ -113,6 +113,7 @@ import {
   parsePassKey,
   passRowLabel,
   presetIdForKey,
+  presetPicker,
   type PassVm,
   type Caps,
   type Preset,
@@ -250,6 +251,14 @@ describe("toTravelPasses", () => {
   });
 });
 
+/** A list that has been read, which is what every case below but the unread-window ones is about.
+ *  Spelled out rather than defaulted in the functions: the two states are the same array, and the
+ *  whole point of #267 is that a caller has to say which one it holds. */
+const read = (presets: Preset[] = []) => ({ presets, loaded: true });
+/** No read has answered for the aimed cutter yet — the seconds after a connect, and for as long as
+ *  a failed `list_presets` stands. */
+const unread = { presets: [], loaded: false };
+
 describe("effectiveSettings", () => {
   it("uses pass override over preset", () => {
     const pass: PassVm = {
@@ -262,7 +271,7 @@ describe("effectiveSettings", () => {
       repeatCount: 2,
     };
 
-    const result = effectiveSettings(pass, []);
+    const result = effectiveSettings(pass, read());
     expect(result.speed).toBe(100);
     expect(result.force).toBe(50);
     expect(result.repeatCount).toBe(2);
@@ -289,7 +298,7 @@ describe("effectiveSettings", () => {
       },
     ];
 
-    const result = effectiveSettings(pass, presets);
+    const result = effectiveSettings(pass, read(presets));
     expect(result.speed).toBe(150);
     expect(result.force).toBe(75);
     expect(result.repeatCount).toBe(3);
@@ -306,7 +315,7 @@ describe("effectiveSettings", () => {
       repeatCount: null,
     };
 
-    const result = effectiveSettings(pass, []);
+    const result = effectiveSettings(pass, read());
     expect(result.speed).toBeNull();
     expect(result.force).toBeNull();
     expect(result.repeatCount).toBe(1);
@@ -333,10 +342,58 @@ describe("effectiveSettings", () => {
       },
     ];
 
-    const result = effectiveSettings(pass, presets);
+    const result = effectiveSettings(pass, read(presets));
     expect(result.speed).toBe(100);
     expect(result.force).toBe(75);
     expect(result.repeatCount).toBe(3);
+  });
+
+  // The window #267 is about: the row names a material, and the list that would resolve it has not
+  // arrived. A repeat of 1 is a claim about the blade — this pass runs once — and a material with
+  // two passes reported as one is the dialog and the machine disagreeing about what will happen.
+  it("defers every setting while the list that would resolve the preset is unread", () => {
+    const pass: PassVm = {
+      key: "preset:card-stock",
+      shapeCount: 5,
+      enabled: true,
+      presetId: "card-stock",
+      speed: null,
+      force: null,
+      repeatCount: null,
+    };
+
+    expect(effectiveSettings(pass, unread)).toEqual({ speed: null, force: null, repeatCount: null });
+  });
+
+  // An override is the operator's own number, not something the list could answer for.
+  it("keeps a row's overrides while the list is unread", () => {
+    const pass: PassVm = {
+      key: "preset:card-stock",
+      shapeCount: 5,
+      enabled: true,
+      presetId: "card-stock",
+      speed: 90,
+      force: 30,
+      repeatCount: 2,
+    };
+
+    expect(effectiveSettings(pass, unread)).toEqual({ speed: 90, force: 30, repeatCount: 2 });
+  });
+
+  // A pass that names no material has nothing to wait for: `no-preset` is an answer, so the
+  // default repeat is a fact about that pass rather than a guess about an unread one.
+  it("defaults the repeat of a pass with no preset even while the list is unread", () => {
+    const pass: PassVm = {
+      key: "no-preset",
+      shapeCount: 5,
+      enabled: true,
+      presetId: null,
+      speed: null,
+      force: null,
+      repeatCount: null,
+    };
+
+    expect(effectiveSettings(pass, unread)).toEqual({ speed: null, force: null, repeatCount: 1 });
   });
 });
 
@@ -514,7 +571,7 @@ describe("passRowLabel", () => {
                      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
 
   it("names a colour pass by its swatch, not by words", () => {
-    expect(passRowLabel("color:ff0000ff", presets, "Color")).toEqual({ swatch: "#ff0000", text: null });
+    expect(passRowLabel("color:ff0000ff", read(presets), "Color")).toEqual({ swatch: "#ff0000", text: null });
   });
 
   // Grouping-aware, because `no-color` means something different in each colour mode: under
@@ -524,27 +581,100 @@ describe("passRowLabel", () => {
     ["Stroke", "No visible stroke"],
     ["Fill", "No visible fill"],
   ])("says what the colourless pass holds under %s", (grouping, text) => {
-    expect(passRowLabel("no-color", presets, grouping as Grouping)).toEqual({ swatch: null, text });
+    expect(passRowLabel("no-color", read(presets), grouping as Grouping)).toEqual({ swatch: null, text });
   });
 
   // Not "every shape": a NoCut shape is excluded and counted as skipped.
   it("names the single pass for what it holds", () => {
-    expect(passRowLabel("all", presets, "Single")).toEqual({ swatch: null, text: "Every cut shape" });
+    expect(passRowLabel("all", read(presets), "Single")).toEqual({ swatch: null, text: "Every cut shape" });
   });
 
   it("resolves a preset to its name", () => {
-    expect(passRowLabel("preset:cameo5-htv", presets, "Preset")).toEqual({ swatch: null, text: "HTV" });
+    expect(passRowLabel("preset:cameo5-htv", read(presets), "Preset")).toEqual({ swatch: null, text: "HTV" });
   });
 
   // A preset a document names but the file no longer has: the planner keys the pass anyway, so
   // the dialog has to render one.
   it("shows an unresolved preset id as unknown", () => {
-    expect(passRowLabel("preset:deleted", presets, "Preset"))
+    expect(passRowLabel("preset:deleted", read(presets), "Preset"))
       .toEqual({ swatch: null, text: "deleted (unknown preset)" });
   });
 
+  // #267: the same empty-handed lookup, for the opposite reason. "unknown preset" is a claim about
+  // the presets file, and a list nobody has read cannot support it — the row would tell an operator
+  // their material is gone on the strength of a lookup that never happened.
+  //
+  // The marker says the name is unread rather than that it is arriving, because `loaded: false`
+  // covers a read in flight, a read that failed, and no cutter aimed at all, and only the first of
+  // those is a read (Greptile on PR #272).
+  it("says a preset's name is unread rather than unknown while no list has answered", () => {
+    expect(passRowLabel("preset:cameo5-htv", unread, "Preset"))
+      .toEqual({ swatch: null, text: "cameo5-htv (name unread)" });
+  });
+
+  // A found entry wins over the unread marker, which exists only for a lookup that came back
+  // empty-handed: the name is the better answer wherever it came from.
+  it("names a material the lookup holds whether or not the read has landed", () => {
+    expect(passRowLabel("preset:cameo5-htv", { presets, loaded: false }, "Preset"))
+      .toEqual({ swatch: null, text: "HTV" });
+  });
+
   it("names the pass that resolves to no material", () => {
-    expect(passRowLabel("no-preset", presets, "Preset")).toEqual({ swatch: null, text: "No preset" });
+    expect(passRowLabel("no-preset", read(presets), "Preset")).toEqual({ swatch: null, text: "No preset" });
+  });
+});
+
+// The picker beside the label, which had the same defect in a worse shape: a `select` whose value
+// matches no option renders blank, and blank is what "No preset" looks like.
+describe("presetPicker", () => {
+  const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
+                     settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
+
+  it("offers the read list and no more, selecting the pass's own material", () => {
+    expect(presetPicker("cameo5-htv", read(presets))).toEqual({
+      selected: "preset:cameo5-htv",
+      options: [{ value: "no-preset", label: "No preset" },
+                { value: "preset:cameo5-htv", label: "HTV" }],
+    });
+  });
+
+  it("selects no material for a pass that names none", () => {
+    expect(presetPicker(null, read(presets)).selected).toBe("no-preset");
+  });
+
+  it("carries a deleted preset the read list does not hold", () => {
+    expect(presetPicker("card-stock", read(presets)).options)
+      .toContainEqual({ value: "preset:card-stock", label: "card-stock (unknown preset)" });
+  });
+
+  // #267's window, in the control that showed it worst: the value has an option, so the picker
+  // cannot render blank, and the option says the name is not available rather than that it is gone.
+  it("carries a preset no list has answered for, marked unread", () => {
+    expect(presetPicker("card-stock", unread)).toEqual({
+      selected: "preset:card-stock",
+      options: [{ value: "no-preset", label: "No preset" },
+                { value: "preset:card-stock", label: "card-stock (name unread)" }],
+    });
+  });
+
+  // Copilot on PR #272: the picker used to value its options by bare id and spend the empty string
+  // on "No preset", so a pass keyed on a preset actually called `""` selected "No preset" however
+  // many options were offered — the exact misreport the rest of this change removes. Keys cannot
+  // collide: `no-preset` is a token, `preset:` is a spelling.
+  it("tells a preset called nothing from no preset at all", () => {
+    const picker = presetPicker("", unread);
+    expect(picker.selected).toBe("preset:");
+    expect(picker.options).toEqual([{ value: "no-preset", label: "No preset" },
+                                    { value: "preset:", label: " (name unread)" }]);
+    expect(presetIdForKey(picker.selected)).toBe("");
+  });
+
+  // Every option round-trips through the grammar the row's own key is written in, which is what
+  // makes reading a selection back a parse rather than a convention.
+  it("names every option in the pass-key grammar", () => {
+    const picker = presetPicker("card-stock", read(presets));
+    expect(picker.options.map((o) => presetIdForKey(o.value)))
+      .toEqual([null, "card-stock", "cameo5-htv"]);
   });
 });
 
@@ -616,12 +746,12 @@ describe("effectiveSettings with an empty preset id", () => {
                        settings: { speed: 7, force: 33, repeat_count: 2 }, builtin: false }];
     const row: PassVm = { key: "preset:", shapeCount: 1, enabled: true, presetId: "",
                           speed: null, force: null, repeatCount: null };
-    expect(effectiveSettings(row, presets)).toEqual({ speed: 7, force: 33, repeatCount: 2 });
+    expect(effectiveSettings(row, read(presets))).toEqual({ speed: 7, force: 33, repeatCount: 2 });
   });
 
   it("still treats a genuinely absent preset as absent", () => {
     const row: PassVm = { key: "no-preset", shapeCount: 1, enabled: true, presetId: null,
                           speed: null, force: null, repeatCount: null };
-    expect(effectiveSettings(row, [])).toEqual({ speed: null, force: null, repeatCount: 1 });
+    expect(effectiveSettings(row, read())).toEqual({ speed: null, force: null, repeatCount: 1 });
   });
 });

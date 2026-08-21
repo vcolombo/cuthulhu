@@ -25,9 +25,11 @@ import {
   toCutRequest,
   passRowLabel,
   presetIdForKey,
+  presetPicker,
   type PassVm,
   type Caps,
   type Preset,
+  type PresetLookup,
 } from "./viewmodel";
 
 // What the fields allow before any machine has been asked. Not a machine's claim —
@@ -429,16 +431,24 @@ export function CutDialog({
    *  generation check now (round 6 on PR #264). */
   const presetAim = useRef({ generation: 0, machineId: null as string | null });
   const isCurrentAim = (generation: number) => presetAim.current.generation === generation;
-  /** Nothing of another aim's is ever shown: the list is cleared when the aim moves and installed
-   *  only under the aim that asked for it. Empty, not the previous entries, while this aim's own
-   *  list is still being read — the pass rows below want the honest answer. */
-  const presets =
-    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : [];
-  /** Whether that empty list means "this cutter has none" or "nobody has answered yet". The editor
-   *  is withheld until it is the former: `freshPresetId` and the name check both read the list to
-   *  avoid colliding with what is already stored, so a New pressed against a list that has not
+  /** This aim's own entries, or null while no read has answered for it. Nothing of another aim's is
+   *  ever shown: the list is cleared when the aim moves and installed only under the aim that asked
+   *  for it.
+   *
+   *  The two facts below are read off this one value because an empty list alone cannot tell a
+   *  cutter with no presets from a cutter nobody has answered for, and every reader needs a
+   *  different one of them (#267). */
+  const aimedPresets =
+    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : null;
+  /** What the pass rows resolve a material in: the entries, and whether they are this aim's. A row
+   *  that cannot tell the two empty cases apart reports a pass with a material as a pass without
+   *  one, for the seconds after a connect and for as long as a failed read stands. */
+  const presetLookup: PresetLookup = { presets: aimedPresets ?? [], loaded: aimedPresets !== null };
+  const presets = presetLookup.presets;
+  /** Whether the editor may be shown at all: `freshPresetId` and the name check both read the list
+   *  to avoid colliding with what is already stored, so a New pressed against a list that has not
    *  arrived can mint an id that already exists and overwrite that entry (Codex on PR #264). */
-  const presetsLoaded = connected !== null && presetsFor?.machineId === connected.machine_id;
+  const presetsLoaded = presetLookup.loaded;
 
   const presetMode = editorMode(draft, presets);
   const presetDirty = draft !== null && baseline !== null && isDirty(draft, baseline);
@@ -992,12 +1002,16 @@ export function CutDialog({
             in that window is discarded without a trace (Greptile reproduced exactly that). */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {(plan?.rows ?? []).map((row, i) => {
-            const eff = effectiveSettings(row, presets);
+            const eff = effectiveSettings(row, presetLookup);
             const speedDisabled = fieldDisabled("speed", caps);
             const forceDisabled = fieldDisabled("force", caps);
             // A pass keyed on a preset has no swatch to be recognised by, so
             // the row says what it holds instead.
-            const label = passRowLabel(row.key, presets, plan?.grouping ?? grouping);
+            const label = passRowLabel(row.key, presetLookup, plan?.grouping ?? grouping);
+            /** Every option the material picker offers, keyed as this row's `PassKey` grammar keys
+             *  a pass: a bare-id picker has to spend the empty string as its "no preset" sentinel,
+             *  and an id can be any string an operator typed, that one included. */
+            const picker = presetPicker(row.presetId, presetLookup);
             return (
               <div
                 key={row.key}
@@ -1023,13 +1037,12 @@ export function CutDialog({
                 <select
                   aria-label={`Preset for pass ${i + 1}`}
                   disabled={replanning}
-                  value={row.presetId ?? ""}
-                  onChange={(e) => updateRow(i, { presetId: e.target.value || null })}
+                  value={picker.selected}
+                  onChange={(e) => updateRow(i, { presetId: presetIdForKey(e.target.value) })}
                 >
-                  <option value="">No preset</option>
-                  {presets.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
+                  {picker.options.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
                     </option>
                   ))}
                 </select>
@@ -1056,7 +1069,7 @@ export function CutDialog({
                   type="number"
                   disabled={replanning}
                   min={1}
-                  value={eff.repeatCount}
+                  value={eff.repeatCount ?? ""}
                   placeholder="repeat"
                   onChange={(e) => updateRow(i, { repeatCount: e.target.value === "" ? null : Number(e.target.value) })}
                   style={{ width: 50 }}

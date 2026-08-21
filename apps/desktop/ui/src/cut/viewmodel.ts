@@ -191,12 +191,60 @@ export function parsePassKey(key: PassKey): ParsedPassKey {
   return { kind: "unknown", raw: key };
 }
 
+/** The entries a row resolves its material in, and whether they are the aimed cutter's own answer.
+ *  Two of the states are the same empty array — a cutter with no presets, and a cutter whose list
+ *  this dialog does not hold — so a row handed only `Preset[]` says a pass has no material when what
+ *  it has is a material whose name is not available (#267).
+ *
+ *  `loaded` is false for every way of not holding the list, and there are three: a read in flight
+ *  (the seconds after a connect), a read that failed and stands failed, and no cutter aimed at all —
+ *  presets are machine-scoped, so with nothing connected there is nothing that could answer. The
+ *  row must not distinguish them: it would have to claim a read is happening in the two cases where
+ *  none is (Greptile on PR #272). The section above the rows is what names the reason. */
+export type PresetLookup = { presets: Preset[]; loaded: boolean };
+
+/** What a row calls the preset it names. An id the list has answered for and does not hold is
+ *  genuinely unknown — presets are machine-scoped and a user entry can be deleted while a document
+ *  still names it. An id resolved against a list this dialog does not hold is not unknown, and
+ *  saying so would report a material as gone on the strength of a lookup that never happened. */
+function presetLabel(presetId: string, { presets, loaded }: PresetLookup): string {
+  const preset = presets.find((p) => p.id === presetId);
+  if (preset) return preset.name;
+  return loaded ? `${presetId} (unknown preset)` : `${presetId} (name unread)`;
+}
+
+/** Everything a row's material picker renders, and which option is selected.
+ *
+ *  Values are `PassKey` spellings rather than bare ids, for the reason the grammar has a
+ *  `no-preset` token at all: an id is an unrestricted operator string, so a bare-id picker has to
+ *  spend one of them — the empty string — as its "no preset" sentinel, and a pass keyed on a preset
+ *  actually called `""` then selects "No preset" no matter what else is offered (Copilot on
+ *  PR #272). `no-preset` and `preset:` cannot collide.
+ *
+ *  The pass's own preset is always among the options, even when the list does not hold it: a
+ *  `select` whose value matches no option renders blank, and blank reads as "no preset" for a pass
+ *  that has one. */
+export function presetPicker(
+  presetId: string | null,
+  lookup: PresetLookup,
+): { selected: PassKey; options: { value: PassKey; label: string }[] } {
+  const key = (id: string | null): PassKey => (id === null ? "no-preset" : `preset:${id}`);
+  const options = [{ value: key(null), label: "No preset" }];
+  if (presetId !== null && !lookup.presets.some((p) => p.id === presetId)) {
+    options.push({ value: key(presetId), label: presetLabel(presetId, lookup) });
+  }
+  for (const preset of lookup.presets) {
+    options.push({ value: key(preset.id), label: preset.name });
+  }
+  return { selected: key(presetId), options };
+}
+
 /** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
  *  Grouping-aware because `no-color` means something different per mode — under Stroke it can
  *  hold brightly filled shapes, so calling it "no visible paint" would be false. */
 export function passRowLabel(
   key: PassKey,
-  presets: Preset[],
+  lookup: PresetLookup,
   grouping: Grouping,
 ): { swatch: string | null; text: string | null } {
   const parsed = parsePassKey(key);
@@ -215,13 +263,9 @@ export function passRowLabel(
     // Not "every shape": a NoCut shape is excluded from it and counted as skipped.
     case "all":
       return { swatch: null, text: "Every cut shape" };
-    case "preset": {
+    case "preset":
       if (parsed.presetId === null) return { swatch: null, text: "No preset" };
-      const preset = presets.find((p) => p.id === parsed.presetId);
-      // An id the preset file no longer resolves is a real state: presets are machine-scoped
-      // and a user entry can be deleted while a document still names it.
-      return { swatch: null, text: preset ? preset.name : `${parsed.presetId} (unknown preset)` };
-    }
+      return { swatch: null, text: presetLabel(parsed.presetId, lookup) };
     case "unknown":
       return { swatch: null, text: parsed.raw };
   }
@@ -253,22 +297,28 @@ export function toTravelPasses<T extends { key: PassKey; enabled: boolean }>(
  * Compute effective settings for a pass, accounting for overrides and presets.
  * Priority: pass override > preset > default (repeatCount defaults to 1)
  *
+ * Every field is deferred — `null`, meaning "whatever resolves" — while the pass names a preset
+ * the lookup has not answered for. The default repeat of 1 is a claim about the blade ("this pass
+ * runs once") and a material with two passes would be reported as one, which is the row saying
+ * something it does not know rather than nothing (#267).
+ *
  * @param p The pass
- * @param presets Available presets
+ * @param lookup The presets to resolve in, and whether they are the aimed cutter's own
  * @returns Effective settings with resolved speed, force, and repeatCount
  */
 export function effectiveSettings(
   p: PassVm,
-  presets: Preset[]
+  lookup: PresetLookup,
 ): {
   speed: number | null;
   force: number | null;
-  repeatCount: number;
+  repeatCount: number | null;
 } {
   // Explicit null, not truthiness: an empty id is a *named* preset, and treating it as absent
   // showed the operator default speed and force while the cut path resolved the real entry — the
   // dialog and the machine disagreeing about what the blade would do.
-  const preset = p.presetId !== null ? presets.find((pr) => pr.id === p.presetId) : null;
+  const preset = p.presetId !== null ? lookup.presets.find((pr) => pr.id === p.presetId) : null;
+  const unread = p.presetId !== null && preset === undefined && !lookup.loaded;
 
   // Speed: pass override > preset > null
   const speed =
@@ -278,11 +328,11 @@ export function effectiveSettings(
   const force =
     p.force !== null ? p.force : preset?.settings.force ?? null;
 
-  // RepeatCount: pass override > preset > 1
+  // RepeatCount: pass override > preset > 1, and nothing at all until the preset can be resolved
   const repeatCount =
     p.repeatCount !== null
       ? p.repeatCount
-      : preset?.settings.repeat_count ?? 1;
+      : unread ? null : preset?.settings.repeat_count ?? 1;
 
   return { speed, force, repeatCount };
 }

@@ -1852,6 +1852,68 @@ test("a written preset's previous name and settings leave the pass row when the 
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
 });
 
+// The delete half of the same window, which is its own branch of the dialog and can regress on its
+// own (Copilot on PR #275): a delete lands in the presets file exactly as a save does, so the list
+// held from before it is just as superseded — and a row priced from it would name a material the
+// operator has just thrown away.
+test("a deleted preset's name and settings leave the pass row when the delete lands", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await page.getByTestId("layer-row").first().click();
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+
+  await openDialogOnCameo(page);
+  await page.getByLabel("Group passes by").selectOption("Preset");
+  const row = page.getByTestId("cut-pass-row").first();
+  await expect(row).toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
+
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Delete preset").click();
+
+  // Unread, not "unknown preset": the delete has landed but nothing has read the file back, so the
+  // row cannot yet say the material is gone — only that it has no answer about it.
+  await expect(row).toContainText("card-stock (name unread)");
+  await expect(row).not.toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // The editor stays, for the same reason it stays across a save: it is what the held entries are
+  // kept for.
+  await expect(page.getByLabel("Preset to manage")).toBeVisible();
+
+  // Once a list does arrive, the row may say what it now knows — the document names a preset this
+  // cutter no longer has — and prices the pass at the default single pass.
+  await callFake(page, "__test_release_presets");
+  await expect(row).toContainText("card-stock (unknown preset)");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
+
+  // Re-mint the entry the document names, so the failing window has a name and a repeat count of
+  // its own to leave behind rather than the ones already proven above.
+  await page.getByLabel("New preset").click();
+  await page.getByLabel("Preset name").fill("Card Stock");
+  await page.getByLabel("Preset repeat count").fill("4");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(row).toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("4");
+
+  // And a re-read that fails after a delete leaves the row unread for good, rather than falling
+  // back to the entry the delete removed.
+  await callFake(page, "__test_fail_next_preset_list");
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Delete preset").click();
+  await expect(page.getByText(/Material presets are unavailable/)).toBeVisible();
+  await expect(row).toContainText("card-stock (name unread)");
+  await expect(row).not.toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

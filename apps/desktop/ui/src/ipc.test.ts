@@ -8,8 +8,9 @@
 // witnessed once whether or not a scenario reaches it (#85).
 //
 // What it can state depends on how the wrapper is typed. A wrapper with named parameters builds the
-// payload itself, so its keys are checked here; the fifteen document wrappers pass a caller's
-// `Args` object straight through, so only their command name is. Typing those is #70.
+// payload itself, so its keys are checked here; the fourteen wrappers typed `Args` — twelve
+// document ones plus `cut` and `savePreset` — pass a caller's object straight through, so only
+// their command name is. Typing those is #70.
 import { describe, expect, test, vi } from "vitest";
 
 import inventory from "../../ipc-inventory.json" with { type: "json" };
@@ -33,11 +34,14 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 const declared: Record<string, string[]> = inventory;
 
+const observed = new Set<string>();
+
 const checkRecordedCalls = (wrapper: string) => {
   for (const { cmd, args } of calls) {
     expect(Object.keys(declared), `${wrapper} invokes an unregistered command`).toContain(cmd);
     const undeclaredKeys = Object.keys(args ?? {}).filter((k) => !declared[cmd].includes(k));
     expect(undeclaredKeys, `${wrapper} sends a key ${cmd} does not declare`).toEqual([]);
+    observed.add(cmd);
   }
 };
 
@@ -77,4 +81,19 @@ describe("a wrapper that forwards its caller's payload", () => {
     expect(calls.map((c) => c.cmd)).toEqual(["load_image_preview"]);
     checkRecordedCalls("loadImagePreview");
   });
+});
+
+// Declared last on purpose: vitest runs a file's tests in order, so this reads what the tests above
+// recorded.
+//
+// Without it the checks above are conditional on a call being made at all — gut `forceQuit` to a
+// bare `return` and every one of them still passes, because a wrapper that invokes nothing has
+// nothing to disagree with. That is the same silence #85 is about, one level up: the command stops
+// being witnessed and no test says so.
+//
+// Equality, not containment. A registered command with no wrapper is one the desktop cannot call
+// from the only place it reaches Rust (`CLAUDE.md`: the UI reaches Rust only through `ui/src/ipc.ts`),
+// so it is worth failing over rather than leaving for someone to notice.
+test("every registered command is witnessed by a wrapper", () => {
+  expect([...observed].sort()).toEqual(Object.keys(declared).sort());
 });

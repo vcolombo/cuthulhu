@@ -153,6 +153,14 @@ pub fn load_project(path: &Path) -> Result<Document, IoError> {
 /// destroyed or because non-conforming trailing data pushed it out of the window. Seeing those
 /// takes a scan of the whole file, which starts refusing ordinary binaries that merely contain
 /// four such bytes by chance. Recorded on #262 with the rest of the crafted-archive family.
+///
+/// An archive naming `manifest.json` twice is *not* part of that residue, though it reads like it
+/// should be: `zip` keeps the last such member and discards the other before any caller sees it, so
+/// the version this guard reads is the only version anything in this workspace can read. That
+/// reading is pinned by
+/// `tests::a_duplicate_manifest_member_reads_as_the_last_one_and_hides_the_other`, because a crate
+/// that stopped collapsing duplicates would turn the ambiguity into something a caller could refuse
+/// — which is the condition #262 records for revisiting it.
 fn refuse_overwriting_a_newer_project(path: &Path) -> Result<(), IoError> {
     use zip::result::ZipError;
     let uninspectable = |e: &dyn std::fmt::Display| {
@@ -752,6 +760,104 @@ mod tests {
         zip.start_file("manifest.json", zip::write::SimpleFileOptions::default()).unwrap();
         zip.write_all(manifest.as_bytes()).unwrap();
         zip.finish().unwrap();
+    }
+
+    /// Renames every occurrence of a member name in an archive's bytes, which is how the fixture
+    /// below gets two members called `manifest.json`. Both names are 13 bytes, so nothing else in
+    /// the file has to move: the name appears in the local file header and in the central directory
+    /// entry, and no offset, length or CRC in the archive depends on which of the two it is.
+    fn rename_every_member(bytes: &[u8], from: &[u8], to: &[u8]) -> (Vec<u8>, usize) {
+        assert_eq!(from.len(), to.len(), "a rename that moves bytes would invalidate every offset");
+        let mut out = bytes.to_vec();
+        let (mut hits, mut at) = (0, 0);
+        while at + from.len() <= out.len() {
+            if &out[at..at + from.len()] == from {
+                out[at..at + from.len()].copy_from_slice(to);
+                hits += 1;
+                at += from.len();
+            } else {
+                at += 1;
+            }
+        }
+        (out, hits)
+    }
+
+    /// How `zip 2.4.2` reads an archive that names `manifest.json` twice, pinned because it is the
+    /// whole reason #262 is a recorded constraint rather than a fix: the crate collapses duplicate
+    /// names before any caller sees them, keeping the **last**. `len()` is 1, `by_name` answers
+    /// once, and `by_index` stops at 1 — so the shadowed member is unaddressable by every reader in
+    /// this workspace, including any future Cuthulhu build, since they all read through this crate.
+    /// Under the only reading available, such an archive *is* whatever its last member says, which
+    /// is why replacing it is the ordinary open/edit/save flow rather than a violated invariant:
+    /// the guarantee — a project this build refuses to open is not replaced by it — holds in both
+    /// orders, which is what the second half of this test states.
+    ///
+    /// Nothing Cuthulhu can run writes such a file: `ZipWriter` refuses the second member outright,
+    /// asserted here because it is what forced the hand-patched fixture. A crate upgrade that
+    /// errors on duplicate names, or that exposes an entry count disagreeing with the name map,
+    /// fails this test — and that is the evidence #262 asks for before the decision is revisited,
+    /// since load could then refuse the ambiguous archive as malformed and the guard would follow.
+    #[test]
+    fn a_duplicate_manifest_member_reads_as_the_last_one_and_hides_the_other() {
+        /// 13 bytes, exactly like `manifest.json`, and nothing a real archive would carry.
+        const PLACEHOLDER: &str = "second_member";
+        let options = zip::write::SimpleFileOptions::default();
+
+        let mut refuses = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        refuses.start_file("manifest.json", options).unwrap();
+        let refusal = refuses.start_file("manifest.json", options).unwrap_err();
+        assert!(refusal.to_string().contains("Duplicate filename"),
+            "premise: no Cuthulhu build can write this fixture, so it is patched instead: {refusal}");
+
+        let future = format!(r#"{{"version":99,"document":{}}}"#,
+            document::Document::new().snapshot_json());
+        let current = crate::manifest::write_manifest(&document::Document::new());
+        let two_manifests = |path: &std::path::Path, first: &str, last: &str| {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            zip.start_file("manifest.json", options).unwrap();
+            zip.write_all(first.as_bytes()).unwrap();
+            zip.start_file(PLACEHOLDER, options).unwrap();
+            zip.write_all(last.as_bytes()).unwrap();
+            zip.finish().unwrap();
+            let (patched, hits) = rename_every_member(&std::fs::read(path).unwrap(),
+                PLACEHOLDER.as_bytes(), b"manifest.json");
+            assert_eq!(hits, 2, "premise: the name is written once in the local header and once \
+                in the central directory");
+            std::fs::write(path, patched).unwrap();
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+            assert_eq!(archive.len(), 1, "the reader collapses the duplicate before any caller \
+                sees it, so nothing in this workspace can tell the archive is ambiguous");
+            let mut read_back = String::new();
+            archive.by_name("manifest.json").unwrap().read_to_string(&mut read_back).unwrap();
+            assert_eq!(read_back, last, "the member kept is the last one named");
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Future first: the archive reads as the current-version project its last member is, so it
+        // opens, and the guard allows the write that destroys the shadowed member with the rest of
+        // the file. That is the accepted consequence, not an oversight — there is no reading under
+        // which this build ever saw a project from the future here.
+        let hidden_future = dir.path().join("future-then-current.cut");
+        two_manifests(&hidden_future, &future, &current);
+        assert_eq!(load_project(&hidden_future).unwrap(), document::Document::new());
+        save_project(&hidden_future, &document::Document::new()).unwrap();
+        let mut replaced = zip::ZipArchive::new(std::fs::File::open(&hidden_future).unwrap()).unwrap();
+        assert_eq!(replaced.len(), 2, "an ordinary save: manifest.json and design.svg, once each");
+        assert!(replaced.by_name("manifest.json").is_ok());
+
+        // Current first, so the version claim is the one that survives: it is refused on open, and
+        // the guard refuses to replace it by name and leaves the bytes alone. The invariant holds
+        // in the order that can express it.
+        let visible_future = dir.path().join("current-then-future.cut");
+        two_manifests(&visible_future, &current, &future);
+        assert!(matches!(load_project(&visible_future),
+            Err(IoError::UnsupportedProjectVersion { found: 99, .. })));
+        let before = std::fs::read(&visible_future).unwrap();
+        assert!(matches!(save_project(&visible_future, &document::Document::new()),
+            Err(IoError::UnsupportedProjectVersion { found: 99, .. })));
+        assert_eq!(std::fs::read(&visible_future).unwrap(), before,
+            "a refused save leaves the destination byte-identical");
     }
 }
 

@@ -762,16 +762,22 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    /// How many times a member name appears in an archive's bytes: twice per member, once in its
-    /// local file header and once in its central directory entry.
+    /// How many times a member name appears in an archive's bytes. Twice per member: the format
+    /// stores it in the member's own local file header and again in its central directory entry, and
+    /// both are plain bytes with an explicit length field
+    /// `[doc: PKWARE .ZIP File Format Specification 6.3.10,
+    /// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT, §4.3.7 local file header,
+    /// §4.3.12 central directory structure]`.
     fn times_named(bytes: &[u8], name: &[u8]) -> usize {
         bytes.windows(name.len()).filter(|window| *window == name).count()
     }
 
     /// Renames every occurrence of a member name in an archive's bytes, which is how the fixture
-    /// below gets two members called `manifest.json`. Both names are 13 bytes, so nothing else in
-    /// the file has to move: no offset, length or CRC in the archive depends on which of the two
-    /// names a member carries.
+    /// below gets two *physical* members called `manifest.json` — two local file headers and two
+    /// central directory entries carrying the same name, which is the ambiguity the reader then
+    /// collapses. Both names are 13 bytes, so nothing has to move: the name's length is recorded in
+    /// each of those two records, and no offset, size or CRC in the format depends on which name a
+    /// member carries (same citation as above).
     fn rename_every_member(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
         assert_eq!(from.len(), to.len(), "a rename that moves bytes would invalidate every offset");
         let mut out = bytes.to_vec();
@@ -812,6 +818,9 @@ mod tests {
         refuses.start_file("manifest.json", options).unwrap();
         // The variant, not its wording: `zip` may reword "Duplicate filename" without changing what
         // it refuses, and a test that failed on that would be reporting nothing (Copilot on PR #273).
+        // The refusal is unconditional — the writer keys its own entries by name and rejects a
+        // second insert of one it already holds
+        // `[src: zip 2.4.2 src/write.rs, ZipWriter::insert_file_data (MIT)]`.
         let refusal = refuses.start_file("manifest.json", options).unwrap_err();
         assert!(matches!(refusal, zip::result::ZipError::InvalidArchive(_)),
             "premise: no Cuthulhu build can write this fixture, so it is patched instead: {refusal}");

@@ -41,10 +41,10 @@ use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, T
 /// `CommandArg` implementations in the pinned `tauri` crate, minus `Channel`, which *is* read from
 /// the payload.
 ///
-/// Matched on the type's last path segment, which is how these are spelled at this seam
-/// (`tauri::State<'_, T>`, `tauri::AppHandle`). A payload type sharing one of these names would be
-/// dropped from the inventory rather than reported — the generated file is committed and read as a
-/// diff so that a key disappearing is something a reviewer sees.
+/// A name alone does not settle it: `custom::Request` is this crate's payload type and its key has
+/// to be sent, so only a bare name or one written under `tauri` counts as the framework's (see
+/// `is_framework_param`). Dropping a real key would have the fake refuse a call the backend
+/// accepts, which is this file's own failure mode rather than the one it is here to catch.
 const FRAMEWORK_PARAMS: &[&str] = &[
     "AppHandle",
     "CommandScope",
@@ -316,10 +316,16 @@ fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
 
 fn is_framework_param(ty: &Type) -> bool {
     let Type::Path(path) = ty else { return false };
-    path.path
-        .segments
-        .last()
-        .is_some_and(|s| FRAMEWORK_PARAMS.contains(&s.ident.to_string().as_str()))
+    let segments: Vec<String> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let Some(name) = segments.last() else { return false };
+    if !FRAMEWORK_PARAMS.contains(&name.as_str()) {
+        return false;
+    }
+    // `State`, `tauri::State`, `tauri::ipc::Request`: the framework's. `custom::Request`: not, and
+    // its key belongs in the payload. A bare name is taken as Tauri's because that is what a `use
+    // tauri::State` import leaves behind, and a local type shadowing one of these names would
+    // announce itself in this file's diff as a key that vanished.
+    segments.len() == 1 || segments[0] == "tauri"
 }
 
 fn quote_path(path: &syn::Path) -> String {
@@ -415,6 +421,20 @@ mod naming {
         let c = command("#[tauri::command(async)] fn force_quit(app: tauri::AppHandle) {}")
             .expect("a supported shape");
         assert!(c.args.is_empty(), "{:?}", c.args);
+    }
+
+    /// A key dropped here is a call the fake refuses and the backend would have accepted, so the
+    /// framework's own types have to be told apart from a payload type that shares a name.
+    #[test]
+    fn a_payload_type_named_like_a_framework_one_still_sends_its_key() {
+        let c = command("#[tauri::command] fn f(request: custom::Request, state: tauri::State<S>) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["request"]);
+
+        // Both spellings of the framework's own, as `use tauri::Window` leaves the first behind.
+        let c = command("#[tauri::command] fn f(w: Window, app: tauri::AppHandle, id: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
     }
 
     /// The whole point of failing here: an inventory that quietly omitted this command would tell

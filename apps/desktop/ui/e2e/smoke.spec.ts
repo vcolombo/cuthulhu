@@ -933,23 +933,29 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // refused here, rather than reaching an operator as an invalid-args error from a real
       // backend. A missing inventory is this file's own setup failing, not a call to wave through.
       // Installed by the beforeEach below, so nothing in the page's own types knows about it.
-      const injected = window as unknown as {
-        __IPC_INVENTORY__?: Record<string, string[]>;
-        __IPC_VIOLATIONS__?: string[];
-      };
+      const injected = window as unknown as { __IPC_INVENTORY__?: Record<string, string[]> };
       const inventory = injected.__IPC_INVENTORY__;
       // Refusals are recorded as well as rejected. What the frontend does with a rejection is its
       // own business — a dialog names it, a poll swallows it — and the afterEach below is what
       // makes a mis-wired call fail the test that made it, saying which command and which key
       // rather than leaving a missing element to be explained.
+      //
+      // In sessionStorage rather than on `window`, because a reload or a navigation gives the page
+      // a fresh `window` and a refusal from before it still has to fail the test. The key is
+      // spelled out at each use: this function is serialized into the page, so it can share no
+      // constant with the hooks that read it.
       const refuse = (message: string) => {
-        injected.__IPC_VIOLATIONS__ = [...(injected.__IPC_VIOLATIONS__ ?? []), message];
+        const stored: unknown = JSON.parse(sessionStorage.getItem("__ipc_violations__") ?? "[]");
+        const seen = Array.isArray(stored) ? stored : [];
+        sessionStorage.setItem("__ipc_violations__", JSON.stringify([...seen, message]));
         return Promise.reject(new Error(message));
       };
       if (!inventory) return refuse("ipc inventory was not installed");
       // `__test_` names are this fake's own hooks, invoked over this channel because it is the only
       // channel a test has. They have no Rust counterpart by design.
       if (!cmd.startsWith("__test_")) {
+        // `inventory` carries no prototype (see the beforeEach), so a command named `toString` or
+        // `constructor` is absent rather than an inherited function that passes for declared.
         const declared = inventory[cmd];
         if (!declared) return refuse(`unregistered command: ${cmd}`);
         const undeclared = Object.keys(args).filter((k) => !declared.includes(k));
@@ -982,16 +988,20 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
 test.beforeEach(async ({ page }) => {
   await page.addInitScript((inventory) => {
     const injected = window as unknown as { __IPC_INVENTORY__: unknown };
-    injected.__IPC_INVENTORY__ = inventory;
+    // Prototype-less: a lookup table, so `Object.prototype`'s members are not commands.
+    injected.__IPC_INVENTORY__ = Object.assign(Object.create(null), inventory);
   }, ipcInventory as Record<string, string[]>);
 });
 
 // Every test's own check on the seam: a call the registered commands do not declare fails the test
 // that made it, by name, whether or not the frontend showed anything for it.
 test.afterEach(async ({ page }) => {
+  // A test that failed before its first navigation invoked nothing, and about:blank has no storage
+  // of its own to read.
+  if (!page.url().startsWith("http")) return;
   const refused = await page.evaluate(() => {
-    const injected = window as unknown as { __IPC_VIOLATIONS__?: string[] };
-    return injected.__IPC_VIOLATIONS__ ?? [];
+    const stored: unknown = JSON.parse(sessionStorage.getItem("__ipc_violations__") ?? "[]");
+    return Array.isArray(stored) ? stored : [];
   });
   expect(refused, "the fake refused an IPC call the desktop's registered commands do not declare").toEqual([]);
 });
@@ -1019,6 +1029,9 @@ test("a command or key the registered commands do not declare is refused", async
     );
 
   expect(await call("trace_imagee", {})).toBe("unregistered command: trace_imagee");
+  // `Object.prototype`'s members are not commands: a lookup that found one would read a function
+  // as a declared argument list and throw on it instead of refusing the call.
+  expect(await call("toString", {})).toBe("unregistered command: toString");
 
   // The rename that shipped green for two commits: Rust's parameter is `controls`, and `ipc.ts`
   // kept sending `opts` (#85). A registered command is not a licence to send it anything.
@@ -1031,10 +1044,7 @@ test("a command or key the registered commands do not declare is refused", async
   expect(await call("trace_image", { path: "/tmp/fake.png", controls: {} })).toBe("resolved");
 
   // Cleared because they were the point: the afterEach above fails any test that leaves one.
-  await page.evaluate(() => {
-    const injected = window as unknown as { __IPC_VIOLATIONS__?: string[] };
-    injected.__IPC_VIOLATIONS__ = [];
-  });
+  await page.evaluate(() => sessionStorage.removeItem("__ipc_violations__"));
 });
 
 test("new doc → add rect → save → reload keeps the rect", async ({ page }) => {

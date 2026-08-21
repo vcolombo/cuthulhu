@@ -9,8 +9,8 @@
 //
 // What it can state depends on how the wrapper is typed. A wrapper with named parameters builds the
 // payload itself, so its keys are checked here; the fourteen wrappers typed `Args` — twelve
-// document ones plus `cut` and `savePreset` — pass a caller's object straight through, so only
-// their command name is. Typing those is #70.
+// document ones plus `cut` and `savePreset` — pass a caller's object straight through, so for those
+// only the command name is checked. Typing them is #70's.
 import { describe, expect, test, vi } from "vitest";
 
 import inventory from "../../ipc-inventory.json" with { type: "json" };

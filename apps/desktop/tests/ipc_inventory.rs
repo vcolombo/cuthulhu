@@ -34,7 +34,7 @@ use heck::{ToLowerCamelCase, ToSnakeCase};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, Token, Type};
+use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, Token, Type, UseTree};
 
 /// Parameters Tauri supplies from the request instead of the payload: each implements `CommandArg`
 /// by reaching into the message, so none of them is a key the frontend sends. Taken from the
@@ -42,10 +42,10 @@ use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, T
 /// the payload.
 ///
 /// A name alone does not settle it: `custom::Request` is this crate's payload type and its key has
-/// to be sent, so only a path written under `tauri` counts as the framework's, and a bare name is
-/// refused rather than guessed (see `is_framework_param`). Dropping a real key would have the fake
-/// refuse a call the backend accepts, which is this file's own failure mode rather than the one it
-/// is here to catch.
+/// to be sent. A qualified path answers for itself, and a bare name is answered by the file's own
+/// `use` items (see `Imports`), which is what `use tauri::State` and `use custom::Request` leave
+/// indistinguishable in a signature. Dropping a real key would have the fake refuse a call the
+/// backend accepts, which is this file's own failure mode rather than the one it is here to catch.
 const FRAMEWORK_PARAMS: &[&str] = &[
     "AppHandle",
     "CommandScope",
@@ -80,7 +80,7 @@ fn the_committed_inventory_is_the_registered_command_surface() {
                 src.display()
             )
         });
-        let command = external_command(definition)
+        let command = external_command(&definition.function, &definition.imports)
             .unwrap_or_else(|e| panic!("cannot state the wire contract of `{function_name}`: {e}"));
         if let Some(other) = inventory.insert(command.name.clone(), command.args) {
             panic!(
@@ -165,20 +165,30 @@ impl<'ast> Visit<'ast> for FindHandlerRegistry {
 }
 
 /// Every `#[tauri::command]` function under `src`, by function name.
-fn command_definitions(src: &Path) -> BTreeMap<String, ItemFn> {
+fn command_definitions(src: &Path) -> BTreeMap<String, Definition> {
     let mut defined = BTreeMap::new();
     for file in rust_files(src) {
-        collect_commands(&parse(&file).items, &file, &mut defined);
+        let parsed = parse(&file);
+        let mut imports = Imports::default();
+        collect_imports(&parsed.items, &mut imports);
+        collect_commands(&parsed.items, &file, &imports, &mut defined);
     }
     defined
 }
 
-fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, ItemFn>) {
+/// A command function together with what the names in its signature mean.
+struct Definition {
+    function: ItemFn,
+    imports: Imports,
+}
+
+fn collect_commands(items: &[Item], file: &Path, imports: &Imports, into: &mut BTreeMap<String, Definition>) {
     for item in items {
         match item {
             Item::Fn(f) if f.attrs.iter().any(is_command_attribute) => {
                 let name = f.sig.ident.to_string();
-                if into.insert(name.clone(), f.clone()).is_some() {
+                let definition = Definition { function: f.clone(), imports: imports.clone() };
+                if into.insert(name.clone(), definition).is_some() {
                     // generate_handler! names a command by the last segment of its path, so two
                     // definitions sharing a name leave nothing to resolve it by.
                     panic!("two #[tauri::command] functions are named `{name}` ({})", file.display());
@@ -188,10 +198,78 @@ fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Ite
             // leave the registry naming something this file could not find.
             Item::Mod(m) => {
                 if let Some((_, items)) = &m.content {
-                    collect_commands(items, file, into);
+                    collect_commands(items, file, imports, into);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// What a bare type name in a signature refers to: the `use` items in scope, gathered per file.
+///
+/// A file's imports are read as one set rather than per module, which is why a name imported twice
+/// under different paths is recorded as ambiguous instead of resolved — the answer would depend on
+/// which module the command sits in, and being wrong about it drops or invents a payload key.
+#[derive(Clone, Default)]
+struct Imports {
+    /// Local name to the path it names, or `None` where two imports disagree.
+    names: BTreeMap<String, Option<Vec<String>>>,
+    /// A glob can bring in a name this cannot see, so an unresolved name is not evidence of a
+    /// local type once one is present.
+    globs: bool,
+}
+
+impl Imports {
+    fn add(&mut self, local: String, path: Vec<String>) {
+        match self.names.get(&local) {
+            Some(Some(existing)) if *existing != path => {
+                self.names.insert(local, None);
+            }
+            Some(_) => {}
+            None => {
+                self.names.insert(local, Some(path));
+            }
+        }
+    }
+}
+
+fn collect_imports(items: &[Item], into: &mut Imports) {
+    for item in items {
+        match item {
+            Item::Use(u) => collect_use_tree(&u.tree, &mut Vec::new(), into),
+            Item::Mod(m) => {
+                if let Some((_, items)) = &m.content {
+                    collect_imports(items, into);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_use_tree(tree: &UseTree, prefix: &mut Vec<String>, into: &mut Imports) {
+    match tree {
+        UseTree::Path(p) => {
+            prefix.push(p.ident.to_string());
+            collect_use_tree(&p.tree, prefix, into);
+            prefix.pop();
+        }
+        UseTree::Name(n) => {
+            let mut path = prefix.clone();
+            path.push(n.ident.to_string());
+            into.add(n.ident.to_string(), path);
+        }
+        UseTree::Rename(r) => {
+            let mut path = prefix.clone();
+            path.push(r.ident.to_string());
+            into.add(r.rename.to_string(), path);
+        }
+        UseTree::Glob(_) => into.globs = true,
+        UseTree::Group(g) => {
+            for item in &g.items {
+                collect_use_tree(item, prefix, into);
+            }
         }
     }
 }
@@ -228,7 +306,7 @@ impl Parse for CommandOption {
     }
 }
 
-fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
+fn external_command(function: &ItemFn, imports: &Imports) -> Result<ExternalCommand, String> {
     let attr = function
         .attrs
         .iter()
@@ -287,7 +365,7 @@ fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
         let FnArg::Typed(typed) = arg else {
             return Err("a `self` parameter".into());
         };
-        if is_framework_param(&typed.ty)? {
+        if is_framework_param(&typed.ty, imports)? {
             continue;
         }
         let Pat::Ident(pat) = &*typed.pat else {
@@ -316,28 +394,34 @@ fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
 }
 
 /// Whether Tauri fills this parameter in from the request. `Err` when the spelling cannot say.
-fn is_framework_param(ty: &Type) -> Result<bool, String> {
+fn is_framework_param(ty: &Type, imports: &Imports) -> Result<bool, String> {
     let Type::Path(path) = ty else { return Ok(false) };
     let segments: Vec<String> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
     let Some(name) = segments.last() else { return Ok(false) };
     if !FRAMEWORK_PARAMS.contains(&name.as_str()) {
         return Ok(false);
     }
-    if segments[0] == "tauri" {
-        return Ok(true);
-    }
     if segments.len() > 1 {
-        // `custom::Request` is this crate's, and its key is part of the payload.
-        return Ok(false);
+        // `tauri::State`, `tauri::ipc::Request`: the framework's. `custom::Request`: this crate's,
+        // and its key is part of the payload.
+        return Ok(segments[0] == "tauri");
     }
-    // A bare name is whatever the file imported it as, and this reads one signature rather than a
-    // module's imports. Guessing either way is a wrong inventory: Tauri's own read as a payload
-    // key declares a key nobody sends, and a payload type read as Tauri's drops a key that is
-    // sent, which has the fake refuse a call the backend accepts. Ask instead.
-    Err(format!(
-        "a parameter typed `{name}`, which is either Tauri's or a payload type of the same name — \
-         spell Tauri's as `tauri::{name}`"
-    ))
+    match imports.names.get(name) {
+        // What `use tauri::State` leaves behind, and what `use custom::Request` does.
+        Some(Some(path)) => Ok(path.first().is_some_and(|first| first == "tauri")),
+        // Two imports of the name disagree, so which one a given module sees is not something a
+        // file-wide reading can answer. Both answers are a wrong inventory — Tauri's own read as a
+        // payload declares a key nobody sends, and a payload type read as Tauri's drops a key that
+        // is sent, which has the fake refuse a call the backend accepts.
+        Some(None) => Err(format!("`{name}`, which this file imports under two different paths")),
+        // Imported from nowhere: a type of this crate's own, since none of these is in the
+        // prelude — unless a glob could have brought one in, which nothing here can see through.
+        None if imports.globs => Err(format!(
+            "`{name}` alongside a glob import, so whether it is Tauri's cannot be read here — \
+             spell Tauri's as `tauri::{name}`"
+        )),
+        None => Ok(false),
+    }
 }
 
 fn quote_path(path: &syn::Path) -> String {
@@ -401,8 +485,21 @@ fn parse(file: &Path) -> File {
 mod naming {
     use super::*;
 
+    /// Parsed as a file rather than a lone function, because a bare type name in the signature is
+    /// answered by the `use` items above it. A function on its own is a valid file with none.
     fn command(source: &str) -> Result<ExternalCommand, String> {
-        external_command(&syn::parse_str::<ItemFn>(source).expect("a function"))
+        let file = syn::parse_file(source).expect("a file");
+        let mut imports = Imports::default();
+        collect_imports(&file.items, &mut imports);
+        let function = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(f) => Some(f),
+                _ => None,
+            })
+            .expect("a function");
+        external_command(function, &imports)
     }
 
     #[test]
@@ -436,16 +533,34 @@ mod naming {
     }
 
     /// A key dropped here is a call the fake refuses and the backend would have accepted, so the
-    /// framework's own types have to be told apart from a payload type that shares a name.
+    /// framework's own types have to be told apart from a payload type that shares a name — which
+    /// for a bare name is a question about the file's imports, not about the signature.
     #[test]
     fn a_payload_type_named_like_a_framework_one_still_sends_its_key() {
         let c = command("#[tauri::command] fn f(request: custom::Request, state: tauri::State<S>) {}")
             .expect("a supported shape");
         assert_eq!(c.args, ["request"]);
 
-        // A bare name says nothing on its own: `Request` is `tauri::Request` or `custom::Request`
-        // depending on an import this does not read, and either guess writes a wrong inventory.
-        assert!(command("#[tauri::command] fn f(w: Window, id: String) {}").is_err());
+        // The import decides, both ways round.
+        let c = command("use tauri::Window; #[tauri::command] fn f(w: Window, id: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        let c = command("use custom::Request; #[tauri::command] fn f(request: Request, id: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["id", "request"]);
+
+        // Not imported at all: this crate's own, since none of these names is in the prelude.
+        let c = command("#[tauri::command] fn f(window: Window) {}").expect("a supported shape");
+        assert_eq!(c.args, ["window"]);
+
+        // A glob could have brought Tauri's in, and two imports disagreeing leave nothing to read.
+        assert!(command("use tauri::*; #[tauri::command] fn f(w: Window) {}").is_err());
+        assert!(command(
+            "use tauri::Window; mod inner { use custom::Window; }
+             #[tauri::command] fn f(w: Window) {}"
+        )
+        .is_err());
     }
 
     /// The whole point of failing here: an inventory that quietly omitted this command would tell

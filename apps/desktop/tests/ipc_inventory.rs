@@ -42,9 +42,10 @@ use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, T
 /// the payload.
 ///
 /// A name alone does not settle it: `custom::Request` is this crate's payload type and its key has
-/// to be sent, so only a bare name or one written under `tauri` counts as the framework's (see
-/// `is_framework_param`). Dropping a real key would have the fake refuse a call the backend
-/// accepts, which is this file's own failure mode rather than the one it is here to catch.
+/// to be sent, so only a path written under `tauri` counts as the framework's, and a bare name is
+/// refused rather than guessed (see `is_framework_param`). Dropping a real key would have the fake
+/// refuse a call the backend accepts, which is this file's own failure mode rather than the one it
+/// is here to catch.
 const FRAMEWORK_PARAMS: &[&str] = &[
     "AppHandle",
     "CommandScope",
@@ -286,7 +287,7 @@ fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
         let FnArg::Typed(typed) = arg else {
             return Err("a `self` parameter".into());
         };
-        if is_framework_param(&typed.ty) {
+        if is_framework_param(&typed.ty)? {
             continue;
         }
         let Pat::Ident(pat) = &*typed.pat else {
@@ -314,18 +315,29 @@ fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
     Ok(ExternalCommand { name, args })
 }
 
-fn is_framework_param(ty: &Type) -> bool {
-    let Type::Path(path) = ty else { return false };
+/// Whether Tauri fills this parameter in from the request. `Err` when the spelling cannot say.
+fn is_framework_param(ty: &Type) -> Result<bool, String> {
+    let Type::Path(path) = ty else { return Ok(false) };
     let segments: Vec<String> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
-    let Some(name) = segments.last() else { return false };
+    let Some(name) = segments.last() else { return Ok(false) };
     if !FRAMEWORK_PARAMS.contains(&name.as_str()) {
-        return false;
+        return Ok(false);
     }
-    // `State`, `tauri::State`, `tauri::ipc::Request`: the framework's. `custom::Request`: not, and
-    // its key belongs in the payload. A bare name is taken as Tauri's because that is what a `use
-    // tauri::State` import leaves behind, and a local type shadowing one of these names would
-    // announce itself in this file's diff as a key that vanished.
-    segments.len() == 1 || segments[0] == "tauri"
+    if segments[0] == "tauri" {
+        return Ok(true);
+    }
+    if segments.len() > 1 {
+        // `custom::Request` is this crate's, and its key is part of the payload.
+        return Ok(false);
+    }
+    // A bare name is whatever the file imported it as, and this reads one signature rather than a
+    // module's imports. Guessing either way is a wrong inventory: Tauri's own read as a payload
+    // key declares a key nobody sends, and a payload type read as Tauri's drops a key that is
+    // sent, which has the fake refuse a call the backend accepts. Ask instead.
+    Err(format!(
+        "a parameter typed `{name}`, which is either Tauri's or a payload type of the same name — \
+         spell Tauri's as `tauri::{name}`"
+    ))
 }
 
 fn quote_path(path: &syn::Path) -> String {
@@ -431,10 +443,9 @@ mod naming {
             .expect("a supported shape");
         assert_eq!(c.args, ["request"]);
 
-        // Both spellings of the framework's own, as `use tauri::Window` leaves the first behind.
-        let c = command("#[tauri::command] fn f(w: Window, app: tauri::AppHandle, id: String) {}")
-            .expect("a supported shape");
-        assert_eq!(c.args, ["id"]);
+        // A bare name says nothing on its own: `Request` is `tauri::Request` or `custom::Request`
+        // depending on an import this does not read, and either guess writes a wrong inventory.
+        assert!(command("#[tauri::command] fn f(w: Window, id: String) {}").is_err());
     }
 
     /// The whole point of failing here: an inventory that quietly omitted this command would tell

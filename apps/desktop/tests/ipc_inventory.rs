@@ -1,0 +1,428 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! The wiring half of the IPC seam: what the desktop registers, under the names JavaScript has to
+//! use.
+//!
+//! Nothing else in the suite calls a real `#[tauri::command]` — `ui/e2e/smoke.spec.ts` installs a
+//! fake over `invoke` — so a renamed command or argument used to ship green. It has: `trace_image`'s
+//! Rust argument became `controls` while `ui/src/ipc.ts` kept sending `opts:`, and two commits cut
+//! nothing while every check passed (#85).
+//!
+//! This test derives the inventory from the handler registry the app actually builds with and
+//! compares it to the committed `ipc-inventory.json`, which the e2e fake then refuses to invoke
+//! outside of. Each half is read in its own language: Rust parses Rust here, TypeScript checks
+//! payloads there, and neither has to parse the other.
+//!
+//! Three rules decide what the file says, and all three are Tauri's rather than ours:
+//!
+//! - Only commands in `generate_handler!` exist. A function carrying the attribute but left out of
+//!   the registry cannot be invoked, so listing it would tell the fake to accept a call that would
+//!   fail against the real backend.
+//! - Parameters Tauri fills in itself are not payload keys (`FRAMEWORK_PARAMS`).
+//! - Argument names are lower camel by default, `rename_all` moves them, `rename` renames the
+//!   command. `heck` does the conversion because the command macro uses `heck` (see
+//!   `tauri-macros`' `wrapper.rs`), and a second implementation of "camelCase" is a second answer.
+//!
+//! Anything else — a pattern with no name to key on, an attribute option this does not know, a
+//! registered command with no definition — fails the test. An omitted command is an unchecked
+//! command, which is the failure this file exists to end.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use heck::{ToLowerCamelCase, ToSnakeCase};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::visit::Visit;
+use syn::{Attribute, Expr, ExprLit, File, FnArg, Item, ItemFn, Lit, Meta, Pat, Token, Type};
+
+/// Parameters Tauri supplies from the request instead of the payload: each implements `CommandArg`
+/// by reaching into the message, so none of them is a key the frontend sends. Taken from the
+/// `CommandArg` implementations in the pinned `tauri` crate, minus `Channel`, which *is* read from
+/// the payload.
+///
+/// Matched on the type's last path segment, which is how these are spelled at this seam
+/// (`tauri::State<'_, T>`, `tauri::AppHandle`). A payload type sharing one of these names would be
+/// dropped from the inventory rather than reported — the generated file is committed and read as a
+/// diff so that a key disappearing is something a reviewer sees.
+const FRAMEWORK_PARAMS: &[&str] = &[
+    "AppHandle",
+    "CommandScope",
+    "GlobalScope",
+    "Request",
+    "State",
+    "Webview",
+    "WebviewWindow",
+    "Window",
+];
+
+const INVENTORY_FILE: &str = "ipc-inventory.json";
+
+/// Set to regenerate the committed inventory instead of failing on it.
+const UPDATE_VAR: &str = "UPDATE_IPC_INVENTORY";
+
+#[test]
+fn the_committed_inventory_is_the_registered_command_surface() {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = crate_dir.join("src");
+
+    let registered = registered_commands(&src.join("main.rs"));
+    assert!(!registered.is_empty(), "no commands registered in main.rs");
+    let defined = command_definitions(&src);
+
+    let mut inventory = BTreeMap::new();
+    for function_name in &registered {
+        let definition = defined.get(function_name).unwrap_or_else(|| {
+            panic!(
+                "`{function_name}` is registered with generate_handler! but no #[tauri::command] \
+                 function of that name was found under {}",
+                src.display()
+            )
+        });
+        let command = external_command(definition)
+            .unwrap_or_else(|e| panic!("cannot state the wire contract of `{function_name}`: {e}"));
+        if let Some(other) = inventory.insert(command.name.clone(), command.args) {
+            panic!(
+                "two registered commands are invoked as `{}` (arguments {other:?}); \
+                 one of them must be renamed",
+                command.name
+            );
+        }
+    }
+
+    let expected = render(&inventory);
+    let path = crate_dir.join(INVENTORY_FILE);
+    let committed = fs::read_to_string(&path).unwrap_or_default();
+    if committed == expected {
+        return;
+    }
+
+    if std::env::var_os(UPDATE_VAR).is_some() {
+        fs::write(&path, &expected).unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+        eprintln!("{INVENTORY_FILE} rewritten from the registered commands; commit it");
+        return;
+    }
+
+    let only_in_source = lines_missing_from(&expected, &committed);
+    let only_in_file = lines_missing_from(&committed, &expected);
+    panic!(
+        "apps/desktop/{INVENTORY_FILE} does not match the registered commands.\n\
+         only in the source: {only_in_source}\n\
+         only in the committed file: {only_in_file}\n\
+         regenerate with `{UPDATE_VAR}=1 cargo test -p desktop --test ipc_inventory` and commit it.\n\
+         The e2e fake refuses whatever this file does not declare, so a stale copy is a call the \
+         frontend can still make and the backend will still reject."
+    );
+}
+
+/// What one command looks like from JavaScript.
+struct ExternalCommand {
+    name: String,
+    args: Vec<String>,
+}
+
+/// The externally invoked names of everything in `generate_handler!`, by the last segment of each
+/// registered path (`ipc::new_doc` → `new_doc`), in registration order.
+fn registered_commands(main_rs: &Path) -> Vec<String> {
+    let mut found = FindHandlerRegistry::default();
+    found.visit_file(&parse(main_rs));
+    match found.registries.len() {
+        1 => found.registries.remove(0),
+        0 => panic!("no generate_handler! in {}", main_rs.display()),
+        // Which one the built app uses is not something reading the source can settle, and the
+        // inventory would silently describe whichever came first.
+        n => panic!("{n} generate_handler! registries in {}", main_rs.display()),
+    }
+}
+
+#[derive(Default)]
+struct FindHandlerRegistry {
+    registries: Vec<Vec<String>>,
+}
+
+impl<'ast> Visit<'ast> for FindHandlerRegistry {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if mac.path.segments.last().is_some_and(|s| s.ident == "generate_handler") {
+            let paths = mac
+                .parse_body_with(Punctuated::<syn::Path, Token![,]>::parse_terminated)
+                .expect("generate_handler! takes a comma-separated list of command paths");
+            self.registries.push(
+                paths
+                    .iter()
+                    .map(|p| {
+                        p.segments
+                            .last()
+                            .expect("a command path has at least one segment")
+                            .ident
+                            .to_string()
+                    })
+                    .collect(),
+            );
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+/// Every `#[tauri::command]` function under `src`, by function name.
+fn command_definitions(src: &Path) -> BTreeMap<String, ItemFn> {
+    let mut defined = BTreeMap::new();
+    for file in rust_files(src) {
+        collect_commands(&parse(&file).items, &file, &mut defined);
+    }
+    defined
+}
+
+fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, ItemFn>) {
+    for item in items {
+        match item {
+            Item::Fn(f) if f.attrs.iter().any(is_command_attribute) => {
+                let name = f.sig.ident.to_string();
+                if into.insert(name.clone(), f.clone()).is_some() {
+                    // generate_handler! names a command by the last segment of its path, so two
+                    // definitions sharing a name leave nothing to resolve it by.
+                    panic!("two #[tauri::command] functions are named `{name}` ({})", file.display());
+                }
+            }
+            // Commands inside an inline module are as invocable as any other; missing them would
+            // leave the registry naming something this file could not find.
+            Item::Mod(m) => {
+                if let Some((_, items)) = &m.content {
+                    collect_commands(items, file, into);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_command_attribute(attr: &Attribute) -> bool {
+    let path = attr.path();
+    path.is_ident("command")
+        || (path.segments.len() == 2
+            && path.segments[0].ident == "tauri"
+            && path.segments[1].ident == "command")
+}
+
+/// Which spelling the command macro gives arguments.
+#[derive(Clone, Copy)]
+enum ArgumentCase {
+    Camel,
+    Snake,
+}
+
+/// `#[tauri::command]`'s own options: `async` is a bare keyword rather than a `Meta`, which is why
+/// this cannot just parse a meta list.
+enum CommandOption {
+    Async,
+    Meta(Meta),
+}
+
+impl Parse for CommandOption {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.peek(Token![async]) {
+            input.parse::<Token![async]>()?;
+            return Ok(Self::Async);
+        }
+        Ok(Self::Meta(input.parse()?))
+    }
+}
+
+fn external_command(function: &ItemFn) -> Result<ExternalCommand, String> {
+    let attr = function
+        .attrs
+        .iter()
+        .find(|a| is_command_attribute(a))
+        .ok_or("no #[tauri::command] attribute")?;
+
+    let mut case = ArgumentCase::Camel;
+    let mut renamed = None;
+    if !matches!(attr.meta, Meta::Path(_)) {
+        let options = attr
+            .parse_args_with(Punctuated::<CommandOption, Token![,]>::parse_terminated)
+            .map_err(|e| format!("cannot read the attribute's options: {e}"))?;
+        for option in options {
+            let meta = match option {
+                CommandOption::Async => continue,
+                CommandOption::Meta(meta) => meta,
+            };
+            let Meta::NameValue(nv) = meta else {
+                return Err("an attribute option this does not know how to read".into());
+            };
+            let value = match &nv.value {
+                Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) => s.value(),
+                _ => return Err("an attribute option whose value is not a string".into()),
+            };
+            if nv.path.is_ident("rename_all") {
+                case = match value.as_str() {
+                    "camelCase" => ArgumentCase::Camel,
+                    "snake_case" => ArgumentCase::Snake,
+                    other => return Err(format!("rename_all = \"{other}\"")),
+                };
+            } else if nv.path.is_ident("rename") {
+                renamed = Some(value);
+            } else if !nv.path.is_ident("root") {
+                // `root` moves where the macro finds `tauri`, which no name depends on. Anything
+                // else may well move a name, and guessing which way is how this file would start
+                // describing a surface that is not there.
+                return Err(format!(
+                    "the attribute option `{}` is not one this knows the naming effect of",
+                    quote_path(&nv.path)
+                ));
+            }
+        }
+    }
+
+    let ident = function.sig.ident.to_string();
+    let name = match renamed {
+        Some(name) => name,
+        // The macro stringifies the identifier verbatim, raw prefix and all. Rather than encode
+        // that, refuse: a command named after a keyword is a rename away from being sayable.
+        None if ident.starts_with("r#") => return Err(format!("a raw identifier (`{ident}`)")),
+        None => ident,
+    };
+
+    let mut args = Vec::new();
+    for arg in &function.sig.inputs {
+        let FnArg::Typed(typed) = arg else {
+            return Err("a `self` parameter".into());
+        };
+        if is_framework_param(&typed.ty) {
+            continue;
+        }
+        let Pat::Ident(pat) = &*typed.pat else {
+            // The macro keys wildcard and destructured parameters off something other than a name
+            // (the empty string, the type's identifier). None is a payload key worth mirroring by
+            // hand, and none appears at this seam.
+            return Err("a parameter with no name to key on".into());
+        };
+        // `unraw`, as the macro does: `r#type` is sent as `type`.
+        let key = pat.ident.to_string();
+        let key = key.strip_prefix("r#").unwrap_or(&key);
+        let key = match case {
+            ArgumentCase::Camel => key.to_lower_camel_case(),
+            ArgumentCase::Snake => key.to_snake_case(),
+        };
+        if args.contains(&key) {
+            return Err(format!("two parameters that both arrive as `{key}`"));
+        }
+        args.push(key);
+    }
+    // Sorted, not in declaration order: the payload is a JSON object, so reordering a Rust
+    // signature changes nothing the frontend can see and should not show up as a change here.
+    args.sort();
+
+    Ok(ExternalCommand { name, args })
+}
+
+fn is_framework_param(ty: &Type) -> bool {
+    let Type::Path(path) = ty else { return false };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|s| FRAMEWORK_PARAMS.contains(&s.ident.to_string().as_str()))
+}
+
+fn quote_path(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// One line per command, so a pull request shows which command changed rather than a reflowed
+/// block. JSON because the e2e fake imports it directly.
+fn render(inventory: &BTreeMap<String, Vec<String>>) -> String {
+    let mut out = String::from("{\n");
+    for (i, (name, args)) in inventory.iter().enumerate() {
+        let keys: Vec<String> = args.iter().map(|a| json_string(a)).collect();
+        let comma = if i + 1 == inventory.len() { "" } else { "," };
+        out.push_str(&format!("  {}: [{}]{comma}\n", json_string(name), keys.join(", ")));
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect("a string serializes")
+}
+
+fn lines_missing_from(these: &str, those: &str) -> String {
+    let missing: Vec<&str> = these
+        .lines()
+        .filter(|l| !those.lines().any(|other| other == *l))
+        .map(str::trim)
+        .collect();
+    if missing.is_empty() {
+        "nothing".into()
+    } else {
+        missing.join(" ")
+    }
+}
+
+fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("a readable directory entry").path();
+        if path.is_dir() {
+            files.extend(rust_files(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn parse(file: &Path) -> File {
+    let source = fs::read_to_string(file).unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+    syn::parse_file(&source).unwrap_or_else(|e| panic!("cannot parse {}: {e}", file.display()))
+}
+
+mod naming {
+    use super::*;
+
+    fn command(source: &str) -> Result<ExternalCommand, String> {
+        external_command(&syn::parse_str::<ItemFn>(source).expect("a function"))
+    }
+
+    #[test]
+    fn arguments_arrive_in_lower_camel_and_framework_parameters_do_not_arrive_at_all() {
+        let c = command(
+            "#[tauri::command]
+             fn travel_for_order(state: tauri::State<AppStateHandle>, doc_revision: String) {}",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.name, "travel_for_order");
+        assert_eq!(c.args, ["docRevision"]);
+    }
+
+    #[test]
+    fn rename_all_moves_the_arguments_and_rename_moves_the_command() {
+        let c = command("#[tauri::command(rename_all = \"snake_case\")] fn f(doc_revision: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["doc_revision"]);
+
+        let c = command("#[tauri::command(async, rename = \"cutIt\")] fn cut(request: R) {}")
+            .expect("a supported shape");
+        assert_eq!(c.name, "cutIt");
+        assert_eq!(c.args, ["request"]);
+    }
+
+    #[test]
+    fn async_is_not_an_argument_and_neither_is_the_app_handle() {
+        let c = command("#[tauri::command(async)] fn force_quit(app: tauri::AppHandle) {}")
+            .expect("a supported shape");
+        assert!(c.args.is_empty(), "{:?}", c.args);
+    }
+
+    /// The whole point of failing here: an inventory that quietly omitted this command would tell
+    /// the e2e fake to accept a payload the real backend does not.
+    #[test]
+    fn a_shape_with_no_key_to_send_is_refused_rather_than_omitted() {
+        assert!(command("#[tauri::command] fn f(_: String) {}").is_err());
+        assert!(command("#[tauri::command(rename_all = \"kebab-case\")] fn f(a: String) {}").is_err());
+        assert!(command("#[tauri::command(unknown = \"x\")] fn f() {}").is_err());
+    }
+}

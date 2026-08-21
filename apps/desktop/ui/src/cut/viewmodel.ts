@@ -203,6 +203,29 @@ export function parsePassKey(key: PassKey): ParsedPassKey {
  *  none is (Greptile on PR #272). The section above the rows is what names the reason. */
 export type PresetLookup = { presets: Preset[]; loaded: boolean };
 
+/** The list the dialog holds for the cutter it is aimed at, and whether it is still that cutter's
+ *  answer. `current` goes false the moment a write lands: the presets file has changed, and the
+ *  re-read that will say how is still out, so what is held is every entry as it was *before* the
+ *  write. Held rather than dropped, because the editor above the rows mints an id and refuses a
+ *  colliding name against exactly this list — dropped, the editor would be withheld on every save. */
+export type AimedPresets = { presets: Preset[]; current: boolean };
+
+/** The lookup a pass row may price a pass from, which is only ever a current list. A row that
+ *  resolved a material in a superseded one would name the preset and show the speed, force and
+ *  repeat it had before the write, while `prepare_cut` resolves the new ones from the file — the
+ *  dialog and the blade disagreeing about what is about to happen (#274).
+ *
+ *  Superseded reads as unread rather than as its own marker, because that is what it is: an answer
+ *  is owed and none has arrived. It is also where a failed re-read stays, since only a list that
+ *  arrives replaces one — so the rows never go back to pricing from the pre-write entries. */
+export function rowPresetLookup(aimed: AimedPresets | null): PresetLookup {
+  // Emptied, not passed through with `loaded: false`: `presetLabel` answers with a name it finds
+  // whatever the flag says, and the name it would find here is the superseded one.
+  return aimed !== null && aimed.current
+    ? { presets: aimed.presets, loaded: true }
+    : { presets: [], loaded: false };
+}
+
 /** What a row calls the preset it names. An id the list has answered for and does not hold is
  *  genuinely unknown — presets are machine-scoped and a user entry can be deleted while a document
  *  still names it. An id resolved against a list this dialog does not hold is not unknown, and

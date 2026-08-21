@@ -1766,7 +1766,7 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   const row = page.getByTestId("cut-pass-row").first();
-  await expect(row).toContainText("card-stock (reading…)");
+  await expect(row).toContainText("card-stock (name unread)");
   // The picker carries the pass's own preset rather than nothing: a `select` whose value matches no
   // option renders blank, and blank is exactly what "No preset" looks like.
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
@@ -1781,6 +1781,15 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(row).toContainText("Card Stock");
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
+
+  // Greptile's P1 on the second push: disconnecting clears the list with the aim, and presets are
+  // machine-scoped, so from here nothing can resolve the name — not "reading", which is why the
+  // marker does not say so. What must not come back is `(unknown preset)`: the material is not gone,
+  // and the file the backend would resolve it from is untouched by a disconnect.
+  await page.getByLabel("Disconnect usb:mock").click();
+  await expect(row).toContainText("card-stock (name unread)");
+  await expect(row).not.toContainText("unknown preset");
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
 });
 
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {

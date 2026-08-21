@@ -602,10 +602,14 @@ describe("passRowLabel", () => {
 
   // #267: the same empty-handed lookup, for the opposite reason. "unknown preset" is a claim about
   // the presets file, and a list nobody has read cannot support it — the row would tell an operator
-  // their material is gone while the read that names it is still in flight.
-  it("says a preset is being read rather than unknown while no list has answered", () => {
+  // their material is gone on the strength of a lookup that never happened.
+  //
+  // The marker says the name is unread rather than that it is arriving, because `loaded: false`
+  // covers a read in flight, a read that failed, and no cutter aimed at all, and only the first of
+  // those is a read (Greptile on PR #272).
+  it("says a preset's name is unread rather than unknown while no list has answered", () => {
     expect(passRowLabel("preset:cameo5-htv", unread, "Preset"))
-      .toEqual({ swatch: null, text: "cameo5-htv (reading…)" });
+      .toEqual({ swatch: null, text: "cameo5-htv (name unread)" });
   });
 
   // A found entry wins over the unread marker, which exists only for a lookup that came back
@@ -644,12 +648,12 @@ describe("presetPicker", () => {
   });
 
   // #267's window, in the control that showed it worst: the value has an option, so the picker
-  // cannot render blank, and the option says why it has no name yet.
-  it("carries a preset no list has answered for, marked as being read", () => {
+  // cannot render blank, and the option says the name is not available rather than that it is gone.
+  it("carries a preset no list has answered for, marked unread", () => {
     expect(presetPicker("card-stock", unread)).toEqual({
       selected: "preset:card-stock",
       options: [{ value: "no-preset", label: "No preset" },
-                { value: "preset:card-stock", label: "card-stock (reading…)" }],
+                { value: "preset:card-stock", label: "card-stock (name unread)" }],
     });
   });
 
@@ -661,7 +665,7 @@ describe("presetPicker", () => {
     const picker = presetPicker("", unread);
     expect(picker.selected).toBe("preset:");
     expect(picker.options).toEqual([{ value: "no-preset", label: "No preset" },
-                                    { value: "preset:", label: " (reading…)" }]);
+                                    { value: "preset:", label: " (name unread)" }]);
     expect(presetIdForKey(picker.selected)).toBe("");
   });
 

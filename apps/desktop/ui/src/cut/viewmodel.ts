@@ -191,21 +191,26 @@ export function parsePassKey(key: PassKey): ParsedPassKey {
   return { kind: "unknown", raw: key };
 }
 
-/** The entries a row resolves its material in, and whether they are the aimed cutter's own
- *  answer. Two of the three states are the same empty array — a cutter with no presets, and a
- *  cutter whose list nobody has answered for yet — so a row handed only `Preset[]` says a pass has
- *  no material during the seconds after a connect, and for as long as a failed read stands, when
- *  what it has is a material whose name has not arrived (#267). */
+/** The entries a row resolves its material in, and whether they are the aimed cutter's own answer.
+ *  Two of the states are the same empty array — a cutter with no presets, and a cutter whose list
+ *  this dialog does not hold — so a row handed only `Preset[]` says a pass has no material when what
+ *  it has is a material whose name is not available (#267).
+ *
+ *  `loaded` is false for every way of not holding the list, and there are three: a read in flight
+ *  (the seconds after a connect), a read that failed and stands failed, and no cutter aimed at all —
+ *  presets are machine-scoped, so with nothing connected there is nothing that could answer. The
+ *  row must not distinguish them: it would have to claim a read is happening in the two cases where
+ *  none is (Greptile on PR #272). The section above the rows is what names the reason. */
 export type PresetLookup = { presets: Preset[]; loaded: boolean };
 
 /** What a row calls the preset it names. An id the list has answered for and does not hold is
  *  genuinely unknown — presets are machine-scoped and a user entry can be deleted while a document
- *  still names it — but an id no list has been read for is not, and saying so would report a
- *  material this dialog is about to name. */
+ *  still names it. An id resolved against a list this dialog does not hold is not unknown, and
+ *  saying so would report a material as gone on the strength of a lookup that never happened. */
 function presetLabel(presetId: string, { presets, loaded }: PresetLookup): string {
   const preset = presets.find((p) => p.id === presetId);
   if (preset) return preset.name;
-  return loaded ? `${presetId} (unknown preset)` : `${presetId} (reading…)`;
+  return loaded ? `${presetId} (unknown preset)` : `${presetId} (name unread)`;
 }
 
 /** Everything a row's material picker renders, and which option is selected.

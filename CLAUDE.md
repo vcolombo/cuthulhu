@@ -22,6 +22,7 @@ research tooling, not the product — do not grow it.
 cargo test --workspace --locked          # what CI runs; --locked is mandatory (see below)
 cargo test -p cutplan preflight          # one crate, filtered by test-name substring
 cargo run -p cli -- cut file.svg --dry-run
+UPDATE_IPC_INVENTORY=1 cargo test -p desktop --test ipc_inventory   # regenerate ipc-inventory.json
 
 P=apps/desktop/ui                        # every line below runs from the repo root
 npm --prefix $P run dev                  # vite dev server on :5173
@@ -54,7 +55,7 @@ directory holding the config. Running `npm run build` yourself from `apps/deskto
 makes the hook look broken — it is not. Do not "fix" it with `--prefix ui`; that resolves to
 `ui/ui` and takes the packaged build down.
 
-Two CI gates that fail on ordinary-looking commits:
+Three CI gates that fail on ordinary-looking commits:
 
 - **`--locked`**: `Cargo.lock` is committed and CI refuses to rewrite it. Add a dependency →
   commit the lock in the same change.
@@ -62,6 +63,11 @@ Two CI gates that fail on ordinary-looking commits:
   `frontendDist` at Rust compile time, so the Rust CI job (no Node) needs it present. CI rebuilds
   and fails if the committed bundle differs. Touch `ui/src` → run
   `npm --prefix apps/desktop/ui run build` and commit `dist/`.
+- **`apps/desktop/ipc-inventory.json` staleness**: the committed inventory of registered Tauri
+  commands and their JavaScript argument names is what the e2e fake refuses calls outside of, so a
+  stale copy is a call the frontend can still make and the real backend still rejects (#85). Change
+  a command's name, its arguments, or its `#[tauri::command]` attribute → regenerate as above and
+  commit the result. The test says so too, and names what moved.
 
 ## Architecture
 
@@ -140,6 +146,10 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   (`ui/src/render/`); each dialog splits into a pure `viewmodel.ts` (unit-tested) plus a thin
   `.tsx`. `e2e/smoke.spec.ts` installs an in-page fake Tauri backend that mirrors
   `Document::snapshot_json()` — change that JSON shape and the mock must change with it.
+  That fake is also where a mis-wired call is caught: it refuses any command name or payload key
+  absent from `apps/desktop/ipc-inventory.json`, which `apps/desktop/tests/ipc_inventory.rs`
+  generates from `main.rs`'s own `generate_handler!` registry. Names and argument names are checked
+  in the language each is written in, which is why neither side parses the other.
 
 ### Document and files
 

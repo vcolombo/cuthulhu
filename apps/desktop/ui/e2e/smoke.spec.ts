@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { test, expect, type Page } from "@playwright/test";
+// Generated from the desktop's own generate_handler! registry by
+// apps/desktop/tests/ipc_inventory.rs. Nothing else here calls a real #[tauri::command], so this
+// is what the fake below checks command and argument names against (#85).
+// The attribute is not decoration: Playwright loads this file as ESM, where a JSON import without
+// one is a TypeError before any test is collected.
+import ipcInventory from "../../ipc-inventory.json" with { type: "json" };
 
 // Minimal in-memory fake Tauri backend. Runs inside the page (via addInitScript, so it
 // can't close over anything outside itself) and mirrors the JSON shape produced by
@@ -923,6 +929,32 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         }
         return Promise.resolve(null);
       }
+      // The wiring gate (#85): a command name or payload key the Rust side does not declare is
+      // refused here, rather than reaching an operator as an invalid-args error from a real
+      // backend. A missing inventory is this file's own setup failing, not a call to wave through.
+      // Installed by the beforeEach below, so nothing in the page's own types knows about it.
+      const injected = window as unknown as {
+        __IPC_INVENTORY__?: Record<string, string[]>;
+        __IPC_VIOLATIONS__?: string[];
+      };
+      const inventory = injected.__IPC_INVENTORY__;
+      // Refusals are recorded as well as rejected. What the frontend does with a rejection is its
+      // own business — a dialog names it, a poll swallows it — and the afterEach below is what
+      // makes a mis-wired call fail the test that made it, saying which command and which key
+      // rather than leaving a missing element to be explained.
+      const refuse = (message: string) => {
+        injected.__IPC_VIOLATIONS__ = [...(injected.__IPC_VIOLATIONS__ ?? []), message];
+        return Promise.reject(new Error(message));
+      };
+      if (!inventory) return refuse("ipc inventory was not installed");
+      // `__test_` names are this fake's own hooks, invoked over this channel because it is the only
+      // channel a test has. They have no Rust counterpart by design.
+      if (!cmd.startsWith("__test_")) {
+        const declared = inventory[cmd];
+        if (!declared) return refuse(`unregistered command: ${cmd}`);
+        const undeclared = Object.keys(args).filter((k) => !declared.includes(k));
+        if (undeclared.length > 0) return refuse(`undeclared argument for ${cmd}: ${undeclared.join(", ")}`);
+      }
       const fn = commands[cmd];
       if (!fn) return Promise.reject(new Error(`unmocked command: ${cmd}`));
       try {
@@ -943,6 +975,67 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     unregisterListener: () => {},
   };
 }
+
+// The inventory travels in its own init script because `addInitScript` passes one argument and
+// `opts` already has it, and because the fake is serialized into the page and so can close over
+// nothing outside itself — including this import.
+test.beforeEach(async ({ page }) => {
+  await page.addInitScript((inventory) => {
+    const injected = window as unknown as { __IPC_INVENTORY__: unknown };
+    injected.__IPC_INVENTORY__ = inventory;
+  }, ipcInventory as Record<string, string[]>);
+});
+
+// Every test's own check on the seam: a call the registered commands do not declare fails the test
+// that made it, by name, whether or not the frontend showed anything for it.
+test.afterEach(async ({ page }) => {
+  const refused = await page.evaluate(() => {
+    const injected = window as unknown as { __IPC_VIOLATIONS__?: string[] };
+    return injected.__IPC_VIOLATIONS__ ?? [];
+  });
+  expect(refused, "the fake refused an IPC call the desktop's registered commands do not declare").toEqual([]);
+});
+
+/** The gate every other test in this file now leans on. Both refusals are stated here because a
+ *  gate that stopped biting would otherwise show up as nothing at all: every test would keep
+ *  passing, which is the failure #85 is about. */
+test("a command or key the registered commands do not declare is refused", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const call = (cmd: string, args: Record<string, unknown>) =>
+    page.evaluate(
+      (c) => {
+        // The fake's own channel, as everywhere else in this file.
+        const internals = window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return internals.__TAURI_INTERNALS__.invoke(c.cmd, c.args).then(
+          () => "resolved",
+          (e: unknown) => (e instanceof Error ? e.message : String(e)),
+        );
+      },
+      { cmd, args },
+    );
+
+  expect(await call("trace_imagee", {})).toBe("unregistered command: trace_imagee");
+
+  // The rename that shipped green for two commits: Rust's parameter is `controls`, and `ipc.ts`
+  // kept sending `opts` (#85). A registered command is not a licence to send it anything.
+  expect(await call("trace_image", { path: "/tmp/fake.png", opts: {} })).toBe(
+    "undeclared argument for trace_image: opts",
+  );
+
+  // The same call as the frontend makes it, which the gate must let through — a check that refuses
+  // everything is indistinguishable from one that refuses nothing.
+  expect(await call("trace_image", { path: "/tmp/fake.png", controls: {} })).toBe("resolved");
+
+  // Cleared because they were the point: the afterEach above fails any test that leaves one.
+  await page.evaluate(() => {
+    const injected = window as unknown as { __IPC_VIOLATIONS__?: string[] };
+    injected.__IPC_VIOLATIONS__ = [];
+  });
+});
 
 test("new doc → add rect → save → reload keeps the rect", async ({ page }) => {
   await page.addInitScript(installMockTauri);

@@ -208,16 +208,30 @@ function presetLabel(presetId: string, { presets, loaded }: PresetLookup): strin
   return loaded ? `${presetId} (unknown preset)` : `${presetId} (reading…)`;
 }
 
-/** The option a row's preset picker needs beyond the list itself: the pass's own preset, when the
- *  list does not hold it. Without it the `select` has no option matching its value and renders
- *  blank, which reads as "no preset" for a pass that has one. */
-export function unlistedPresetOption(
+/** Everything a row's material picker renders, and which option is selected.
+ *
+ *  Values are `PassKey` spellings rather than bare ids, for the reason the grammar has a
+ *  `no-preset` token at all: an id is an unrestricted operator string, so a bare-id picker has to
+ *  spend one of them — the empty string — as its "no preset" sentinel, and a pass keyed on a preset
+ *  actually called `""` then selects "No preset" no matter what else is offered (Copilot on
+ *  PR #272). `no-preset` and `preset:` cannot collide.
+ *
+ *  The pass's own preset is always among the options, even when the list does not hold it: a
+ *  `select` whose value matches no option renders blank, and blank reads as "no preset" for a pass
+ *  that has one. */
+export function presetPicker(
   presetId: string | null,
   lookup: PresetLookup,
-): { value: string; label: string } | null {
-  if (presetId === null) return null;
-  if (lookup.presets.some((p) => p.id === presetId)) return null;
-  return { value: presetId, label: presetLabel(presetId, lookup) };
+): { selected: PassKey; options: { value: PassKey; label: string }[] } {
+  const key = (id: string | null): PassKey => (id === null ? "no-preset" : `preset:${id}`);
+  const options = [{ value: key(null), label: "No preset" }];
+  if (presetId !== null && !lookup.presets.some((p) => p.id === presetId)) {
+    options.push({ value: key(presetId), label: presetLabel(presetId, lookup) });
+  }
+  for (const preset of lookup.presets) {
+    options.push({ value: key(preset.id), label: preset.name });
+  }
+  return { selected: key(presetId), options };
 }
 
 /** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.

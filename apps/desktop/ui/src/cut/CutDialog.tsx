@@ -25,7 +25,7 @@ import {
   toCutRequest,
   passRowLabel,
   presetIdForKey,
-  unlistedPresetOption,
+  presetPicker,
   type PassVm,
   type Caps,
   type Preset,
@@ -1008,10 +1008,10 @@ export function CutDialog({
             // A pass keyed on a preset has no swatch to be recognised by, so
             // the row says what it holds instead.
             const label = passRowLabel(row.key, presetLookup, plan?.grouping ?? grouping);
-            /** The row's own preset when the list does not hold it — deleted, or not yet read. The
-             *  `select` has no option matching its value without it, so it renders blank and a pass
-             *  with a material reads as a pass with none. */
-            const unlisted = unlistedPresetOption(row.presetId, presetLookup);
+            /** Every option the material picker offers, keyed as this row's `PassKey` grammar keys
+             *  a pass: a bare-id picker has to spend the empty string as its "no preset" sentinel,
+             *  and an id can be any string an operator typed, that one included. */
+            const picker = presetPicker(row.presetId, presetLookup);
             return (
               <div
                 key={row.key}
@@ -1037,16 +1037,12 @@ export function CutDialog({
                 <select
                   aria-label={`Preset for pass ${i + 1}`}
                   disabled={replanning}
-                  value={row.presetId ?? ""}
-                  onChange={(e) => updateRow(i, { presetId: e.target.value || null })}
+                  value={picker.selected}
+                  onChange={(e) => updateRow(i, { presetId: presetIdForKey(e.target.value) })}
                 >
-                  <option value="">No preset</option>
-                  {unlisted !== null ? (
-                    <option value={unlisted.value}>{unlisted.label}</option>
-                  ) : null}
-                  {presets.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
+                  {picker.options.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
                     </option>
                   ))}
                 </select>

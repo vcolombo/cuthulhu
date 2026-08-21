@@ -113,7 +113,7 @@ import {
   parsePassKey,
   passRowLabel,
   presetIdForKey,
-  unlistedPresetOption,
+  presetPicker,
   type PassVm,
   type Caps,
   type Preset,
@@ -622,32 +622,55 @@ describe("passRowLabel", () => {
 
 // The picker beside the label, which had the same defect in a worse shape: a `select` whose value
 // matches no option renders blank, and blank is what "No preset" looks like.
-describe("unlistedPresetOption", () => {
+describe("presetPicker", () => {
   const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
                      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
 
-  it("adds nothing for a preset the list holds", () => {
-    expect(unlistedPresetOption("cameo5-htv", read(presets))).toBeNull();
+  it("offers the read list and no more, selecting the pass's own material", () => {
+    expect(presetPicker("cameo5-htv", read(presets))).toEqual({
+      selected: "preset:cameo5-htv",
+      options: [{ value: "no-preset", label: "No preset" },
+                { value: "preset:cameo5-htv", label: "HTV" }],
+    });
   });
 
-  it("adds nothing for a pass that names no preset", () => {
-    expect(unlistedPresetOption(null, read(presets))).toBeNull();
+  it("selects no material for a pass that names none", () => {
+    expect(presetPicker(null, read(presets)).selected).toBe("no-preset");
   });
 
-  it("names a deleted preset the read list does not hold", () => {
-    expect(unlistedPresetOption("card-stock", read(presets)))
-      .toEqual({ value: "card-stock", label: "card-stock (unknown preset)" });
+  it("carries a deleted preset the read list does not hold", () => {
+    expect(presetPicker("card-stock", read(presets)).options)
+      .toContainEqual({ value: "preset:card-stock", label: "card-stock (unknown preset)" });
   });
 
-  it("names a preset no list has answered for as being read", () => {
-    expect(unlistedPresetOption("card-stock", unread))
-      .toEqual({ value: "card-stock", label: "card-stock (reading…)" });
+  // #267's window, in the control that showed it worst: the value has an option, so the picker
+  // cannot render blank, and the option says why it has no name yet.
+  it("carries a preset no list has answered for, marked as being read", () => {
+    expect(presetPicker("card-stock", unread)).toEqual({
+      selected: "preset:card-stock",
+      options: [{ value: "no-preset", label: "No preset" },
+                { value: "preset:card-stock", label: "card-stock (reading…)" }],
+    });
   });
 
-  // The id that reads like no id at all: an empty string is a named preset, and an option carrying
-  // it is what keeps the picker off "No preset" for a pass that has one.
-  it("names an empty preset id the list does not hold", () => {
-    expect(unlistedPresetOption("", unread)).toEqual({ value: "", label: " (reading…)" });
+  // Copilot on PR #272: the picker used to value its options by bare id and spend the empty string
+  // on "No preset", so a pass keyed on a preset actually called `""` selected "No preset" however
+  // many options were offered — the exact misreport the rest of this change removes. Keys cannot
+  // collide: `no-preset` is a token, `preset:` is a spelling.
+  it("tells a preset called nothing from no preset at all", () => {
+    const picker = presetPicker("", unread);
+    expect(picker.selected).toBe("preset:");
+    expect(picker.options).toEqual([{ value: "no-preset", label: "No preset" },
+                                    { value: "preset:", label: " (reading…)" }]);
+    expect(presetIdForKey(picker.selected)).toBe("");
+  });
+
+  // Every option round-trips through the grammar the row's own key is written in, which is what
+  // makes reading a selection back a parse rather than a convention.
+  it("names every option in the pass-key grammar", () => {
+    const picker = presetPicker("card-stock", read(presets));
+    expect(picker.options.map((o) => presetIdForKey(o.value)))
+      .toEqual([null, "card-stock", "cameo5-htv"]);
   });
 });
 

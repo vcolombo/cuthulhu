@@ -1180,6 +1180,11 @@ test("an empty preset id is still named and refused", async ({ page }) => {
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await page.getByLabel("Group passes by").selectOption("Preset");
 
+  // Copilot on PR #272: the picker keys its options in the pass-key grammar, so the pass keyed on a
+  // preset called `""` selects that preset rather than "No preset" — which a bare-id picker could
+  // not express, since it had to spend the empty string on the absence.
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:");
+  await expect(page.getByTestId("cut-pass-row").first()).toContainText("(unknown preset)");
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText(/material preset ``.*not available for this machine/)).toBeVisible();
 });
@@ -1313,7 +1318,7 @@ test("a preset created in the cut dialog is offered to a pass and cut by its id"
   await expect(page.getByTestId("preset-preview")).toHaveText("Cuts at speed 7, force 21, 2 passes.");
   // And a pass can now be cut with it, which is the whole point of managing them here.
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
-  await page.getByLabel("Preset for pass 1").selectOption("thick-card");
+  await page.getByLabel("Preset for pass 1").selectOption("preset:thick-card");
   await page.getByRole("button", { name: "Start Cut" }).click();
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
@@ -1764,7 +1769,7 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(row).toContainText("card-stock (reading…)");
   // The picker carries the pass's own preset rather than nothing: a `select` whose value matches no
   // option renders blank, and blank is exactly what "No preset" looks like.
-  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("card-stock");
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
   // And the repeat says nothing rather than one pass, which is a claim about the blade.
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
   // Cutting stays available throughout: the backend resolves the material from the presets file,
@@ -1774,7 +1779,7 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   // The name and its settings arrive together, under the aim that asked for them.
   await callFake(page, "__test_release_presets");
   await expect(row).toContainText("Card Stock");
-  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("card-stock");
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
 });
 

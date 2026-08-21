@@ -762,24 +762,29 @@ mod tests {
         zip.finish().unwrap();
     }
 
+    /// How many times a member name appears in an archive's bytes: twice per member, once in its
+    /// local file header and once in its central directory entry.
+    fn times_named(bytes: &[u8], name: &[u8]) -> usize {
+        bytes.windows(name.len()).filter(|window| *window == name).count()
+    }
+
     /// Renames every occurrence of a member name in an archive's bytes, which is how the fixture
     /// below gets two members called `manifest.json`. Both names are 13 bytes, so nothing else in
-    /// the file has to move: the name appears in the local file header and in the central directory
-    /// entry, and no offset, length or CRC in the archive depends on which of the two it is.
-    fn rename_every_member(bytes: &[u8], from: &[u8], to: &[u8]) -> (Vec<u8>, usize) {
+    /// the file has to move: no offset, length or CRC in the archive depends on which of the two
+    /// names a member carries.
+    fn rename_every_member(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
         assert_eq!(from.len(), to.len(), "a rename that moves bytes would invalidate every offset");
         let mut out = bytes.to_vec();
-        let (mut hits, mut at) = (0, 0);
+        let mut at = 0;
         while at + from.len() <= out.len() {
             if &out[at..at + from.len()] == from {
                 out[at..at + from.len()].copy_from_slice(to);
-                hits += 1;
                 at += from.len();
             } else {
                 at += 1;
             }
         }
-        (out, hits)
+        out
     }
 
     /// How `zip 2.4.2` reads an archive that names `manifest.json` twice, pinned because it is the
@@ -805,8 +810,10 @@ mod tests {
 
         let mut refuses = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         refuses.start_file("manifest.json", options).unwrap();
+        // The variant, not its wording: `zip` may reword "Duplicate filename" without changing what
+        // it refuses, and a test that failed on that would be reporting nothing (Copilot on PR #273).
         let refusal = refuses.start_file("manifest.json", options).unwrap_err();
-        assert!(refusal.to_string().contains("Duplicate filename"),
+        assert!(matches!(refusal, zip::result::ZipError::InvalidArchive(_)),
             "premise: no Cuthulhu build can write this fixture, so it is patched instead: {refusal}");
 
         let future = format!(r#"{{"version":99,"document":{}}}"#,
@@ -819,17 +826,29 @@ mod tests {
             zip.start_file(PLACEHOLDER, options).unwrap();
             zip.write_all(last.as_bytes()).unwrap();
             zip.finish().unwrap();
-            let (patched, hits) = rename_every_member(&std::fs::read(path).unwrap(),
-                PLACEHOLDER.as_bytes(), b"manifest.json");
-            assert_eq!(hits, 2, "premise: the name is written once in the local header and once \
-                in the central directory");
-            std::fs::write(path, patched).unwrap();
+            let raw = std::fs::read(path).unwrap();
+            assert_eq!(times_named(&raw, PLACEHOLDER.as_bytes()), 2,
+                "premise: the placeholder is written once in the local header and once in the \
+                 central directory, and the rename below reaches both");
+            std::fs::write(path,
+                rename_every_member(&raw, PLACEHOLDER.as_bytes(), b"manifest.json")).unwrap();
             let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
             assert_eq!(archive.len(), 1, "the reader collapses the duplicate before any caller \
                 sees it, so nothing in this workspace can tell the archive is ambiguous");
             let mut read_back = String::new();
             archive.by_name("manifest.json").unwrap().read_to_string(&mut read_back).unwrap();
             assert_eq!(read_back, last, "the member kept is the last one named");
+            // The indexed view is the deduplicated one, so it is not a way around `by_name`: the one
+            // index carries the surviving member and there is no second one to visit. Every parsed
+            // central-directory entry is inserted into an `IndexMap` keyed on its own name, so a
+            // repeated name replaces the earlier entry's *value* while keeping its position — which
+            // is why the count drops and the last member is what remains
+            // `[src: zip 2.4.2 src/read.rs, shared::SharedBuilder::build (MIT)]`, reported upstream
+            // as zip-rs/zip2#841.
+            let mut first_index = String::new();
+            archive.by_index(0).unwrap().read_to_string(&mut first_index).unwrap();
+            assert_eq!(first_index, last, "the one index holds the surviving member");
+            assert!(archive.by_index(1).is_err(), "there is no shadowed member to reach");
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -842,9 +861,17 @@ mod tests {
         two_manifests(&hidden_future, &future, &current);
         assert_eq!(load_project(&hidden_future).unwrap(), document::Document::new());
         save_project(&hidden_future, &document::Document::new()).unwrap();
+        // Not a member count: the design anticipates an `assets/` member, and this test is about the
+        // duplicate rather than the format's shape (Copilot on PR #273). What it states is that the
+        // ambiguity is gone and the file is an ordinary project.
         let mut replaced = zip::ZipArchive::new(std::fs::File::open(&hidden_future).unwrap()).unwrap();
-        assert_eq!(replaced.len(), 2, "an ordinary save: manifest.json and design.svg, once each");
-        assert!(replaced.by_name("manifest.json").is_ok());
+        for member in ["manifest.json", "design.svg"] {
+            assert!(replaced.by_name(member).is_ok(), "an ordinary save writes {member}");
+        }
+        drop(replaced);
+        assert_eq!(times_named(&std::fs::read(&hidden_future).unwrap(), b"manifest.json"), 2,
+            "one member, not two: the name is written once in the local header and once in the \
+             central directory");
 
         // Current first, so the version claim is the one that survives: it is refused on open, and
         // the guard refuses to replace it by name and leaves the bytes alone. The invariant holds

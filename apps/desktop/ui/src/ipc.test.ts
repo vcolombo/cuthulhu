@@ -33,6 +33,14 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 const declared: Record<string, string[]> = inventory;
 
+const checkRecordedCalls = (wrapper: string) => {
+  for (const { cmd, args } of calls) {
+    expect(Object.keys(declared), `${wrapper} invokes an unregistered command`).toContain(cmd);
+    const undeclaredKeys = Object.keys(args ?? {}).filter((k) => !declared[cmd].includes(k));
+    expect(undeclaredKeys, `${wrapper} sends a key ${cmd} does not declare`).toEqual([]);
+  }
+};
+
 describe("every ipc.ts wrapper names a registered command", () => {
   for (const [wrapper, exported] of Object.entries(ipc)) {
     if (typeof exported !== "function") continue;
@@ -43,12 +51,30 @@ describe("every ipc.ts wrapper names a registered command", () => {
       // present and undefined rather than absent. What the backend would do with the values is not
       // the question — the names are.
       await (exported as () => Promise<unknown>)();
-
-      for (const { cmd, args } of calls) {
-        expect(Object.keys(declared), `${wrapper} invokes an unregistered command`).toContain(cmd);
-        const undeclaredKeys = Object.keys(args ?? {}).filter((k) => !declared[cmd].includes(k));
-        expect(undeclaredKeys, `${wrapper} sends a key ${cmd} does not declare`).toEqual([]);
-      }
+      checkRecordedCalls(wrapper);
     });
   }
+});
+
+// Two wrappers forward the caller's object rather than building one, so calling them with nothing
+// records nothing and says nothing. Their parameter types name the keys, which makes a literal
+// here checked twice: by `tsc` against the wrapper's own type, and below against the inventory. A
+// wrapper typed `{ path, opts }` — #85's own incident — fails the first before reaching the second.
+describe("a wrapper that forwards its caller's payload", () => {
+  test("traceImage", async () => {
+    calls.length = 0;
+    await ipc.traceImage({
+      path: "/tmp/trace.png",
+      controls: { mode: "binary", speckle: 4, smoothing: 60, detail: 9, colors: 2 },
+    });
+    expect(calls.map((c) => c.cmd)).toEqual(["trace_image"]);
+    checkRecordedCalls("traceImage");
+  });
+
+  test("loadImagePreview", async () => {
+    calls.length = 0;
+    await ipc.loadImagePreview({ path: "/tmp/trace.png" });
+    expect(calls.map((c) => c.cmd)).toEqual(["load_image_preview"]);
+    checkRecordedCalls("loadImagePreview");
+  });
 });

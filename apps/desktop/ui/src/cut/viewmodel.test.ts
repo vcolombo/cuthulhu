@@ -114,6 +114,7 @@ import {
   passRowLabel,
   presetIdForKey,
   presetPicker,
+  rowPresetLookup,
   type PassVm,
   type Caps,
   type Preset,
@@ -753,5 +754,42 @@ describe("effectiveSettings with an empty preset id", () => {
     const row: PassVm = { key: "no-preset", shapeCount: 1, enabled: true, presetId: null,
                           speed: null, force: null, repeatCount: null };
     expect(effectiveSettings(row, read())).toEqual({ speed: null, force: null, repeatCount: 1 });
+  });
+});
+
+// #274: the window between a write landing and its re-read arriving, where the list the dialog
+// holds is every entry as it was *before* the write. `prepare_cut` resolves a pass's material from
+// the file, so a row priced from that list shows the operator a name and a speed the blade will
+// not use.
+describe("rowPresetLookup", () => {
+  const presets = [{ id: "card-stock", name: "Card Stock", machine_id: "cameo5",
+                     settings: { speed: 6, force: 18, repeat_count: 1 }, builtin: false }];
+  const row: PassVm = { key: "preset:card-stock", shapeCount: 1, enabled: true,
+                        presetId: "card-stock", speed: null, force: null, repeatCount: null };
+
+  it("prices a pass from a list that is still the file's answer", () => {
+    expect(rowPresetLookup({ presets, current: true })).toEqual({ presets, loaded: true });
+    expect(effectiveSettings(row, rowPresetLookup({ presets, current: true })))
+      .toEqual({ speed: 6, force: 18, repeatCount: 1 });
+  });
+
+  // Emptied rather than passed through with `loaded: false`, which would still resolve the name:
+  // `presetLabel` answers with an entry it finds whatever the flag says, and the entry it would
+  // find here is the superseded one.
+  it("prices a pass from nothing while a write's re-read is out", () => {
+    const lookup = rowPresetLookup({ presets, current: false });
+    expect(lookup).toEqual({ presets: [], loaded: false });
+    expect(passRowLabel("preset:card-stock", lookup, "Preset"))
+      .toEqual({ swatch: null, text: "card-stock (name unread)" });
+    // Deferred, not defaulted: a repeat of 1 beside a preset that now repeats three times is a
+    // claim about the blade, and it would be the wrong one.
+    expect(effectiveSettings(row, lookup)).toEqual({ speed: null, force: null, repeatCount: null });
+  });
+
+  // A re-read that failed never replaces the list, so it stays superseded — which is the half of
+  // #274 that outlives the window: without this the pre-write entries stand on the rows for as
+  // long as the dialog is open on that cutter.
+  it("holds no aim's list as unread", () => {
+    expect(rowPresetLookup(null)).toEqual({ presets: [], loaded: false });
   });
 });

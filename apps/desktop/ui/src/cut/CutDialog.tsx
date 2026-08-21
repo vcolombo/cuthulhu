@@ -26,10 +26,11 @@ import {
   passRowLabel,
   presetIdForKey,
   presetPicker,
+  rowPresetLookup,
+  type AimedPresets,
   type PassVm,
   type Caps,
   type Preset,
-  type PresetLookup,
 } from "./viewmodel";
 
 // What the fields allow before any machine has been asked. Not a machine's claim —
@@ -144,7 +145,7 @@ export function CutDialog({
   // out, and an operator who aims elsewhere while it is in flight would otherwise get the previous
   // cutter's entries — and a save would then write that draft under the new machine's id (Greptile
   // on PR #264).
-  const [presetsFor, setPresetsFor] = useState<{ machineId: string; presets: Preset[] } | null>(null);
+  const [presetsFor, setPresetsFor] = useState<(AimedPresets & { machineId: string }) | null>(null);
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
    *  cut over them. Held rather than defaulted: with no answer there is nothing to validate a
    *  preset against, and guessed bounds would offer saves the cut path then refuses. */
@@ -438,17 +439,19 @@ export function CutDialog({
    *  The two facts below are read off this one value because an empty list alone cannot tell a
    *  cutter with no presets from a cutter nobody has answered for, and every reader needs a
    *  different one of them (#267). */
-  const aimedPresets =
-    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor.presets : null;
-  /** What the pass rows resolve a material in: the entries, and whether they are this aim's. A row
-   *  that cannot tell the two empty cases apart reports a pass with a material as a pass without
-   *  one, for the seconds after a connect and for as long as a failed read stands. */
-  const presetLookup: PresetLookup = { presets: aimedPresets ?? [], loaded: aimedPresets !== null };
-  const presets = presetLookup.presets;
+  const aimedPresets: AimedPresets | null =
+    connected !== null && presetsFor?.machineId === connected.machine_id ? presetsFor : null;
+  /** What the pass rows resolve a material in. Not the same question the editor below asks: a row
+   *  may only price a pass from a list that is still the file's answer, and the editor needs the
+   *  entries a new one has to avoid whether or not a write has superseded them (#274). */
+  const presetLookup = rowPresetLookup(aimedPresets);
+  /** The entries this aim holds, superseded or not — what the editor writes against. */
+  const presets = aimedPresets?.presets ?? [];
   /** Whether the editor may be shown at all: `freshPresetId` and the name check both read the list
    *  to avoid colliding with what is already stored, so a New pressed against a list that has not
-   *  arrived can mint an id that already exists and overwrite that entry (Codex on PR #264). */
-  const presetsLoaded = presetLookup.loaded;
+   *  arrived can mint an id that already exists and overwrite that entry (Codex on PR #264). A
+   *  superseded list still answers that, so a save does not take the editor off screen. */
+  const presetsLoaded = aimedPresets !== null;
 
   const presetMode = editorMode(draft, presets);
   const presetDirty = draft !== null && baseline !== null && isDirty(draft, baseline);
@@ -481,7 +484,7 @@ export function CutDialog({
    *  PR #264). */
   const installPresets = (generation: number, machineId: string, list: unknown) => {
     if (!isCurrentAim(generation)) return false;
-    setPresetsFor({ machineId, presets: list as Preset[] });
+    setPresetsFor({ machineId, presets: list as Preset[], current: true });
     setPresetListError(null);
     return true;
   };
@@ -498,6 +501,16 @@ export function CutDialog({
         return null;
       },
     );
+
+  /** Marks the held list superseded, which every write does the moment it lands: the presets file
+   *  no longer holds what this list says, and the read that will say what it does hold is out. The
+   *  rows stop pricing passes from it here rather than when that read lands, because a read that
+   *  fails does not land at all — and the pre-write name, speed, force and repeat would otherwise
+   *  stand on the rows for the life of the dialog on this cutter (#274). */
+  const supersedePresets = (generation: number) => {
+    if (!isCurrentAim(generation)) return;
+    setPresetsFor((prev) => (prev === null ? prev : { ...prev, current: false }));
+  };
 
   /** Every action that replaces or drops the draft goes through here: selecting another preset,
    *  aiming at another cutter, and closing the dialog. An operator who typed a force and pressed
@@ -556,6 +569,7 @@ export function CutDialog({
             setDraft(written);
             setBaseline(written);
           }
+          supersedePresets(aim);
           return readPresets(aim, preset.machine_id).then((stored) => {
             const saved = stored?.find((p) => p.id === preset.id);
             if (saved !== undefined) {
@@ -622,6 +636,7 @@ export function CutDialog({
             setDraft(null);
             setBaseline(null);
           }
+          supersedePresets(aim);
           return readPresets(aim, machineId);
         },
         (e) => {

@@ -1792,6 +1792,66 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
 });
 
+// #274, the sharper half of the same family: the list a row prices from is replaced only by a read
+// that succeeds, so between a write landing and its re-read arriving — and forever if that read
+// fails — the row names and prices the pass from the entry as it was *before* the write, while
+// `prepare_cut` resolves the new one from the presets file. A stale number reads as a fact.
+test("a written preset's previous name and settings leave the pass row when the write lands", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await page.getByTestId("layer-row").first().click();
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+
+  await openDialogOnCameo(page);
+  await page.getByLabel("Group passes by").selectOption("Preset");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  const row = page.getByTestId("cut-pass-row").first();
+  await expect(row).toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
+
+  // Rename the material the row is priced from and make it cut three times, with every list reply
+  // parked: the write lands, so that is what the file holds and what the blade will do, and the
+  // read that would say so is still out.
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Preset name").fill("Heavy Card");
+  await page.getByLabel("Preset repeat count").fill("3");
+  await callFake(page, "__test_hold_presets");
+  await page.getByLabel("Save preset", { exact: true }).click();
+
+  // Neither the name nor the repeat the entry used to have. Unread is what the row has: an answer
+  // is owed and none has arrived.
+  await expect(row).toContainText("card-stock (name unread)");
+  await expect(row).not.toContainText("Card Stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
+  // Cutting stays available throughout: the backend resolves the material from the presets file,
+  // and refuses by name when it cannot, so nothing here is a gate.
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // And the editor above the rows does not go with them. It is withheld only until *some* list for
+  // this aim has arrived, because what is stored is what a new entry's id and name must avoid —
+  // withholding it here would take it off screen on every save.
+  await expect(page.getByLabel("Preset name")).toHaveValue("Heavy Card");
+
+  await callFake(page, "__test_release_presets");
+  await expect(row).toContainText("Heavy Card");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("3");
+
+  // The half that outlives the window: a re-read that fails never replaces the list, so the row
+  // must not fall back to the entry the write superseded — which it did for the life of the dialog.
+  await page.getByLabel("Preset repeat count").fill("5");
+  await callFake(page, "__test_fail_next_preset_list");
+  await page.getByLabel("Save preset", { exact: true }).click();
+  await expect(page.getByText(/Material presets are unavailable/)).toBeVisible();
+  await expect(row).toContainText("card-stock (name unread)");
+  await expect(row).not.toContainText("Heavy Card");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

@@ -1735,6 +1735,49 @@ test("an unsaved edit withholds the actions that would discard it, and an unread
   await expect(page.getByLabel("New preset")).toBeEnabled();
 });
 
+// The pass rows' half of the same window, and the one #267 was filed for: the editor above is
+// withheld until this aim's list arrives, but the rows are rendered from it regardless, and they
+// name a material by looking its id up in exactly that list. Read as an ordinary empty list, a row
+// tells the operator their pass has no material while `prepare_cut` would resolve it from the
+// presets file and cut it.
+test("a pass whose preset list has not arrived is named as unread, not as having no material", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await page.getByTestId("layer-row").first().click();
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+
+  // Parked before the connect that asks for it, so every row below is rendered against a list
+  // nobody has answered for — the seconds after a connect, held open.
+  await page.getByRole("button", { name: "Cut" }).click();
+  await callFake(page, "__test_hold_presets");
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
+  await page.getByLabel("Group passes by").selectOption("Preset");
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  const row = page.getByTestId("cut-pass-row").first();
+  await expect(row).toContainText("card-stock (reading…)");
+  // The picker carries the pass's own preset rather than nothing: a `select` whose value matches no
+  // option renders blank, and blank is exactly what "No preset" looks like.
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("card-stock");
+  // And the repeat says nothing rather than one pass, which is a claim about the blade.
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
+  // Cutting stays available throughout: the backend resolves the material from the presets file,
+  // and refuses by name when it cannot, so nothing here is a gate.
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+
+  // The name and its settings arrive together, under the aim that asked for them.
+  await callFake(page, "__test_release_presets");
+  await expect(row).toContainText("Card Stock");
+  await expect(page.getByLabel("Preset for pass 1")).toHaveValue("card-stock");
+  await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("1");
+});
+
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

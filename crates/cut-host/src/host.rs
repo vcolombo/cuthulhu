@@ -188,7 +188,7 @@ impl Host {
         for info in infos {
             let (manager, events) = DeviceManager::spawn(factory.clone());
             if let Err(e) = manager.connect(info.clone()) {
-                eprintln!("cut host: {} did not connect: {e:?}", info.instance_id);
+                eprintln!("cut host: {} did not connect: {e}", info.instance_id);
             }
             order.push(info.instance_id.clone());
             pumps.push((info.instance_id.clone(), events));
@@ -354,7 +354,7 @@ impl Host {
                     // so nothing else will tell anyone. Give the id back: a retry
                     // after a Job that never started must be able to run.
                     slot.admission.lock().unwrap().accepted.remove(&id);
-                    eprintln!("cut host: {} refused the job: {e:?}", claim.device);
+                    eprintln!("cut host: {} refused the job: {e}", claim.device);
                 }
             }
             // `claim` drops here, clearing `starting` — after the id has been handed back, so no
@@ -366,7 +366,13 @@ impl Host {
             if let Some(slot) = self.slot(&device) {
                 slot.admission.lock().unwrap().accepted.remove(&dispatch_id);
             }
-            return Err(Refusal::Device(DeviceError::Io(e.to_string())));
+            // A sentence, because `DeviceError::Io`'s payload is read verbatim by whoever the
+            // client hands it to — and an `io::Error` from a failed `spawn` on its own
+            // ("Resource temporarily unavailable (os error 35)") names nothing an operator could
+            // act on.
+            return Err(Refusal::Device(DeviceError::Io(format!(
+                "this host could not start a worker for the cut ({e})"
+            ))));
         }
         Ok(Admitted::Started)
     }

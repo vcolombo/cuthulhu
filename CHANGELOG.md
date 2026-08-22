@@ -66,6 +66,13 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A cutter's failures read as sentences, and the app can tell them apart.** A cable pull, a jam,
+  a cutter that never answered, and a verb issued at a moment the cutter cannot accept it all
+  reached the operator as one code with a Rust value inside the message — `Busy`, or
+  `Io("cable pulled")`. Each now says what it means and carries its own code, so the same fault
+  reads the same whether the cutter is plugged into this computer or into a Cut Host, and
+  `cuthulhu cut` no longer prints `connect: Disconnected` at a terminal.
+
 - **The editor's refusals read as sentences.** Deleting an empty selection, transforming a Node
   the document no longer holds, assigning a material with no id, converting to a machine this
   build does not ship, and a boolean op on shapes that do not overlap each reached the operator as

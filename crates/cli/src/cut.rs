@@ -126,10 +126,14 @@ pub fn ended_message(outcome: &Outcome) -> String {
 /// That is the state having moved, not a fault: the next turn of the loop re-reads
 /// the status and reports the real ending. Every other `DeviceError` is a device
 /// that stopped working, and stays an error.
-fn answer_pause(what: &str, result: Result<(), DeviceError>) -> Result<(), String> {
+///
+/// The verb being answered used to prefix the message (`"resume: "`, `"confirm: "`). Dropped
+/// with the `Debug` rendering it introduced: a `DeviceError` writes a whole sentence, and the
+/// prompt the operator just answered already said which pause this was (#73, #90).
+fn answer_pause(result: Result<(), DeviceError>) -> Result<(), String> {
     match result {
         Ok(()) | Err(DeviceError::Busy) => Ok(()),
-        Err(e) => Err(format!("{what}: {e:?}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -167,11 +171,13 @@ pub fn run(
     }
     let (mgr, _events) = DeviceManager::spawn(factory);
     let mgr = Arc::new(mgr);
-    mgr.connect(info).map_err(|e| format!("connect: {e:?}"))?;
+    // No `"connect: "` / `"cut: "` prefix, for the reason `answer_pause` dropped its own: the
+    // sentence is finished, and one wrapped in a verb read twice.
+    mgr.connect(info).map_err(|e| e.to_string())?;
 
     with_cancel(mgr.clone())?;
 
-    mgr.cut(plan.cut_passes()).map_err(|e| format!("cut: {e:?}"))?;
+    mgr.cut(plan.cut_passes()).map_err(|e| e.to_string())?;
 
     loop {
         let status = mgr.status();
@@ -179,11 +185,10 @@ pub fn run(
         // what is happening once there is nothing to answer.
         if let Some(pause) = pause_of(&status) {
             if operator.wait_ack(&pause_prompt(pause, plan, &status), &mgr) {
-                let (what, answered) = match pause {
-                    Pause::Swap => ("resume", mgr.resume()),
-                    Pause::Confirm => ("confirm", mgr.confirm_pass_done()),
-                };
-                answer_pause(what, answered)?;
+                answer_pause(match pause {
+                    Pause::Swap => mgr.resume(),
+                    Pause::Confirm => mgr.confirm_pass_done(),
+                })?;
             }
             continue;
         }

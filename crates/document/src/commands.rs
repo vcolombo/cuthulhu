@@ -4,7 +4,42 @@ use geometry::{boolean, ellipse_path, rect_path, text_to_path, Affine, BoolOp, P
 use crate::{node::*, delta::*};
 
 #[derive(Debug, PartialEq)]
-pub enum CmdError { NotFound, EmptySelection, Geometry(String), EmptyPresetId }
+pub enum CmdError { NotFound, NoParent, EmptySelection, Geometry(String), EmptyPresetId }
+
+/// What the operator reads when a command refuses: the desktop's `ipc` layer forwards this
+/// string straight into the dialog. It used to forward `{e:?}` instead, so a boolean op on
+/// two shapes that do not overlap arrived as `Geometry("Degenerate")` — a struct literal
+/// wrapped around the sentence `GeomError` had already written (#93).
+impl std::fmt::Display for CmdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Two rules raise this, and only a wording that names both is true of both: a node
+            // id the document does not hold, and `set_machine` naming a profile this build does
+            // not ship (a project saved against a cutter it has never heard of).
+            //
+            // "node", not "shape": every command here takes ids straight from the selection, and
+            // the Layers panel selects Groups and Layers too, so the id that went stale is as
+            // often a container. Node is CONTEXT.md's word for all three.
+            CmdError::NotFound => write!(f, "the node or machine this command names is not there"),
+            // Split off `NotFound` rather than widening it: a node with no parent is present,
+            // and saying it "is not there" was the third rewording that sentence needed. Reached
+            // by the document root and by an orphan out of a manifest, whose topology is not
+            // validated on load.
+            CmdError::NoParent => write!(f, "this node has no parent, and the command needs one"),
+            // Not only an empty selection: also a boolean op given one shape, and a delete whose
+            // every id was skipped as the descendant of another. In each the selection exists and
+            // still offers this command nothing to do.
+            CmdError::EmptySelection => write!(f, "the selection has nothing this command can act on"),
+            // No clause in front of the payload: every site that builds one writes a finished
+            // sentence, so a prefix would make the refusal read twice (the reason #90 dropped
+            // `"preflight: "`).
+            CmdError::Geometry(m) => write!(f, "{m}"),
+            CmdError::EmptyPresetId => write!(f, "a material assignment needs a preset id"),
+        }
+    }
+}
+
+impl std::error::Error for CmdError {}
 
 /// Build a delta that appends a new primitive under `parent`. Mints the id from `ids`.
 pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result<Delta, CmdError> {
@@ -33,8 +68,10 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
             Some(pid) => world_transform(doc, pid).ok_or(CmdError::NotFound)?,
             None => Affine::identity(),
         };
-        let pw_inv = pw.inverse()
-            .ok_or_else(|| CmdError::Geometry("degenerate ancestor transform".into()))?;
+        // "something in the selection", not "this shape": `transform_nodes` acts on whole
+        // selected subtrees, so the node under the singular ancestor is as often a Group.
+        let pw_inv = pw.inverse().ok_or_else(|| CmdError::Geometry(
+            "something in the selection sits under a transform that cannot be reversed".into()))?;
         let mut after = before.clone();
         after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
@@ -131,7 +168,10 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     let mut seen = HashSet::new();
     for &id in ids {
         if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
-        let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
+        // Existence first: an id that names nothing has no parent either, so asking `parent_of`
+        // about it would answer `NoParent` for what is really a stale selection.
+        doc.get(id).ok_or(CmdError::NotFound)?;
+        let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
         push_subtree(doc, id, parent, &mut ops)?;
     }
     if ops.is_empty() { return Err(CmdError::EmptySelection); }
@@ -139,10 +179,12 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
 }
 
 pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, CmdError> {
-    let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
+    // Existence first, for the reason `delete_nodes` gives above.
+    let node = doc.get(id).ok_or(CmdError::NotFound)?.clone();
+    let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
     Ok(Delta(vec![
         NodeOp::Remove { parent, id },
-        NodeOp::Add { parent, node: doc.get(id).unwrap().clone(), index: new_index },
+        NodeOp::Add { parent, node, index: new_index },
     ]))
 }
 
@@ -200,21 +242,40 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     let mut seen = HashSet::new();
     let ids: Vec<NodeId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
     if ids.len() < 2 { return Err(CmdError::EmptySelection); }
+    // Settle the tree before the geometry: whether a selected node exists and where its result
+    // can land does not depend on any outline, so a stale id or an orphan should say so rather
+    // than lose the race to a no-outline or empty-result refusal. Walking `parent_of` once per
+    // id also drops a second scan of `doc.nodes` per node.
+    let parents: Vec<NodeId> = ids.iter()
+        .map(|&id| {
+            doc.get(id).ok_or(CmdError::NotFound)?;
+            parent_of(doc, id).ok_or(CmdError::NoParent)
+        })
+        .collect::<Result<_, CmdError>>()?;
+    let dest_parent = parents[0];
+
     let mut paths = vec![];
     for &id in &ids {
-        let node = doc.get(id).ok_or(CmdError::NotFound)?;
-        let local = shape_outline(node).map_err(CmdError::Geometry)?.ok_or(CmdError::NotFound)?;
+        let node = doc.get(id).expect("settled above");
+        // `Ok(None)` is a Group or Layer: present, and simply without an outline of its own —
+        // not the absent node `NotFound` names. Reachable, because the Layers panel selects
+        // containers and the toolbar offers a boolean op on any two selected nodes.
+        let local = shape_outline(node).map_err(CmdError::Geometry)?.ok_or_else(|| {
+            CmdError::Geometry("a group or layer has no outline of its own to combine".into())
+        })?;
         let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
         paths.push(local.transformed(&world));
     }
-    let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
-    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    // `to_string`, not `{e:?}`: the same operator-facing contract as `shape_outline` above.
+    // Two shapes that do not overlap refuse here, and `Degenerate` alone said nothing (#93).
+    let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(e.to_string()))?;
     let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
     let dest_inv = dest_world.inverse()
-        .ok_or_else(|| CmdError::Geometry("degenerate destination transform".into()))?;
+        .ok_or_else(|| CmdError::Geometry(
+            "the result's parent sits under a transform that cannot be reversed".into()))?;
     let result_local = result.transformed(&dest_inv);
-    let mut ops: Vec<NodeOp> = ids.iter()
-        .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
+    let mut ops: Vec<NodeOp> = ids.iter().zip(parents)
+        .map(|(&id, parent)| NodeOp::Remove { parent, id })
         .collect();
     ops.push(NodeOp::Add {
         parent: dest_parent,
@@ -239,6 +300,147 @@ mod tests {
     use super::*;
     use crate::history::Editor;
     use geometry::Affine;
+
+    /// The whole table at once: a new variant fails to compile the match in `Display`, and a
+    /// reworded one fails here. These strings are what an operator reads — every one of them
+    /// used to arrive as `{e:?}` (`EmptySelection`, `Geometry("Degenerate")`), which is why
+    /// this type gained `Display` at all (#93).
+    #[test]
+    fn every_command_refusal_has_a_sentence() {
+        let cases: Vec<(CmdError, &str)> = vec![
+            (CmdError::NotFound, "the node or machine this command names is not there"),
+            (CmdError::NoParent, "this node has no parent, and the command needs one"),
+            (CmdError::EmptySelection, "the selection has nothing this command can act on"),
+            // Forwarded verbatim, so what the operator reads for a boolean op on shapes that do
+            // not overlap is the sentence `GeomError` writes, with nothing wrapped around it.
+            (
+                CmdError::Geometry(geometry::GeomError::Degenerate.to_string()),
+                "the operation left no geometry behind",
+            ),
+            (CmdError::EmptyPresetId, "a material assignment needs a preset id"),
+        ];
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence, "{error:?}");
+        }
+    }
+
+    /// The end-to-end shape of #93, one layer below the IPC call: the refusal an operator gets
+    /// for a boolean op on two shapes that do not overlap is a sentence, not `Degenerate`.
+    #[test]
+    fn a_boolean_op_on_disjoint_shapes_refuses_in_words() {
+        let mut ed = Editor::new();
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        let mut far = Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        far.transform = Affine::translate(100.0, 100.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: far, index: 1 }]));
+
+        let refusal = boolean_op(&ed.doc, &[a, b], geometry::BoolOp::Intersect).unwrap_err();
+        assert_eq!(refusal.to_string(), "the operation left no geometry behind");
+    }
+
+    /// A collapsed transform (scale 0) is the only way to reach the two hand-written
+    /// `Geometry` payloads, so build one: without a construction path they are strings no test
+    /// reads, free to drift back into the noun phrases they used to be.
+    fn singular() -> Affine {
+        Affine([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    }
+
+    /// A *container* under the collapsed ancestor, deliberately: `transform_nodes` acts on whole
+    /// selected subtrees, so the refusal must not call what it names a shape.
+    #[test]
+    fn a_transform_under_a_collapsed_ancestor_refuses_in_words() {
+        let mut ed = Editor::new();
+        let outer = ed.doc.ids.next();
+        let mut collapsed = Node::container(outer, NodeKind::Group);
+        collapsed.transform = singular();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: collapsed, index: 0 }]));
+        let inner = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer,
+            node: Node::container(inner, NodeKind::Group), index: 0 }]));
+
+        let refusal = transform_nodes(&ed.doc, &[inner], Affine::translate(5.0, 0.0)).unwrap_err();
+        assert_eq!(refusal.to_string(),
+            "something in the selection sits under a transform that cannot be reversed");
+    }
+
+    /// The result lands under the parent of `ids[0]`, so a collapsed parent there refuses after
+    /// the op itself succeeded — a different sentence from the ancestor case above.
+    #[test]
+    fn a_boolean_op_into_a_collapsed_parent_refuses_in_words() {
+        let mut ed = Editor::new();
+        let outer = ed.doc.ids.next();
+        let mut collapsed = Node::container(outer, NodeKind::Group);
+        collapsed.transform = singular();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: collapsed, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 1 }]));
+
+        let refusal = boolean_op(&ed.doc, &[a, b], geometry::BoolOp::Union).unwrap_err();
+        assert_eq!(refusal.to_string(),
+            "the result's parent sits under a transform that cannot be reversed");
+    }
+
+    /// A Group is present and has no outline of its own, which is not what `NotFound` says.
+    /// Reachable: the Layers panel selects containers and the toolbar offers a boolean op on
+    /// any two selected nodes, so Union over two Layers lands here.
+    #[test]
+    fn a_boolean_op_on_containers_says_they_have_no_outline() {
+        let mut ed = Editor::new();
+        let ids: Vec<NodeId> = (0..2).map(|i| {
+            let id = ed.doc.ids.next();
+            ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+                node: Node::container(id, NodeKind::Layer), index: i }]));
+            id
+        }).collect();
+
+        let refusal = boolean_op(&ed.doc, &ids, geometry::BoolOp::Union).unwrap_err();
+        assert_eq!(refusal.to_string(), "a group or layer has no outline of its own to combine");
+    }
+
+    /// The document root is present and parentless, so `delete` and `reorder` used to call it
+    /// missing. Codex found it in the review of #93; the Layers panel gives the root no row, so
+    /// nothing wired reaches this, but the sentence has to be true wherever the id comes from.
+    #[test]
+    fn a_command_on_the_parentless_root_says_it_has_no_parent() {
+        let ed = Editor::new();
+        let root = ed.doc.root;
+        assert!(ed.doc.get(root).is_some(), "the root is present, which is the whole point");
+
+        for refusal in [
+            delete_nodes(&ed.doc, &[root]).unwrap_err(),
+            reorder(&ed.doc, root, 0).unwrap_err(),
+        ] {
+            assert_eq!(refusal.to_string(), "this node has no parent, and the command needs one");
+        }
+    }
+
+    /// The other side of `NoParent`: an id naming nothing has no parent either, so a command
+    /// that asked `parent_of` first would blame the parent for a stale selection. Copilot found
+    /// that regression in the review of #93.
+    #[test]
+    fn a_stale_id_is_still_not_found_rather_than_parentless() {
+        let mut ed = Editor::new();
+        let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+            ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let real = *ed.doc.get(ed.doc.root).unwrap().children.first().unwrap();
+        let stale = NodeId(9999);
+
+        for refusal in [
+            delete_nodes(&ed.doc, &[stale]).unwrap_err(),
+            reorder(&ed.doc, stale, 0).unwrap_err(),
+            boolean_op(&ed.doc, &[stale, real], geometry::BoolOp::Union).unwrap_err(),
+        ] {
+            assert_eq!(refusal, CmdError::NotFound);
+        }
+    }
 
     #[test]
     fn transform_nodes_multiplies_into_transform() {

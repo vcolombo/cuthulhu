@@ -46,7 +46,11 @@ pub enum PresetError {
     Corrupt(String),
     /// A version other than `PRESETS_VERSION`. Carries what was found; what this build reads is
     /// a build constant, so `Display` takes it from there rather than from the payload.
-    UnknownVersion(u32),
+    ///
+    /// `u64`, the width the probe reads, and not `u32`: narrowing it made the sentence
+    /// contradict itself, because `4294967297 as u32` is `1` and the refusal then read
+    /// "presets version 1; this build reads 1" (CodeRabbit, Copilot and Greptile on PR #280).
+    UnknownVersion(u64),
     /// `load_presets` could not get the file's bytes. The payload is the OS diagnostic and
     /// `Display` wraps it: one site raises this, so one wrapper covers it.
     Unreadable(String),
@@ -265,7 +269,7 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
                  tell what format it is in".into()))?;
 
         if version != PRESETS_VERSION as u64 {
-            return Err(PresetError::UnknownVersion(version as u32));
+            return Err(PresetError::UnknownVersion(version));
         }
 
         // Now parse full schema. Version was already validated from the Value probe above, so
@@ -470,6 +474,27 @@ mod tests {
             err.to_string(),
             "this presets file is in a format this build does not read \
              (presets version 3; this build reads 1)"
+        );
+    }
+
+    /// The version the refusal names is the version on disk, whatever its width. Carried as a
+    /// `u32` it was truncated, so a file saying `4294967297` was refused with "presets version
+    /// 1; this build reads 1" — a sentence contradicting itself while naming the one version
+    /// this build does read (CodeRabbit, Copilot and Greptile on PR #280).
+    #[test]
+    fn a_version_too_large_for_a_u32_is_named_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        let truncates_to_one = u32::MAX as u64 + 2;
+        std::fs::write(&user_file, format!(r#"{{"version":{truncates_to_one},"presets":[]}}"#))
+            .unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err, PresetError::UnknownVersion(truncates_to_one));
+        assert_eq!(
+            err.to_string(),
+            "this presets file is in a format this build does not read \
+             (presets version 4294967297; this build reads 1)"
         );
     }
 

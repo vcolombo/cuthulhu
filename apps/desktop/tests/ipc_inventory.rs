@@ -241,33 +241,64 @@ impl Imports {
         }
     }
 
-    /// The same imports with `use super::X` replaced by whatever `X` is in the enclosing module —
-    /// which is how a nested module reaches an import it cannot inherit. Left as written, the
-    /// parameter would read as this crate's own and its key would be sent for something Tauri
-    /// fills in.
+    /// The same imports with every path spelled out: `use super::X` is whatever `X` is in the
+    /// enclosing module, and a path through an alias — `use tauri as t; use t::State;`, which Rust
+    /// 2018's uniform paths allow — is the path that alias stands for.
     ///
-    /// `use super::super::X` and `use super::x::Y` are left alone: the first needs a scope this
-    /// does not hold, and the second names an item rather than an import. Both then read as a
-    /// payload key, which is the harmless direction — a declared key nobody sends, rather than a
-    /// sent key nothing declares.
+    /// Written names are not enough for either. An unresolved `super` reads as this crate's own, so
+    /// a key would be sent for something Tauri fills in; an unresolved alias reads as whatever it
+    /// is spelled, so a local module aliased to `tauri` would drop a key the frontend does send and
+    /// have the fake refuse a call the backend accepts.
+    ///
+    /// `use super::super::X` and `use super::x::Y` are still left as written: the first needs a
+    /// scope this does not hold, and the second names an item rather than an import. Both then read
+    /// as a payload key, which is the harmless direction — a declared key nobody sends, rather than
+    /// a sent key nothing declares.
     fn resolved_against(&self, parent: &Imports) -> Imports {
         let mut resolved = Imports { names: BTreeMap::new(), globs: self.globs };
         for (local, paths) in &self.names {
             for path in paths {
-                match path.as_slice() {
-                    [first, name] if first == "super" => match parent.names.get(name) {
-                        Some(inherited) => {
-                            for path in inherited {
-                                resolved.add(local.clone(), path.clone());
-                            }
-                        }
-                        None => resolved.add(local.clone(), path.clone()),
-                    },
-                    _ => resolved.add(local.clone(), path.clone()),
+                for spelled in self.spell_out(path, parent) {
+                    resolved.add(local.clone(), spelled);
                 }
             }
         }
         resolved
+    }
+
+    fn spell_out(&self, path: &[String], parent: &Imports) -> Vec<Vec<String>> {
+        if let [first, name] = path {
+            if first == "super" {
+                return parent.names.get(name).cloned().unwrap_or_else(|| vec![path.to_vec()]);
+            }
+        }
+
+        let mut spellings = vec![path.to_vec()];
+        // Bounded rather than run to a fixed point: an alias chain this long is not a real spelling,
+        // and `use a::b as a;` names itself, which would otherwise grow a path forever.
+        for _ in 0..4 {
+            let mut expanded = Vec::new();
+            let mut moved = false;
+            for path in &spellings {
+                match path.split_first() {
+                    // Only a prefix can be an alias; a single segment is the name itself, which
+                    // `is_framework_param` resolves where it is read.
+                    Some((first, rest)) if !rest.is_empty() => match self.names.get(first) {
+                        Some(prefixes) => {
+                            moved = true;
+                            expanded.extend(prefixes.iter().map(|prefix| [prefix.as_slice(), rest].concat()));
+                        }
+                        None => expanded.push(path.clone()),
+                    },
+                    _ => expanded.push(path.clone()),
+                }
+            }
+            spellings = expanded;
+            if !moved {
+                break;
+            }
+        }
+        spellings
     }
 }
 
@@ -277,6 +308,13 @@ fn collect_use_tree(tree: &UseTree, prefix: &mut Vec<String>, into: &mut Imports
             prefix.push(p.ident.to_string());
             collect_use_tree(&p.tree, prefix, into);
             prefix.pop();
+        }
+        // `use tauri::ipc::{self, Request}` binds the module under its own last segment, so `self`
+        // is not the name it introduces.
+        UseTree::Name(n) if n.ident == "self" => {
+            if let Some(local) = prefix.last().cloned() {
+                into.add(local, prefix.clone());
+            }
         }
         UseTree::Name(n) => {
             let mut path = prefix.clone();
@@ -619,6 +657,30 @@ mod naming {
         let c = command(
             "use tauri::Window;
              mod inner { use super::Window; #[tauri::command] pub fn f(w: Window, id: String) {} }",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        // An import can be reached through an alias of the module it lives in (Rust 2018 lets a
+        // `use` path start with a name already in scope), and the written name then says the wrong
+        // thing in both directions: this one is Tauri's…
+        let c = command(
+            "use tauri::ipc as messages; use messages::Request;
+             #[tauri::command] fn f(request: Request, id: String) {}",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        // …and this one only looks it, so dropping its key would refuse a call the backend takes.
+        let c = command(
+            "use custom as tauri; use tauri::Request; #[tauri::command] fn f(request: Request) {}",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["request"]);
+
+        // `{self}` names the module, not a type called `self`.
+        let c = command(
+            "use tauri::ipc::{self, Request}; #[tauri::command] fn f(r: ipc::Request, id: String) {}",
         )
         .expect("a supported shape");
         assert_eq!(c.args, ["id"]);

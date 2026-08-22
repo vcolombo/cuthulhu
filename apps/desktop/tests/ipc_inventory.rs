@@ -26,7 +26,7 @@
 //! registered command with no definition — fails the test. An omitted command is an unchecked
 //! command, which is the failure this file exists to end.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -206,15 +206,16 @@ fn collect_commands(items: &[Item], file: &Path, imports: &Imports, into: &mut B
     }
 }
 
-/// What a bare type name in a signature refers to: the `use` items in scope, gathered per file.
+/// What a name in a signature refers to: the `use` items in scope, gathered per file.
 ///
-/// A file's imports are read as one set rather than per module, which is why a name imported twice
-/// under different paths is recorded as ambiguous instead of resolved — the answer would depend on
-/// which module the command sits in, and being wrong about it drops or invents a payload key.
+/// A file's imports are read as one set rather than per module, so a name imported twice keeps both
+/// paths — which module a command sits in decides which one it sees, and that is not something a
+/// file-wide reading can answer. Where the two disagree about being Tauri's, the caller refuses
+/// rather than picking, because either wrong answer drops or invents a payload key.
 #[derive(Clone, Default)]
 struct Imports {
-    /// Local name to the path it names, or `None` where two imports disagree.
-    names: BTreeMap<String, Option<Vec<String>>>,
+    /// Local name to every path this file imports it from.
+    names: BTreeMap<String, Vec<Vec<String>>>,
     /// A glob can bring in a name this cannot see, so an unresolved name is not evidence of a
     /// local type once one is present.
     globs: bool,
@@ -222,14 +223,9 @@ struct Imports {
 
 impl Imports {
     fn add(&mut self, local: String, path: Vec<String>) {
-        match self.names.get(&local) {
-            Some(Some(existing)) if *existing != path => {
-                self.names.insert(local, None);
-            }
-            Some(_) => {}
-            None => {
-                self.names.insert(local, Some(path));
-            }
+        let paths = self.names.entry(local).or_default();
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
 }
@@ -397,31 +393,43 @@ fn external_command(function: &ItemFn, imports: &Imports) -> Result<ExternalComm
 fn is_framework_param(ty: &Type, imports: &Imports) -> Result<bool, String> {
     let Type::Path(path) = ty else { return Ok(false) };
     let segments: Vec<String> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
-    let Some(name) = segments.last() else { return Ok(false) };
-    if !FRAMEWORK_PARAMS.contains(&name.as_str()) {
-        return Ok(false);
+    let Some((first, rest)) = segments.split_first() else { return Ok(false) };
+
+    // The leading segment is a local name before it is anything else, and an import can rename
+    // either the type (`use tauri::Window as W`) or the module it came from (`use tauri as t;
+    // t::Window`). Resolving it first is what keeps a rename from hiding what the parameter is:
+    // reading the written name would make `W` a payload key Tauri never lets the frontend send.
+    let imported = imports.names.get(first);
+    let spellings: Vec<Vec<String>> = match imported {
+        Some(paths) => paths.iter().map(|path| [path.as_slice(), rest].concat()).collect(),
+        None => vec![segments.clone()],
+    };
+
+    let answers: BTreeSet<bool> = spellings.iter().map(|path| names_a_framework_param(path)).collect();
+    if answers.len() > 1 {
+        // Two imports of this name disagree about it, and either wrong answer writes a wrong
+        // inventory: Tauri's own read as a payload declares a key nobody sends, and a payload type
+        // read as Tauri's drops a key that is sent, so the fake refuses a call the backend accepts.
+        return Err(format!("`{first}`, which this file imports under two paths that disagree"));
     }
-    if segments.len() > 1 {
-        // `tauri::State`, `tauri::ipc::Request`: the framework's. `custom::Request`: this crate's,
-        // and its key is part of the payload.
-        return Ok(segments[0] == "tauri");
+    let framework = answers.into_iter().next().unwrap_or(false);
+
+    // Named by no import, so a type of this crate's own — none of these names is in the prelude. A
+    // glob is the one thing that can hide Tauri's own here, and only under its real name, since a
+    // glob cannot rename what it brings in.
+    if !framework && imported.is_none() && imports.globs && rest.is_empty() && FRAMEWORK_PARAMS.contains(&first.as_str()) {
+        return Err(format!(
+            "`{first}` alongside a glob import, so whether it is Tauri's cannot be read here — \
+             spell Tauri's as `tauri::{first}`"
+        ));
     }
-    match imports.names.get(name) {
-        // What `use tauri::State` leaves behind, and what `use custom::Request` does.
-        Some(Some(path)) => Ok(path.first().is_some_and(|first| first == "tauri")),
-        // Two imports of the name disagree, so which one a given module sees is not something a
-        // file-wide reading can answer. Both answers are a wrong inventory — Tauri's own read as a
-        // payload declares a key nobody sends, and a payload type read as Tauri's drops a key that
-        // is sent, which has the fake refuse a call the backend accepts.
-        Some(None) => Err(format!("`{name}`, which this file imports under two different paths")),
-        // Imported from nowhere: a type of this crate's own, since none of these is in the
-        // prelude — unless a glob could have brought one in, which nothing here can see through.
-        None if imports.globs => Err(format!(
-            "`{name}` alongside a glob import, so whether it is Tauri's cannot be read here — \
-             spell Tauri's as `tauri::{name}`"
-        )),
-        None => Ok(false),
-    }
+    Ok(framework)
+}
+
+/// Whether a path, spelled out in full, names one of the parameters Tauri fills in itself.
+fn names_a_framework_param(path: &[String]) -> bool {
+    path.first().is_some_and(|first| first == "tauri")
+        && path.last().is_some_and(|name| FRAMEWORK_PARAMS.contains(&name.as_str()))
 }
 
 fn quote_path(path: &syn::Path) -> String {
@@ -553,6 +561,21 @@ mod naming {
         // Not imported at all: this crate's own, since none of these names is in the prelude.
         let c = command("#[tauri::command] fn f(window: Window) {}").expect("a supported shape");
         assert_eq!(c.args, ["window"]);
+
+        // A rename moves the local name, not the type behind it — neither of these sends a key.
+        let c = command("use tauri::Window as W; #[tauri::command] fn f(w: W, id: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        let c = command("use tauri as t; #[tauri::command] fn f(w: t::Window, id: String) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        // The same rename over a payload type keeps its key, which is the half a name-first reading
+        // got right and an import-blind one gets wrong in the other direction.
+        let c = command("use custom::Window as W; #[tauri::command] fn f(w: W) {}")
+            .expect("a supported shape");
+        assert_eq!(c.args, ["w"]);
 
         // A glob could have brought Tauri's in, and two imports disagreeing leave nothing to read.
         assert!(command("use tauri::*; #[tauri::command] fn f(w: Window) {}").is_err());

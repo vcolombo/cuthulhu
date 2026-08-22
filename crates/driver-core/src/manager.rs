@@ -113,9 +113,10 @@ impl From<TransportError> for DeviceError {
             TransportError::WriteZero => DeviceError::WriteZero,
             // Wrapped, not passed through: a transport's payload is an OS string
             // ("Permission denied (os error 13)", "transfer thread panicked"), and `Io`'s
-            // payload is what an operator reads verbatim. Same shape as
-            // `ClientError::Transport`'s "the host could not be reached ({m})".
-            TransportError::Io(s) => DeviceError::Io(format!("the connection to the cutter failed ({s})")),
+            // payload is what an operator reads verbatim. Borrows `ClientError::Transport`'s
+            // wording one layer down — "could not be reached", because CONTEXT.md's Transport
+            // entry lists `connection`, `channel`, `port` and `link` under `_Avoid_`.
+            TransportError::Io(s) => DeviceError::Io(format!("the cutter could not be reached ({s})")),
         }
     }
 }
@@ -1242,6 +1243,50 @@ mod tests {
         mgr.shutdown();
     }
 
+    /// A driver that refuses the Job it is handed. Nothing in the workspace constructs a
+    /// `DriverError` — both real `encode_pass` implementations end in an unconditional `Ok` — so
+    /// the only way to reach the pass-encode fault, and pin the sentence wrapped around it, is a
+    /// fake that returns one. Whether that type should have a producer at all is #69's question.
+    struct UnencodableFactory;
+    impl DeviceBackendFactory for UnencodableFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> { vec![cameo_info()] }
+        fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            struct UnencodableDriver(MachineProfile);
+            impl Driver for UnencodableDriver {
+                fn profile(&self) -> &MachineProfile { &self.0 }
+                fn caps(&self) -> MachineCaps {
+                    MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false }
+                }
+                fn session_begin(&self) -> Vec<u8> { Vec::new() }
+                fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> {
+                    Err(DriverError::UnsupportedGeometry)
+                }
+                fn pass_park(&self) -> Vec<u8> { Vec::new() }
+                fn session_end(&self) -> Vec<u8> { Vec::new() }
+                fn abort_bytes(&self) -> Option<Vec<u8>> { None }
+            }
+            Some(Box::new(UnencodableDriver(MachineProfile {
+                id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0,
+            })))
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Ok(Box::new(MockTransport::default()))
+        }
+    }
+
+    #[test]
+    fn a_pass_that_cannot_be_encoded_is_refused_in_words() {
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(UnencodableFactory));
+        mgr.connect(cameo_info()).unwrap();
+        let err = mgr.cut(one_pass_job()).unwrap_err();
+        // The `Debug` in the parenthetical is the deliberate exception: it is over a
+        // `DriverError`, which has no `Display` and no producer (#69). Pinned so that if #69
+        // gives it one, this is where the wrapper stops being needed.
+        assert_eq!(err.to_string(), "the cut could not be encoded for this cutter (UnsupportedGeometry)");
+        assert_eq!(err.code(), "device_io");
+        mgr.shutdown();
+    }
+
     /// One sentence and one code per variant. A new variant fails to compile the `Display` and
     /// `code` matches; a reworded or re-coded one fails here.
     ///
@@ -1251,8 +1296,9 @@ mod tests {
     /// pinned where they are built instead — `a_machine_this_build_has_no_driver_for_is_refused_in_words`,
     /// `silent_candidate_device_is_refused_instead_of_connected`,
     /// `candidate_device_answering_junk_is_refused`,
-    /// `unloaded_media_fails_fast_instead_of_polling_out_the_deadline` and
-    /// `resume_and_confirm_are_busy_with_no_active_job_and_cancel_is_noop`.
+    /// `unloaded_media_fails_fast_instead_of_polling_out_the_deadline`,
+    /// `resume_and_confirm_are_busy_with_no_active_job_and_cancel_is_noop` and
+    /// `a_pass_that_cannot_be_encoded_is_refused_in_words`.
     #[test]
     fn every_device_fault_has_a_sentence_and_a_code() {
         let cases: Vec<(DeviceError, &str, &str)> = vec![
@@ -1263,7 +1309,7 @@ mod tests {
             (
                 DeviceError::from(TransportError::Io("Permission denied (os error 13)".into())),
                 "device_io",
-                "the connection to the cutter failed (Permission denied (os error 13))",
+                "the cutter could not be reached (Permission denied (os error 13))",
             ),
         ];
         for (error, code, message) in cases {
@@ -1615,10 +1661,10 @@ mod tests {
         drain(&events);
 
         let err = mgr.cut(one_pass_job()).unwrap_err();
-        assert_eq!(err, DeviceError::Io("the connection to the cutter failed (cable pulled)".into()));
+        assert_eq!(err, DeviceError::Io("the cutter could not be reached (cable pulled)".into()));
         let s = mgr.status();
         assert_eq!(s.phase, Phase::Failed);
-        assert_eq!(s.error, Some(DeviceError::Io("the connection to the cutter failed (cable pulled)".into())));
+        assert_eq!(s.error, Some(DeviceError::Io("the cutter could not be reached (cable pulled)".into())));
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
@@ -1710,7 +1756,7 @@ mod tests {
                 mgr.cut(one_pass_job())?;
                 mgr.confirm_pass_done()
             },
-            DeviceError::Io("the connection to the cutter failed (cable pulled)".into()),
+            DeviceError::Io("the cutter could not be reached (cable pulled)".into()),
         );
 
         // WaitingForColorSwap: pass 1 completes and parks (empty pass_park is a

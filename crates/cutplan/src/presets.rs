@@ -21,11 +21,86 @@ pub struct PresetSettings {
     pub repeat_count: u32,
 }
 
+/// The only on-disk format this build reads or writes. Named once so the check in
+/// `load_presets`, the header `save_user_presets` writes and the sentence `UnknownVersion`
+/// reads cannot drift apart.
+const PRESETS_VERSION: u32 = 1;
+
+/// Every way the presets file refuses to be read or written.
+///
+/// The desktop is the only caller — no CLI or Cut Host path reads or writes presets — and it
+/// turns each of these straight into an `IpcError`, so the sentences and codes below are what
+/// an operator reads and what a dialog can branch on (#278).
+///
+/// Reading and writing are separate variants rather than one `Io` because they are separate
+/// facts with separate answers: an unreadable file means no material is available to cut with,
+/// an unwritable one means an edit did not land while everything already saved is untouched.
+/// One variant could only have said "read or written", which is vaguer at both of the places
+/// the desktop shows it.
 #[derive(Debug, PartialEq)]
 pub enum PresetError {
+    /// The file's bytes arrived and did not make sense. `Display` forwards the payload
+    /// verbatim, so every site that builds one owes a finished sentence: the three that exist
+    /// say three different things — not JSON at all, no version stated, no usable presets list
+    /// — and no single wrapper could say all three.
     Corrupt(String),
+    /// A version other than `PRESETS_VERSION`. Carries what was found; what this build reads is
+    /// a build constant, so `Display` takes it from there rather than from the payload.
     UnknownVersion(u32),
-    Io(String),
+    /// `load_presets` could not get the file's bytes. The payload is the OS diagnostic and
+    /// `Display` wraps it: one site raises this, so one wrapper covers it.
+    Unreadable(String),
+    /// `save_user_presets` did not land the file. The payload is the OS or serde diagnostic and
+    /// `Display` wraps it: five sites raise this — the directory, the temp file, the encode,
+    /// the write and the rename — and every one of them leaves the file unwritten.
+    Unwritable(String),
+}
+
+/// Every refusal in the words an operator reads.
+///
+/// Two of the four wrap their payload here and two do not, and which is which follows from the
+/// sites. `Unreadable` and `Unwritable` state one fact at every site that raises them, so one
+/// wrapper says it once and the payload stays the raw diagnostic it is. `Corrupt` states a
+/// different fact at each of its three, so the sentence is written there and forwarded — a
+/// wrapper in front of one would read twice, the reason #90 dropped `"preflight: "`.
+impl std::fmt::Display for PresetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PresetError::Corrupt(message) => write!(f, "{message}"),
+            // Not "written by a newer Cuthulhu", which would be false of the other direction:
+            // the check below is `!= PRESETS_VERSION`, so a hand-edited `"version": 0` lands
+            // here too. Naming both numbers says which way it went without claiming it.
+            PresetError::UnknownVersion(found) => write!(
+                f,
+                "this presets file is in a format this build does not read \
+                 (presets version {found}; this build reads {PRESETS_VERSION})"
+            ),
+            PresetError::Unreadable(message) =>
+                write!(f, "the presets file could not be read ({message})"),
+            PresetError::Unwritable(message) =>
+                write!(f, "the presets file could not be written ({message})"),
+        }
+    }
+}
+impl std::error::Error for PresetError {}
+
+impl PresetError {
+    /// Stable identifier for a caller that must branch on the *kind* of refusal instead of
+    /// matching the text of one. The desktop turns it straight into an `IpcError` code, and an
+    /// `IpcError` code survives to the frontend, so offering an update check on a version this
+    /// build cannot read and a path to the file on a corrupt one is a UI choice rather than a
+    /// backend change. Same shape as `PreflightError::code` and `DeviceError::code`.
+    ///
+    /// Plural, unlike the desktop's own `unknown_preset` and `invalid_preset`: these name the
+    /// presets file's refusals, not one material's.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PresetError::Corrupt(_) => "presets_corrupt",
+            PresetError::UnknownVersion(_) => "presets_unknown_version",
+            PresetError::Unreadable(_) => "presets_unreadable",
+            PresetError::Unwritable(_) => "presets_unwritable",
+        }
+    }
 }
 
 /// Per-pass settings a caller wants applied on top of whatever preset is
@@ -173,30 +248,37 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
     // Try to load user presets if file exists
     if user_file.exists() {
         let content = fs::read_to_string(user_file)
-            .map_err(|e| PresetError::Io(e.to_string()))?;
+            .map_err(|e| PresetError::Unreadable(e.to_string()))?;
 
         // Check version FIRST before parsing full schema (allows future schema changes)
         let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| PresetError::Corrupt(e.to_string()))?;
+            .map_err(|e| PresetError::Corrupt(
+                format!("the presets file is not valid JSON ({e})")))?;
 
+        // Absent, not a number, or a number no `u64` holds — all three leave this build with
+        // nothing to check the format against, which is what the sentence has to say.
         let version = value
             .get("version")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| PresetError::Corrupt("missing or invalid version field".into()))?;
+            .ok_or_else(|| PresetError::Corrupt(
+                "the presets file does not state a whole-number version, so this build cannot \
+                 tell what format it is in".into()))?;
 
-        if version != 1 {
+        if version != PRESETS_VERSION as u64 {
             return Err(PresetError::UnknownVersion(version as u32));
         }
 
-        // Now parse full schema. Version was already validated from the Value probe
-        // above, so the full parse only needs the presets.
+        // Now parse full schema. Version was already validated from the Value probe above, so
+        // the full parse only needs the presets — which is also why this refusal can say the
+        // presets are the part that did not read, rather than repeating "not valid JSON".
         #[derive(Deserialize)]
         struct FileFormat {
             presets: Vec<MaterialPreset>,
         }
 
         let file_data: FileFormat = serde_json::from_str(&content)
-            .map_err(|e| PresetError::Corrupt(e.to_string()))?;
+            .map_err(|e| PresetError::Corrupt(
+                format!("the presets file does not hold a usable list of material presets ({e})")))?;
 
         // Force builtin: false on all user entries (on-disk contract is user-entries-only)
         let mut user_presets = file_data.presets;
@@ -234,10 +316,10 @@ pub fn save_user_presets(user_file: &Path, user: &[MaterialPreset]) -> Result<()
 
     // First-run: the default path lives under config_dir()/cuthulhu/, which doesn't
     // exist on a fresh install, and NamedTempFile::new_in requires it to.
-    std::fs::create_dir_all(dir).map_err(|e| PresetError::Io(e.to_string()))?;
+    std::fs::create_dir_all(dir).map_err(|e| PresetError::Unwritable(e.to_string()))?;
 
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .map_err(|e| PresetError::Io(e.to_string()))?;
+        .map_err(|e| PresetError::Unwritable(e.to_string()))?;
 
     #[derive(Serialize)]
     struct FileFormat {
@@ -246,21 +328,26 @@ pub fn save_user_presets(user_file: &Path, user: &[MaterialPreset]) -> Result<()
     }
 
     let file_data = FileFormat {
-        version: 1,
+        version: PRESETS_VERSION,
         presets: user.to_vec(),
     };
 
+    // Serializing `String`s and numbers cannot fail, so this arm is unreachable in practice —
+    // but if it ever fired the file would still be the thing that did not get written, which is
+    // what `Unwritable` says.
     let json = serde_json::to_string_pretty(&file_data)
-        .map_err(|e| PresetError::Io(e.to_string()))?;
+        .map_err(|e| PresetError::Unwritable(e.to_string()))?;
 
     // Write through the temp file's own handle: a reopen()'d second handle held
     // across persist() can make the atomic rename fail on Windows.
     tmp.as_file_mut()
         .write_all(json.as_bytes())
-        .map_err(|e| PresetError::Io(e.to_string()))?;
+        .map_err(|e| PresetError::Unwritable(e.to_string()))?;
 
+    // `PersistError`'s own `Display` prefixes the OS string with temp-file plumbing the operator
+    // has no use for, so the payload is the io error it wraps.
     tmp.persist(user_file)
-        .map_err(|e| PresetError::Io(e.to_string()))?;
+        .map_err(|e| PresetError::Unwritable(e.error.to_string()))?;
 
     Ok(())
 }
@@ -272,6 +359,155 @@ pub fn default_presets_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table, in the shape of `passes.rs`'s `every_plan_refusal_has_a_sentence`. A new
+    /// variant fails to compile `Display` and `code`; a reworded or re-coded one fails here.
+    ///
+    /// `Corrupt`'s sentence column is `None` on purpose: `Display` forwards that payload
+    /// verbatim, so a row here would compare a literal with itself and pass however the three
+    /// real sites are worded. Those three are pinned where they are built, by the
+    /// construction-path tests below. The other three variants compose their sentence here, so
+    /// a row is the whole contract for every site that raises them.
+    #[test]
+    fn every_preset_refusal_has_a_sentence_and_a_code() {
+        let cases: Vec<(PresetError, &str, Option<&str>)> = vec![
+            (PresetError::Corrupt("whatever the site wrote".into()), "presets_corrupt", None),
+            (
+                PresetError::UnknownVersion(3),
+                "presets_unknown_version",
+                Some("this presets file is in a format this build does not read \
+                      (presets version 3; this build reads 1)"),
+            ),
+            (
+                PresetError::Unreadable("Permission denied (os error 13)".into()),
+                "presets_unreadable",
+                Some("the presets file could not be read (Permission denied (os error 13))"),
+            ),
+            (
+                PresetError::Unwritable("No space left on device (os error 28)".into()),
+                "presets_unwritable",
+                Some("the presets file could not be written (No space left on device (os error 28))"),
+            ),
+        ];
+        for (error, code, sentence) in cases {
+            assert_eq!(error.code(), code, "{error:?}");
+            if let Some(sentence) = sentence {
+                assert_eq!(error.to_string(), sentence, "{error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_presets_file_that_is_not_json_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::write(&user_file, "half a file, truncated mid-").unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err.code(), "presets_corrupt");
+        assert!(
+            err.to_string().starts_with("the presets file is not valid JSON ("),
+            "got {err}"
+        );
+    }
+
+    /// The issue's own scenario: a hand-edited file with the header dropped. Reaches the
+    /// `ok_or_else` in `load_presets` rather than asserting the literal against itself.
+    #[test]
+    fn a_presets_file_with_no_version_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::write(&user_file, r#"{"presets":[]}"#).unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err.code(), "presets_corrupt");
+        assert_eq!(
+            err.to_string(),
+            "the presets file does not state a whole-number version, so this build cannot \
+             tell what format it is in"
+        );
+
+        // Present but unusable takes the same branch, so the sentence has to be true of it too.
+        std::fs::write(&user_file, r#"{"version":"one","presets":[]}"#).unwrap();
+        assert_eq!(load_presets(&user_file).unwrap_err(), err);
+    }
+
+    /// Valid JSON, a version this build reads, and a `presets` field that is not a list of
+    /// presets — the third `Corrupt` site, which says something the other two do not.
+    #[test]
+    fn a_presets_file_with_no_usable_list_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::write(&user_file, r#"{"version":1,"presets":"not a list"}"#).unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err.code(), "presets_corrupt");
+        assert!(
+            err.to_string()
+                .starts_with("the presets file does not hold a usable list of material presets ("),
+            "got {err}"
+        );
+    }
+
+    /// A version refusal must beat the schema parse below it: a file this build cannot read the
+    /// format of has not been shown to be damaged, and telling the operator to repair it would
+    /// send them to edit a file a newer build wrote correctly.
+    ///
+    /// `corrupt_and_unknown_version_files_error_without_clobbering` reaches the same branch, but
+    /// with a `presets` field that is absent or empty — parseable either way, so nothing there
+    /// would notice the two checks swapping. This one puts a payload under the version that the
+    /// parse below would reject.
+    #[test]
+    fn a_version_this_build_does_not_read_is_refused_before_its_contents_are_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::write(&user_file, r#"{"version":3,"presets":"not a list either"}"#).unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err, PresetError::UnknownVersion(3));
+        assert_eq!(err.code(), "presets_unknown_version");
+        assert_eq!(
+            err.to_string(),
+            "this presets file is in a format this build does not read \
+             (presets version 3; this build reads 1)"
+        );
+    }
+
+    /// The only `Unreadable` site, reached for real. A directory at the file's path exists, so
+    /// the `exists()` guard lets the read happen and the read fails — which no permission bit
+    /// can be relied on to do, since a test running as root reads a 0o000 file anyway.
+    #[test]
+    fn a_presets_file_whose_bytes_cannot_be_read_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        std::fs::create_dir(&user_file).unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err.code(), "presets_unreadable");
+        assert!(
+            err.to_string().starts_with("the presets file could not be read ("),
+            "got {err}"
+        );
+    }
+
+    /// `Unwritable` through `create_dir_all`, the first of the five sites the save path can fail
+    /// at: the parent is an ordinary file, so the directory cannot be made. The other four
+    /// (the temp file, the encode, the write, the rename) need a full disk or a mid-flight
+    /// unmount to force, and do not need forcing here — `Display` wraps this variant rather
+    /// than forwarding it, so one sentence covers all five and the table above pins it.
+    #[test]
+    fn a_presets_file_that_cannot_be_written_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("cuthulhu");
+        std::fs::write(&blocker, "not a directory").unwrap();
+
+        let err = save_user_presets(&blocker.join("presets.json"), &[]).unwrap_err();
+        assert_eq!(err.code(), "presets_unwritable");
+        assert!(
+            err.to_string().starts_with("the presets file could not be written ("),
+            "got {err}"
+        );
+    }
 
     #[test]
     fn an_override_field_beats_the_preset_and_a_missing_preset_falls_back_to_default() {

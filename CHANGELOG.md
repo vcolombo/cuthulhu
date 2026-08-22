@@ -76,3 +76,8 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 - **A boolean op over groups or layers says so**, instead of reporting the selected containers as
   missing. The Layers panel selects containers and the toolbar offers Union on any two selections,
   so the refusal was reachable and named the wrong problem.
+
+- **A command on a Node with no parent says so**, rather than calling a Node that is plainly
+  present missing. The document root and an orphan out of a manifest — whose topology is not
+  validated on load — both reach this. A boolean op over such a Node used to panic instead of
+  refusing, since only the first id's parent was ever checked.

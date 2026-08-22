@@ -4,7 +4,7 @@ use geometry::{boolean, ellipse_path, rect_path, text_to_path, Affine, BoolOp, P
 use crate::{node::*, delta::*};
 
 #[derive(Debug, PartialEq)]
-pub enum CmdError { NotFound, EmptySelection, Geometry(String), EmptyPresetId }
+pub enum CmdError { NotFound, NoParent, EmptySelection, Geometry(String), EmptyPresetId }
 
 /// What the operator reads when a command refuses: the desktop's `ipc` layer forwards this
 /// string straight into the dialog. It used to forward `{e:?}` instead, so a boolean op on
@@ -21,6 +21,11 @@ impl std::fmt::Display for CmdError {
             // the Layers panel selects Groups and Layers too, so the id that went stale is as
             // often a container. Node is CONTEXT.md's word for all three.
             CmdError::NotFound => write!(f, "the node or machine this command names is not there"),
+            // Split off `NotFound` rather than widening it: a node with no parent is present,
+            // and saying it "is not there" was the third rewording that sentence needed. Reached
+            // by the document root and by an orphan out of a manifest, whose topology is not
+            // validated on load.
+            CmdError::NoParent => write!(f, "this node has no parent, and the command needs one"),
             // Not only an empty selection: also a boolean op given one shape, and a delete whose
             // every id was skipped as the descendant of another. In each the selection exists and
             // still offers this command nothing to do.
@@ -163,7 +168,7 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     let mut seen = HashSet::new();
     for &id in ids {
         if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
-        let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
+        let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
         push_subtree(doc, id, parent, &mut ops)?;
     }
     if ops.is_empty() { return Err(CmdError::EmptySelection); }
@@ -171,7 +176,7 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
 }
 
 pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, CmdError> {
-    let parent = parent_of(doc, id).ok_or(CmdError::NotFound)?;
+    let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
     Ok(Delta(vec![
         NodeOp::Remove { parent, id },
         NodeOp::Add { parent, node: doc.get(id).unwrap().clone(), index: new_index },
@@ -247,15 +252,17 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     // `to_string`, not `{e:?}`: the same operator-facing contract as `shape_outline` above.
     // Two shapes that do not overlap refuse here, and `Degenerate` alone said nothing (#93).
     let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(e.to_string()))?;
-    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
+    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NoParent)?;
     let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
     let dest_inv = dest_world.inverse()
         .ok_or_else(|| CmdError::Geometry(
             "the result's parent sits under a transform that cannot be reversed".into()))?;
     let result_local = result.transformed(&dest_inv);
+    // `NoParent`, not `unwrap()`: only `ids[0]`'s parent was proven above, so an orphan later in
+    // the selection used to panic the command rather than refuse it.
     let mut ops: Vec<NodeOp> = ids.iter()
-        .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
-        .collect();
+        .map(|&id| Ok(NodeOp::Remove { parent: parent_of(doc, id).ok_or(CmdError::NoParent)?, id }))
+        .collect::<Result<_, CmdError>>()?;
     ops.push(NodeOp::Add {
         parent: dest_parent,
         node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result_local.to_svg() }),
@@ -288,6 +295,7 @@ mod tests {
     fn every_command_refusal_has_a_sentence() {
         let cases: Vec<(CmdError, &str)> = vec![
             (CmdError::NotFound, "the node or machine this command names is not there"),
+            (CmdError::NoParent, "this node has no parent, and the command needs one"),
             (CmdError::EmptySelection, "the selection has nothing this command can act on"),
             // Forwarded verbatim, so what the operator reads for a boolean op on shapes that do
             // not overlap is the sentence `GeomError` writes, with nothing wrapped around it.
@@ -380,6 +388,23 @@ mod tests {
 
         let refusal = boolean_op(&ed.doc, &ids, geometry::BoolOp::Union).unwrap_err();
         assert_eq!(refusal.to_string(), "a group or layer has no outline of its own to combine");
+    }
+
+    /// The document root is present and parentless, so `delete` and `reorder` used to call it
+    /// missing. Codex found it in the review of #93; the Layers panel gives the root no row, so
+    /// nothing wired reaches this, but the sentence has to be true wherever the id comes from.
+    #[test]
+    fn a_command_on_the_parentless_root_says_it_has_no_parent() {
+        let ed = Editor::new();
+        let root = ed.doc.root;
+        assert!(ed.doc.get(root).is_some(), "the root is present, which is the whole point");
+
+        for refusal in [
+            delete_nodes(&ed.doc, &[root]).unwrap_err(),
+            reorder(&ed.doc, root, 0).unwrap_err(),
+        ] {
+            assert_eq!(refusal.to_string(), "this node has no parent, and the command needs one");
+        }
     }
 
     #[test]

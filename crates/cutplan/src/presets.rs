@@ -249,24 +249,38 @@ pub fn builtin_presets() -> Vec<MaterialPreset> {
 pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError> {
     let mut all_presets = builtin_presets();
 
-    // Try to load user presets if file exists
-    if user_file.exists() {
-        let content = fs::read_to_string(user_file)
-            .map_err(|e| PresetError::Unreadable(e.to_string()))?;
+    // `read`, not `exists()` and then a read: `Path::exists` answers false when the file cannot
+    // be stat'd at all — a config directory the process may not search, say — so the operator's
+    // whole saved list vanished and every caller carried on as if they had never saved one. Only
+    // a file that is genuinely absent is the first-run case (Codex on PR #280).
+    let found = match fs::read(user_file) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(PresetError::Unreadable(e.to_string())),
+    };
+
+    if let Some(bytes) = found {
+        // Bytes that are not text are damage, not a read that failed: `read_to_string` folded
+        // the two together, so a `presets.json` an editor saved in Latin-1 reported a disk fault
+        // and sent the operator to check permissions (Codex on PR #280).
+        let content = String::from_utf8(bytes)
+            .map_err(|_| PresetError::Corrupt("the presets file is not UTF-8 text".into()))?;
 
         // Check version FIRST before parsing full schema (allows future schema changes)
         let value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| PresetError::Corrupt(
                 format!("the presets file is not valid JSON ({e})")))?;
 
-        // Absent, not a number, or a number no `u64` holds — all three leave this build with
-        // nothing to check the format against, which is what the sentence has to say.
+        // Absent, not a number, not whole, negative, or past what a `u64` holds — all of them
+        // leave this build with nothing to check the format against, which is what the sentence
+        // has to say. "Usable" rather than plain "whole-number" because the last of those *is* a
+        // whole number, just not one this can read (Codex on PR #280).
         let version = value
             .get("version")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| PresetError::Corrupt(
-                "the presets file does not state a whole-number version, so this build cannot \
-                 tell what format it is in".into()))?;
+                "the presets file does not state a usable whole-number version, so this build \
+                 cannot tell what format it is in".into()))?;
 
         if version != PRESETS_VERSION as u64 {
             return Err(PresetError::UnknownVersion(version));
@@ -427,13 +441,17 @@ mod tests {
         assert_eq!(err.code(), "presets_corrupt");
         assert_eq!(
             err.to_string(),
-            "the presets file does not state a whole-number version, so this build cannot \
-             tell what format it is in"
+            "the presets file does not state a usable whole-number version, so this build \
+             cannot tell what format it is in"
         );
 
-        // Present but unusable takes the same branch, so the sentence has to be true of it too.
-        std::fs::write(&user_file, r#"{"version":"one","presets":[]}"#).unwrap();
-        assert_eq!(load_presets(&user_file).unwrap_err(), err);
+        // Every other way the probe returns `None` takes the same branch, so the sentence has to
+        // be true of all of them. The last is a whole number and still unusable, which is why it
+        // does not say plain "whole-number".
+        for unusable in [r#""one""#, "-1", "1.5", "18446744073709551616"] {
+            std::fs::write(&user_file, format!(r#"{{"version":{unusable},"presets":[]}}"#)).unwrap();
+            assert_eq!(load_presets(&user_file).unwrap_err(), err, "version {unusable}");
+        }
     }
 
     /// Valid JSON, a version this build reads, and a `presets` field that is not a list of
@@ -498,9 +516,14 @@ mod tests {
         );
     }
 
-    /// The only `Unreadable` site, reached for real. A directory at the file's path exists, so
-    /// the `exists()` guard lets the read happen and the read fails — which no permission bit
-    /// can be relied on to do, since a test running as root reads a 0o000 file anyway.
+    /// The `Unreadable` site, reached for real. A directory at the file's path fails the read —
+    /// which no permission bit can be relied on to do, since a test running as root reads a
+    /// 0o000 file anyway.
+    ///
+    /// The second half is what `Path::exists` used to swallow: a read that fails without the
+    /// file being absent must refuse, not answer with the builtins as though the operator had
+    /// never saved anything. `exists()` is false for both, which is why it could not tell them
+    /// apart (Codex on PR #280).
     #[test]
     fn a_presets_file_whose_bytes_cannot_be_read_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();
@@ -513,6 +536,34 @@ mod tests {
             err.to_string().starts_with("the presets file could not be read ("),
             "got {err}"
         );
+
+        // The parent is an ordinary file, so the read fails and the path does not exist.
+        let blocker = dir.path().join("cuthulhu");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let behind_a_file = load_presets(&blocker.join("presets.json")).unwrap_err();
+        assert_eq!(behind_a_file.code(), "presets_unreadable", "got {behind_a_file}");
+
+        // And a file that is genuinely absent is still the first run, not a refusal.
+        let fresh = load_presets(&dir.path().join("never-saved.json")).expect("first run loads");
+        assert_eq!(fresh, builtin_presets());
+    }
+
+    /// Bytes that are not text are damage, not a read that failed. `read_to_string` reported a
+    /// `presets.json` an editor had saved in Latin-1 as a disk fault, sending the operator to
+    /// check permissions on a file whose problem was its contents (Codex on PR #280).
+    #[test]
+    fn a_presets_file_that_is_not_text_is_refused_as_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_file = dir.path().join("presets.json");
+        // `Caf\xe9` in Latin-1, inside an otherwise well-formed file.
+        let mut bytes = br#"{"version":1,"presets":[{"name":"Caf"#.to_vec();
+        bytes.extend_from_slice(&[0xE9]);
+        bytes.extend_from_slice(br#""}]}"#);
+        std::fs::write(&user_file, bytes).unwrap();
+
+        let err = load_presets(&user_file).unwrap_err();
+        assert_eq!(err.code(), "presets_corrupt", "got {err}");
+        assert_eq!(err.to_string(), "the presets file is not UTF-8 text");
     }
 
     /// `Unwritable` through `create_dir_all`, the first of the five sites the save path can fail

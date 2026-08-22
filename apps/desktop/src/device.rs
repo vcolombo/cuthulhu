@@ -3290,8 +3290,8 @@ mod tests {
         for err in [list_presets(&path, "cameo5").unwrap_err(),
                     delete_preset(&path, "cameo5", "my-vinyl").unwrap_err()] {
             assert_eq!(err.code, "presets_corrupt", "{}", err.message);
-            assert_eq!(err.message, "the presets file does not state a whole-number version, \
-                                     so this build cannot tell what format it is in");
+            assert_eq!(err.message, "the presets file does not state a usable whole-number \
+                                     version, so this build cannot tell what format it is in");
         }
 
         std::fs::write(&path, r#"{"version":3,"presets":[]}"#).expect("wrote the fixture");
@@ -3306,7 +3306,7 @@ mod tests {
     #[test]
     fn what_a_preset_is_refuses_it_before_the_file_is_touched() {
         let dir = tempfile::tempdir().unwrap();
-        // The parent is an ordinary file, so every write to this path fails.
+        // The parent is an ordinary file, so every read of and write to this path fails.
         let blocker = dir.path().join("cuthulhu");
         std::fs::write(&blocker, "not a directory").expect("wrote the blocker");
         let path = blocker.join("presets.json");
@@ -3316,8 +3316,11 @@ mod tests {
         assert_eq!(err.code, "invalid_preset",
             "an unsavable entry was reported as a disk fault: {}", err.message);
 
-        // And the write really would have failed, so the assertion above is not vacuous.
+        // And the file really is unusable, so the assertion above is not vacuous: a valid entry
+        // is refused by it. `presets_unreadable`, not `presets_unwritable`, because `save_preset`
+        // re-reads the user entries first and a save that cannot see what it would replace must
+        // not write over it.
         let valid = a_user_preset("cameo5", "mine", 12);
-        assert_eq!(save_preset(&path, valid).unwrap_err().code, "presets_unwritable");
+        assert_eq!(save_preset(&path, valid).unwrap_err().code, "presets_unreadable");
     }
 }

@@ -79,7 +79,9 @@ impl std::fmt::Display for DeviceError {
             // poll and still ends up here.
             DeviceError::Timeout => write!(f, "the cutter took too long"),
             // An underlying `write` returned `Ok(0)` with bytes still to go, so `write_all`
-            // would otherwise spin: the cutter is there and taking nothing.
+            // would otherwise spin. Says nothing about whether the cutter is still attached:
+            // `write_all` performs no presence check, so `Ok(0)` is a transport that took
+            // nothing, not proof of one that is there (Codex on PR #279).
             DeviceError::WriteZero => write!(f, "the cutter stopped accepting data"),
             // Already a whole sentence, so a prefix would read twice — the reason #90 dropped
             // `"preflight: "`.

@@ -59,8 +59,10 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
             Some(pid) => world_transform(doc, pid).ok_or(CmdError::NotFound)?,
             None => Affine::identity(),
         };
-        let pw_inv = pw.inverse()
-            .ok_or_else(|| CmdError::Geometry("this shape sits under a transform that cannot be reversed".into()))?;
+        // "something in the selection", not "this shape": `transform_nodes` acts on whole
+        // selected subtrees, so the node under the singular ancestor is as often a Group.
+        let pw_inv = pw.inverse().ok_or_else(|| CmdError::Geometry(
+            "something in the selection sits under a transform that cannot be reversed".into()))?;
         let mut after = before.clone();
         after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
@@ -229,7 +231,12 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     let mut paths = vec![];
     for &id in &ids {
         let node = doc.get(id).ok_or(CmdError::NotFound)?;
-        let local = shape_outline(node).map_err(CmdError::Geometry)?.ok_or(CmdError::NotFound)?;
+        // `Ok(None)` is a Group or Layer: present, and simply without an outline of its own —
+        // not the absent node `NotFound` names. Reachable, because the Layers panel selects
+        // containers and the toolbar offers a boolean op on any two selected nodes.
+        let local = shape_outline(node).map_err(CmdError::Geometry)?.ok_or_else(|| {
+            CmdError::Geometry("a group or layer has no outline of its own to combine".into())
+        })?;
         let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
         paths.push(local.transformed(&world));
     }
@@ -306,6 +313,69 @@ mod tests {
 
         let refusal = boolean_op(&ed.doc, &[a, b], geometry::BoolOp::Intersect).unwrap_err();
         assert_eq!(refusal.to_string(), "the operation left no geometry behind");
+    }
+
+    /// A collapsed transform (scale 0) is the only way to reach the two hand-written
+    /// `Geometry` payloads, so build one: without a construction path they are strings no test
+    /// reads, free to drift back into the noun phrases they used to be.
+    fn singular() -> Affine {
+        Affine([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    }
+
+    /// A *container* under the collapsed ancestor, deliberately: `transform_nodes` acts on whole
+    /// selected subtrees, so the refusal must not call what it names a shape.
+    #[test]
+    fn a_transform_under_a_collapsed_ancestor_refuses_in_words() {
+        let mut ed = Editor::new();
+        let outer = ed.doc.ids.next();
+        let mut collapsed = Node::container(outer, NodeKind::Group);
+        collapsed.transform = singular();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: collapsed, index: 0 }]));
+        let inner = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer,
+            node: Node::container(inner, NodeKind::Group), index: 0 }]));
+
+        let refusal = transform_nodes(&ed.doc, &[inner], Affine::translate(5.0, 0.0)).unwrap_err();
+        assert_eq!(refusal.to_string(),
+            "something in the selection sits under a transform that cannot be reversed");
+    }
+
+    /// The result lands under the parent of `ids[0]`, so a collapsed parent there refuses after
+    /// the op itself succeeded — a different sentence from the ancestor case above.
+    #[test]
+    fn a_boolean_op_into_a_collapsed_parent_refuses_in_words() {
+        let mut ed = Editor::new();
+        let outer = ed.doc.ids.next();
+        let mut collapsed = Node::container(outer, NodeKind::Group);
+        collapsed.transform = singular();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: collapsed, index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 1 }]));
+
+        let refusal = boolean_op(&ed.doc, &[a, b], geometry::BoolOp::Union).unwrap_err();
+        assert_eq!(refusal.to_string(),
+            "the result's parent sits under a transform that cannot be reversed");
+    }
+
+    /// A Group is present and has no outline of its own, which is not what `NotFound` says.
+    /// Reachable: the Layers panel selects containers and the toolbar offers a boolean op on
+    /// any two selected nodes, so Union over two Layers lands here.
+    #[test]
+    fn a_boolean_op_on_containers_says_they_have_no_outline() {
+        let mut ed = Editor::new();
+        let ids: Vec<NodeId> = (0..2).map(|i| {
+            let id = ed.doc.ids.next();
+            ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+                node: Node::container(id, NodeKind::Layer), index: i }]));
+            id
+        }).collect();
+
+        let refusal = boolean_op(&ed.doc, &ids, geometry::BoolOp::Union).unwrap_err();
+        assert_eq!(refusal.to_string(), "a group or layer has no outline of its own to combine");
     }
 
     #[test]

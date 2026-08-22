@@ -72,3 +72,7 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   a Rust `Debug` rendering — `EmptySelection`, or `Geometry("Degenerate")` for the boolean, which
   wrapped a struct literal around a sentence the geometry layer had already written. Each now says
   what it means.
+
+- **A boolean op over groups or layers says so**, instead of reporting the selected containers as
+  missing. The Layers panel selects containers and the toolbar offers Union on any two selections,
+  so the refusal was reachable and named the wrong problem.

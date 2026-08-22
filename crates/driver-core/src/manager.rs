@@ -35,8 +35,76 @@ pub(crate) enum DeviceState {
     Error(DeviceError),
 }
 
+/// Every way a device command can fail.
+///
+/// Travels: a Cut Host's `Refusal::Device` carries one over the wire, and `CutStatus::error`
+/// and `DeviceEventKind::Failed` carry one to the desktop — so the sentences and codes below
+/// are declared here, next to the worker that raises them, rather than restated by each of
+/// the three callers that used to write their own English for them (#73).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum DeviceError { Disconnected, Busy, Timeout, WriteZero, Io(String) }
+pub enum DeviceError {
+    Disconnected,
+    Busy,
+    Timeout,
+    WriteZero,
+    /// A fault carrying its own reason, as a finished sentence: `Display` forwards the payload
+    /// verbatim, so every site that builds one owes a sentence rather than a fragment or a
+    /// `Debug` rendering. That contract is why `From<TransportError>` below wraps a transport's
+    /// bare OS string instead of passing it through.
+    Io(String),
+}
+
+/// Every fault in the words an operator reads.
+///
+/// Each sentence has to be true of *every* site that raises its variant, which is what keeps
+/// three of them this general. `Busy` is six wrong-state guards (`connect`, `cut`, `resume` and
+/// `confirm_pass_done` here, plus a Cut Host's admission gate and its `reconnect`);
+/// `Disconnected` is three unrelated ones (a transport that was never there, one that went away
+/// mid-cut, and a worker thread that is gone); `Timeout` is both a transport wait and the
+/// completion poll's deadline. Refining them means splitting variants, which is `driver-core`'s
+/// decision to make and not the IPC mapping's.
+impl std::fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Not "no longer connected": `TransportError::NotFound` lands here too, and that
+            // device was never opened at all.
+            DeviceError::Disconnected => write!(f, "the cutter is not connected"),
+            // Not "the cutter is busy": `resume` and `confirm_pass_done` raise this when the
+            // cutter is sitting idle with nothing parked to answer. What every site shares is
+            // that the verb is not legal now — `CutStatus::actions` is what says which are.
+            DeviceError::Busy => write!(f, "the cutter cannot do that right now"),
+            // A transport write that timed out, or a pass that never reported itself finished
+            // inside the completion poll's 60s. "Stopped answering" would be false of the
+            // second: a cutter that keeps replying "still moving" for a minute answers every
+            // poll and still ends up here.
+            DeviceError::Timeout => write!(f, "the cutter took too long"),
+            // An underlying `write` returned `Ok(0)` with bytes still to go, so `write_all`
+            // would otherwise spin: the cutter is there and taking nothing.
+            DeviceError::WriteZero => write!(f, "the cutter stopped accepting data"),
+            // Already a whole sentence, so a prefix would read twice — the reason #90 dropped
+            // `"preflight: "`.
+            DeviceError::Io(message) => write!(f, "{message}"),
+        }
+    }
+}
+impl std::error::Error for DeviceError {}
+
+impl DeviceError {
+    /// Stable identifier for a caller that must branch on the *kind* of fault instead of
+    /// matching the text of one — the desktop turns it straight into an `IpcError` code, so a
+    /// dialog can offer a reconnect on a disconnect and a retry on a timeout without reading
+    /// English. Same shape as `PreflightError::code` and `CutError::code`, and declared beside
+    /// the enum so the CLI, the Cut Host and the desktop share one spelling.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DeviceError::Disconnected => "device_disconnected",
+            DeviceError::Busy => "device_busy",
+            DeviceError::Timeout => "device_timeout",
+            DeviceError::WriteZero => "device_write_zero",
+            DeviceError::Io(_) => "device_io",
+        }
+    }
+}
 
 impl From<TransportError> for DeviceError {
     fn from(e: TransportError) -> Self {
@@ -44,7 +112,19 @@ impl From<TransportError> for DeviceError {
             TransportError::NotFound | TransportError::Disconnected => DeviceError::Disconnected,
             TransportError::Timeout => DeviceError::Timeout,
             TransportError::WriteZero => DeviceError::WriteZero,
-            TransportError::Io(s) => DeviceError::Io(s),
+            // Wrapped, not passed through: a transport's payload is an OS or driver string
+            // ("Permission denied (os error 13)", "Stall", "transfer thread panicked"), and
+            // `Io`'s payload is what an operator reads verbatim.
+            //
+            // Not "could not be reached", which the first draft of this said: both classifiers
+            // route an absent cutter to `Disconnected` and keep `Io` for one that is still
+            // there — a stalled endpoint on a listed USB device
+            // (`driver-silhouette/src/usb.rs::classify_transfer_error`), a write that failed on
+            // a port the OS still lists (`driver-hpgl/src/serial.rs::classify_io_error`) — plus
+            // the open-time failures (`list_devices`, `open`, `claim_interface`,
+            // `serialport::open`). "Talking failed" is the one clause true of all of them, and
+            // it names no `Transport` synonym CONTEXT.md lists under `_Avoid_`.
+            TransportError::Io(s) => DeviceError::Io(format!("talking to the cutter failed ({s})")),
         }
     }
 }
@@ -361,7 +441,7 @@ fn resolve_pass_completion(
             // Unloaded media can never become ready on its own — fail with a
             // real reason instead of silently polling out the 60s deadline.
             Ok(n) if n > 0 && buf[0] == b'2' => {
-                return Err(DeviceError::Io("media unloaded".to_string()))
+                return Err(DeviceError::Io("the cutter reports its media is unloaded".to_string()))
             }
             Ok(_) => {} // not-ready reply (e.g. still moving); keep polling
             Err(TransportError::Timeout) => {} // no reply within the interval; keep polling
@@ -457,7 +537,11 @@ fn run_from_pass(
 ) -> Result<PassRunOutcome, DeviceError> {
     let total_passes = passes.len();
     let bytes = open_pass(driver, &passes[pass_index].job, pass_index)
-        .map_err(|e| DeviceError::Io(format!("{e:?}")))?;
+        // The one `Debug` rendering left in this file, and it is over a `DriverError`, which
+        // neither production `Driver` constructs — both real `encode_pass` implementations end in
+        // an unconditional `Ok`, so only a test fake reaches this. Giving that type a producer or
+        // deleting it is #69's either/or; the wrapper keeps `Io`'s payload a sentence meanwhile.
+        .map_err(|e| DeviceError::Io(format!("the cut could not be encoded for this cutter ({e:?})")))?;
     match transmit_bytes(transport, &bytes, job_id, pass_index, total_passes, state, rep, cancel_flag)? {
         TransmitOutcome::Cancelled { submitted_bytes } => {
             return Ok(PassRunOutcome::Cancelled { pass_index, submitted_bytes });
@@ -598,7 +682,7 @@ fn worker_loop(
                     .and_then(|t| {
                         factory
                             .driver_for(&info.machine_id)
-                            .ok_or_else(|| DeviceError::Io(format!("no driver for machine `{}`", info.machine_id)))
+                            .ok_or_else(|| DeviceError::Io(format!("this build has no driver for a `{}`", info.machine_id)))
                             .map(|d| (t, d))
                     })
                     .and_then(|(mut t, d)| {
@@ -641,7 +725,7 @@ fn worker_loop(
                     continue;
                 }
                 if passes.is_empty() {
-                    let _ = reply.send(Err(DeviceError::Io("cut: no passes".into())));
+                    let _ = reply.send(Err(DeviceError::Io("this cut has no passes to send".into())));
                     continue;
                 }
                 if matches!(state, DeviceState::Cancelled { .. }) {
@@ -909,7 +993,7 @@ mod tests {
     fn resume_and_confirm_are_busy_with_no_active_job_and_cancel_is_noop() {
         let (mgr, _events) = DeviceManager::spawn(Arc::new(test_factory()));
         mgr.connect(cameo_info()).unwrap();
-        assert_eq!(mgr.cut(Vec::new()).unwrap_err(), DeviceError::Io("cut: no passes".into()));
+        assert_eq!(mgr.cut(Vec::new()).unwrap_err(), DeviceError::Io("this cut has no passes to send".into()));
         assert_eq!(mgr.resume().unwrap_err(), DeviceError::Busy);
         assert_eq!(mgr.confirm_pass_done().unwrap_err(), DeviceError::Busy);
         mgr.cancel(); // no active job: safe no-op, must not panic or hang
@@ -1120,18 +1204,146 @@ mod tests {
         // a label printer, a debug console. Connecting would let a cut job transmit into it.
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), Vec::new()));
         let err = mgr.connect(puma_info()).unwrap_err();
-        assert!(matches!(err, DeviceError::Io(_)), "refusal must carry a reason, got {err:?}");
+        // The sentence, not just the variant: `Display` forwards an `Io` payload verbatim, so
+        // this branch's wording is only pinned where the branch is actually reached.
+        assert_eq!(
+            err.to_string(),
+            "serial:/dev/ttyUSB0 did not answer a status query, so it cannot be confirmed as a cutter"
+        );
         let s = mgr.status();
         assert_eq!(s.phase, Phase::Failed);
-        assert!(matches!(s.error, Some(DeviceError::Io(_))), "and status must repeat the reason");
+        assert_eq!(s.error, Some(err), "and status must repeat the reason");
         mgr.shutdown();
     }
 
     #[test]
     fn candidate_device_answering_junk_is_refused() {
         let (mgr, _events) = DeviceManager::spawn(probe_factory(puma_info(), vec![Ok(b"BROTHER".to_vec())]));
-        assert!(mgr.connect(puma_info()).is_err(), "a reply that is not a status char proves nothing");
+        let err = mgr.connect(puma_info()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "serial:/dev/ttyUSB0 answered a status query with something other than a status: \
+             not a cutter, or not one this driver speaks",
+            "a reply that is not a status char proves nothing",
+        );
         mgr.shutdown();
+    }
+
+    /// A machine id no driver in this build answers to. Reachable in production by opening a
+    /// project saved against a cutter a later build dropped, or by a `driver-registry` id that
+    /// moved — and unreachable through every other factory in this module, all of which hand
+    /// back a driver unconditionally.
+    struct DriverlessFactory;
+    impl DeviceBackendFactory for DriverlessFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> { vec![puma_info()] }
+        fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> { None }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Ok(Box::new(MockTransport::default()))
+        }
+    }
+
+    #[test]
+    fn a_machine_this_build_has_no_driver_for_is_refused_in_words() {
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(DriverlessFactory));
+        let err = mgr.connect(puma_info()).unwrap_err();
+        assert_eq!(err.to_string(), "this build has no driver for a `puma`");
+        assert_eq!(err.code(), "device_io");
+        mgr.shutdown();
+    }
+
+    /// A driver that refuses the Job it is handed. Neither production `Driver` constructs a
+    /// `DriverError` — both real `encode_pass` implementations end in an unconditional `Ok` — so
+    /// a fake returning one is the only way to reach the pass-encode fault and pin the sentence
+    /// wrapped around it. Whether that type should have a producer at all is #69's question.
+    struct UnencodableFactory;
+    impl DeviceBackendFactory for UnencodableFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> { vec![cameo_info()] }
+        fn driver_for(&self, _machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            struct UnencodableDriver(MachineProfile);
+            impl Driver for UnencodableDriver {
+                fn profile(&self) -> &MachineProfile { &self.0 }
+                fn caps(&self) -> MachineCaps {
+                    MachineCaps { supports_speed: true, supports_force: true, needs_operator_pass_confirm: false }
+                }
+                fn session_begin(&self) -> Vec<u8> { Vec::new() }
+                fn encode_pass(&self, _pass: &Job) -> Result<Vec<u8>, DriverError> {
+                    Err(DriverError::UnsupportedGeometry)
+                }
+                fn pass_park(&self) -> Vec<u8> { Vec::new() }
+                fn session_end(&self) -> Vec<u8> { Vec::new() }
+                fn abort_bytes(&self) -> Option<Vec<u8>> { None }
+            }
+            Some(Box::new(UnencodableDriver(MachineProfile {
+                id: "cameo5".into(), name: "Cameo 5".into(), width_mm: 305.0, height_mm: 1000.0,
+            })))
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            Ok(Box::new(MockTransport::default()))
+        }
+    }
+
+    #[test]
+    fn a_pass_that_cannot_be_encoded_is_refused_in_words() {
+        let (mgr, _events) = DeviceManager::spawn(Arc::new(UnencodableFactory));
+        mgr.connect(cameo_info()).unwrap();
+        let err = mgr.cut(one_pass_job()).unwrap_err();
+        // The `Debug` in the parenthetical is the deliberate exception: it is over a
+        // `DriverError`, which has no `Display` and no producer (#69). Pinned so that if #69
+        // gives it one, this is where the wrapper stops being needed.
+        assert_eq!(err.to_string(), "the cut could not be encoded for this cutter (UnsupportedGeometry)");
+        assert_eq!(err.code(), "device_io");
+        mgr.shutdown();
+    }
+
+    /// One sentence and one code per variant. A new variant fails to compile the `Display` and
+    /// `code` matches; a reworded or re-coded one fails here.
+    ///
+    /// `Io`'s case asserts the wrapper `From<TransportError>` puts around a transport's OS
+    /// string, not a hand-written payload: `Display` forwards a payload verbatim, so a
+    /// hand-written one asserted here would only be a string compared with itself. Those are
+    /// pinned where they are built instead — `a_machine_this_build_has_no_driver_for_is_refused_in_words`,
+    /// `silent_candidate_device_is_refused_instead_of_connected`,
+    /// `candidate_device_answering_junk_is_refused`,
+    /// `unloaded_media_fails_fast_instead_of_polling_out_the_deadline`,
+    /// `resume_and_confirm_are_busy_with_no_active_job_and_cancel_is_noop` and
+    /// `a_pass_that_cannot_be_encoded_is_refused_in_words`.
+    #[test]
+    fn every_device_fault_has_a_sentence_and_a_code() {
+        let cases: Vec<(DeviceError, &str, &str)> = vec![
+            (DeviceError::Disconnected, "device_disconnected", "the cutter is not connected"),
+            (DeviceError::Busy, "device_busy", "the cutter cannot do that right now"),
+            (DeviceError::Timeout, "device_timeout", "the cutter took too long"),
+            (DeviceError::WriteZero, "device_write_zero", "the cutter stopped accepting data"),
+            (
+                DeviceError::from(TransportError::Io("Permission denied (os error 13)".into())),
+                "device_io",
+                "talking to the cutter failed (Permission denied (os error 13))",
+            ),
+            // Two cases, because the two authentic producers are unalike and the sentence has to
+            // hold for both: an open that never got started, and a cutter that is plainly there
+            // and stalled mid-transfer (`usb.rs::classify_transfer_error` keeps `Io` for a device
+            // the OS still lists, and routes an absent one to `Disconnected`).
+            (
+                DeviceError::from(TransportError::Io("Stall".into())),
+                "device_io",
+                "talking to the cutter failed (Stall)",
+            ),
+        ];
+        for (error, code, message) in cases {
+            assert_eq!(error.code(), code, "code for {error:?}");
+            assert_eq!(error.to_string(), message, "message for {error:?}");
+        }
+    }
+
+    /// The four payload-free `TransportError`s map to three `DeviceError`s, so the mapping is
+    /// only visible in which sentence comes out — and `NotFound` sharing `Disconnected`'s is
+    /// exactly why that sentence cannot say the cutter *was* connected.
+    #[test]
+    fn a_transport_fault_keeps_its_kind_across_the_conversion() {
+        assert_eq!(DeviceError::from(TransportError::NotFound), DeviceError::Disconnected);
+        assert_eq!(DeviceError::from(TransportError::Disconnected), DeviceError::Disconnected);
+        assert_eq!(DeviceError::from(TransportError::Timeout), DeviceError::Timeout);
+        assert_eq!(DeviceError::from(TransportError::WriteZero), DeviceError::WriteZero);
     }
 
     #[test]
@@ -1466,10 +1678,10 @@ mod tests {
         drain(&events);
 
         let err = mgr.cut(one_pass_job()).unwrap_err();
-        assert_eq!(err, DeviceError::Io("cable pulled".into()));
+        assert_eq!(err, DeviceError::Io("talking to the cutter failed (cable pulled)".into()));
         let s = mgr.status();
         assert_eq!(s.phase, Phase::Failed);
-        assert_eq!(s.error, Some(DeviceError::Io("cable pulled".into())));
+        assert_eq!(s.error, Some(DeviceError::Io("talking to the cutter failed (cable pulled)".into())));
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
@@ -1561,7 +1773,7 @@ mod tests {
                 mgr.cut(one_pass_job())?;
                 mgr.confirm_pass_done()
             },
-            DeviceError::Io("cable pulled".into()),
+            DeviceError::Io("talking to the cutter failed (cable pulled)".into()),
         );
 
         // WaitingForColorSwap: pass 1 completes and parks (empty pass_park is a
@@ -1595,7 +1807,7 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
         let start = std::time::Instant::now();
         let err = mgr.cut(two_pass_job()).unwrap_err();
-        assert_eq!(err, DeviceError::Io("media unloaded".to_string()));
+        assert_eq!(err, DeviceError::Io("the cutter reports its media is unloaded".to_string()));
         // The whole point: an unloaded reply must not silently poll out the 60s cap.
         assert!(start.elapsed() < Duration::from_secs(5));
     }

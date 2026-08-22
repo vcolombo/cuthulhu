@@ -25,6 +25,23 @@ impl IpcError {
     }
 }
 
+/// A device fault as the UI's own currency, in one place instead of at every call site.
+///
+/// Eight sites wrote `IpcError::new("device_error", format!("{e:?}"))`, so every variant arrived
+/// as one code with the discriminant surviving only inside a `Debug` string — a cable pull and a
+/// verb issued at the wrong moment were the same failure to anything reading the code, and
+/// distinguishable to a human only by the Rust value in the message. The conversion lives here
+/// so the call sites are a bare `?`, which is what makes a ninth hand-written one impossible to
+/// add by accident (#73).
+///
+/// The code and the sentence are both `driver-core`'s: the CLI, the Cut Host and this desktop
+/// name the same fault the same way, and adding a variant means editing one match, there.
+impl From<driver_core::manager::DeviceError> for IpcError {
+    fn from(e: driver_core::manager::DeviceError) -> Self {
+        IpcError::new(e.code(), e.to_string())
+    }
+}
+
 /// A client failure as a code the UI can branch on, keeping the three that need three different
 /// things from the operator apart.
 ///
@@ -40,6 +57,11 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         ClientError::Fingerprint { .. } => "host_fingerprint",
         // The host answered and said no. Re-pairing is the fix; waiting is not.
         ClientError::Unauthorized => "host_unauthorized",
+        // A refusal that is the *cutter's* is reported as that fault, not as the host's: the
+        // same jam, cable pull or wrong-moment verb must not read differently depending on
+        // whether the cutter hangs off this laptop or off a Pi. The other refusals are the
+        // host's own and keep its code.
+        ClientError::Refused(cut_host::protocol::Refusal::Device(fault)) => fault.code(),
         // The host was reached, understood the request, and refused it.
         ClientError::Refused(_) => "host_refused",
         ClientError::Transport(_) => "host_unreachable",
@@ -579,8 +601,7 @@ impl DeviceManagerHandle {
         match route {
             Route::Local => {
                 self.manager()?
-                    .connect(info.clone())
-                    .map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+                    .connect(info.clone())?;
             }
             // A Cut Host connects each cutter itself at startup, so aiming at one is a local
             // bookkeeping act: there is no remote connection to open. But the local manager must
@@ -591,7 +612,7 @@ impl DeviceManagerHandle {
             // cut is active, so this can only disconnect an idle (or already-disconnected)
             // manager — freeing the USB device for other software as a side effect.
             Route::Host(_) => {
-                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+                self.manager()?.disconnect()?;
             }
         }
         *self.connected.lock().unwrap() = Some(info);
@@ -623,7 +644,7 @@ impl DeviceManagerHandle {
             // transport and discard its parked job while aimed at a Pi, silently.
             None | Some(Route::Local) => {
                 self.refuse_while_the_local_cutter_is_working("disconnecting it")?;
-                self.manager()?.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
+                self.manager()?.disconnect()?;
             }
             Some(Route::Host(_)) => {}
         }
@@ -647,8 +668,8 @@ impl DeviceManagerHandle {
             Route::Local => {
                 self.refuse_while_the_local_cutter_is_working("reconnecting it")?;
                 let mgr = self.manager()?;
-                mgr.disconnect().map_err(|e| IpcError::new("device_error", format!("{e:?}")))?;
-                mgr.connect(device).map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+                mgr.disconnect()?;
+                Ok(mgr.connect(device)?)
             }
             Route::Host(id) => self.with_host(&id, |c| c.reconnect(&device.instance_id)),
         }
@@ -784,7 +805,7 @@ impl DeviceManagerHandle {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => {
-                self.manager()?.resume().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+                Ok(self.manager()?.resume()?)
             }
             Some(Route::Host(id)) => {
                 let device = aimed.expect("a route implies a device").instance_id;
@@ -797,7 +818,7 @@ impl DeviceManagerHandle {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => {
-                self.manager()?.confirm_pass_done().map_err(|e| IpcError::new("device_error", format!("{e:?}")))
+                Ok(self.manager()?.confirm_pass_done()?)
             }
             Some(Route::Host(id)) => {
                 let device = aimed.expect("a route implies a device").instance_id;
@@ -929,11 +950,7 @@ impl DeviceManagerHandle {
 
         // Routed by the device Preflight approved, now that it is known to be the one aimed at.
         match self.route(&planned_for)? {
-            Route::Local => self
-                .manager()?
-                .cut(passes)
-                .map(|job_id| CutStarted { job_id, duplicate: false })
-                .map_err(|e| IpcError::new("device_error", format!("{e:?}"))),
+            Route::Local => Ok(CutStarted { job_id: self.manager()?.cut(passes)?, duplicate: false }),
             Route::Host(id) => {
                 let (device, machine_id) = (planned_for.instance_id, planned_for.machine_id);
                 let key = JobKey {
@@ -1980,6 +1997,65 @@ mod tests {
         }
         // Still parked, and still answerable — the refusal changed nothing.
         assert!(dev.status().actions.confirm);
+    }
+
+    /// The wrong-state refusal, which needs no hardware to reach: `resume` with nothing parked.
+    /// It used to arrive as `device_error` with `Busy` inside a `Debug` string, indistinguishable
+    /// to a caller from a cable pull — the two things this issue exists to separate (#73).
+    #[test]
+    fn a_verb_the_cutter_cannot_accept_reports_the_busy_code() {
+        let dev = test_device_setup();
+        let err = dev.resume().unwrap_err();
+        assert_eq!(err.code, "device_busy", "got {err:?}");
+        assert_eq!(err.message, "the cutter cannot do that right now");
+    }
+
+    /// A cutter whose transport takes the worker thread down as it opens.
+    ///
+    /// The only way to reach `Disconnected`'s worker-gone site from out here:
+    /// `DeviceManagerHandle::shutdown` clears the stored manager, so a verb after it reports
+    /// `shut_down` rather than reaching a dead worker at all, and `DeviceManager`'s own command
+    /// channel is private to `driver-core`.
+    struct DeadWorkerFactory;
+    impl DeviceBackendFactory for DeadWorkerFactory {
+        fn list_devices(&self) -> Vec<DeviceInfo> { vec![test_instance()] }
+        fn driver_for(&self, machine_id: &str) -> Option<Box<dyn Driver + Send>> {
+            TestFactory.driver_for(machine_id)
+        }
+        fn open_transport(&self, _info: &DeviceInfo) -> Result<Box<dyn Transport>, TransportError> {
+            panic!("a transport that takes the worker thread with it")
+        }
+    }
+
+    /// The other half of the code the eight sites collapsed: nothing refused this verb, there is
+    /// simply no worker left to answer it. The panic the harness prints is this test working.
+    #[test]
+    fn a_verb_with_no_worker_left_reports_the_disconnected_code() {
+        let (dev, _events) = DeviceManagerHandle::new(Arc::new(DeadWorkerFactory));
+        let err = dev.connect(test_instance()).unwrap_err();
+        assert_eq!(err.code, "device_disconnected", "got {err:?}");
+        assert_eq!(err.message, "the cutter is not connected");
+    }
+
+    /// A cutter jamming, unplugged or asked for a verb it cannot do must read the same whether it
+    /// hangs off this laptop or off a Pi. The Cut Host route carries a real `DeviceError` across
+    /// the wire and `host_error` used to fold it — with every other refusal — into
+    /// `host_refused`, so the identical fault had two codes and two sentences (#73).
+    #[test]
+    fn a_device_fault_from_a_host_reports_what_the_same_fault_reports_locally() {
+        use cut_host::client::ClientError;
+        use cut_host::protocol::Refusal;
+
+        let dev = test_device_setup();
+        let local = dev.resume().unwrap_err();
+        let remote = host_error(&ClientError::Refused(Refusal::Device(
+            driver_core::manager::DeviceError::Busy,
+        )));
+        assert_eq!((remote.code, remote.message), (local.code, local.message));
+
+        // And the arm is not a catch-all: a refusal that is the host's own keeps the host's code.
+        let its_own = host_error(&ClientError::Refused(Refusal::UnknownDevice("usb:1:4".into())));
+        assert_eq!(its_own.code, "host_refused", "got {its_own:?}");
     }
 
     fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {

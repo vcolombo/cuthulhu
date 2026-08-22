@@ -35,7 +35,11 @@ impl std::fmt::Display for ClientError {
             ClientError::Refused(Refusal::MachineMismatch { dispatched, attached }) =>
                 write!(f, "the cut was planned for a `{dispatched}`, but a `{attached}` is attached"),
             ClientError::Refused(Refusal::Preflight(fault)) => write!(f, "{fault}"),
-            ClientError::Refused(Refusal::Device(e)) => write!(f, "the cutter refused: {e:?}"),
+            // Forwarded, not prefixed: a `DeviceError` writes a whole sentence of its own, and
+            // "the cutter refused: " in front of one read twice — the same call `CutError` makes
+            // for `Preflight` above (#90). Which cutter it was is the caller's context, not this
+            // string's: the desktop asked one host about one device.
+            ClientError::Refused(Refusal::Device(e)) => write!(f, "{e}"),
             ClientError::Refused(Refusal::DispatchIdTooLong { max }) =>
                 write!(f, "this host will not accept a dispatch id longer than {max} characters"),
             ClientError::Fingerprint { expected, found } =>

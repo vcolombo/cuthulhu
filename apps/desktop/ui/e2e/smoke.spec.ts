@@ -534,7 +534,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const holdsATransport = status.phase !== "Disconnected" && status.phase !== "Failed";
       if (connected && connected.host === null && info.host === null
           && connected.instance_id !== info.instance_id && holdsATransport) {
-        throw ipcError("device_error", "Busy");
+        throw ipcError("device_busy", "the cutter cannot do that right now");
       }
       connected = info;
       // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
@@ -715,7 +715,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return null;
     },
     resume_cut: () => {
-      if (status.phase !== "AwaitingColorSwap") throw ipcError("device_error", "not waiting for color swap");
+      // Production's own refusal, verbatim: the worker answers a `Resume` outside
+      // `WaitingForColorSwap` with `DeviceError::Busy`, which the desktop reports as
+      // `device_busy` (#73). It used to read `device_error` with an invented message.
+      if (status.phase !== "AwaitingColorSwap") throw ipcError("device_busy", "the cutter cannot do that right now");
       const nextIndex = status.pass?.index ?? 0;
       if (failNextResume) {
         // Async failure, as in production: resume_cut returns Ok and the failure

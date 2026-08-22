@@ -407,16 +407,27 @@ mod tests {
     /// The document root is present and parentless, so `delete` and `reorder` used to call it
     /// missing. Codex found it in the review of #93; the Layers panel gives the root no row, so
     /// nothing wired reaches this, but the sentence has to be true wherever the id comes from.
+    ///
+    /// `boolean_op` is here in both positions because it is the one command that walks more than
+    /// one id: its parent lookup was a `.unwrap()` justified only for `ids[0]`, so the id *after*
+    /// a good one is where a revert to `NotFound` — or to a panic — would show. Left uncovered
+    /// when #277 hit the review-push cap.
     #[test]
     fn a_command_on_the_parentless_root_says_it_has_no_parent() {
-        let ed = Editor::new();
+        let mut ed = Editor::new();
         let root = ed.doc.root;
+        let d = add_primitive(&mut ed.doc.ids, root, ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let real = *ed.doc.get(root).unwrap().children.first().unwrap();
         assert!(ed.doc.get(root).is_some(), "the root is present, which is the whole point");
 
         for refusal in [
             delete_nodes(&ed.doc, &[root]).unwrap_err(),
             reorder(&ed.doc, root, 0).unwrap_err(),
+            boolean_op(&ed.doc, &[root, real], geometry::BoolOp::Union).unwrap_err(),
+            boolean_op(&ed.doc, &[real, root], geometry::BoolOp::Union).unwrap_err(),
         ] {
+            assert_eq!(refusal, CmdError::NoParent);
             assert_eq!(refusal.to_string(), "this node has no parent, and the command needs one");
         }
     }

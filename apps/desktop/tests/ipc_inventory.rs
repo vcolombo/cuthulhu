@@ -168,10 +168,7 @@ impl<'ast> Visit<'ast> for FindHandlerRegistry {
 fn command_definitions(src: &Path) -> BTreeMap<String, Definition> {
     let mut defined = BTreeMap::new();
     for file in rust_files(src) {
-        let parsed = parse(&file);
-        let mut imports = Imports::default();
-        collect_imports(&parsed.items, &mut imports);
-        collect_commands(&parsed.items, &file, &imports, &mut defined);
+        collect_commands(&parse(&file).items, &file, &mut defined);
     }
     defined
 }
@@ -182,7 +179,19 @@ struct Definition {
     imports: Imports,
 }
 
-fn collect_commands(items: &[Item], file: &Path, imports: &Imports, into: &mut BTreeMap<String, Definition>) {
+/// Walks one module's items, carrying that module's own imports. Scopes are exact rather than
+/// inherited, because Rust does not lend a `use` to a nested module either: a command inside `mod
+/// inner` sees `inner`'s imports and not its parent's, and `use super::*` arrives as a glob.
+fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Definition>) {
+    // Collected first, in a pass of its own: a `use` is in scope for the whole module regardless of
+    // whether it is written above or below the function that reads it.
+    let mut imports = Imports::default();
+    for item in items {
+        if let Item::Use(u) = item {
+            collect_use_tree(&u.tree, &mut Vec::new(), &mut imports);
+        }
+    }
+
     for item in items {
         match item {
             Item::Fn(f) if f.attrs.iter().any(is_command_attribute) => {
@@ -198,7 +207,7 @@ fn collect_commands(items: &[Item], file: &Path, imports: &Imports, into: &mut B
             // leave the registry naming something this file could not find.
             Item::Mod(m) => {
                 if let Some((_, items)) = &m.content {
-                    collect_commands(items, file, imports, into);
+                    collect_commands(items, file, into);
                 }
             }
             _ => {}
@@ -206,12 +215,12 @@ fn collect_commands(items: &[Item], file: &Path, imports: &Imports, into: &mut B
     }
 }
 
-/// What a name in a signature refers to: the `use` items in scope, gathered per file.
+/// What a name in a signature refers to: the `use` items of the module the command is written in.
 ///
-/// A file's imports are read as one set rather than per module, so a name imported twice keeps both
-/// paths — which module a command sits in decides which one it sees, and that is not something a
-/// file-wide reading can answer. Where the two disagree about being Tauri's, the caller refuses
-/// rather than picking, because either wrong answer drops or invents a payload key.
+/// One local name can still stand for several paths — `use a::X; use b::X as X;` does not compile,
+/// but `use a::X;` twice does, and a rename can land a second path on the same name. The paths are
+/// all kept, and the caller refuses only where they disagree about being Tauri's, because either
+/// wrong answer drops or invents a payload key.
 #[derive(Clone, Default)]
 struct Imports {
     /// Local name to every path this file imports it from.
@@ -226,20 +235,6 @@ impl Imports {
         let paths = self.names.entry(local).or_default();
         if !paths.contains(&path) {
             paths.push(path);
-        }
-    }
-}
-
-fn collect_imports(items: &[Item], into: &mut Imports) {
-    for item in items {
-        match item {
-            Item::Use(u) => collect_use_tree(&u.tree, &mut Vec::new(), into),
-            Item::Mod(m) => {
-                if let Some((_, items)) = &m.content {
-                    collect_imports(items, into);
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -494,20 +489,14 @@ mod naming {
     use super::*;
 
     /// Parsed as a file rather than a lone function, because a bare type name in the signature is
-    /// answered by the `use` items above it. A function on its own is a valid file with none.
+    /// answered by the `use` items of the module around it — so the helper takes the same route the
+    /// generator does, `collect_commands`, and reads back what it recorded for the command.
     fn command(source: &str) -> Result<ExternalCommand, String> {
         let file = syn::parse_file(source).expect("a file");
-        let mut imports = Imports::default();
-        collect_imports(&file.items, &mut imports);
-        let function = file
-            .items
-            .iter()
-            .find_map(|item| match item {
-                Item::Fn(f) => Some(f),
-                _ => None,
-            })
-            .expect("a function");
-        external_command(function, &imports)
+        let mut defined = BTreeMap::new();
+        collect_commands(&file.items, Path::new("<test>"), &mut defined);
+        let (_, definition) = defined.iter().next().expect("a command function");
+        external_command(&definition.function, &definition.imports)
     }
 
     #[test]
@@ -577,11 +566,30 @@ mod naming {
             .expect("a supported shape");
         assert_eq!(c.args, ["w"]);
 
-        // A glob could have brought Tauri's in, and two imports disagreeing leave nothing to read.
-        assert!(command("use tauri::*; #[tauri::command] fn f(w: Window) {}").is_err());
-        assert!(command(
+        // Each module answers for itself. An unrelated `mod inner` shadowing the name locally says
+        // nothing about a command outside it, and Rust does not lend the outer `use` inward either.
+        let c = command(
             "use tauri::Window; mod inner { use custom::Window; }
-             #[tauri::command] fn f(w: Window) {}"
+             #[tauri::command] fn f(w: Window, id: String) {}",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
+
+        let c = command(
+            "use tauri::Window;
+             mod inner { use custom::Window; #[tauri::command] pub fn f(w: Window) {} }",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["w"]);
+
+        // A glob can bring Tauri's own in under its real name, and nothing here sees through one.
+        assert!(command("use tauri::*; #[tauri::command] fn f(w: Window) {}").is_err());
+
+        // Two imports the compiler keeps apart with `cfg` both land in the same scope here, and a
+        // signature that means one thing on Unix and another on Windows has no single answer.
+        assert!(command(
+            "#[cfg(unix)] use tauri::Window; #[cfg(windows)] use custom::Window;
+             #[tauri::command] fn f(w: Window) {}",
         )
         .is_err());
     }

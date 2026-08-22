@@ -78,7 +78,8 @@ impl std::fmt::Display for DeviceError {
             // second: a cutter that keeps replying "still moving" for a minute answers every
             // poll and still ends up here.
             DeviceError::Timeout => write!(f, "the cutter took too long"),
-            // `write_all` was handed a zero-byte write, on a cut's bytes or on a status query.
+            // An underlying `write` returned `Ok(0)` with bytes still to go, so `write_all`
+            // would otherwise spin: the cutter is there and taking nothing.
             DeviceError::WriteZero => write!(f, "the cutter stopped accepting data"),
             // Already a whole sentence, so a prefix would read twice — the reason #90 dropped
             // `"preflight: "`.
@@ -111,12 +112,19 @@ impl From<TransportError> for DeviceError {
             TransportError::NotFound | TransportError::Disconnected => DeviceError::Disconnected,
             TransportError::Timeout => DeviceError::Timeout,
             TransportError::WriteZero => DeviceError::WriteZero,
-            // Wrapped, not passed through: a transport's payload is an OS string
-            // ("Permission denied (os error 13)", "transfer thread panicked"), and `Io`'s
-            // payload is what an operator reads verbatim. Borrows `ClientError::Transport`'s
-            // wording one layer down — "could not be reached", because CONTEXT.md's Transport
-            // entry lists `connection`, `channel`, `port` and `link` under `_Avoid_`.
-            TransportError::Io(s) => DeviceError::Io(format!("the cutter could not be reached ({s})")),
+            // Wrapped, not passed through: a transport's payload is an OS or driver string
+            // ("Permission denied (os error 13)", "Stall", "transfer thread panicked"), and
+            // `Io`'s payload is what an operator reads verbatim.
+            //
+            // Not "could not be reached", which the first draft of this said: both classifiers
+            // route an absent cutter to `Disconnected` and keep `Io` for one that is still
+            // there — a stalled endpoint on a listed USB device
+            // (`driver-silhouette/src/usb.rs::classify_transfer_error`), a write that failed on
+            // a port the OS still lists (`driver-hpgl/src/serial.rs::classify_io_error`) — plus
+            // the open-time failures (`list_devices`, `open`, `claim_interface`,
+            // `serialport::open`). "Talking failed" is the one clause true of all of them, and
+            // it names no `Transport` synonym CONTEXT.md lists under `_Avoid_`.
+            TransportError::Io(s) => DeviceError::Io(format!("talking to the cutter failed ({s})")),
         }
     }
 }
@@ -529,10 +537,10 @@ fn run_from_pass(
 ) -> Result<PassRunOutcome, DeviceError> {
     let total_passes = passes.len();
     let bytes = open_pass(driver, &passes[pass_index].job, pass_index)
-        // The one `Debug` rendering left in this file, and it is over a `DriverError`, which no
-        // code in the workspace constructs — both real `encode_pass` implementations end in an
-        // unconditional `Ok`. Giving that type a producer or deleting it is #69's either/or; the
-        // wrapper keeps `Io`'s payload a sentence in the meantime.
+        // The one `Debug` rendering left in this file, and it is over a `DriverError`, which
+        // neither production `Driver` constructs — both real `encode_pass` implementations end in
+        // an unconditional `Ok`, so only a test fake reaches this. Giving that type a producer or
+        // deleting it is #69's either/or; the wrapper keeps `Io`'s payload a sentence meanwhile.
         .map_err(|e| DeviceError::Io(format!("the cut could not be encoded for this cutter ({e:?})")))?;
     match transmit_bytes(transport, &bytes, job_id, pass_index, total_passes, state, rep, cancel_flag)? {
         TransmitOutcome::Cancelled { submitted_bytes } => {
@@ -1243,10 +1251,10 @@ mod tests {
         mgr.shutdown();
     }
 
-    /// A driver that refuses the Job it is handed. Nothing in the workspace constructs a
+    /// A driver that refuses the Job it is handed. Neither production `Driver` constructs a
     /// `DriverError` — both real `encode_pass` implementations end in an unconditional `Ok` — so
-    /// the only way to reach the pass-encode fault, and pin the sentence wrapped around it, is a
-    /// fake that returns one. Whether that type should have a producer at all is #69's question.
+    /// a fake returning one is the only way to reach the pass-encode fault and pin the sentence
+    /// wrapped around it. Whether that type should have a producer at all is #69's question.
     struct UnencodableFactory;
     impl DeviceBackendFactory for UnencodableFactory {
         fn list_devices(&self) -> Vec<DeviceInfo> { vec![cameo_info()] }
@@ -1309,7 +1317,16 @@ mod tests {
             (
                 DeviceError::from(TransportError::Io("Permission denied (os error 13)".into())),
                 "device_io",
-                "the cutter could not be reached (Permission denied (os error 13))",
+                "talking to the cutter failed (Permission denied (os error 13))",
+            ),
+            // Two cases, because the two authentic producers are unalike and the sentence has to
+            // hold for both: an open that never got started, and a cutter that is plainly there
+            // and stalled mid-transfer (`usb.rs::classify_transfer_error` keeps `Io` for a device
+            // the OS still lists, and routes an absent one to `Disconnected`).
+            (
+                DeviceError::from(TransportError::Io("Stall".into())),
+                "device_io",
+                "talking to the cutter failed (Stall)",
             ),
         ];
         for (error, code, message) in cases {
@@ -1318,9 +1335,9 @@ mod tests {
         }
     }
 
-    /// The other three `TransportError`s carry no payload, so their mapping is only visible in
-    /// which sentence comes out — and `NotFound` sharing `Disconnected`'s is exactly why that
-    /// sentence cannot say the cutter *was* connected.
+    /// The four payload-free `TransportError`s map to three `DeviceError`s, so the mapping is
+    /// only visible in which sentence comes out — and `NotFound` sharing `Disconnected`'s is
+    /// exactly why that sentence cannot say the cutter *was* connected.
     #[test]
     fn a_transport_fault_keeps_its_kind_across_the_conversion() {
         assert_eq!(DeviceError::from(TransportError::NotFound), DeviceError::Disconnected);
@@ -1661,10 +1678,10 @@ mod tests {
         drain(&events);
 
         let err = mgr.cut(one_pass_job()).unwrap_err();
-        assert_eq!(err, DeviceError::Io("the cutter could not be reached (cable pulled)".into()));
+        assert_eq!(err, DeviceError::Io("talking to the cutter failed (cable pulled)".into()));
         let s = mgr.status();
         assert_eq!(s.phase, Phase::Failed);
-        assert_eq!(s.error, Some(DeviceError::Io("the cutter could not be reached (cable pulled)".into())));
+        assert_eq!(s.error, Some(DeviceError::Io("talking to the cutter failed (cable pulled)".into())));
 
         let evs = drain(&events);
         assert!(evs.iter().any(|e| matches!(&e.kind, DeviceEventKind::Failed(DeviceError::Io(_)))));
@@ -1756,7 +1773,7 @@ mod tests {
                 mgr.cut(one_pass_job())?;
                 mgr.confirm_pass_done()
             },
-            DeviceError::Io("the cutter could not be reached (cable pulled)".into()),
+            DeviceError::Io("talking to the cutter failed (cable pulled)".into()),
         );
 
         // WaitingForColorSwap: pass 1 completes and parks (empty pass_park is a

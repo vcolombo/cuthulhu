@@ -36,16 +36,34 @@ const declared: Record<string, string[]> = inventory;
 
 const observed = new Set<string>();
 
+// Four exports are not commands: two open the dialog plugin's own picker, and two only read a
+// rejected value. Each must invoke nothing at all, which is as much a fact about the seam as the
+// others.
+const NOT_COMMANDS = ["pickSavePath", "pickOpenPath", "ipcErrorCode", "ipcErrorMessage"];
+
+// A wrapper is named after the command it calls, so the pairing is derived rather than kept by hand
+// in what would be a fourth copy of the surface. Two wrappers cannot follow the rule: `delete` is a
+// reserved word in TypeScript, and `pickImagePath` is named for what it returns.
+const RENAMED: Record<string, string> = { deleteNodes: "delete", pickImagePath: "pick_image" };
+
+const commandsExpectedOf = (wrapper: string) => {
+  if (NOT_COMMANDS.includes(wrapper)) return [];
+  return [RENAMED[wrapper] ?? wrapper.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)];
+};
+
 const checkRecordedCalls = (wrapper: string) => {
+  // Exactly its own command, exactly once. Membership alone would let two wrappers swap the
+  // literals they invoke — `newDoc` calling `snapshot` and back — while every name stayed
+  // registered and every command stayed observed.
+  expect(calls.map((c) => c.cmd), `what ${wrapper} invoked`).toEqual(commandsExpectedOf(wrapper));
   for (const { cmd, args } of calls) {
-    expect(Object.keys(declared), `${wrapper} invokes an unregistered command`).toContain(cmd);
     const undeclaredKeys = Object.keys(args ?? {}).filter((k) => !declared[cmd].includes(k));
     expect(undeclaredKeys, `${wrapper} sends a key ${cmd} does not declare`).toEqual([]);
     observed.add(cmd);
   }
 };
 
-describe("every ipc.ts wrapper names a registered command", () => {
+describe("every ipc.ts wrapper calls its own registered command", () => {
   for (const [wrapper, exported] of Object.entries(ipc)) {
     if (typeof exported !== "function") continue;
 
@@ -71,14 +89,12 @@ describe("a wrapper that forwards its caller's payload", () => {
       path: "/tmp/trace.png",
       controls: { mode: "binary", speckle: 4, smoothing: 60, detail: 9, colors: 2 },
     });
-    expect(calls.map((c) => c.cmd)).toEqual(["trace_image"]);
     checkRecordedCalls("traceImage");
   });
 
   test("loadImagePreview", async () => {
     calls.length = 0;
     await ipc.loadImagePreview({ path: "/tmp/trace.png" });
-    expect(calls.map((c) => c.cmd)).toEqual(["load_image_preview"]);
     checkRecordedCalls("loadImagePreview");
   });
 });
@@ -86,14 +102,10 @@ describe("a wrapper that forwards its caller's payload", () => {
 // Declared last on purpose: vitest runs a file's tests in order, so this reads what the tests above
 // recorded.
 //
-// Without it the checks above are conditional on a call being made at all — gut `forceQuit` to a
-// bare `return` and every one of them still passes, because a wrapper that invokes nothing has
-// nothing to disagree with. That is the same silence #85 is about, one level up: the command stops
-// being witnessed and no test says so.
-//
-// Equality, not containment. A registered command with no wrapper is one the desktop cannot call
-// from the only place it reaches Rust (`CLAUDE.md`: the UI reaches Rust only through `ui/src/ipc.ts`),
-// so it is worth failing over rather than leaving for someone to notice.
+// The tests above each hold one wrapper to one command, which leaves the other direction: a command
+// registered in Rust that no wrapper names at all. Nothing else here would notice it, and it is
+// worth failing over — `CLAUDE.md` has the UI reaching Rust only through `ui/src/ipc.ts`, so a
+// registered command with no wrapper there is one nothing can invoke.
 test("every registered command is witnessed by a wrapper", () => {
   expect([...observed].sort()).toEqual(Object.keys(declared).sort());
 });

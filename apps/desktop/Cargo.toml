@@ -31,3 +31,11 @@ serde_json = "1"
 base64 = "0.22"
 dirs = "6"
 tempfile = "3"
+
+# Both are already in `Cargo.lock` as build-time dependencies of `tauri-macros`, so this adds a
+# lockfile edit rather than a crate to the tree. `heck` is pinned to the same major the command
+# macro itself uses: `tests/ipc_inventory.rs` has to reproduce Tauri's argument casing exactly, and
+# reimplementing that conversion is how the two spellings would drift.
+[dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+heck = "0.5"

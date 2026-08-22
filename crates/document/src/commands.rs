@@ -168,6 +168,9 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     let mut seen = HashSet::new();
     for &id in ids {
         if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
+        // Existence first: an id that names nothing has no parent either, so asking `parent_of`
+        // about it would answer `NoParent` for what is really a stale selection.
+        doc.get(id).ok_or(CmdError::NotFound)?;
         let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
         push_subtree(doc, id, parent, &mut ops)?;
     }
@@ -176,10 +179,12 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
 }
 
 pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, CmdError> {
+    // Existence first, for the reason `delete_nodes` gives above.
+    let node = doc.get(id).ok_or(CmdError::NotFound)?.clone();
     let parent = parent_of(doc, id).ok_or(CmdError::NoParent)?;
     Ok(Delta(vec![
         NodeOp::Remove { parent, id },
-        NodeOp::Add { parent, node: doc.get(id).unwrap().clone(), index: new_index },
+        NodeOp::Add { parent, node, index: new_index },
     ]))
 }
 
@@ -237,9 +242,21 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     let mut seen = HashSet::new();
     let ids: Vec<NodeId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
     if ids.len() < 2 { return Err(CmdError::EmptySelection); }
+    // Settle the tree before the geometry: whether a selected node exists and where its result
+    // can land does not depend on any outline, so a stale id or an orphan should say so rather
+    // than lose the race to a no-outline or empty-result refusal. Walking `parent_of` once per
+    // id also drops a second scan of `doc.nodes` per node.
+    let parents: Vec<NodeId> = ids.iter()
+        .map(|&id| {
+            doc.get(id).ok_or(CmdError::NotFound)?;
+            parent_of(doc, id).ok_or(CmdError::NoParent)
+        })
+        .collect::<Result<_, CmdError>>()?;
+    let dest_parent = parents[0];
+
     let mut paths = vec![];
     for &id in &ids {
-        let node = doc.get(id).ok_or(CmdError::NotFound)?;
+        let node = doc.get(id).expect("settled above");
         // `Ok(None)` is a Group or Layer: present, and simply without an outline of its own —
         // not the absent node `NotFound` names. Reachable, because the Layers panel selects
         // containers and the toolbar offers a boolean op on any two selected nodes.
@@ -252,17 +269,14 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
     // `to_string`, not `{e:?}`: the same operator-facing contract as `shape_outline` above.
     // Two shapes that do not overlap refuse here, and `Degenerate` alone said nothing (#93).
     let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(e.to_string()))?;
-    let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NoParent)?;
     let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
     let dest_inv = dest_world.inverse()
         .ok_or_else(|| CmdError::Geometry(
             "the result's parent sits under a transform that cannot be reversed".into()))?;
     let result_local = result.transformed(&dest_inv);
-    // `NoParent`, not `unwrap()`: only `ids[0]`'s parent was proven above, so an orphan later in
-    // the selection used to panic the command rather than refuse it.
-    let mut ops: Vec<NodeOp> = ids.iter()
-        .map(|&id| Ok(NodeOp::Remove { parent: parent_of(doc, id).ok_or(CmdError::NoParent)?, id }))
-        .collect::<Result<_, CmdError>>()?;
+    let mut ops: Vec<NodeOp> = ids.iter().zip(parents)
+        .map(|(&id, parent)| NodeOp::Remove { parent, id })
+        .collect();
     ops.push(NodeOp::Add {
         parent: dest_parent,
         node: Node::shape(NodeId(u64::MAX), ShapeKind::Path { d: result_local.to_svg() }),
@@ -404,6 +418,27 @@ mod tests {
             reorder(&ed.doc, root, 0).unwrap_err(),
         ] {
             assert_eq!(refusal.to_string(), "this node has no parent, and the command needs one");
+        }
+    }
+
+    /// The other side of `NoParent`: an id naming nothing has no parent either, so a command
+    /// that asked `parent_of` first would blame the parent for a stale selection. Copilot found
+    /// that regression in the review of #93.
+    #[test]
+    fn a_stale_id_is_still_not_found_rather_than_parentless() {
+        let mut ed = Editor::new();
+        let d = add_primitive(&mut ed.doc.ids, ed.doc.root,
+            ShapeKind::Rect { w: 10.0, h: 10.0 }).unwrap();
+        ed.commit(d);
+        let real = *ed.doc.get(ed.doc.root).unwrap().children.first().unwrap();
+        let stale = NodeId(9999);
+
+        for refusal in [
+            delete_nodes(&ed.doc, &[stale]).unwrap_err(),
+            reorder(&ed.doc, stale, 0).unwrap_err(),
+            boolean_op(&ed.doc, &[stale, real], geometry::BoolOp::Union).unwrap_err(),
+        ] {
+            assert_eq!(refusal, CmdError::NotFound);
         }
     }
 

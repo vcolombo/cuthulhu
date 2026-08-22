@@ -208,7 +208,14 @@ pub fn run(
                     None => Err("cut ended without reporting how".into()),
                 }
             }
-            Phase::Failed => return Err(format!("device error: {:?}", status.error)),
+            // `status_of` maps `Error(e)` to both the phase and the reason, so a `Failed` with
+            // nothing in `error` is the same `driver-core` bug the `Idle` arm above names — not a
+            // state a cut can reach. It used to print `device error: Some(Timeout)` regardless.
+            Phase::Failed => {
+                return Err(status
+                    .error
+                    .map_or_else(|| "the cutter failed without saying why".to_string(), |e| e.to_string()))
+            }
             // Sending / Cancelling / connection phases: nothing for the operator to do.
             _ => std::thread::sleep(std::time::Duration::from_millis(50)),
         }

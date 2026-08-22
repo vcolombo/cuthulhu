@@ -427,6 +427,7 @@ mod tests {
             boolean_op(&ed.doc, &[root, real], geometry::BoolOp::Union).unwrap_err(),
             boolean_op(&ed.doc, &[real, root], geometry::BoolOp::Union).unwrap_err(),
         ] {
+            assert_eq!(refusal, CmdError::NoParent);
             assert_eq!(refusal.to_string(), "this node has no parent, and the command needs one");
         }
     }

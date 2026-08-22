@@ -168,7 +168,7 @@ impl<'ast> Visit<'ast> for FindHandlerRegistry {
 fn command_definitions(src: &Path) -> BTreeMap<String, Definition> {
     let mut defined = BTreeMap::new();
     for file in rust_files(src) {
-        collect_commands(&parse(&file).items, &file, &mut defined);
+        collect_commands(&parse(&file).items, &file, &Imports::default(), &mut defined);
     }
     defined
 }
@@ -179,18 +179,20 @@ struct Definition {
     imports: Imports,
 }
 
-/// Walks one module's items, carrying that module's own imports. Scopes are exact rather than
-/// inherited, because Rust does not lend a `use` to a nested module either: a command inside `mod
-/// inner` sees `inner`'s imports and not its parent's, and `use super::*` arrives as a glob.
-fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Definition>) {
+/// Walks one module's items with that module's own imports. Scopes are exact rather than merged,
+/// because Rust does not lend a `use` to a nested module: a command inside `mod inner` sees
+/// `inner`'s imports, and `use super::Window` is how it reaches for its parent's — which is why the
+/// parent's scope is passed in rather than dropped.
+fn collect_commands(items: &[Item], file: &Path, parent: &Imports, into: &mut BTreeMap<String, Definition>) {
     // Collected first, in a pass of its own: a `use` is in scope for the whole module regardless of
     // whether it is written above or below the function that reads it.
-    let mut imports = Imports::default();
+    let mut written = Imports::default();
     for item in items {
         if let Item::Use(u) = item {
-            collect_use_tree(&u.tree, &mut Vec::new(), &mut imports);
+            collect_use_tree(&u.tree, &mut Vec::new(), &mut written);
         }
     }
+    let imports = written.resolved_against(parent);
 
     for item in items {
         match item {
@@ -198,8 +200,9 @@ fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Def
                 let name = f.sig.ident.to_string();
                 let definition = Definition { function: f.clone(), imports: imports.clone() };
                 if into.insert(name.clone(), definition).is_some() {
-                    // generate_handler! names a command by the last segment of its path, so two
-                    // definitions sharing a name leave nothing to resolve it by.
+                    // Not merely ambiguous here: `generate_handler!` builds a match on the bare
+                    // function name, so two commands sharing one would be two identical arms and
+                    // only the first could ever be reached (`tauri-macros`' `handler.rs`).
                     panic!("two #[tauri::command] functions are named `{name}` ({})", file.display());
                 }
             }
@@ -207,7 +210,7 @@ fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Def
             // leave the registry naming something this file could not find.
             Item::Mod(m) => {
                 if let Some((_, items)) = &m.content {
-                    collect_commands(items, file, into);
+                    collect_commands(items, file, &imports, into);
                 }
             }
             _ => {}
@@ -223,7 +226,7 @@ fn collect_commands(items: &[Item], file: &Path, into: &mut BTreeMap<String, Def
 /// wrong answer drops or invents a payload key.
 #[derive(Clone, Default)]
 struct Imports {
-    /// Local name to every path this file imports it from.
+    /// Local name to every path this module imports it from.
     names: BTreeMap<String, Vec<Vec<String>>>,
     /// A glob can bring in a name this cannot see, so an unresolved name is not evidence of a
     /// local type once one is present.
@@ -236,6 +239,35 @@ impl Imports {
         if !paths.contains(&path) {
             paths.push(path);
         }
+    }
+
+    /// The same imports with `use super::X` replaced by whatever `X` is in the enclosing module —
+    /// which is how a nested module reaches an import it cannot inherit. Left as written, the
+    /// parameter would read as this crate's own and its key would be sent for something Tauri
+    /// fills in.
+    ///
+    /// `use super::super::X` and `use super::x::Y` are left alone: the first needs a scope this
+    /// does not hold, and the second names an item rather than an import. Both then read as a
+    /// payload key, which is the harmless direction — a declared key nobody sends, rather than a
+    /// sent key nothing declares.
+    fn resolved_against(&self, parent: &Imports) -> Imports {
+        let mut resolved = Imports { names: BTreeMap::new(), globs: self.globs };
+        for (local, paths) in &self.names {
+            for path in paths {
+                match path.as_slice() {
+                    [first, name] if first == "super" => match parent.names.get(name) {
+                        Some(inherited) => {
+                            for path in inherited {
+                                resolved.add(local.clone(), path.clone());
+                            }
+                        }
+                        None => resolved.add(local.clone(), path.clone()),
+                    },
+                    _ => resolved.add(local.clone(), path.clone()),
+                }
+            }
+        }
+        resolved
     }
 }
 
@@ -494,7 +526,7 @@ mod naming {
     fn command(source: &str) -> Result<ExternalCommand, String> {
         let file = syn::parse_file(source).expect("a file");
         let mut defined = BTreeMap::new();
-        collect_commands(&file.items, Path::new("<test>"), &mut defined);
+        collect_commands(&file.items, Path::new("<test>"), &Imports::default(), &mut defined);
         let (_, definition) = defined.iter().next().expect("a command function");
         external_command(&definition.function, &definition.imports)
     }
@@ -581,6 +613,15 @@ mod naming {
         )
         .expect("a supported shape");
         assert_eq!(c.args, ["w"]);
+
+        // …and `use super::Window` is how it reaches the import it cannot inherit, so that one
+        // resolves to the parent's, not to a type of this crate's own.
+        let c = command(
+            "use tauri::Window;
+             mod inner { use super::Window; #[tauri::command] pub fn f(w: Window, id: String) {} }",
+        )
+        .expect("a supported shape");
+        assert_eq!(c.args, ["id"]);
 
         // A glob can bring Tauri's own in under its real name, and nothing here sees through one.
         assert!(command("use tauri::*; #[tauri::command] fn f(w: Window) {}").is_err());

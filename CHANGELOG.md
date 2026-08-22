@@ -66,7 +66,7 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
-- **The editor's refusals read as sentences.** Deleting an empty selection, transforming a shape
+- **The editor's refusals read as sentences.** Deleting an empty selection, transforming a Node
   the document no longer holds, assigning a material with no id, converting to a machine this
   build does not ship, and a boolean op on shapes that do not overlap each reached the operator as
   a Rust `Debug` rendering — `EmptySelection`, or `Geometry("Degenerate")` for the boolean, which

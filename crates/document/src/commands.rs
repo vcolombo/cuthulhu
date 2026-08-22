@@ -16,7 +16,11 @@ impl std::fmt::Display for CmdError {
             // Two rules raise this, and only a wording that names both is true of both: a node
             // id the document does not hold, and `set_machine` naming a profile this build does
             // not ship (a project saved against a cutter it has never heard of).
-            CmdError::NotFound => write!(f, "the shape or machine this command names is not there"),
+            //
+            // "node", not "shape": every command here takes ids straight from the selection, and
+            // the Layers panel selects Groups and Layers too, so the id that went stale is as
+            // often a container. Node is CONTEXT.md's word for all three.
+            CmdError::NotFound => write!(f, "the node or machine this command names is not there"),
             // Not only an empty selection: also a boolean op given one shape, and a delete whose
             // every id was skipped as the descendant of another. In each the selection exists and
             // still offers this command nothing to do.
@@ -283,7 +287,7 @@ mod tests {
     #[test]
     fn every_command_refusal_has_a_sentence() {
         let cases: Vec<(CmdError, &str)> = vec![
-            (CmdError::NotFound, "the shape or machine this command names is not there"),
+            (CmdError::NotFound, "the node or machine this command names is not there"),
             (CmdError::EmptySelection, "the selection has nothing this command can act on"),
             // Forwarded verbatim, so what the operator reads for a boolean op on shapes that do
             // not overlap is the sentence `GeomError` writes, with nothing wrapped around it.

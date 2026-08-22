@@ -185,13 +185,29 @@ fn paint_rgba(paint: &usvg::Paint, opacity: usvg::Opacity) -> u32 {
 mod tests {
     use super::*;
 
-    /// The refusal is operator-facing, so its wording is pinned rather than just its variant.
+    /// The whole table at once: a new variant fails to compile the match in `Display`, and a
+    /// reworded one fails here. These strings are what an operator reads when a project will
+    /// not open or save, so their wording is pinned rather than just their variant (#93).
     #[test]
-    fn the_unsupported_version_error_names_both_versions() {
-        let e = IoError::UnsupportedProjectVersion { found: 99, supported: 2 };
-        assert_eq!(e.to_string(),
-            "this project was saved by a newer Cuthulhu \
-             (manifest version 99; this build reads 2)");
+    fn every_io_refusal_has_a_sentence() {
+        let cases: Vec<(IoError, &str)> = vec![
+            (
+                IoError::Parse("unexpected end of file".into()),
+                "the file could not be understood (unexpected end of file)",
+            ),
+            (
+                IoError::Io("Permission denied (os error 13)".into()),
+                "the file could not be read or written (Permission denied (os error 13))",
+            ),
+            (
+                IoError::UnsupportedProjectVersion { found: 99, supported: 2 },
+                "this project was saved by a newer Cuthulhu \
+                 (manifest version 99; this build reads 2)",
+            ),
+        ];
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence, "{error:?}");
+        }
     }
 
     #[test]

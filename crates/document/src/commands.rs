@@ -6,6 +6,32 @@ use crate::{node::*, delta::*};
 #[derive(Debug, PartialEq)]
 pub enum CmdError { NotFound, EmptySelection, Geometry(String), EmptyPresetId }
 
+/// What the operator reads when a command refuses: the desktop's `ipc` layer forwards this
+/// string straight into the dialog. It used to forward `{e:?}` instead, so a boolean op on
+/// two shapes that do not overlap arrived as `Geometry("Degenerate")` — a struct literal
+/// wrapped around the sentence `GeomError` had already written (#93).
+impl std::fmt::Display for CmdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Two rules raise this, and only a wording that names both is true of both: a node
+            // id the document does not hold, and `set_machine` naming a profile this build does
+            // not ship (a project saved against a cutter it has never heard of).
+            CmdError::NotFound => write!(f, "the shape or machine this command names is not there"),
+            // Not only an empty selection: also a boolean op given one shape, and a delete whose
+            // every id was skipped as the descendant of another. In each the selection exists and
+            // still offers this command nothing to do.
+            CmdError::EmptySelection => write!(f, "the selection has nothing this command can act on"),
+            // No clause in front of the payload: every site that builds one writes a finished
+            // sentence, so a prefix would make the refusal read twice (the reason #90 dropped
+            // `"preflight: "`).
+            CmdError::Geometry(m) => write!(f, "{m}"),
+            CmdError::EmptyPresetId => write!(f, "a material assignment needs a preset id"),
+        }
+    }
+}
+
+impl std::error::Error for CmdError {}
+
 /// Build a delta that appends a new primitive under `parent`. Mints the id from `ids`.
 pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result<Delta, CmdError> {
     let node = Node::shape(ids.next(), kind);
@@ -34,7 +60,7 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
             None => Affine::identity(),
         };
         let pw_inv = pw.inverse()
-            .ok_or_else(|| CmdError::Geometry("degenerate ancestor transform".into()))?;
+            .ok_or_else(|| CmdError::Geometry("this shape sits under a transform that cannot be reversed".into()))?;
         let mut after = before.clone();
         after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
@@ -207,11 +233,14 @@ pub fn boolean_op(doc: &Document, ids: &[NodeId], op: BoolOp) -> Result<Delta, C
         let world = world_transform(doc, id).ok_or(CmdError::NotFound)?;
         paths.push(local.transformed(&world));
     }
-    let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(format!("{e:?}")))?;
+    // `to_string`, not `{e:?}`: the same operator-facing contract as `shape_outline` above.
+    // Two shapes that do not overlap refuse here, and `Degenerate` alone said nothing (#93).
+    let result = boolean(op, &paths).map_err(|e| CmdError::Geometry(e.to_string()))?;
     let dest_parent = parent_of(doc, ids[0]).ok_or(CmdError::NotFound)?;
     let dest_world = world_transform(doc, dest_parent).ok_or(CmdError::NotFound)?;
     let dest_inv = dest_world.inverse()
-        .ok_or_else(|| CmdError::Geometry("degenerate destination transform".into()))?;
+        .ok_or_else(|| CmdError::Geometry(
+            "the result's parent sits under a transform that cannot be reversed".into()))?;
     let result_local = result.transformed(&dest_inv);
     let mut ops: Vec<NodeOp> = ids.iter()
         .map(|&id| NodeOp::Remove { parent: parent_of(doc, id).unwrap(), id })
@@ -239,6 +268,45 @@ mod tests {
     use super::*;
     use crate::history::Editor;
     use geometry::Affine;
+
+    /// The whole table at once: a new variant fails to compile the match in `Display`, and a
+    /// reworded one fails here. These strings are what an operator reads — every one of them
+    /// used to arrive as `{e:?}` (`EmptySelection`, `Geometry("Degenerate")`), which is why
+    /// this type gained `Display` at all (#93).
+    #[test]
+    fn every_command_refusal_has_a_sentence() {
+        let cases: Vec<(CmdError, &str)> = vec![
+            (CmdError::NotFound, "the shape or machine this command names is not there"),
+            (CmdError::EmptySelection, "the selection has nothing this command can act on"),
+            // Forwarded verbatim, so what the operator reads for a boolean op on shapes that do
+            // not overlap is the sentence `GeomError` writes, with nothing wrapped around it.
+            (
+                CmdError::Geometry(geometry::GeomError::Degenerate.to_string()),
+                "the operation left no geometry behind",
+            ),
+            (CmdError::EmptyPresetId, "a material assignment needs a preset id"),
+        ];
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence, "{error:?}");
+        }
+    }
+
+    /// The end-to-end shape of #93, one layer below the IPC call: the refusal an operator gets
+    /// for a boolean op on two shapes that do not overlap is a sentence, not `Degenerate`.
+    #[test]
+    fn a_boolean_op_on_disjoint_shapes_refuses_in_words() {
+        let mut ed = Editor::new();
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root,
+            node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let b = ed.doc.ids.next();
+        let mut far = Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 });
+        far.transform = Affine::translate(100.0, 100.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: far, index: 1 }]));
+
+        let refusal = boolean_op(&ed.doc, &[a, b], geometry::BoolOp::Intersect).unwrap_err();
+        assert_eq!(refusal.to_string(), "the operation left no geometry behind");
+    }
 
     #[test]
     fn transform_nodes_multiplies_into_transform() {

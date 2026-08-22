@@ -23,44 +23,44 @@ pub fn snapshot(state: tauri::State<AppStateHandle>) -> Result<String, String> {
 
 #[tauri::command]
 pub fn commit_transform(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, m: Affine) -> Result<Delta, String> {
-    state.lock().unwrap().commit_transform(ids, m).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().commit_transform(ids, m).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn add_primitive(state: tauri::State<AppStateHandle>, parent: NodeId, kind: ShapeKind) -> Result<Delta, String> {
-    state.lock().unwrap().add_primitive(parent, kind).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().add_primitive(parent, kind).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn boolean_op(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, op: BoolOp) -> Result<Delta, String> {
-    state.lock().unwrap().boolean_op(ids, op).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().boolean_op(ids, op).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn add_text(state: tauri::State<AppStateHandle>, parent: NodeId, family: String, size_mm: f64, text: String) -> Result<Delta, String> {
-    state.lock().unwrap().add_text(parent, family, size_mm, text).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().add_text(parent, family, size_mm, text).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>) -> Result<Delta, String> {
-    state.lock().unwrap().delete(ids).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().delete(ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn reorder(state: tauri::State<AppStateHandle>, id: NodeId, new_index: usize) -> Result<Delta, String> {
-    state.lock().unwrap().reorder(id, new_index).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().reorder(id, new_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_cut_line_type(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: CutLineType)
     -> Result<Delta, String> {
-    state.lock().unwrap().set_cut_line_type(ids, value).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().set_cut_line_type(ids, value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: PresetAssignment)
     -> Result<Delta, String> {
-    state.lock().unwrap().set_material_preset(ids, value).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().set_material_preset(ids, value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -90,7 +90,7 @@ pub fn load_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Resul
 
 #[tauri::command]
 pub fn set_machine(state: tauri::State<AppStateHandle>, machine_id: String) -> Result<(), String> {
-    state.lock().unwrap().set_machine(&machine_id).map_err(|e| format!("{e:?}"))
+    state.lock().unwrap().set_machine(&machine_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

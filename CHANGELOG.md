@@ -63,3 +63,12 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 - `cuthulhu trace` reports when a large image was reduced to 2048 px for tracing. The reduction
   always happened; it was only ever visible in the desktop.
+
+### Fixed
+
+- **The editor's refusals read as sentences.** Deleting an empty selection, transforming a shape
+  the document no longer holds, assigning a material with no id, converting to a machine this
+  build does not ship, and a boolean op on shapes that do not overlap each reached the operator as
+  a Rust `Debug` rendering — `EmptySelection`, or `Geometry("Degenerate")` for the boolean, which
+  wrapped a struct literal around a sentence the geometry layer had already written. Each now says
+  what it means.

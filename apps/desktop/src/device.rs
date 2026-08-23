@@ -81,6 +81,10 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         ClientError::Refused(cut_host::protocol::Refusal::Device(fault)) => fault.code(),
         // The host was reached, understood the request, and refused it.
         ClientError::Refused(_) => "host_refused",
+        // The host answered, so its reachability is settled — the answer is the proof. What it
+        // answered was a reply this request cannot use, which nothing about the network or the
+        // pairing will change, and `host_unreachable` sent the operator to check both (#283).
+        ClientError::WrongReply { .. } => "host_wrong_reply",
         ClientError::Transport(_) => "host_unreachable",
     };
     IpcError::new(code, e.to_string())
@@ -183,7 +187,10 @@ pub struct PairedHostView {
     pub id: HostId,
     pub name: String,
     pub address: String,
-    /// Why this host cannot be reached, or `None` when it can.
+    /// The last thing that went wrong with this host, or `None` while nothing has. Named for the
+    /// case that fills it most — a Pi that is off or unplugged — but since #283 it also carries a
+    /// host that answered outside the protocol, which was reached and whose sentence says so. The
+    /// row prints it when it is present; nothing reads what is in it.
     pub unreachable: Option<String>,
 }
 
@@ -574,13 +581,24 @@ impl DeviceManagerHandle {
         match host.ensure_within(connect_timeout) {
             Some(client) => {
                 let out = f(client);
-                if let Err(e @ cut_host::client::ClientError::Transport(_)) = &out {
+                if let Err(
+                    e @ (cut_host::client::ClientError::Transport(_)
+                    | cut_host::client::ClientError::WrongReply { .. }),
+                ) = &out
+                {
                     // A connection that broke mid-call stays broken, and `ensure` only redials
                     // when there is no client at all — so leaving this one in place fails every
                     // later verb on this host against the same dead socket. `list_devices` has
                     // always dropped it here; the call that most needs the same is the retry
                     // after a lost reply, which is by definition made on a connection that just
                     // failed (see `execute_cut`).
+                    //
+                    // `WrongReply` is dropped with it because it was a `Transport` until #283 and
+                    // dropping is what it already did. It is not the same situation — a wrong reply
+                    // arrives framed and in order, and the client's own tests drive four such verbs
+                    // across one connection to say so — but narrowing this to `Transport` alone
+                    // would change which connections survive, and nothing here establishes that a
+                    // host answering outside the protocol is worth keeping one to.
                     host.last_error = Some(host_error(e));
                     host.client = None;
                 }
@@ -1015,10 +1033,17 @@ impl DeviceManagerHandle {
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
                     let sent = c.dispatch(dispatch_id.clone(), &device, &machine_id, passes);
-                    // Cleared by any answer — refusals included, since a host that refused was
-                    // reached and its answer is not in doubt. What marks a reply lost is this
-                    // entry outliving the call.
-                    if !matches!(sent, Err(cut_host::client::ClientError::Transport(_))) {
+                    // Cleared by an answer that settles what the host did — a refusal included,
+                    // since a host that refused says it started nothing. A reply this request
+                    // cannot use settles nothing: it arrived, so nothing was lost, but it does not
+                    // say whether the Job began, and the failure below tells the operator to press
+                    // Cut again because "the host recognizes the same Job and will not cut it
+                    // twice" — which is only true while this entry keeps the id that retry needs.
+                    if !matches!(
+                        sent,
+                        Err(cut_host::client::ClientError::Transport(_)
+                            | cut_host::client::ClientError::WrongReply { .. })
+                    ) {
                         self.in_doubt.lock().unwrap().remove(&key);
                     }
                     // A refusal is the host saying it started nothing, so it is not something the
@@ -2072,6 +2097,23 @@ mod tests {
         assert_eq!(its_own.code, "host_refused", "got {its_own:?}");
     }
 
+    /// A host that answered was reached, and the code has to say so. A wrong reply used to arrive
+    /// as `host_unreachable` with a `Debug` rendering of the reply in the message, so the code
+    /// claimed the opposite of what had just happened (#283).
+    #[test]
+    fn a_reply_a_verb_cannot_use_is_not_reported_as_an_unreachable_host() {
+        use cut_host::client::ClientError;
+
+        let err = host_error(&ClientError::WrongReply { expected: "Snapshots", found: "Devices" });
+        assert_eq!(err.code, "host_wrong_reply", "got {err:?}");
+        assert_eq!(err.message, "this host answered with `Devices` where `Snapshots` was expected");
+
+        // And it did not take the arm next to it with it: a Pi that never answered is still
+        // unreachable, which is the one case waiting actually fixes.
+        let offline = host_error(&ClientError::Transport("timed out".into()));
+        assert_eq!(offline.code, "host_unreachable", "got {offline:?}");
+    }
+
     fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -3047,6 +3089,57 @@ mod tests {
             dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone()),
             Some(earlier),
             "a call that never reached the host discarded a previous dispatch's id"
+        );
+    }
+
+    /// A dispatch answered with a reply that is not `Accepted` learned nothing about whether the
+    /// Job began, so it stays in doubt and keeps its id — which is what makes the refusal's own
+    /// advice true: "press Cut again … the host recognizes the same Job and will not cut it twice"
+    /// only holds while the retry goes out under the id the first attempt used.
+    ///
+    /// The reply is the answer to no request this desktop made, so it takes a peer built to break
+    /// the protocol; a real `Host` answers every verb with a reply that verb admits (#283).
+    #[test]
+    fn a_dispatch_answered_with_the_wrong_reply_stays_in_doubt() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Ok,
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: aimed.instance_id.clone(),
+            digest: job_digest(&aimed.machine_id, &a_square(10.0)),
+        };
+        let err = dev
+            .execute_cut(aimed, a_square(10.0))
+            .expect_err("`Ok` is not a dispatch this desktop can read as accepted");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            err.message.contains("answered with `Ok` where `Accepted` was expected"),
+            "the reply is not named: {}",
+            err.message
+        );
+
+        let held = dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone());
+        assert!(held.is_some(), "a dispatch nothing confirmed must keep the id its retry needs");
+        // And the retry joins it rather than minting a second name the host has never seen.
+        assert_eq!(dev.reserve_dispatch_id(&key).0, held.unwrap());
+
+        // The same failure is what the host's own row then shows, because `with_host_within`
+        // records it and drops the client alongside it. Pinned here because the row used to say
+        // the host could not be reached, directly under the cutters it had just listed.
+        let view = dev.host_views().pop().expect("the host is still paired");
+        assert_eq!(
+            view.unreachable.as_deref(),
+            Some("this host answered with `Ok` where `Accepted` was expected")
         );
     }
 

@@ -559,16 +559,21 @@ mod tests {
     /// `IoError` whose payload stopped being `usvg`'s account would satisfy this and is
     /// `fileio`'s own tests' to catch.
     ///
-    /// The six were chosen to reach four of `usvg::Error`'s five variants at the version
+    /// The seven were chosen to reach four of `usvg::Error`'s five variants at the version
     /// in `Cargo.toml`, which is a fact about the fixtures rather than one this asserts —
     /// the sentence is the contract, and pinning a variant would pin a parser's internals.
-    /// `ElementsLimitReached` is the one left out; no cheap fixture reaches it, since it
-    /// wants a million elements. The last two are why the list is not shorter: their
-    /// payloads say "provided data" and never the word SVG, so they are the cases the
-    /// dropped `SVG parse: ` prefix is a decision about rather than a formality.
+    /// The first four all land on `ParsingFailed`, two of them on the same message; they
+    /// are here as the shapes an operator hands a cutter by accident, not as branches.
+    /// The fifth variant, `ElementsLimitReached`, is not reachable at all: usvg 0.44
+    /// declares it and writes a sentence for it and constructs it nowhere, since the
+    /// million-node cap raises its own `NodesLimitReached`, which arrives here as
+    /// `ParsingFailed`.
+    /// The UTF-16 and `.svgz` cases are why the list is not shorter: their payloads say
+    /// "provided data" and never the word SVG, so they are the cases the dropped
+    /// `SVG parse: ` prefix is a decision about rather than a formality.
     #[test]
     fn an_svg_that_cannot_be_parsed_reads_as_a_sentence() {
-        let refused: [(&str, &[u8]); 6] = [
+        let refused: [(&str, &[u8]); 7] = [
             ("not markup at all", b"this is not an SVG"),
             ("truncated mid-element", br#"<svg xmlns="http://www.w3.org/2000/svg"><rect"#),
             ("well-formed XML that is not SVG", br#"<html><body/></html>"#),
@@ -580,6 +585,13 @@ mod tests {
             // The gzip magic makes `from_data` inflate rather than parse, so a damaged
             // `.svgz` fails before any XML is seen.
             ("an .svgz that will not inflate", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03junkjunk"),
+            // Well-formed SVG that usvg declines rather than corrects: the same class of
+            // refusal as the element cap, and the reason the changelog says the CLI now
+            // says *why* a file could not be imported rather than what is wrong with it.
+            (
+                "an SVG whose own size is zero",
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"/>"#,
+            ),
         ];
 
         for (what, bytes) in refused {

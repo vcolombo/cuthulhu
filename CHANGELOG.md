@@ -72,8 +72,8 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   verb that repeats the sentence following it. The desktop has printed the sentence for this
   exact failure since project files were versioned; the CLI was the one caller still handing
   over the Rust value. "Why" rather than "what is wrong with it", because a file can also be
-  turned away for being larger than the parser's element cap or for being UTF-16, and neither
-  of those is a file with anything wrong with it.
+  turned away for stating its own size as zero, or for being written in UTF-16, and neither of
+  those is a file with anything wrong with it.
 
 - **A presets file that cannot be read says what is wrong with it.** A hand-edited
   `presets.json` with its header dropped told the operator `Corrupt("missing or invalid version

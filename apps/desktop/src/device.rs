@@ -42,6 +42,23 @@ impl From<driver_core::manager::DeviceError> for IpcError {
     }
 }
 
+/// A presets-file refusal as the UI's own currency, in one place instead of at every call site.
+///
+/// Five sites wrote `IpcError::new("preset_error", format!("{e:?}"))`, so a missing header on the
+/// file told the operator `Corrupt("missing or invalid version field")` — the sentence the code
+/// wrote, wrapped in a struct literal, in quotes — and a permission problem told them
+/// `Io("Permission denied (os error 13)")`. One code covered all of it, so nothing could tell a
+/// file this build is too old to read from one that is damaged without parsing the Rust value in
+/// the message (#278).
+///
+/// The code and the sentence are both `cutplan`'s, declared beside `load_presets` and
+/// `save_user_presets` which raise them, so adding a variant means editing one match, there.
+impl From<cutplan::presets::PresetError> for IpcError {
+    fn from(e: cutplan::presets::PresetError) -> Self {
+        IpcError::new(e.code(), e.to_string())
+    }
+}
+
 /// A client failure as a code the UI can branch on, keeping the three that need three different
 /// things from the operator apart.
 ///
@@ -872,8 +889,7 @@ impl DeviceManagerHandle {
         let presets: Vec<MaterialPreset> = if enabled().any(|p| p.preset_id.is_some()) {
             let path = default_presets_path()
                 .ok_or_else(|| IpcError::new("no_config_dir", "cannot resolve presets file location"))?;
-            load_presets(&path)
-                .map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
+            load_presets(&path)?
                 .into_iter()
                 .filter(|p| p.machine_id == connected.machine_id)
                 .collect()
@@ -1269,14 +1285,12 @@ pub fn travel_for_order(
 /// `hosts.json`: the command layer resolves the default location, and a test can hand over a
 /// temporary file instead of the operator's real one.
 pub fn list_presets(path: &Path, machine_id: &str) -> Result<Vec<MaterialPreset>, IpcError> {
-    let all = load_presets(path).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?;
+    let all = load_presets(path)?;
     Ok(all.into_iter().filter(|p| p.machine_id == machine_id).collect())
 }
 
 fn user_entries(path: &Path) -> Result<Vec<MaterialPreset>, IpcError> {
-    Ok(load_presets(path)
-        .map_err(|e| IpcError::new("preset_error", format!("{e:?}")))?
-        .into_iter().filter(|p| !p.builtin).collect())
+    Ok(load_presets(path)?.into_iter().filter(|p| !p.builtin).collect())
 }
 
 /// Whether the pair names a preset that ships with the app. Keyed on the pair like everything
@@ -1326,7 +1340,7 @@ pub fn save_preset(path: &Path, preset: MaterialPreset) -> Result<(), IpcError> 
     let mut user = user_entries(path)?;
     user.retain(|p| (&p.machine_id, &p.id) != (&preset.machine_id, &preset.id));
     user.push(MaterialPreset { builtin: false, ..preset });
-    save_user_presets(path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
+    Ok(save_user_presets(path, &user)?)
 }
 
 pub fn delete_preset(path: &Path, machine_id: &str, id: &str) -> Result<(), IpcError> {
@@ -1350,7 +1364,7 @@ pub fn delete_preset(path: &Path, machine_id: &str, id: &str) -> Result<(), IpcE
             )
         });
     }
-    save_user_presets(path, &user).map_err(|e| IpcError::new("preset_error", format!("{e:?}")))
+    Ok(save_user_presets(path, &user)?)
 }
 
 #[cfg(test)]
@@ -3261,5 +3275,71 @@ mod tests {
         delete_preset(&path, "cameo5", "my-vinyl").expect("deleted");
         assert!(!list_presets(&path, "cameo5").unwrap().iter().any(|p| p.id == "my-vinyl"),
             "the entry survived its delete");
+    }
+
+    /// The conversion, end to end below the IPC call. Every one of the five sites used to send
+    /// the code `preset_error` with a `Debug` rendering of the value, so a file this build is
+    /// too old to read and a damaged one arrived under the same code, told apart only by the
+    /// discriminant inside the message (#278).
+    #[test]
+    fn a_presets_file_this_build_cannot_read_is_refused_in_words_with_its_own_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("presets.json");
+        std::fs::write(&path, r#"{"presets":[]}"#).expect("wrote the fixture");
+
+        // `list_presets` is the read side; `delete_preset` reaches the same read through
+        // `user_entries`, so both must speak cutplan's words rather than each writing their own.
+        for err in [list_presets(&path, "cameo5").unwrap_err(),
+                    delete_preset(&path, "cameo5", "my-vinyl").unwrap_err()] {
+            assert_eq!(err.code, "presets_corrupt", "{}", err.message);
+            assert_eq!(err.message, "the presets file does not state a usable whole-number \
+                                     version, so this build cannot tell what format it is in");
+        }
+
+        std::fs::write(&path, r#"{"version":3,"presets":[]}"#).expect("wrote the fixture");
+        let newer = list_presets(&path, "cameo5").unwrap_err();
+        assert_eq!(newer.code, "presets_unknown_version",
+            "a version this build does not read shares a code with a damaged file: {}", newer.message);
+    }
+
+    /// A refusal that does not depend on writing the file must not lose the race to one that
+    /// does: an entry the editor should never have sent is named as that, not as a disk fault,
+    /// however the disk is behaving. This is the ordering the e2e fake mirrors.
+    #[test]
+    fn what_a_preset_is_refuses_it_before_the_file_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the presets path, not a file where its parent belongs: reading a
+        // directory fails on every platform, where a non-directory *parent* is `ENOTDIR` on Unix
+        // and `ERROR_PATH_NOT_FOUND` on Windows — which Rust maps to `NotFound`, so `load_presets`
+        // would call it a first run there and this test would read a disk fault it never got
+        // (Codex on PR #280).
+        let path = dir.path().join("presets.json");
+        std::fs::create_dir(&path).expect("put a directory where the file goes");
+
+        // Every refusal `save_preset` makes without touching the file, not just one: with only
+        // the blank name asserted, moving any of the other four below the read left this green
+        // while those saves reported a disk fault (Codex on PR #280).
+        let mine = || a_user_preset("cameo5", "mine", 12);
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+        let unsavable = [
+            ("a blank name", MaterialPreset { name: "  ".into(), ..mine() }, "invalid_preset"),
+            ("an empty id", MaterialPreset { id: String::new(), ..mine() }, "invalid_preset"),
+            ("no machine", MaterialPreset { machine_id: String::new(), ..mine() }, "invalid_preset"),
+            ("a force out of range", a_user_preset("cameo5", "mine", 99), "invalid_preset"),
+            ("a builtin's pair", a_user_preset("cameo5", &builtin.id, 12), "builtin_preset"),
+        ];
+        for (what, preset, code) in unsavable {
+            let err = save_preset(&path, preset).unwrap_err();
+            assert_eq!(err.code, code,
+                "{what} was reported as a disk fault: {}", err.message);
+        }
+
+        // And the file really is unusable, so the assertion above is not vacuous: a valid entry
+        // is refused by it. `presets_unreadable`, not `presets_unwritable`, because `save_preset`
+        // re-reads the user entries first and a save that cannot see what it would replace must
+        // not write over it.
+        let valid = a_user_preset("cameo5", "mine", 12);
+        assert_eq!(save_preset(&path, valid).unwrap_err().code, "presets_unreadable");
     }
 }

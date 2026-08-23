@@ -768,7 +768,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // the refresh are held apart for.
       if (failNextPresetList) {
         failNextPresetList = false;
-        throw ipcError("preset_error", "Corrupt(\"the presets file could not be read\")");
+        // Production's own words and code: `cutplan::presets::PresetError::Unreadable` through
+        // `From<PresetError> for IpcError`. Invented prose here (it used to throw
+        // `Corrupt("the presets file could not be read")`) meant the two assertions on this
+        // banner matched a string production never sends (#278).
+        throw ipcError("presets_unreadable",
+          "the presets file could not be read (Permission denied (os error 13))");
       }
       const list = effectivePresets(a.machineId as string);
       if (!holdingPresets) return list;
@@ -790,10 +795,6 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // ship any of those green.
     save_preset: (a) => {
       const p = a.p as MaterialPreset;
-      if (failNextPresetSave) {
-        failNextPresetSave = false;
-        throw ipcError("preset_error", "Io(\"the presets file could not be written\")");
-      }
       // In the backend's order: what the entry *is* before what it holds, so a test cannot pass
       // against a precedence production does not use (CodeRabbit on PR #264).
       if (p.id === "" || p.machine_id === "") {
@@ -812,6 +813,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         if (v !== null && (v < range[field][0] || v > range[field][1])) {
           throw ipcError("invalid_preset", `${field} must be ${range[field][0]}..=${range[field][1]}`);
         }
+      }
+      // Last, because the file is the last thing production touches: every refusal above is
+      // decided without writing, so none of them may lose the race to a disk fault
+      // (`what_a_preset_is_refuses_it_before_the_file_is_touched`). Production's own words and
+      // code, as on the read side above.
+      if (failNextPresetSave) {
+        failNextPresetSave = false;
+        throw ipcError("presets_unwritable",
+          "the presets file could not be written (Permission denied (os error 13))");
       }
       userPresets = [
         ...userPresets.filter((u) => !(u.machine_id === p.machine_id && u.id === p.id)),

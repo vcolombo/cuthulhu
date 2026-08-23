@@ -227,7 +227,8 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
-    /// The dispatch id each Job's next press must go out under, by the Job it names.
+    /// The dispatch id a Job's next press goes out under while an entry for it stands, by the Job it
+    /// names.
     ///
     /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
     /// cannot cut the same material twice — but only the sender knows whether a given press of
@@ -235,20 +236,25 @@ pub struct DeviceManagerHandle {
     /// same design are byte-identical. What separates them is this entry: while a Job has one, the
     /// next press reuses the id in it instead of minting a fresh one.
     ///
-    /// Written before the request goes out, and dropped only where dropping it is provably safe.
-    /// Two answers make it so: `Accepted` says the host has the Job, and a refusal says it started
-    /// nothing. A dropped reply does not, and since #283 neither does a reply the request could not
-    /// use — it arrived, so nothing was lost, but it says nothing about whether the Job began.
+    /// Written before the request goes out, and dropped by an answer that settles what the host did:
+    /// `Accepted` means it has the Job, a refusal means it started nothing. A dropped reply settles
+    /// neither, and since #283 neither does a reply the request could not use — it arrived, so
+    /// nothing was lost, but it says nothing about whether the Job began.
+    ///
+    /// "Settles" is the client's reading of the reply, not a proof about the host. An `Accepted` is
+    /// believed without checking which dispatch it names (#285), and past the bounds below the id it
+    /// holds may mean nothing to the host any more. Deduplicating by memory is best-effort on both
+    /// sides, and nothing here upgrades it.
     ///
     /// So an entry does not mean "outcome unknown", and a dispatch that never left this machine is
     /// the case that shows the difference: its outcome is known — nothing started — and the entry
-    /// stays anyway, because the call cannot prove the entry is *its* rather than a concurrent
+    /// stays anyway, because the call cannot tell whether the entry is *its* or a concurrent
     /// press's, and discarding another press's record would send that press's retry out under a
-    /// name the host has never seen (see `execute_cut`). Held, in other words, whenever letting go
+    /// name the host has never seen (see `execute_cut`). Kept, in other words, wherever letting go
     /// would risk that, which is a weaker condition than doubt.
     ///
-    /// Beyond those two answers an entry leaves only by expiry or by making room, below.
-    /// An earlier version aged them out after fifteen minutes, which was the
+    /// Beyond those two answers an entry leaves only by expiry or by making room, below. An earlier
+    /// version aged them out after fifteen minutes, which was the
     /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
     /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
     /// still remembers under the old one and cuts the design twice. What makes an entry nobody
@@ -1041,10 +1047,11 @@ impl DeviceManagerHandle {
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
                 // `first_attempt` is information, not ownership, and it is narrower than it looks:
-                // it says only that no entry existed for this Job before this call, which is
-                // usually an earlier dispatch still unsettled and can also be an earlier press that
-                // never reached a host. What it changes is what a failure here means. It is
-                // deliberately not used to decide whether to undo the reservation.
+                // `true` says only that no entry existed for this Job before this call. So `false`
+                // means an entry stood already — usually an earlier dispatch nothing settled, and
+                // sometimes an earlier press that never reached a host. What it changes is what a
+                // failure here means. It is deliberately not used to decide whether to undo the
+                // reservation.
                 let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
                 // whose reply is lost is exactly the case the window-close guard must still warn

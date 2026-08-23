@@ -65,8 +65,10 @@ pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     // `to_string`, not `{e:?}`: `IoError` has written a sentence since #261, and the
     // desktop's three `IoError` commands forward it verbatim, so this was the one place
     // the same failure still printed a struct literal (#281). No prefix in front of it
-    // either — the sentence already names the file, and `main` prints it behind
-    // `error: `.
+    // either, and not because `usvg`'s payload names the format — two of its five
+    // variants say only "provided data", so it does not. It is that `cuthulhu cut` reads
+    // exactly one file, the one named on the command line beside it, so "the file" has
+    // one possible referent and a verb in front of the sentence only says it twice.
     let (delta, _skipped) =
         fileio::import_svg(svg, &mut doc.ids, doc.root).map_err(|e| e.to_string())?;
     doc.apply(delta);
@@ -545,9 +547,13 @@ mod tests {
     /// (#281). `import_svg` can fail in exactly one place — the `usvg::Tree::from_data`
     /// call inside `svg_to_paths` — so one sentence is true of every input below; the
     /// four are the shapes an operator hands a cutter by accident, not four branches.
-    /// The parenthesised half is `usvg`'s own wording and is deliberately not asserted:
-    /// pinning it would break on a parser upgrade. The second assertion is the one that
-    /// fails if a `Debug` rendering returns by any route, prefix or no prefix.
+    ///
+    /// Stated as forwarding, because forwarding is the contract: whatever `IoError`
+    /// writes for these bytes is what the operator reads, character for character. A
+    /// test that pinned `usvg`'s own wording instead would break on a parser upgrade,
+    /// and — the gap Codex found in the first version of this — would still pass if the
+    /// parenthesised half were dropped on the way out, which is the whole of what the
+    /// operator can act on.
     #[test]
     fn an_svg_that_cannot_be_parsed_reads_as_a_sentence() {
         let refused: [(&str, &[u8]); 4] = [
@@ -558,15 +564,20 @@ mod tests {
         ];
 
         for (what, bytes) in refused {
-            let err = doc_from_svg(bytes).expect_err(&format!("{what} is not an importable SVG"));
-            assert!(
-                err.starts_with("the file could not be understood ("),
-                "{what}: {err}",
-            );
-            assert!(
-                !err.contains("Parse("),
-                "{what} reached the operator as a Debug rendering: {err}",
-            );
+            let mut doc = document::Document::new();
+            let sentence = fileio::import_svg(bytes, &mut doc.ids, doc.root)
+                .err()
+                .unwrap_or_else(|| panic!("{what} is not an importable SVG"))
+                .to_string();
+            let err = doc_from_svg(bytes).expect_err(what);
+            assert_eq!(err, sentence, "{what}: the CLI reworded what `IoError` wrote");
+
+            let detail = err
+                .strip_prefix("the file could not be understood (")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{what}: not the sentence `IoError` writes: {err}"));
+            assert!(!detail.is_empty(), "{what}: the parser's own account was dropped");
+            assert!(!detail.contains("Parse("), "{what}: a `Debug` rendering came back: {err}");
         }
     }
 }

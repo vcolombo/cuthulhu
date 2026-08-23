@@ -62,8 +62,13 @@ pub fn dry_run_pass_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> 
 /// cut is planned against a document that exists only for this command.
 pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     let mut doc = document::Document::new();
-    let (delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
-        .map_err(|e| format!("SVG parse: {e:?}"))?;
+    // `to_string`, not `{e:?}`: `IoError` has written a sentence since #261, and the
+    // desktop's three `IoError` commands forward it verbatim, so this was the one place
+    // the same failure still printed a struct literal (#281). No prefix in front of it
+    // either — the sentence already names the file, and `main` prints it behind
+    // `error: `.
+    let (delta, _skipped) =
+        fileio::import_svg(svg, &mut doc.ids, doc.root).map_err(|e| e.to_string())?;
     doc.apply(delta);
     Ok(doc)
 }
@@ -532,5 +537,36 @@ mod tests {
             err,
             "shape #3 lies outside the 304.8 x 304.8 mm cutting area — pass --allow-out-of-bounds to send it anyway",
         );
+    }
+
+    /// Bytes `usvg` declines used to reach the operator as `SVG parse: Parse("…")` — a
+    /// struct literal wrapped around the sentence `IoError` has written since #261, and
+    /// which the desktop's own `import_svg` command has forwarded since that same change
+    /// (#281). `import_svg` can fail in exactly one place — the `usvg::Tree::from_data`
+    /// call inside `svg_to_paths` — so one sentence is true of every input below; the
+    /// four are the shapes an operator hands a cutter by accident, not four branches.
+    /// The parenthesised half is `usvg`'s own wording and is deliberately not asserted:
+    /// pinning it would break on a parser upgrade. The second assertion is the one that
+    /// fails if a `Debug` rendering returns by any route, prefix or no prefix.
+    #[test]
+    fn an_svg_that_cannot_be_parsed_reads_as_a_sentence() {
+        let refused: [(&str, &[u8]); 4] = [
+            ("not markup at all", b"this is not an SVG"),
+            ("truncated mid-element", br#"<svg xmlns="http://www.w3.org/2000/svg"><rect"#),
+            ("well-formed XML that is not SVG", br#"<html><body/></html>"#),
+            ("nothing at all", b""),
+        ];
+
+        for (what, bytes) in refused {
+            let err = doc_from_svg(bytes).expect_err(&format!("{what} is not an importable SVG"));
+            assert!(
+                err.starts_with("the file could not be understood ("),
+                "{what}: {err}",
+            );
+            assert!(
+                !err.contains("Parse("),
+                "{what} reached the operator as a Debug rendering: {err}",
+            );
+        }
     }
 }

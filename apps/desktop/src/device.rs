@@ -81,6 +81,10 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         ClientError::Refused(cut_host::protocol::Refusal::Device(fault)) => fault.code(),
         // The host was reached, understood the request, and refused it.
         ClientError::Refused(_) => "host_refused",
+        // The host answered, so its reachability is settled — the answer is the proof. What it
+        // answered was a reply this request cannot use, which nothing about the network or the
+        // pairing will change, and `host_unreachable` sent the operator to check both (#283).
+        ClientError::WrongReply { .. } => "host_wrong_reply",
         ClientError::Transport(_) => "host_unreachable",
     };
     IpcError::new(code, e.to_string())
@@ -183,7 +187,11 @@ pub struct PairedHostView {
     pub id: HostId,
     pub name: String,
     pub address: String,
-    /// Why this host cannot be reached, or `None` when it can.
+    /// The last thing that went wrong with this host, or `None` while nothing has. The name is the
+    /// serialized one this field has always had, kept because every consumer only prints the
+    /// message: since #283 it also carries a host that answered outside the protocol, which was
+    /// reached and whose sentence says so, and before that a refused token, a changed certificate
+    /// and a refusal. The row prints it when it is present; nothing reads what is in it.
     pub unreachable: Option<String>,
 }
 
@@ -219,28 +227,55 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
-    /// Dispatches this desktop sent and never got an answer to, by the Job they carried.
+    /// The dispatch id a Job's next press goes out under while an entry for it stands, by the Job it
+    /// names.
     ///
     /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
     /// cannot cut the same material twice — but only the sender knows whether a given press of
     /// Cut *is* that retry, and nothing in the Job says so: a retry and a second sheet of the
-    /// same design are byte-identical. What separates them is this entry. It is written before
-    /// the request goes out and cleared by any answer, so a Job still listed here is one whose
-    /// fate is genuinely unknown, and the next dispatch of it reuses the same id.
+    /// same design are byte-identical. What separates them is this entry: while a Job has one, the
+    /// next press reuses the id in it instead of minting a fresh one.
     ///
-    /// An entry is cleared by an *answer*, and otherwise only once the host itself can no longer
-    /// recognise the id. An earlier version aged them out after fifteen minutes, which was the
+    /// Written before the request goes out, and dropped by an answer that settles what the host did:
+    /// `Accepted` means it has the Job, a refusal means it started nothing. A dropped reply settles
+    /// neither, and since #283 neither does a reply the request could not use — it arrived, so
+    /// nothing was lost, but it says nothing about whether the Job began.
+    ///
+    /// "Settles" is the client's reading of the reply, not a proof about the host. An `Accepted` is
+    /// believed without checking which dispatch it names (#285), and past the bounds below the id it
+    /// holds may mean nothing to the host any more. Deduplicating by memory is best-effort on both
+    /// sides, and nothing here upgrades it.
+    ///
+    /// So an entry does not mean "outcome unknown", and a dispatch that never left this machine is
+    /// the case that shows the difference: its outcome is known — nothing started — and the entry
+    /// stays anyway, because the call cannot tell whether the entry is *its* or a concurrent
+    /// press's, and discarding another press's record would send that press's retry out under a
+    /// name the host has never seen (see `execute_cut`). Kept, in other words, wherever letting go
+    /// would risk that, which is a weaker condition than doubt.
+    ///
+    /// Beyond those two answers an entry leaves only by expiry or by making room, below. An earlier
+    /// version aged them out after fifteen minutes, which was the
     /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
     /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
     /// still remembers under the old one and cuts the design twice. What makes an entry nobody
     /// revisits harmless is that the next Cut is *told* it was read as a retry
-    /// (`CutStarted::duplicate`), and that the answer clears the entry, so pressing Cut again
-    /// really does cut (#121).
+    /// (`CutStarted::duplicate`), and that a settling answer clears the entry, so pressing Cut
+    /// again really does cut (#121).
     ///
-    /// The one honest expiry is the host's own `ID_RETENTION`: past it the id means nothing to
-    /// anyone, so holding it only pretends to a protection that has already lapsed. Nothing on
+    /// The one honest expiry is `ID_RETENTION`, the host's own constant: an hour after this entry
+    /// was written, holding it only pretends to a protection that may well have lapsed. Nothing on
     /// either side can prevent a re-cut past that point — which is the true limit of deduplicating
     /// by memory, not something a client-side rule can close.
+    ///
+    /// "May well", because sharing the constant does not make the two windows the same window. This
+    /// entry ages from when the id was written; a host's `Admission` re-stamps an id every time a
+    /// duplicate arrives, so a Job retried near the hour can be remembered there after it has
+    /// expired here. And two capacity bounds cut in ahead of the hour on both sides, neither
+    /// controlling the other's: this map evicts its oldest entry at `MAX_JOBS_IN_DOUBT`, a host
+    /// forgets its oldest accepted id at `MAX_REMEMBERED_IDS`. So an entry can outlive the host's
+    /// memory of its id and an id can outlive this entry, in either direction. All of it is a
+    /// backstop against exhaustion rather than a policy, which is why the numbers are set where
+    /// reaching them is itself the unusual event.
     ///
     /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
     /// while holding it.
@@ -268,8 +303,9 @@ pub struct DeviceManagerHandle {
 /// How many Jobs may be held in doubt at once.
 ///
 /// A backstop against a session that dispatches thousands of distinct designs to hosts that never
-/// answer, not a policy anyone should reach: entries clear on any answer, and expire with the
-/// host's own memory. The oldest is evicted, which is the one a retry is least likely to name.
+/// answer, not a policy anyone should reach: entries clear on a settling answer, and expire on the
+/// host's own `ID_RETENTION` — though not in step with the host's own memory of the id, for the
+/// reasons on `in_doubt`. The oldest is evicted, which is the one a retry is least likely to name.
 const MAX_JOBS_IN_DOUBT: usize = 256;
 
 /// One dispatchable Job as this desktop identifies it: which cutter, on which host, carrying
@@ -574,13 +610,25 @@ impl DeviceManagerHandle {
         match host.ensure_within(connect_timeout) {
             Some(client) => {
                 let out = f(client);
-                if let Err(e @ cut_host::client::ClientError::Transport(_)) = &out {
+                if let Err(
+                    e @ (cut_host::client::ClientError::Transport(_)
+                    | cut_host::client::ClientError::WrongReply { .. }),
+                ) = &out
+                {
                     // A connection that broke mid-call stays broken, and `ensure` only redials
                     // when there is no client at all — so leaving this one in place fails every
                     // later verb on this host against the same dead socket. `list_devices` has
                     // always dropped it here; the call that most needs the same is the retry
                     // after a lost reply, which is by definition made on a connection that just
                     // failed (see `execute_cut`).
+                    //
+                    // `WrongReply` is dropped with it, and not only because it was a `Transport`
+                    // until #283. The framing survives a wrong reply — one request written, frames
+                    // read until the reply — but nothing correlates a reply with its request, so a
+                    // peer that answered outside the protocol once may also have volunteered a
+                    // second `Response` this call has not read, and the next verb on this socket
+                    // would take that one for its own answer. Redialling costs a handshake; reading
+                    // a stale reply as the answer to a cut verb does not stop at costing that.
                     host.last_error = Some(host_error(e));
                     host.client = None;
                 }
@@ -982,24 +1030,28 @@ impl DeviceManagerHandle {
                 // sheet and loads another is dispatching the identical Job on purpose, and must
                 // not be silently swallowed as a duplicate. So the id is the digest plus a
                 // once-per-attempt nonce, and `in_doubt` decides which of the two this is —
-                // reuse while the previous dispatch of this same Job has no answer, mint fresh
-                // once it has one. The desktop is the only party that can tell them apart: it
-                // is the one that knows whether the last try was answered.
+                // reuse while this Job still has an entry here, mint fresh once nothing holds one.
+                // The desktop is the only party that can tell them apart: it is the
+                // one that knows what the last try was told.
                 //
                 // The first Cut after a lost reply is therefore always read as the retry. That
-                // is the safe direction, and it self-clears: the retry gets an answer (the
-                // host's dedupe makes it a no-op if the Job is already running), which frees the
-                // next Cut to be a new Job. A desktop restarted in between loses `in_doubt` and
-                // is back to cutting twice — persisting it is the fix if that stops being rare.
+                // is the safe direction, and a settling answer is what ends it: the retry is either
+                // accepted — the host's dedupe making it a no-op if the Job is already running — or
+                // refused, and either frees the next Cut to be a new Job. A desktop restarted in
+                // between loses `in_doubt` and is back to cutting twice — persisting it is the fix
+                // if that stops being rare.
                 //
                 // Chosen and written down in one step, before any network call. Choosing and
                 // recording separately let two presses of Cut both find nothing and mint an id
                 // each: if the first reached the host and lost its reply, the second's entry
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
-                // `first_attempt` is information, not ownership: it says whether an *earlier*
-                // dispatch of this Job is still unanswered, which changes what a failure here
-                // means. It is deliberately not used to decide whether to undo the reservation.
+                // `first_attempt` is information, not ownership, and it is narrower than it looks:
+                // `true` says only that no entry existed for this Job before this call. So `false`
+                // means an entry stood already — usually an earlier dispatch nothing settled, and
+                // sometimes an earlier press that never reached a host. What it changes is what a
+                // failure here means. It is deliberately not used to decide whether to undo the
+                // reservation.
                 let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
                 // whose reply is lost is exactly the case the window-close guard must still warn
@@ -1015,10 +1067,23 @@ impl DeviceManagerHandle {
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
                     let sent = c.dispatch(dispatch_id.clone(), &device, &machine_id, passes);
-                    // Cleared by any answer — refusals included, since a host that refused was
-                    // reached and its answer is not in doubt. What marks a reply lost is this
-                    // entry outliving the call.
-                    if !matches!(sent, Err(cut_host::client::ClientError::Transport(_))) {
+                    // Cleared by an answer that settles what the host did — a refusal included,
+                    // since a host that refused says it started nothing. A reply this request
+                    // cannot use settles nothing: it arrived, so nothing was lost, but it does not
+                    // say whether the Job began, so the entry stays.
+                    //
+                    // Keeping it is the only thing that leaves host-side deduplication a chance: a
+                    // fresh id matches nothing the host has seen, so nothing there can read the
+                    // next press as this dispatch again. The same id may still be read as a new
+                    // Job — a host forgets ids past `ID_RETENTION` and past `MAX_REMEMBERED_IDS`,
+                    // and a peer answering outside the protocol may dedupe nothing at all — which
+                    // is why the refusal below is `unconfirmed` rather than an all-clear. Clearing
+                    // the entry would remove the chance rather than improve on it.
+                    if !matches!(
+                        sent,
+                        Err(cut_host::client::ClientError::Transport(_)
+                            | cut_host::client::ClientError::WrongReply { .. })
+                    ) {
                         self.in_doubt.lock().unwrap().remove(&key);
                     }
                     // A refusal is the host saying it started nothing, so it is not something the
@@ -1058,7 +1123,7 @@ impl DeviceManagerHandle {
                     // Never reached the host, and nothing of this Job was outstanding before it:
                     // there is nothing in doubt, so this stays the plain error it is. Both halves
                     // matter — a first press against an offline Pi must not claim the Job may be
-                    // cutting, and a press made while an earlier dispatch is unanswered must.
+                    // cutting, and a press made while an earlier dispatch is unsettled must.
                     Err(e)
                         if first_attempt
                             && !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) =>
@@ -1078,10 +1143,12 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// The id this Job goes out under — the one its unanswered dispatch already used, or a fresh
+    /// The id this Job goes out under — the one its unsettled dispatch already used, or a fresh
     /// one — recorded as in doubt in the same breath. `true` means this call is what recorded it,
-    /// which is what lets a caller that never reached the host undo its own reservation without
-    /// discarding an *earlier* dispatch's, the one a retry still needs.
+    /// which is what tells a caller that never reached the host that the entry it would be
+    /// discarding is its own and not an *earlier* dispatch's, the one a retry still needs. Read
+    /// rather than acted on: `execute_cut` deliberately keeps even its own reservation, because a
+    /// concurrent press of Cut on the same Job is using that id (see the comment there).
     ///
     /// Get-and-record under one lock, because the gap between them is a Cut pressed twice: both
     /// presses found nothing, minted an id each, and the second overwrote the record of the first
@@ -1099,7 +1166,10 @@ impl DeviceManagerHandle {
         // were: past `ID_RETENTION` it has forgotten the id, so reusing it protects nothing and
         // only hides that fact. This is *not* the fifteen-minute expiry that was removed — that
         // one discarded protection while it still existed. Aligned to the host's own constant so
-        // the two sides cannot drift apart about when the window closes.
+        // neither side prunes on a number of its own invention — not so that the two windows
+        // coincide, which they do not: this ages from when the id was *written*, while a host's
+        // `Admission` re-stamps an id every time a duplicate arrives, and either side may also have
+        // evicted it at its own cap by then.
         in_doubt.retain(|_, (_, written)| {
             now.saturating_duration_since(*written) < cut_host::host::ID_RETENTION
         });
@@ -2072,6 +2142,24 @@ mod tests {
         assert_eq!(its_own.code, "host_refused", "got {its_own:?}");
     }
 
+    /// A host that answered was reached, and the code has to say so. A wrong reply used to arrive
+    /// as `host_unreachable` with a `Debug` rendering of the reply in the message, so the code
+    /// claimed the opposite of what had just happened (#283).
+    #[test]
+    fn a_reply_a_verb_cannot_use_is_not_reported_as_an_unreachable_host() {
+        use cut_host::client::ClientError;
+
+        let err = host_error(&ClientError::WrongReply { expected: "Snapshots", found: "Devices" });
+        assert_eq!(err.code, "host_wrong_reply", "got {err:?}");
+        assert_eq!(err.message, "this host answered with `Devices` where `Snapshots` was expected");
+
+        // And it did not take the arm next to it with it. A poll that timed out is one example of
+        // the many payloads `Transport` carries; what they have in common is that no reply this
+        // desktop could use ever arrived.
+        let offline = host_error(&ClientError::Transport("timed out".into()));
+        assert_eq!(offline.code, "host_unreachable", "got {offline:?}");
+    }
+
     fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -2914,9 +3002,11 @@ mod tests {
         assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("puma", &a_square(10.0)));
     }
 
-    /// The whole distinction, in the one place it lives. Flip either half and this fails.
+    /// The whole distinction, in the one place it lives. Flip either half and this fails. Asserted
+    /// against the entry rather than against "an answer", because since #283 an answer that does not
+    /// settle what the host did leaves the entry standing — what reuse turns on is the entry.
     #[test]
-    fn an_id_is_reused_only_while_its_dispatch_has_no_answer() {
+    fn an_id_is_reused_only_while_its_job_still_has_an_entry() {
         let dev = test_device_setup();
         let key = key_for(&a_square(10.0));
 
@@ -2931,8 +3021,8 @@ mod tests {
         // ...and only for that Job. A different one is never mistaken for the retry.
         assert_ne!(dev.reserve_dispatch_id(&key_for(&a_square(20.0))).0, first);
 
-        // The answer arrives, so nothing is in doubt any more — and a deliberate re-cut of the
-        // same design is its own Job, not a duplicate of the one that finished.
+        // A settling answer clears the entry, and a deliberate re-cut of the same design is then its
+        // own Job rather than a duplicate of the one that finished.
         dev.in_doubt.lock().unwrap().remove(&key);
         assert_ne!(dev.reserve_dispatch_id(&key).0, first, "a re-cut must not be swallowed");
     }
@@ -2961,9 +3051,9 @@ mod tests {
         assert_ne!(dev.reserve_dispatch_id(&other).0, id);
     }
 
-    /// Entries clear on any answer and expire with the host's memory, so this is a backstop rather
-    /// than a policy — but without it a session dispatching thousands of distinct designs at hosts
-    /// that never answer grows a map nothing ever prunes.
+    /// Entries clear on a settling answer and expire on `ID_RETENTION`, so this is a backstop
+    /// rather than a policy — but without it a session dispatching thousands of distinct designs at
+    /// hosts that never answer grows a map nothing ever prunes.
     #[test]
     fn jobs_held_in_doubt_are_bounded() {
         let dev = test_device_setup();
@@ -3004,25 +3094,31 @@ mod tests {
         assert!(!dev.reserve_dispatch_id(&key).1, "the next press joins the id already reserved");
     }
 
-    /// An abandoned entry is deliberately *kept*, not aged out. Time cannot show that the operator
-    /// loaded fresh material, so expiring an unanswered dispatch mints a new id for a Job the host
-    /// still remembers under the old one — and cuts the material a second time. What makes it
-    /// harmless is that the next press is told it was read as a retry and the answer clears the
-    /// entry, so pressing Cut again really does cut (#121).
+    /// An abandoned entry is deliberately not aged out on a timer of this desktop's own choosing.
+    /// Time cannot show that the operator loaded fresh material, so expiring one early mints a new
+    /// id for a Job the host still remembers under the old one — and cuts the material a second
+    /// time. What makes an entry nobody revisits harmless is that the next press is told it was read
+    /// as a retry, and that a settling answer clears it, so pressing Cut again really does cut
+    /// (#121). The two prunings that do exist are the host's own `ID_RETENTION` and the cap, both on
+    /// `in_doubt`; neither is reached here, and neither is a timer of this desktop's invention.
+    ///
+    /// Named for what is asserted rather than for the scenario: nothing is dispatched, no time
+    /// passes, and nothing settles. Two reservations, one entry, one id.
     #[test]
-    fn an_unanswered_dispatch_stays_the_retry_until_something_answers_it() {
+    fn an_entry_nobody_clears_keeps_naming_the_same_id() {
         let dev = test_device_setup();
         let key = key_for(&a_square(10.0));
         let (abandoned, _) = dev.reserve_dispatch_id(&key);
 
-        // However long nobody comes back to it.
+        // The next press joins it, and the entry is still the only one.
         assert_eq!(dev.reserve_dispatch_id(&key).0, abandoned);
         assert_eq!(dev.in_doubt.lock().unwrap().len(), 1);
     }
 
-    /// A dispatch that never reached a host drops the reservation *it* made, and only that one:
-    /// an earlier unanswered dispatch's entry is what a later retry still needs, and clearing it
-    /// here would send that retry out under a name the host has never seen.
+    /// A dispatch that never reached a host must not drop an *earlier* dispatch's reservation: that
+    /// entry is what a later retry still needs, and clearing it here would send that retry out
+    /// under a name the host has never seen. That a call keeps its *own* reservation as well is
+    /// asserted separately, by `a_press_that_never_reached_a_host_keeps_its_id_for_the_next_one`.
     #[test]
     fn a_dispatch_that_never_reached_a_host_leaves_an_earlier_one_in_doubt() {
         let dev = test_device_setup();
@@ -3047,6 +3143,60 @@ mod tests {
             dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone()),
             Some(earlier),
             "a call that never reached the host discarded a previous dispatch's id"
+        );
+    }
+
+    /// A dispatch answered with a reply that is not `Accepted` learned nothing about whether the
+    /// Job began, so it stays in doubt and keeps its id. Asserted here on the desktop's own side of
+    /// that: the entry survives, and the next press reserves the same id rather than a fresh one.
+    /// What the *host* then does with a repeated id is the host's, and this fixture does not model
+    /// it — a peer answering outside the protocol may honour no dedupe at all, which is why the
+    /// refusal is `unconfirmed` rather than an all-clear.
+    ///
+    /// The reply is one no real `Host` sends to a `Dispatch`, so it takes a peer built to break the
+    /// protocol; `handle_request` answers every request with a reply that request admits (#283).
+    #[test]
+    fn a_dispatch_answered_with_the_wrong_reply_stays_in_doubt() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Ok,
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: aimed.instance_id.clone(),
+            digest: job_digest(&aimed.machine_id, &a_square(10.0)),
+        };
+        let err = dev
+            .execute_cut(aimed, a_square(10.0))
+            .expect_err("`Ok` is not a dispatch this desktop can read as accepted");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            err.message.contains("answered with `Ok` where `Accepted` was expected"),
+            "the reply is not named: {}",
+            err.message
+        );
+
+        let held = dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone());
+        assert!(held.is_some(), "a dispatch nothing confirmed must keep the id its retry needs");
+        // And the next press reserves that id rather than minting a second name the host has never
+        // seen — `reserve_dispatch_id` is the call `execute_cut` makes to choose one.
+        assert_eq!(dev.reserve_dispatch_id(&key).0, held.unwrap());
+
+        // The same failure is what the host's own row then shows, because `with_host_within`
+        // records it and drops the client alongside it. Pinned here because the row used to say
+        // the host could not be reached, directly under the cutters it had just listed.
+        let view = dev.host_views().pop().expect("the host is still paired");
+        assert_eq!(
+            view.unreachable.as_deref(),
+            Some("this host answered with `Ok` where `Accepted` was expected")
         );
     }
 

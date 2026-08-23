@@ -66,6 +66,17 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A Cut Host that answers with the wrong reply names it, instead of calling itself unreachable.**
+  A reply arriving where the request could not use it told the operator `the host could not be
+  reached (the host answered with Devices([DeviceInfo { instance_id: "usb:1:4", machine_id:
+  "cameo5", transport: Usb { locator: "1:4" }, candidate: false, host: None }]))` — every field of
+  every cutter that host knows, rendered with `Debug`, inside a sentence blaming a network that had
+  just carried the answer. The reply and the one that was owed are now named instead, and the
+  failure carries its own code rather than the one that means a Pi is off, so a host that answered
+  is no longer reported as one that never did. A dispatch answered this way still counts as
+  unconfirmed, and still keeps the id it went out under, so pressing Cut again is the retry a host
+  that deduplicates can recognise rather than a second Job it has never seen.
+
 - **A `cuthulhu cut` on an SVG it cannot import says why.** A truncated file told the operator
   `SVG parse: Parse("SVG data parsing failed cause the root node was opened but never closed")`
   — the parser's own account of the problem, wrapped in a struct literal, in quotes, behind a

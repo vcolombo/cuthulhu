@@ -24,6 +24,11 @@ pub enum ClientError {
     /// next move is: re-pair with the token from the Pi's `cutd.toml` — not wait for a host that
     /// is merely asleep (#112).
     Unauthorized,
+    /// A reply that arrived and the request could not use, named rather than rendered. Distinct
+    /// from `Transport` because a host that answered was reached — the answer is the proof — and
+    /// the desktop's `host_unreachable` sent the operator to check a network that had just carried
+    /// it. Nothing about that network or the pairing is the thing to change (#283).
+    WrongReply { expected: &'static str, found: &'static str },
     Transport(String),
 }
 
@@ -47,6 +52,8 @@ impl std::fmt::Display for ClientError {
                            (expected {expected}, found {found})"),
             ClientError::Unauthorized =>
                 write!(f, "this host refused the token; pair again with the one in its `cutd.toml`"),
+            ClientError::WrongReply { expected, found } =>
+                write!(f, "this host answered with `{found}` where `{expected}` was expected"),
             ClientError::Transport(m) => write!(f, "the host could not be reached ({m})"),
         }
     }
@@ -354,7 +361,9 @@ impl HostClient {
             // the same thing an asleep Pi looks like, and the two need opposite things from the
             // operator.
             Ok(Response::Unauthorized) => return Err(ClientError::Unauthorized),
-            Ok(other) => return Err(ClientError::Transport(format!("unexpected greeting: {other:?}"))),
+            // Decided after `Unauthorized`, not instead of it: a refused token is also not `Ok`,
+            // and it is the one answer on this path that tells the operator what to do next.
+            Ok(other) => return Err(wrong_reply("Ok", &other)),
             Err(e) => {
                 if let Some(found) = verifier.seen.lock().unwrap().clone() {
                     if found != pinned_fingerprint {
@@ -388,7 +397,7 @@ impl HostClient {
     pub fn devices(&self) -> Result<Vec<DeviceInfo>, ClientError> {
         match self.call(Request::ListDevices, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Devices(d) => Ok(d),
-            other => Err(unexpected(other)),
+            other => Err(wrong_reply("Devices", &other)),
         }
     }
 
@@ -403,7 +412,7 @@ impl HostClient {
     pub fn snapshots_within(&self, timeout: Duration) -> Result<Vec<DeviceSnapshot>, ClientError> {
         match self.call(Request::Snapshot, timeout)? {
             Response::Snapshots(s) => Ok(s),
-            other => Err(unexpected(other)),
+            other => Err(wrong_reply("Snapshots", &other)),
         }
     }
 
@@ -426,7 +435,7 @@ impl HostClient {
             crate::frame::DEFAULT_BODY_TIMEOUT,
         )? {
             Response::Accepted { admitted, .. } => Ok(admitted),
-            other => Err(unexpected(other)),
+            other => Err(wrong_reply("Accepted", &other)),
         }
     }
 
@@ -449,7 +458,7 @@ impl HostClient {
     fn expect_ok(&self, request: Request) -> Result<(), ClientError> {
         match self.call(request, crate::frame::DEFAULT_BODY_TIMEOUT)? {
             Response::Ok => Ok(()),
-            other => Err(unexpected(other)),
+            other => Err(wrong_reply("Ok", &other)),
         }
     }
 
@@ -507,13 +516,121 @@ enum Incoming {
     Event(Event),
 }
 
-fn unexpected(response: Response) -> ClientError {
-    ClientError::Transport(format!("the host answered with {response:?}"))
+/// A `Response`'s variant name, which is what a reply of the *wrong variant* is worth saying and
+/// all of it: the value behind it belongs to a reply this request cannot use, and `Devices` carries
+/// every field of every cutter the host knows (#283). It says nothing about a reply of the right
+/// variant carrying the wrong contents — `dispatch` does not check the `dispatch_id` echoed back to
+/// it, and that gap is its own defect rather than something a name would close. Private to this
+/// module, since naming a reply is only useful where one turned out to be the wrong one.
+fn response_name(response: &Response) -> &'static str {
+    match response {
+        Response::Devices(_) => "Devices",
+        Response::Snapshots(_) => "Snapshots",
+        Response::Accepted { .. } => "Accepted",
+        Response::Ok => "Ok",
+        Response::Refused(_) => "Refused",
+        Response::Unauthorized => "Unauthorized",
+    }
+}
+
+/// `expected` is the caller's, because nothing below it knows which reply was owed: `call` hands
+/// back every `Response` it did not turn into a `Refused`, and the greeting is read before any
+/// `Request` exists to have asked for one.
+fn wrong_reply(expected: &'static str, found: &Response) -> ClientError {
+    ClientError::WrongReply { expected, found: response_name(found) }
 }
 
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         ClientError::Transport(e.to_string())
+    }
+}
+
+/// A peer that answers a client with replies of the test's choosing, including variants no real
+/// Cut Host sends in the position it sends them in.
+///
+/// Public rather than `#[cfg(test)]` for the reason `host::testing` is: the desktop's own tests
+/// compile as a separate crate and cannot reach test-only code. Nothing that serves a real `Host`
+/// can stand in — `serve_client` answers every request through `handle_request`, which returns
+/// only replies that request admits — so the mismatch branches need a peer built to break the
+/// protocol.
+pub mod testing {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::frame::{read_frame, write_frame, DEFAULT_MAX_FRAME, SOCKET_POLL_INTERVAL};
+    use crate::protocol::{Request, Response};
+
+    /// Where a misbehaving host is listening, and the fingerprint a client must pin to reach it.
+    pub struct MisbehavingHost {
+        pub addr: String,
+        pub fingerprint: String,
+    }
+
+    /// The budget this peer hands each `read_frame` — twice over, in fact, since `read_frame` spends
+    /// one waiting for a frame to begin and a fresh one on the rest of it. Not a ceiling on how long
+    /// a frame can take: a deadline is only checked between reads, so a read already under way still
+    /// spends its `SOCKET_POLL_INTERVAL`, and decoding happens outside both. That is fine, because
+    /// this bounds nothing a test asserts on — it is only here so a client that stops talking does
+    /// not hold the thread for the whole run.
+    const BUDGET: Duration = Duration::from_secs(10);
+
+    /// Answers `replies` in order: the first as the greeting a token earns, then one per request.
+    ///
+    /// Binds port 0 so tests run concurrently, and replays the same script on every connection, so
+    /// a client that redials is answered rather than left hanging.
+    pub fn start_host_answering(replies: Vec<Response>) -> MisbehavingHost {
+        let cert = rcgen::generate_simple_self_signed(vec!["cuthulhu-cutd".to_string()])
+            .expect("a self-signed certificate for the fake host");
+        let der = cert.cert.der().clone();
+        let fingerprint = crate::serve::fingerprint(&der);
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let tls = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![der], key)
+                .expect("the generated certificate and its own key"),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the port the OS chose").to_string();
+        let script = Arc::new(replies);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (tls, script) = (tls.clone(), script.clone());
+                std::thread::spawn(move || answer(stream, tls, &script));
+            }
+        });
+        MisbehavingHost { addr, fingerprint }
+    }
+
+    fn answer(stream: TcpStream, tls: Arc<rustls::ServerConfig>, replies: &[Response]) {
+        // The frame layer re-checks its deadline whenever a read comes back empty, so the socket
+        // has to come back empty rather than block — the pacing `serve_client` sets, for the same
+        // reason. Unwrapped rather than ignored so the cause is named: this worker is detached, so a
+        // fixture blocked in a read does not hang the test — the client's own deadline fires and the
+        // test fails as a timeout, with nothing to say why. The panic prints the reason instead.
+        stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a read timeout on a loopback socket");
+        stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a write timeout on a loopback socket");
+        let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        // The token is read and discarded: a client that got this far already pinned the
+        // certificate, and nothing here is proving anything about tokens.
+        if read_frame::<_, String>(&mut tls, 1024, Some(BUDGET), BUDGET).is_err() {
+            return;
+        }
+        for reply in replies {
+            if write_frame(&mut tls, reply, BUDGET).is_err() {
+                return;
+            }
+            // Each reply after the greeting waits for the request it answers, so none can land
+            // ahead of it and be read as the answer to something else.
+            if read_frame::<_, Request>(&mut tls, DEFAULT_MAX_FRAME, Some(BUDGET), BUDGET).is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -574,6 +691,188 @@ mod tests {
             start.elapsed() < CONNECT_TIMEOUT + Duration::from_secs(2),
             "took {:?}, longer than the timeout allows for: {err}",
             start.elapsed()
+        );
+    }
+
+    /// The whole table at once: a new variant fails to compile `Display`'s match, and a rewording
+    /// that is `ClientError`'s own fails here. These are the strings the desktop shows —
+    /// `host_error` puts `to_string()` in the message unaltered.
+    ///
+    /// Two rows compute the sentence they expect from the value underneath instead of restating it,
+    /// because those two forward a payload whole: writing the forwarded wording out here would
+    /// compare a literal with itself and pin the wrong layer, when the claim being made is that the
+    /// payload arrives unaltered. Those two rows therefore follow the payload's own `Display` and
+    /// stay green when it is reworded, which is the point of them. `Transport`'s row does restate
+    /// its sentence, and rightly — the wrapping around the payload is this type's own, and the
+    /// payload it wraps is one of the many the client and its resolver write rather than a sentence
+    /// from a layer below.
+    #[test]
+    fn every_client_failure_has_a_sentence() {
+        let fault = crate::check::PassFault::Degenerate(2);
+        let device = driver_core::manager::DeviceError::Busy;
+        let cases: Vec<(ClientError, String)> = vec![
+            (
+                ClientError::Refused(Refusal::UnknownDevice("usb:1:4".into())),
+                "this host has no cutter called `usb:1:4`".into(),
+            ),
+            (
+                ClientError::Refused(Refusal::MachineMismatch {
+                    dispatched: "cameo5".into(),
+                    attached: "puma".into(),
+                }),
+                "the cut was planned for a `cameo5`, but a `puma` is attached".into(),
+            ),
+            (
+                ClientError::Refused(Refusal::Preflight(crate::check::PassFault::Degenerate(2))),
+                fault.to_string(),
+            ),
+            (
+                ClientError::Refused(Refusal::Device(driver_core::manager::DeviceError::Busy)),
+                device.to_string(),
+            ),
+            (
+                ClientError::Refused(Refusal::DispatchIdTooLong { max: 128 }),
+                "this host will not accept a dispatch id longer than 128 characters".into(),
+            ),
+            (
+                ClientError::Fingerprint { expected: "aa:bb".into(), found: "cc:dd".into() },
+                "this host presented a different certificate than the one paired \
+                 (expected aa:bb, found cc:dd)"
+                    .into(),
+            ),
+            (
+                ClientError::Unauthorized,
+                "this host refused the token; pair again with the one in its `cutd.toml`".into(),
+            ),
+            (
+                ClientError::WrongReply { expected: "Snapshots", found: "Devices" },
+                "this host answered with `Devices` where `Snapshots` was expected".into(),
+            ),
+            (
+                ClientError::Transport("the host closed the connection".into()),
+                "the host could not be reached (the host closed the connection)".into(),
+            ),
+        ];
+        for (error, sentence) in cases {
+            assert_eq!(error.to_string(), sentence, "{error:?}");
+        }
+    }
+
+    /// Every name a mismatch can report. `Refused` and `Unauthorized` are reachable here even
+    /// though each has a `ClientError` of its own: `call` turns a `Refused` into one only in a
+    /// reply slot, and the greeting decides `Unauthorized` only there — so either arriving in the
+    /// other place is a wrong reply and has to be nameable.
+    #[test]
+    fn every_response_variant_has_a_name() {
+        let named: Vec<(Response, &str)> = vec![
+            (Response::Devices(Vec::new()), "Devices"),
+            (Response::Snapshots(Vec::new()), "Snapshots"),
+            (
+                Response::Accepted {
+                    dispatch_id: DispatchId("d1".into()),
+                    admitted: Admitted::Started,
+                },
+                "Accepted",
+            ),
+            (Response::Ok, "Ok"),
+            (Response::Refused(Refusal::UnknownDevice("usb:1:4".into())), "Refused"),
+            (Response::Unauthorized, "Unauthorized"),
+        ];
+        for (response, name) in named {
+            assert_eq!(response_name(&response), name, "{response:?}");
+        }
+    }
+
+    /// Every distinct reply a verb can expect, against a host that answers a variant it cannot use.
+    /// Four branches, not seven verbs: `cancel`, `resume`, `confirm_pass_done` and `reconnect` share
+    /// `expect_ok`, so `cancel` stands for all four. Each branch passes its own `expected` name, so
+    /// each of the four is a separate hand-written string to pin.
+    ///
+    /// All four on one connection, which shows that this peer's mismatches leave the stream usable:
+    /// `call` writes one request and reads frames until the reply, and this fixture answers exactly
+    /// once per request, so nothing is left over for the next verb to misread. That is a fact about
+    /// the fixture and not about every off-protocol peer — one that volunteered a second complete
+    /// `Response` would leave the next call reading a stale one, which is why the desktop drops the
+    /// connection rather than trusting it (see `with_host_within`).
+    ///
+    /// The old rendering put the reply's `Debug` in the message under a sentence about
+    /// reachability, so a single wrong reply printed every field of every cutter the host knew,
+    /// inside a claim that it could not be reached (#283).
+    #[test]
+    fn a_reply_a_verb_cannot_use_is_named_rather_than_rendered() {
+        let host = testing::start_host_answering(vec![
+            Response::Ok,
+            // `Ok` where a device list was asked for.
+            Response::Ok,
+            // The reply that gave #283 its example: a `Vec<DeviceInfo>` in the wrong slot.
+            Response::Devices(vec![DeviceInfo {
+                instance_id: "usb:1:4".into(),
+                machine_id: "cameo5".into(),
+                transport: driver_core::TransportKind::Usb { locator: "1:4".into() },
+                candidate: false,
+                host: None,
+            }]),
+            Response::Ok,
+            Response::Devices(Vec::new()),
+        ]);
+        let client = HostClient::connect(&host.addr, "token", &host.fingerprint)
+            .expect("this host greets a client normally; only its replies are wrong");
+
+        assert_eq!(
+            client.devices().unwrap_err().to_string(),
+            "this host answered with `Ok` where `Devices` was expected"
+        );
+
+        let listed = client.snapshots().unwrap_err().to_string();
+        assert_eq!(listed, "this host answered with `Devices` where `Snapshots` was expected");
+        assert!(!listed.contains("DeviceInfo"), "the reply's fields reached the operator: {listed}");
+        assert!(
+            !listed.contains("could not be reached"),
+            "a host that answered was reported unreachable: {listed}"
+        );
+
+        assert_eq!(
+            client
+                .dispatch(DispatchId("d1".into()), "usb:1:4", "cameo5", Vec::new())
+                .unwrap_err()
+                .to_string(),
+            "this host answered with `Ok` where `Accepted` was expected"
+        );
+        assert_eq!(
+            client.cancel("usb:1:4").unwrap_err().to_string(),
+            "this host answered with `Devices` where `Ok` was expected"
+        );
+    }
+
+    /// `connect`'s failure. `HostClient` is deliberately not `Debug` — it holds a TLS stream — so
+    /// `expect_err` cannot be used on its result.
+    fn connect_failure(host: &testing::MisbehavingHost) -> ClientError {
+        match HostClient::connect(&host.addr, "token", &host.fingerprint) {
+            Ok(_) => panic!("this host's greeting cannot open a session"),
+            Err(e) => e,
+        }
+    }
+
+    /// The greeting is its own construction site: it is answered before any `Request` is written,
+    /// so it cannot go through `call` and had a second hand-written payload of its own.
+    #[test]
+    fn a_greeting_that_is_not_ok_is_named_rather_than_rendered() {
+        let host = testing::start_host_answering(vec![Response::Snapshots(Vec::new())]);
+        assert_eq!(
+            connect_failure(&host).to_string(),
+            "this host answered with `Snapshots` where `Ok` was expected"
+        );
+    }
+
+    /// A refused token is also "not `Ok`", and the greeting decides it before it reaches a
+    /// mismatch at all — reading it as a wrong reply would lose the one refusal on this path that
+    /// tells the operator what to do about it (#112).
+    #[test]
+    fn a_refused_token_is_still_a_refused_token_rather_than_a_wrong_reply() {
+        let host = testing::start_host_answering(vec![Response::Unauthorized]);
+        assert_eq!(
+            connect_failure(&host).to_string(),
+            "this host refused the token; pair again with the one in its `cutd.toml`"
         );
     }
 }

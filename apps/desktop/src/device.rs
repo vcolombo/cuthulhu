@@ -227,22 +227,27 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
-    /// Dispatch ids held for reuse, by the Job they name — one per Job whose outcome nothing has
-    /// settled, written before the request goes out and so also covering a Job whose dispatch never
-    /// left this machine.
+    /// The dispatch id each Job's next press must go out under, by the Job it names.
     ///
     /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
     /// cannot cut the same material twice — but only the sender knows whether a given press of
     /// Cut *is* that retry, and nothing in the Job says so: a retry and a second sheet of the
-    /// same design are byte-identical. What separates them is this entry. It is written before
-    /// the request goes out and cleared by an answer that settles what the host did, so a Job still
-    /// listed here is one whose fate is genuinely unknown, and the next dispatch of it reuses the
-    /// same id.
+    /// same design are byte-identical. What separates them is this entry: while a Job has one, the
+    /// next press reuses the id in it instead of minting a fresh one.
     ///
-    /// Only two answers settle it: `Accepted` says the host has the Job, and a refusal says it
-    /// started nothing. A dropped reply does not, and since #283 neither does a reply the request
-    /// could not use — it arrived, so nothing was lost, but it says nothing about whether the Job
-    /// began. Otherwise an entry leaves only by expiry or by making room, below.
+    /// Written before the request goes out, and dropped only where dropping it is provably safe.
+    /// Two answers make it so: `Accepted` says the host has the Job, and a refusal says it started
+    /// nothing. A dropped reply does not, and since #283 neither does a reply the request could not
+    /// use — it arrived, so nothing was lost, but it says nothing about whether the Job began.
+    ///
+    /// So an entry does not mean "outcome unknown", and a dispatch that never left this machine is
+    /// the case that shows the difference: its outcome is known — nothing started — and the entry
+    /// stays anyway, because the call cannot prove the entry is *its* rather than a concurrent
+    /// press's, and discarding another press's record would send that press's retry out under a
+    /// name the host has never seen (see `execute_cut`). Held, in other words, whenever letting go
+    /// would risk that, which is a weaker condition than doubt.
+    ///
+    /// Beyond those two answers an entry leaves only by expiry or by making room, below.
     /// An earlier version aged them out after fifteen minutes, which was the
     /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
     /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
@@ -252,11 +257,11 @@ pub struct DeviceManagerHandle {
     /// again really does cut (#121).
     ///
     /// The one honest expiry is `ID_RETENTION`, the host's own constant: an hour after this entry
-    /// was written, holding it only pretends to a protection that has probably lapsed. Nothing on
+    /// was written, holding it only pretends to a protection that may well have lapsed. Nothing on
     /// either side can prevent a re-cut past that point — which is the true limit of deduplicating
     /// by memory, not something a client-side rule can close.
     ///
-    /// "Probably", because sharing the constant does not make the two windows the same window. This
+    /// "May well", because sharing the constant does not make the two windows the same window. This
     /// entry ages from when the id was written; a host's `Admission` re-stamps an id every time a
     /// duplicate arrives, so a Job retried near the hour can be remembered there after it has
     /// expired here. And two capacity bounds cut in ahead of the hour on both sides, neither
@@ -292,8 +297,9 @@ pub struct DeviceManagerHandle {
 /// How many Jobs may be held in doubt at once.
 ///
 /// A backstop against a session that dispatches thousands of distinct designs to hosts that never
-/// answer, not a policy anyone should reach: entries clear on a settling answer, and expire with the
-/// host's own memory. The oldest is evicted, which is the one a retry is least likely to name.
+/// answer, not a policy anyone should reach: entries clear on a settling answer, and expire on the
+/// host's own `ID_RETENTION` — though not in step with the host's own memory of the id, for the
+/// reasons on `in_doubt`. The oldest is evicted, which is the one a retry is least likely to name.
 const MAX_JOBS_IN_DOUBT: usize = 256;
 
 /// One dispatchable Job as this desktop identifies it: which cutter, on which host, carrying
@@ -1018,24 +1024,27 @@ impl DeviceManagerHandle {
                 // sheet and loads another is dispatching the identical Job on purpose, and must
                 // not be silently swallowed as a duplicate. So the id is the digest plus a
                 // once-per-attempt nonce, and `in_doubt` decides which of the two this is —
-                // reuse while this Job still has an entry here, mint fresh once a settling answer
-                // has cleared it. The desktop is the only party that can tell them apart: it is the
+                // reuse while this Job still has an entry here, mint fresh once nothing holds one.
+                // The desktop is the only party that can tell them apart: it is the
                 // one that knows what the last try was told.
                 //
                 // The first Cut after a lost reply is therefore always read as the retry. That
-                // is the safe direction, and it self-clears: the retry gets an answer (the
-                // host's dedupe makes it a no-op if the Job is already running), which frees the
-                // next Cut to be a new Job. A desktop restarted in between loses `in_doubt` and
-                // is back to cutting twice — persisting it is the fix if that stops being rare.
+                // is the safe direction, and a settling answer is what ends it: the retry is either
+                // accepted — the host's dedupe making it a no-op if the Job is already running — or
+                // refused, and either frees the next Cut to be a new Job. A desktop restarted in
+                // between loses `in_doubt` and is back to cutting twice — persisting it is the fix
+                // if that stops being rare.
                 //
                 // Chosen and written down in one step, before any network call. Choosing and
                 // recording separately let two presses of Cut both find nothing and mint an id
                 // each: if the first reached the host and lost its reply, the second's entry
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
-                // `first_attempt` is information, not ownership: it says whether an *earlier*
-                // dispatch of this Job is still unsettled, which changes what a failure here
-                // means. It is deliberately not used to decide whether to undo the reservation.
+                // `first_attempt` is information, not ownership, and it is narrower than it looks:
+                // it says only that no entry existed for this Job before this call, which is
+                // usually an earlier dispatch still unsettled and can also be an earlier press that
+                // never reached a host. What it changes is what a failure here means. It is
+                // deliberately not used to decide whether to undo the reservation.
                 let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
                 // whose reply is lost is exactly the case the window-close guard must still warn
@@ -3035,7 +3044,7 @@ mod tests {
         assert_ne!(dev.reserve_dispatch_id(&other).0, id);
     }
 
-    /// Entries clear on a settling answer and expire with the host's memory, so this is a backstop
+    /// Entries clear on a settling answer and expire on `ID_RETENTION`, so this is a backstop
     /// rather than a policy — but without it a session dispatching thousands of distinct designs at
     /// hosts that never answer grows a map nothing ever prunes.
     #[test]
@@ -3078,13 +3087,18 @@ mod tests {
         assert!(!dev.reserve_dispatch_id(&key).1, "the next press joins the id already reserved");
     }
 
-    /// An abandoned entry is deliberately *kept*, not aged out. Time cannot show that the operator
-    /// loaded fresh material, so expiring an unsettled dispatch mints a new id for a Job the host
-    /// still remembers under the old one — and cuts the material a second time. What makes it
-    /// harmless is that the next press is told it was read as a retry and that a settling answer
-    /// clears the entry, so pressing Cut again really does cut (#121).
+    /// An abandoned entry is deliberately not aged out on a timer of this desktop's own choosing.
+    /// Time cannot show that the operator loaded fresh material, so expiring one early mints a new
+    /// id for a Job the host still remembers under the old one — and cuts the material a second
+    /// time. What makes an entry nobody revisits harmless is that the next press is told it was read
+    /// as a retry, and that a settling answer clears it, so pressing Cut again really does cut
+    /// (#121). The two prunings that do exist are the host's own `ID_RETENTION` and the cap, both on
+    /// `in_doubt`; neither is reached here, and neither is a timer of this desktop's invention.
+    ///
+    /// Named for what is asserted rather than for the scenario: nothing is dispatched, no time
+    /// passes, and nothing settles. Two reservations, one entry, one id.
     #[test]
-    fn an_unsettled_dispatch_stays_the_retry_until_something_settles_it() {
+    fn an_entry_nobody_clears_keeps_naming_the_same_id() {
         let dev = test_device_setup();
         let key = key_for(&a_square(10.0));
         let (abandoned, _) = dev.reserve_dispatch_id(&key);
@@ -3096,8 +3110,8 @@ mod tests {
 
     /// A dispatch that never reached a host must not drop an *earlier* dispatch's reservation: that
     /// entry is what a later retry still needs, and clearing it here would send that retry out
-    /// under a name the host has never seen. Its own reservation is kept too — it cannot know it
-    /// owns the entry, since a concurrent press of Cut on the same Job is using that id.
+    /// under a name the host has never seen. That a call keeps its *own* reservation as well is
+    /// asserted separately, by `a_press_that_never_reached_a_host_keeps_its_id_for_the_next_one`.
     #[test]
     fn a_dispatch_that_never_reached_a_host_leaves_an_earlier_one_in_doubt() {
         let dev = test_device_setup();

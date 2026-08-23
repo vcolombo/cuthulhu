@@ -516,10 +516,12 @@ enum Incoming {
     Event(Event),
 }
 
-/// A `Response`'s variant name, which is the whole of what a mismatch is worth saying: the value
-/// behind it belongs to a reply this request cannot use, and `Devices` carries every field of every
-/// cutter the host knows (#283). Private to this module, since naming a reply is only useful where
-/// one turned out to be the wrong one.
+/// A `Response`'s variant name, which is what a reply of the *wrong variant* is worth saying and
+/// all of it: the value behind it belongs to a reply this request cannot use, and `Devices` carries
+/// every field of every cutter the host knows (#283). It says nothing about a reply of the right
+/// variant carrying the wrong contents — `dispatch` does not check the `dispatch_id` echoed back to
+/// it, and that gap is its own defect rather than something a name would close. Private to this
+/// module, since naming a reply is only useful where one turned out to be the wrong one.
 fn response_name(response: &Response) -> &'static str {
     match response {
         Response::Devices(_) => "Devices",
@@ -544,8 +546,8 @@ impl From<io::Error> for ClientError {
     }
 }
 
-/// A peer that answers a client with replies of the test's choosing, including ones no Cut Host
-/// sends.
+/// A peer that answers a client with replies of the test's choosing, including variants no real
+/// Cut Host sends in the position it sends them in.
 ///
 /// Public rather than `#[cfg(test)]` for the reason `host::testing` is: the desktop's own tests
 /// compile as a separate crate and cannot reach test-only code. Nothing that serves a real `Host`
@@ -566,9 +568,10 @@ pub mod testing {
         pub fingerprint: String,
     }
 
-    /// How long this peer waits on any one frame. Generous, because it bounds nothing a test is
-    /// asserting on — a client that stops talking should not hold the thread for the whole run,
-    /// and that is all this is for.
+    /// The per-frame budget this peer hands `read_frame`, which spends it once waiting for a frame
+    /// to begin and again on the rest of it — so a frame costs up to twice this. Generous, because
+    /// it bounds nothing a test is asserting on: it is only here so a client that stops talking
+    /// does not hold the thread for the whole run.
     const BUDGET: Duration = Duration::from_secs(10);
 
     /// Answers `replies` in order: the first as the greeting a token earns, then one per request.
@@ -604,9 +607,10 @@ pub mod testing {
     fn answer(stream: TcpStream, tls: Arc<rustls::ServerConfig>, replies: &[Response]) {
         // The frame layer re-checks its deadline whenever a read comes back empty, so the socket
         // has to come back empty rather than block — the pacing `serve_client` sets, for the same
-        // reason.
-        let _ = stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL));
-        let _ = stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL));
+        // reason. Unwrapped rather than ignored: without it `read_frame`'s deadlines never come due,
+        // so a fixture that silently failed to install them would hang a test instead of failing it.
+        stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a read timeout on a loopback socket");
+        stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a write timeout on a loopback socket");
         let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
         let mut tls = rustls::StreamOwned::new(conn, stream);
         // The token is read and discarded: a client that got this far already pinned the
@@ -687,16 +691,18 @@ mod tests {
         );
     }
 
-    /// The whole table at once: a new variant fails to compile `Display`'s match, and a reworded
-    /// one fails here. These are the strings the desktop shows — `host_error` puts `to_string()`
-    /// in the message unaltered.
+    /// The whole table at once: a new variant fails to compile `Display`'s match, and a rewording
+    /// that is `ClientError`'s own fails here. These are the strings the desktop shows —
+    /// `host_error` puts `to_string()` in the message unaltered.
     ///
     /// Two rows compute the sentence they expect from the value underneath instead of restating it,
     /// because those two forward a payload whole: writing the forwarded wording out here would
     /// compare a literal with itself and pin the wrong layer, when the claim being made is that the
-    /// payload arrives unaltered. `Transport`'s row does restate its sentence, and rightly — the
-    /// wrapping around the payload is this type's own, and the payload it wraps is one of the many
-    /// the client and its resolver write rather than a sentence from a layer below.
+    /// payload arrives unaltered. Those two rows therefore follow the payload's own `Display` and
+    /// stay green when it is reworded, which is the point of them. `Transport`'s row does restate
+    /// its sentence, and rightly — the wrapping around the payload is this type's own, and the
+    /// payload it wraps is one of the many the client and its resolver write rather than a sentence
+    /// from a layer below.
     #[test]
     fn every_client_failure_has_a_sentence() {
         let fault = crate::check::PassFault::Degenerate(2);
@@ -774,12 +780,17 @@ mod tests {
         }
     }
 
-    /// Every verb that reads a reply, against a host that answers a variant the verb cannot use.
+    /// Every distinct reply a verb can expect, against a host that answers a variant it cannot use.
+    /// Four branches, not seven verbs: `cancel`, `resume`, `confirm_pass_done` and `reconnect` share
+    /// `expect_ok`, so `cancel` stands for all four. Each branch passes its own `expected` name, so
+    /// each of the four is a separate hand-written string to pin.
     ///
-    /// All four on one connection, which is itself the assertion that a mismatch is not a broken
-    /// socket: `call` writes one request and reads frames until the reply, so the stream is still
-    /// aligned afterwards and the next verb is answered normally. Each verb passes its own
-    /// `expected` name, so each of the four is a separate hand-written string to pin.
+    /// All four on one connection, which shows that this peer's mismatches leave the stream usable:
+    /// `call` writes one request and reads frames until the reply, and this fixture answers exactly
+    /// once per request, so nothing is left over for the next verb to misread. That is a fact about
+    /// the fixture and not about every off-protocol peer — one that volunteered a second complete
+    /// `Response` would leave the next call reading a stale one, which is why the desktop drops the
+    /// connection rather than trusting it (see `with_host_within`).
     ///
     /// The old rendering put the reply's `Debug` in the message under a sentence about
     /// reachability, so a single wrong reply printed every field of every cutter the host knew,

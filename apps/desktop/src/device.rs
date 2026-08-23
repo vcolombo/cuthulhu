@@ -187,10 +187,11 @@ pub struct PairedHostView {
     pub id: HostId,
     pub name: String,
     pub address: String,
-    /// The last thing that went wrong with this host, or `None` while nothing has. Named for the
-    /// case that fills it most — a Pi that is off or unplugged — but since #283 it also carries a
-    /// host that answered outside the protocol, which was reached and whose sentence says so. The
-    /// row prints it when it is present; nothing reads what is in it.
+    /// The last thing that went wrong with this host, or `None` while nothing has. The name is the
+    /// serialized one this field has always had, kept because every consumer only prints the
+    /// message: since #283 it also carries a host that answered outside the protocol, which was
+    /// reached and whose sentence says so, and before that a refused token, a changed certificate
+    /// and a refusal. The row prints it when it is present; nothing reads what is in it.
     pub unreachable: Option<String>,
 }
 
@@ -232,17 +233,21 @@ pub struct DeviceManagerHandle {
     /// cannot cut the same material twice — but only the sender knows whether a given press of
     /// Cut *is* that retry, and nothing in the Job says so: a retry and a second sheet of the
     /// same design are byte-identical. What separates them is this entry. It is written before
-    /// the request goes out and cleared by any answer, so a Job still listed here is one whose
-    /// fate is genuinely unknown, and the next dispatch of it reuses the same id.
+    /// the request goes out and cleared by an answer that settles what the host did, so a Job still
+    /// listed here is one whose fate is genuinely unknown, and the next dispatch of it reuses the
+    /// same id.
     ///
-    /// An entry is cleared by an *answer*, and otherwise only once the host itself can no longer
-    /// recognise the id. An earlier version aged them out after fifteen minutes, which was the
+    /// Only two answers settle it: `Accepted` says the host has the Job, and a refusal says it
+    /// started nothing. A dropped reply does not, and since #283 neither does a reply the request
+    /// could not use — it arrived, so nothing was lost, but it says nothing about whether the Job
+    /// began. Otherwise an entry clears only once the host itself can no longer recognise the id.
+    /// An earlier version aged them out after fifteen minutes, which was the
     /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
     /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
     /// still remembers under the old one and cuts the design twice. What makes an entry nobody
     /// revisits harmless is that the next Cut is *told* it was read as a retry
-    /// (`CutStarted::duplicate`), and that the answer clears the entry, so pressing Cut again
-    /// really does cut (#121).
+    /// (`CutStarted::duplicate`), and that a settling answer clears the entry, so pressing Cut
+    /// again really does cut (#121).
     ///
     /// The one honest expiry is the host's own `ID_RETENTION`: past it the id means nothing to
     /// anyone, so holding it only pretends to a protection that has already lapsed. Nothing on
@@ -275,7 +280,7 @@ pub struct DeviceManagerHandle {
 /// How many Jobs may be held in doubt at once.
 ///
 /// A backstop against a session that dispatches thousands of distinct designs to hosts that never
-/// answer, not a policy anyone should reach: entries clear on any answer, and expire with the
+/// answer, not a policy anyone should reach: entries clear on a settling answer, and expire with the
 /// host's own memory. The oldest is evicted, which is the one a retry is least likely to name.
 const MAX_JOBS_IN_DOUBT: usize = 256;
 
@@ -593,12 +598,13 @@ impl DeviceManagerHandle {
                     // after a lost reply, which is by definition made on a connection that just
                     // failed (see `execute_cut`).
                     //
-                    // `WrongReply` is dropped with it because it was a `Transport` until #283 and
-                    // dropping is what it already did. It is not the same situation — a wrong reply
-                    // arrives framed and in order, and the client's own tests drive four such verbs
-                    // across one connection to say so — but narrowing this to `Transport` alone
-                    // would change which connections survive, and nothing here establishes that a
-                    // host answering outside the protocol is worth keeping one to.
+                    // `WrongReply` is dropped with it, and not only because it was a `Transport`
+                    // until #283. The framing survives a wrong reply — one request written, frames
+                    // read until the reply — but nothing correlates a reply with its request, so a
+                    // peer that answered outside the protocol once may also have volunteered a
+                    // second `Response` this call has not read, and the next verb on this socket
+                    // would take that one for its own answer. Redialling costs a handshake; reading
+                    // a stale reply as the answer to a cut verb does not stop at costing that.
                     host.last_error = Some(host_error(e));
                     host.client = None;
                 }
@@ -1036,9 +1042,14 @@ impl DeviceManagerHandle {
                     // Cleared by an answer that settles what the host did — a refusal included,
                     // since a host that refused says it started nothing. A reply this request
                     // cannot use settles nothing: it arrived, so nothing was lost, but it does not
-                    // say whether the Job began, and the failure below tells the operator to press
-                    // Cut again because "the host recognizes the same Job and will not cut it
-                    // twice" — which is only true while this entry keeps the id that retry needs.
+                    // say whether the Job began, so the entry stays.
+                    //
+                    // Keeping it is the weakly safer of the two: a retry under a fresh id is cut
+                    // again by every host, where a retry under the same id is recognised by one
+                    // that honours its own `ID_RETENTION`. A peer that answered outside the
+                    // protocol may honour nothing, which is why the refusal below is `unconfirmed`
+                    // rather than an all-clear — but clearing the entry would remove the only
+                    // protection there is, not add one.
                     if !matches!(
                         sent,
                         Err(cut_host::client::ClientError::Transport(_)
@@ -2108,8 +2119,9 @@ mod tests {
         assert_eq!(err.code, "host_wrong_reply", "got {err:?}");
         assert_eq!(err.message, "this host answered with `Devices` where `Snapshots` was expected");
 
-        // And it did not take the arm next to it with it: a Pi that never answered is still
-        // unreachable, which is the one case waiting actually fixes.
+        // And it did not take the arm next to it with it. A poll that timed out is one example of
+        // the many payloads `Transport` carries; what they have in common is that no reply this
+        // desktop could use ever arrived.
         let offline = host_error(&ClientError::Transport("timed out".into()));
         assert_eq!(offline.code, "host_unreachable", "got {offline:?}");
     }
@@ -3003,9 +3015,9 @@ mod tests {
         assert_ne!(dev.reserve_dispatch_id(&other).0, id);
     }
 
-    /// Entries clear on any answer and expire with the host's memory, so this is a backstop rather
-    /// than a policy — but without it a session dispatching thousands of distinct designs at hosts
-    /// that never answer grows a map nothing ever prunes.
+    /// Entries clear on a settling answer and expire with the host's memory, so this is a backstop
+    /// rather than a policy — but without it a session dispatching thousands of distinct designs at
+    /// hosts that never answer grows a map nothing ever prunes.
     #[test]
     fn jobs_held_in_doubt_are_bounded() {
         let dev = test_device_setup();
@@ -3049,8 +3061,8 @@ mod tests {
     /// An abandoned entry is deliberately *kept*, not aged out. Time cannot show that the operator
     /// loaded fresh material, so expiring an unanswered dispatch mints a new id for a Job the host
     /// still remembers under the old one — and cuts the material a second time. What makes it
-    /// harmless is that the next press is told it was read as a retry and the answer clears the
-    /// entry, so pressing Cut again really does cut (#121).
+    /// harmless is that the next press is told it was read as a retry and that a settling answer
+    /// clears the entry, so pressing Cut again really does cut (#121).
     #[test]
     fn an_unanswered_dispatch_stays_the_retry_until_something_answers_it() {
         let dev = test_device_setup();
@@ -3093,12 +3105,14 @@ mod tests {
     }
 
     /// A dispatch answered with a reply that is not `Accepted` learned nothing about whether the
-    /// Job began, so it stays in doubt and keeps its id — which is what makes the refusal's own
-    /// advice true: "press Cut again … the host recognizes the same Job and will not cut it twice"
-    /// only holds while the retry goes out under the id the first attempt used.
+    /// Job began, so it stays in doubt and keeps its id. Asserted here on the desktop's own side of
+    /// that: the entry survives, and the next press reserves the same id rather than a fresh one.
+    /// What the *host* then does with a repeated id is the host's, and this fixture does not model
+    /// it — a peer answering outside the protocol may honour no dedupe at all, which is why the
+    /// refusal is `unconfirmed` rather than an all-clear.
     ///
-    /// The reply is the answer to no request this desktop made, so it takes a peer built to break
-    /// the protocol; a real `Host` answers every verb with a reply that verb admits (#283).
+    /// The reply is one no real `Host` sends to a `Dispatch`, so it takes a peer built to break the
+    /// protocol; `handle_request` answers every request with a reply that request admits (#283).
     #[test]
     fn a_dispatch_answered_with_the_wrong_reply_stays_in_doubt() {
         let host = cut_host::client::testing::start_host_answering(vec![
@@ -3130,7 +3144,8 @@ mod tests {
 
         let held = dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone());
         assert!(held.is_some(), "a dispatch nothing confirmed must keep the id its retry needs");
-        // And the retry joins it rather than minting a second name the host has never seen.
+        // And the next press reserves that id rather than minting a second name the host has never
+        // seen — `reserve_dispatch_id` is the call `execute_cut` makes to choose one.
         assert_eq!(dev.reserve_dispatch_id(&key).0, held.unwrap());
 
         // The same failure is what the host's own row then shows, because `with_host_within`

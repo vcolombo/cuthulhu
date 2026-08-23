@@ -74,8 +74,8 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   just carried the answer. The reply and the one that was owed are now named instead, and the
   failure carries its own code rather than the one that means a Pi is off, so a host that answered
   is no longer reported as one that never did. A dispatch answered this way still counts as
-  unconfirmed: pressing Cut again retries it under the id the first attempt used, rather than
-  cutting the material a second time.
+  unconfirmed, and still keeps the id it went out under, so pressing Cut again is the retry a host
+  that deduplicates can recognise rather than a second Job it has never seen.
 
 - **A `cuthulhu cut` on an SVG it cannot import says why.** A truncated file told the operator
   `SVG parse: Parse("SVG data parsing failed cause the root node was opened but never closed")`

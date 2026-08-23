@@ -227,7 +227,7 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
-    /// Dispatches this desktop sent and never got an answer to, by the Job they carried.
+    /// Dispatches this desktop sent whose outcome nothing has settled, by the Job they carried.
     ///
     /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
     /// cannot cut the same material twice — but only the sender knows whether a given press of
@@ -240,7 +240,7 @@ pub struct DeviceManagerHandle {
     /// Only two answers settle it: `Accepted` says the host has the Job, and a refusal says it
     /// started nothing. A dropped reply does not, and since #283 neither does a reply the request
     /// could not use — it arrived, so nothing was lost, but it says nothing about whether the Job
-    /// began. Otherwise an entry clears only once the host itself can no longer recognise the id.
+    /// began. Otherwise an entry leaves only by expiry or by making room, below.
     /// An earlier version aged them out after fifteen minutes, which was the
     /// wrong fix for a dispatch nobody revisits: inside the host's window, time cannot show that
     /// the operator loaded fresh material, so expiring early mints a new id for a Job the host
@@ -253,6 +253,12 @@ pub struct DeviceManagerHandle {
     /// anyone, so holding it only pretends to a protection that has already lapsed. Nothing on
     /// either side can prevent a re-cut past that point — which is the true limit of deduplicating
     /// by memory, not something a client-side rule can close.
+    ///
+    /// Two capacity bounds cut in ahead of that expiry, and neither side controls the other's: this
+    /// map evicts its oldest entry at `MAX_JOBS_IN_DOUBT`, and a host forgets its oldest accepted id
+    /// at its own `MAX_REMEMBERED_IDS`. So an entry can outlive the host's memory of its id, and an
+    /// id can outlive this entry. Both are backstops against exhaustion rather than policies, which
+    /// is why the numbers are set where reaching them is itself the unusual event.
     ///
     /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
     /// while holding it.
@@ -1044,12 +1050,13 @@ impl DeviceManagerHandle {
                     // cannot use settles nothing: it arrived, so nothing was lost, but it does not
                     // say whether the Job began, so the entry stays.
                     //
-                    // Keeping it is the weakly safer of the two: a retry under a fresh id is cut
-                    // again by every host, where a retry under the same id is recognised by one
-                    // that honours its own `ID_RETENTION`. A peer that answered outside the
-                    // protocol may honour nothing, which is why the refusal below is `unconfirmed`
-                    // rather than an all-clear — but clearing the entry would remove the only
-                    // protection there is, not add one.
+                    // Keeping it is the only thing that leaves host-side deduplication a chance: a
+                    // fresh id matches nothing the host has seen, so nothing there can read the
+                    // next press as this dispatch again. The same id may still be read as a new
+                    // Job — a host forgets ids past `ID_RETENTION` and past `MAX_REMEMBERED_IDS`,
+                    // and a peer answering outside the protocol may dedupe nothing at all — which
+                    // is why the refusal below is `unconfirmed` rather than an all-clear. Clearing
+                    // the entry would remove the chance rather than improve on it.
                     if !matches!(
                         sent,
                         Err(cut_host::client::ClientError::Transport(_)

@@ -569,9 +569,11 @@ pub mod testing {
     }
 
     /// The per-frame budget this peer hands `read_frame`, which spends it once waiting for a frame
-    /// to begin and again on the rest of it — so a frame costs up to twice this. Generous, because
-    /// it bounds nothing a test is asserting on: it is only here so a client that stops talking
-    /// does not hold the thread for the whole run.
+    /// to begin and again on the rest of it — so a frame costs up to twice this, plus whatever a
+    /// read already under way still spends, since a deadline is only checked between reads and the
+    /// socket is paced at `SOCKET_POLL_INTERVAL`. Generous, because it bounds nothing a test is
+    /// asserting on: it is only here so a client that stops talking does not hold the thread for
+    /// the whole run.
     const BUDGET: Duration = Duration::from_secs(10);
 
     /// Answers `replies` in order: the first as the greeting a token earns, then one per request.
@@ -607,8 +609,9 @@ pub mod testing {
     fn answer(stream: TcpStream, tls: Arc<rustls::ServerConfig>, replies: &[Response]) {
         // The frame layer re-checks its deadline whenever a read comes back empty, so the socket
         // has to come back empty rather than block — the pacing `serve_client` sets, for the same
-        // reason. Unwrapped rather than ignored: without it `read_frame`'s deadlines never come due,
-        // so a fixture that silently failed to install them would hang a test instead of failing it.
+        // reason. Unwrapped rather than ignored so the cause is named: this worker is detached, so a
+        // fixture blocked in a read does not hang the test — the client's own deadline fires and the
+        // test fails as a timeout, with nothing to say why. The panic prints the reason instead.
         stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a read timeout on a loopback socket");
         stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a write timeout on a loopback socket");
         let Ok(conn) = rustls::ServerConnection::new(tls) else { return };

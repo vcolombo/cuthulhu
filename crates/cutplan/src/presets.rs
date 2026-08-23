@@ -535,14 +535,18 @@ mod tests {
     /// every platform — which no permission bit can be relied on to do, since a test running as
     /// root reads a 0o000 file anyway.
     ///
-    /// The middle case is the one `Path::exists` used to swallow, and the only one that tells
-    /// the fix from what it replaced: `exists()` answers false for a path behind a non-directory
-    /// parent, so the old code returned the builtins as though the operator had never saved
-    /// anything, where a read that fails without the file being absent must refuse. It is
-    /// Unix-only because Windows reports a non-directory component as `ERROR_PATH_NOT_FOUND`,
-    /// which Rust maps to `NotFound` — correctly, there: the enclosing directory not existing
-    /// *is* the first run, and `create_dir_all` makes it. The contract this pins is the same on
-    /// both, and the other two cases hold everywhere (Codex on PR #280).
+    /// The middle case is the one `Path::exists` used to swallow, and the only one here that
+    /// tells the fix from what it replaced: `exists()` answers false for a path behind a
+    /// non-directory parent, so the old code returned the builtins as though the operator had
+    /// never saved anything, where a read that fails without the file being absent must refuse.
+    ///
+    /// It is Unix-only because Windows reports a non-directory component as
+    /// `ERROR_PATH_NOT_FOUND`, which Rust maps to `NotFound`. That is the right answer for the
+    /// case an operator meets — an enclosing directory that does not exist yet is the first run,
+    /// and `create_dir_all` makes it — and only wrong for this fixture, where the save would
+    /// then refuse as `Unwritable` instead. A path holding an interior NUL would discriminate on
+    /// both platforms, and is not used because it tests the branch and nothing an operator could
+    /// produce. The other two cases hold everywhere (Codex on PR #280).
     #[test]
     fn a_presets_file_whose_bytes_cannot_be_read_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();

@@ -48,7 +48,8 @@ impl From<driver_core::manager::DeviceError> for IpcError {
 /// file told the operator `Corrupt("missing or invalid version field")` — the sentence the code
 /// wrote, wrapped in a struct literal, in quotes — and a permission problem told them
 /// `Io("Permission denied (os error 13)")`. One code covered all of it, so nothing could tell a
-/// file this build is too old to read from one that is damaged (#278).
+/// file this build is too old to read from one that is damaged without parsing the Rust value in
+/// the message (#278).
 ///
 /// The code and the sentence are both `cutplan`'s, declared beside `load_presets` and
 /// `save_user_presets` which raise them, so adding a variant means editing one match, there.
@@ -3278,7 +3279,8 @@ mod tests {
 
     /// The conversion, end to end below the IPC call. Every one of the five sites used to send
     /// the code `preset_error` with a `Debug` rendering of the value, so a file this build is
-    /// too old to read and a damaged one arrived indistinguishable (#278).
+    /// too old to read and a damaged one arrived under the same code, told apart only by the
+    /// discriminant inside the message (#278).
     #[test]
     fn a_presets_file_this_build_cannot_read_is_refused_in_words_with_its_own_code() {
         let dir = tempfile::tempdir().unwrap();

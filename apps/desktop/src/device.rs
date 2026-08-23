@@ -227,7 +227,9 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
-    /// Dispatches this desktop sent whose outcome nothing has settled, by the Job they carried.
+    /// Dispatch ids held for reuse, by the Job they name — one per Job whose outcome nothing has
+    /// settled, written before the request goes out and so also covering a Job whose dispatch never
+    /// left this machine.
     ///
     /// The host deduplicates on the dispatch id precisely so a retry after a dropped reply
     /// cannot cut the same material twice — but only the sender knows whether a given press of
@@ -249,16 +251,20 @@ pub struct DeviceManagerHandle {
     /// (`CutStarted::duplicate`), and that a settling answer clears the entry, so pressing Cut
     /// again really does cut (#121).
     ///
-    /// The one honest expiry is the host's own `ID_RETENTION`: past it the id means nothing to
-    /// anyone, so holding it only pretends to a protection that has already lapsed. Nothing on
+    /// The one honest expiry is `ID_RETENTION`, the host's own constant: an hour after this entry
+    /// was written, holding it only pretends to a protection that has probably lapsed. Nothing on
     /// either side can prevent a re-cut past that point — which is the true limit of deduplicating
     /// by memory, not something a client-side rule can close.
     ///
-    /// Two capacity bounds cut in ahead of that expiry, and neither side controls the other's: this
-    /// map evicts its oldest entry at `MAX_JOBS_IN_DOUBT`, and a host forgets its oldest accepted id
-    /// at its own `MAX_REMEMBERED_IDS`. So an entry can outlive the host's memory of its id, and an
-    /// id can outlive this entry. Both are backstops against exhaustion rather than policies, which
-    /// is why the numbers are set where reaching them is itself the unusual event.
+    /// "Probably", because sharing the constant does not make the two windows the same window. This
+    /// entry ages from when the id was written; a host's `Admission` re-stamps an id every time a
+    /// duplicate arrives, so a Job retried near the hour can be remembered there after it has
+    /// expired here. And two capacity bounds cut in ahead of the hour on both sides, neither
+    /// controlling the other's: this map evicts its oldest entry at `MAX_JOBS_IN_DOUBT`, a host
+    /// forgets its oldest accepted id at `MAX_REMEMBERED_IDS`. So an entry can outlive the host's
+    /// memory of its id and an id can outlive this entry, in either direction. All of it is a
+    /// backstop against exhaustion rather than a policy, which is why the numbers are set where
+    /// reaching them is itself the unusual event.
     ///
     /// **Lock order:** taken alone, or last — never with `hosts` or a `HostConnection` acquired
     /// while holding it.
@@ -1012,9 +1018,9 @@ impl DeviceManagerHandle {
                 // sheet and loads another is dispatching the identical Job on purpose, and must
                 // not be silently swallowed as a duplicate. So the id is the digest plus a
                 // once-per-attempt nonce, and `in_doubt` decides which of the two this is —
-                // reuse while the previous dispatch of this same Job has no answer, mint fresh
-                // once it has one. The desktop is the only party that can tell them apart: it
-                // is the one that knows whether the last try was answered.
+                // reuse while this Job still has an entry here, mint fresh once a settling answer
+                // has cleared it. The desktop is the only party that can tell them apart: it is the
+                // one that knows what the last try was told.
                 //
                 // The first Cut after a lost reply is therefore always read as the retry. That
                 // is the safe direction, and it self-clears: the retry gets an answer (the
@@ -1028,7 +1034,7 @@ impl DeviceManagerHandle {
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
                 // `first_attempt` is information, not ownership: it says whether an *earlier*
-                // dispatch of this Job is still unanswered, which changes what a failure here
+                // dispatch of this Job is still unsettled, which changes what a failure here
                 // means. It is deliberately not used to decide whether to undo the reservation.
                 let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
@@ -1101,7 +1107,7 @@ impl DeviceManagerHandle {
                     // Never reached the host, and nothing of this Job was outstanding before it:
                     // there is nothing in doubt, so this stays the plain error it is. Both halves
                     // matter — a first press against an offline Pi must not claim the Job may be
-                    // cutting, and a press made while an earlier dispatch is unanswered must.
+                    // cutting, and a press made while an earlier dispatch is unsettled must.
                     Err(e)
                         if first_attempt
                             && !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) =>
@@ -1121,10 +1127,12 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// The id this Job goes out under — the one its unanswered dispatch already used, or a fresh
+    /// The id this Job goes out under — the one its unsettled dispatch already used, or a fresh
     /// one — recorded as in doubt in the same breath. `true` means this call is what recorded it,
-    /// which is what lets a caller that never reached the host undo its own reservation without
-    /// discarding an *earlier* dispatch's, the one a retry still needs.
+    /// which is what tells a caller that never reached the host that the entry it would be
+    /// discarding is its own and not an *earlier* dispatch's, the one a retry still needs. Read
+    /// rather than acted on: `execute_cut` deliberately keeps even its own reservation, because a
+    /// concurrent press of Cut on the same Job is using that id (see the comment there).
     ///
     /// Get-and-record under one lock, because the gap between them is a Cut pressed twice: both
     /// presses found nothing, minted an id each, and the second overwrote the record of the first
@@ -1142,7 +1150,10 @@ impl DeviceManagerHandle {
         // were: past `ID_RETENTION` it has forgotten the id, so reusing it protects nothing and
         // only hides that fact. This is *not* the fifteen-minute expiry that was removed — that
         // one discarded protection while it still existed. Aligned to the host's own constant so
-        // the two sides cannot drift apart about when the window closes.
+        // neither side prunes on a number of its own invention — not so that the two windows
+        // coincide, which they do not: this ages from when the id was *written*, while a host's
+        // `Admission` re-stamps an id every time a duplicate arrives, and either side may also have
+        // evicted it at its own cap by then.
         in_doubt.retain(|_, (_, written)| {
             now.saturating_duration_since(*written) < cut_host::host::ID_RETENTION
         });
@@ -2975,9 +2986,11 @@ mod tests {
         assert_ne!(job_digest("cameo5", &a_square(10.0)), job_digest("puma", &a_square(10.0)));
     }
 
-    /// The whole distinction, in the one place it lives. Flip either half and this fails.
+    /// The whole distinction, in the one place it lives. Flip either half and this fails. Asserted
+    /// against the entry rather than against "an answer", because since #283 an answer that does not
+    /// settle what the host did leaves the entry standing — what reuse turns on is the entry.
     #[test]
-    fn an_id_is_reused_only_while_its_dispatch_has_no_answer() {
+    fn an_id_is_reused_only_while_its_job_still_has_an_entry() {
         let dev = test_device_setup();
         let key = key_for(&a_square(10.0));
 
@@ -2992,8 +3005,8 @@ mod tests {
         // ...and only for that Job. A different one is never mistaken for the retry.
         assert_ne!(dev.reserve_dispatch_id(&key_for(&a_square(20.0))).0, first);
 
-        // The answer arrives, so nothing is in doubt any more — and a deliberate re-cut of the
-        // same design is its own Job, not a duplicate of the one that finished.
+        // A settling answer clears the entry, and a deliberate re-cut of the same design is then its
+        // own Job rather than a duplicate of the one that finished.
         dev.in_doubt.lock().unwrap().remove(&key);
         assert_ne!(dev.reserve_dispatch_id(&key).0, first, "a re-cut must not be swallowed");
     }
@@ -3066,24 +3079,25 @@ mod tests {
     }
 
     /// An abandoned entry is deliberately *kept*, not aged out. Time cannot show that the operator
-    /// loaded fresh material, so expiring an unanswered dispatch mints a new id for a Job the host
+    /// loaded fresh material, so expiring an unsettled dispatch mints a new id for a Job the host
     /// still remembers under the old one — and cuts the material a second time. What makes it
     /// harmless is that the next press is told it was read as a retry and that a settling answer
     /// clears the entry, so pressing Cut again really does cut (#121).
     #[test]
-    fn an_unanswered_dispatch_stays_the_retry_until_something_answers_it() {
+    fn an_unsettled_dispatch_stays_the_retry_until_something_settles_it() {
         let dev = test_device_setup();
         let key = key_for(&a_square(10.0));
         let (abandoned, _) = dev.reserve_dispatch_id(&key);
 
-        // However long nobody comes back to it.
+        // The next press joins it, and the entry is still the only one.
         assert_eq!(dev.reserve_dispatch_id(&key).0, abandoned);
         assert_eq!(dev.in_doubt.lock().unwrap().len(), 1);
     }
 
-    /// A dispatch that never reached a host drops the reservation *it* made, and only that one:
-    /// an earlier unanswered dispatch's entry is what a later retry still needs, and clearing it
-    /// here would send that retry out under a name the host has never seen.
+    /// A dispatch that never reached a host must not drop an *earlier* dispatch's reservation: that
+    /// entry is what a later retry still needs, and clearing it here would send that retry out
+    /// under a name the host has never seen. Its own reservation is kept too — it cannot know it
+    /// owns the entry, since a concurrent press of Cut on the same Job is using that id.
     #[test]
     fn a_dispatch_that_never_reached_a_host_leaves_an_earlier_one_in_doubt() {
         let dev = test_device_setup();

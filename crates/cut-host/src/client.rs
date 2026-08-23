@@ -568,12 +568,12 @@ pub mod testing {
         pub fingerprint: String,
     }
 
-    /// The per-frame budget this peer hands `read_frame`, which spends it once waiting for a frame
-    /// to begin and again on the rest of it — so a frame costs up to twice this, plus whatever a
-    /// read already under way still spends, since a deadline is only checked between reads and the
-    /// socket is paced at `SOCKET_POLL_INTERVAL`. Generous, because it bounds nothing a test is
-    /// asserting on: it is only here so a client that stops talking does not hold the thread for
-    /// the whole run.
+    /// The budget this peer hands each `read_frame` — twice over, in fact, since `read_frame` spends
+    /// one waiting for a frame to begin and a fresh one on the rest of it. Not a ceiling on how long
+    /// a frame can take: a deadline is only checked between reads, so a read already under way still
+    /// spends its `SOCKET_POLL_INTERVAL`, and decoding happens outside both. That is fine, because
+    /// this bounds nothing a test asserts on — it is only here so a client that stops talking does
+    /// not hold the thread for the whole run.
     const BUDGET: Duration = Duration::from_secs(10);
 
     /// Answers `replies` in order: the first as the greeting a token earns, then one per request.

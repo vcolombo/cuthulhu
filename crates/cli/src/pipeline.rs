@@ -545,22 +545,41 @@ mod tests {
     /// struct literal wrapped around the sentence `IoError` has written since #261, and
     /// which the desktop's own `import_svg` command has forwarded since that same change
     /// (#281). `import_svg` can fail in exactly one place — the `usvg::Tree::from_data`
-    /// call inside `svg_to_paths` — so one sentence is true of every input below; the
-    /// four are the shapes an operator hands a cutter by accident, not four branches.
+    /// call inside `svg_to_paths` — so one sentence is true of every input here.
     ///
     /// Stated as forwarding, because forwarding is the contract: whatever `IoError`
-    /// writes for these bytes is what the operator reads, character for character. A
-    /// test that pinned `usvg`'s own wording instead would break on a parser upgrade,
-    /// and — the gap Codex found in the first version of this — would still pass if the
-    /// parenthesised half were dropped on the way out, which is the whole of what the
-    /// operator can act on.
+    /// writes for these bytes is what the operator reads, character for character. The
+    /// two obvious alternatives each give up one half of that. A `starts_with` on the
+    /// sentence — the first version of this, and Codex's finding — is silent about the
+    /// parenthesised half, which is the whole of what an operator can act on, so a caller
+    /// that kept the sentence and dropped the parser's account would have passed. Pinning
+    /// `usvg`'s own wording would catch that and break on the next parser upgrade instead.
+    ///
+    /// What it therefore pins is this caller's boundary, not `fileio`'s wording: an
+    /// `IoError` whose payload stopped being `usvg`'s account would satisfy this and is
+    /// `fileio`'s own tests' to catch.
+    ///
+    /// The six were chosen to reach four of `usvg::Error`'s five variants at the version
+    /// in `Cargo.toml`, which is a fact about the fixtures rather than one this asserts —
+    /// the sentence is the contract, and pinning a variant would pin a parser's internals.
+    /// `ElementsLimitReached` is the one left out; no cheap fixture reaches it, since it
+    /// wants a million elements. The last two are why the list is not shorter: their
+    /// payloads say "provided data" and never the word SVG, so they are the cases the
+    /// dropped `SVG parse: ` prefix is a decision about rather than a formality.
     #[test]
     fn an_svg_that_cannot_be_parsed_reads_as_a_sentence() {
-        let refused: [(&str, &[u8]); 4] = [
+        let refused: [(&str, &[u8]); 6] = [
             ("not markup at all", b"this is not an SVG"),
             ("truncated mid-element", br#"<svg xmlns="http://www.w3.org/2000/svg"><rect"#),
             ("well-formed XML that is not SVG", br#"<html><body/></html>"#),
             ("nothing at all", b""),
+            // A byte-order mark and UTF-16 code units: what a text editor writes when it is
+            // asked for "Unicode" on Windows, and the whole file is unreadable to a parser
+            // that takes UTF-8 only.
+            ("UTF-16, which usvg does not read", b"\xff\xfe<\x00s\x00v\x00g\x00 \x00/\x00>\x00"),
+            // The gzip magic makes `from_data` inflate rather than parse, so a damaged
+            // `.svgz` fails before any XML is seen.
+            ("an .svgz that will not inflate", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03junkjunk"),
         ];
 
         for (what, bytes) in refused {

@@ -3306,10 +3306,13 @@ mod tests {
     #[test]
     fn what_a_preset_is_refuses_it_before_the_file_is_touched() {
         let dir = tempfile::tempdir().unwrap();
-        // The parent is an ordinary file, so every read of and write to this path fails.
-        let blocker = dir.path().join("cuthulhu");
-        std::fs::write(&blocker, "not a directory").expect("wrote the blocker");
-        let path = blocker.join("presets.json");
+        // A directory at the presets path, not a file where its parent belongs: reading a
+        // directory fails on every platform, where a non-directory *parent* is `ENOTDIR` on Unix
+        // and `ERROR_PATH_NOT_FOUND` on Windows — which Rust maps to `NotFound`, so `load_presets`
+        // would call it a first run there and this test would read a disk fault it never got
+        // (Codex on PR #280).
+        let path = dir.path().join("presets.json");
+        std::fs::create_dir(&path).expect("put a directory where the file goes");
 
         // Every refusal `save_preset` makes without touching the file, not just one: with only
         // the blank name asserted, moving any of the other four below the read left this green

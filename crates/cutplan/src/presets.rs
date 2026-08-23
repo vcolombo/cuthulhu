@@ -266,10 +266,16 @@ pub fn load_presets(user_file: &Path) -> Result<Vec<MaterialPreset>, PresetError
         let content = String::from_utf8(bytes)
             .map_err(|_| PresetError::Corrupt("the presets file is not UTF-8 text".into()))?;
 
-        // Check version FIRST before parsing full schema (allows future schema changes)
+        // Check version FIRST before parsing full schema (allows future schema changes).
+        //
+        // "Could not be understood as JSON", not "is not valid JSON": `serde_json` also refuses
+        // input it cannot handle rather than input that is wrong, and nesting past its 128-level
+        // recursion limit is valid JSON this parser declines (Codex on PR #280). The wording
+        // follows `fileio::IoError::Parse`, which says "could not be understood" for the same
+        // reason.
         let value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| PresetError::Corrupt(
-                format!("the presets file is not valid JSON ({e})")))?;
+                format!("the presets file could not be understood as JSON ({e})")))?;
 
         // Absent, not a number, not whole, negative, or past what a `u64` holds — all of them
         // leave this build with nothing to check the format against, which is what the sentence
@@ -415,18 +421,27 @@ mod tests {
         }
     }
 
+    /// Both ways `serde_json` declines a document: one that is not JSON, and one that is valid
+    /// JSON it will not handle. The second is why the sentence says "could not be understood as
+    /// JSON" rather than "is not valid JSON" — 129 nested arrays are well-formed, and calling
+    /// them invalid would send the operator hunting a syntax error that is not there (Codex on
+    /// PR #280).
     #[test]
-    fn a_presets_file_that_is_not_json_is_refused_in_words() {
+    fn a_presets_file_json_cannot_be_understood_from_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();
         let user_file = dir.path().join("presets.json");
-        std::fs::write(&user_file, "half a file, truncated mid-").unwrap();
 
-        let err = load_presets(&user_file).unwrap_err();
-        assert_eq!(err.code(), "presets_corrupt");
-        assert!(
-            err.to_string().starts_with("the presets file is not valid JSON ("),
-            "got {err}"
-        );
+        // Past `serde_json`'s 128-level recursion limit, counting the enclosing object.
+        let too_deep = format!(r#"{{"version":1,"presets":{}{}}}"#, "[".repeat(129), "]".repeat(129));
+        for contents in ["half a file, truncated mid-".to_string(), too_deep] {
+            std::fs::write(&user_file, &contents).unwrap();
+            let err = load_presets(&user_file).unwrap_err();
+            assert_eq!(err.code(), "presets_corrupt");
+            assert!(
+                err.to_string().starts_with("the presets file could not be understood as JSON ("),
+                "got {err}"
+            );
+        }
     }
 
     /// The issue's own scenario: a hand-edited file with the header dropped. Reaches the
@@ -455,7 +470,7 @@ mod tests {
     }
 
     /// Valid JSON, a version this build reads, and a `presets` field that is not a list of
-    /// presets — the third `Corrupt` site, which says something the other two do not.
+    /// presets — the fourth `Corrupt` site, which says something the other three do not.
     #[test]
     fn a_presets_file_with_no_usable_list_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();
@@ -475,10 +490,10 @@ mod tests {
     /// format of has not been shown to be damaged, and telling the operator to repair it would
     /// send them to edit a file a newer build wrote correctly.
     ///
-    /// `corrupt_and_unknown_version_files_error_without_clobbering` reaches the same branch, but
-    /// with a `presets` field that is absent or empty — parseable either way, so nothing there
-    /// would notice the two checks swapping. This one puts a payload under the version that the
-    /// parse below would reject.
+    /// The existing `corrupt_and_unknown_version_files_error_without_clobbering` reaches the
+    /// same branch and would notice a swap for one of its two fixtures, but asserts only the
+    /// variant. This one pins the sentence and the code to the ordering, over a payload the
+    /// parse below would reject outright.
     #[test]
     fn a_version_this_build_does_not_read_is_refused_before_its_contents_are_judged() {
         let dir = tempfile::tempdir().unwrap();

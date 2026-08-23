@@ -581,24 +581,38 @@ mod tests {
         assert_eq!(err.to_string(), "the presets file is not UTF-8 text");
     }
 
-    /// `Unwritable` through `create_dir_all`, the first of the five sites the save path can fail
-    /// at: the parent is an ordinary file, so the directory cannot be made. Of the other four,
-    /// three (the temp file, the write, the rename) need a full disk or a mid-flight unmount to
-    /// force and the encode cannot be made to fail at all — and none of them needs forcing here,
-    /// because `Display` wraps this variant rather than forwarding it, so one sentence covers
-    /// all five and the table above pins it.
+    /// `Unwritable` at the first and last of the five sites the save path can fail at: the
+    /// parent is an ordinary file, so the directory cannot be made, and the destination is a
+    /// directory, so the rename cannot land. Both are deterministic and need no permission bit,
+    /// which a test running as root defeats.
+    ///
+    /// The rename half was written after Codex on PR #280 disproved the claim that it needed a
+    /// full disk. Of the three sites still unreached, the temp file and the write do need one
+    /// (or a mid-flight unmount) and the encode cannot be made to fail at all — and none of them
+    /// needs reaching, because `Display` wraps this variant rather than forwarding it, so one
+    /// sentence covers all five and the table above pins it.
     #[test]
     fn a_presets_file_that_cannot_be_written_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("cuthulhu");
         std::fs::write(&blocker, "not a directory").unwrap();
 
-        let err = save_user_presets(&blocker.join("presets.json"), &[]).unwrap_err();
-        assert_eq!(err.code(), "presets_unwritable");
-        assert!(
-            err.to_string().starts_with("the presets file could not be written ("),
-            "got {err}"
-        );
+        // `create_dir_all`: the parent is a file.
+        let no_dir = save_user_presets(&blocker.join("presets.json"), &[]).unwrap_err();
+
+        // `persist`: the destination itself is a directory, so the rename fails after the temp
+        // file has already been written.
+        let occupied = dir.path().join("presets.json");
+        std::fs::create_dir(&occupied).unwrap();
+        let no_rename = save_user_presets(&occupied, &[]).unwrap_err();
+
+        for err in [no_dir, no_rename] {
+            assert_eq!(err.code(), "presets_unwritable");
+            assert!(
+                err.to_string().starts_with("the presets file could not be written ("),
+                "got {err}"
+            );
+        }
     }
 
     #[test]

@@ -70,9 +70,10 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   `presets.json` with its header dropped told the operator `Corrupt("missing or invalid version
   field")` — the sentence the code wrote, wrapped in a struct literal, in quotes — and a
   permission problem told them `Io("Permission denied (os error 13)")`. All five places the
-  desktop reads or writes presets sent the same code, so a file this build is too old to read
-  looked exactly like a damaged one. Each refusal now says what it means and carries its own
-  code, and a file that cannot be read is kept apart from one that cannot be written.
+  desktop reads or writes presets also sent the same code, so nothing in the app could tell a
+  file this build is too old to read from a damaged one. Each refusal now says what it means and
+  carries its own code, and a file that cannot be read is kept apart from one that cannot be
+  written.
 
 - **A cutter's failures read as sentences, and the app can tell them apart.** A cable pull, a jam,
   a cutter that never answered, and a verb issued at a moment the cutter cannot accept it all

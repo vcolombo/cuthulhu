@@ -66,6 +66,15 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A `cuthulhu cut` on an SVG it cannot import says why.** A truncated file told the operator
+  `SVG parse: Parse("SVG data parsing failed cause the root node was opened but never closed")`
+  — the parser's own account of the problem, wrapped in a struct literal, in quotes, behind a
+  verb that repeats the sentence following it. The desktop has printed the sentence for this
+  exact failure since project files were versioned; the CLI was the one caller still handing
+  over the Rust value. "Why" rather than "what is wrong with it", because a file can also be
+  turned away for stating its own size as zero, or for being written in UTF-16, and neither of
+  those is a file with anything wrong with it.
+
 - **A presets file that cannot be read says what is wrong with it.** A hand-edited
   `presets.json` with its header dropped told the operator `Corrupt("missing or invalid version
   field")` — the sentence the code wrote, wrapped in a struct literal, in quotes — and a

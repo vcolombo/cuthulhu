@@ -62,8 +62,15 @@ pub fn dry_run_pass_bytes(d: &dyn Driver, job: &Job, i: usize, total: usize) -> 
 /// cut is planned against a document that exists only for this command.
 pub fn doc_from_svg(svg: &[u8]) -> Result<document::Document, String> {
     let mut doc = document::Document::new();
-    let (delta, _skipped) = fileio::import_svg(svg, &mut doc.ids, doc.root)
-        .map_err(|e| format!("SVG parse: {e:?}"))?;
+    // `to_string`, not `{e:?}`: `IoError` has written a sentence since #261, and the
+    // desktop's three `IoError` commands forward it verbatim, so this was the one place
+    // the same failure still printed a struct literal (#281). No prefix in front of it
+    // either, and not because `usvg`'s payload names the format — two of its five
+    // variants say only "provided data", so it does not. It is that `cuthulhu cut` reads
+    // exactly one file, the one named on the command line beside it, so "the file" has
+    // one possible referent and a verb in front of the sentence only says it twice.
+    let (delta, _skipped) =
+        fileio::import_svg(svg, &mut doc.ids, doc.root).map_err(|e| e.to_string())?;
     doc.apply(delta);
     Ok(doc)
 }
@@ -532,5 +539,76 @@ mod tests {
             err,
             "shape #3 lies outside the 304.8 x 304.8 mm cutting area — pass --allow-out-of-bounds to send it anyway",
         );
+    }
+
+    /// Bytes `usvg` declines used to reach the operator as `SVG parse: Parse("…")` — a
+    /// struct literal wrapped around the sentence `IoError` has written since #261, and
+    /// which the desktop's own `import_svg` command has forwarded since that same change
+    /// (#281). `import_svg` can fail in exactly one place — the `usvg::Tree::from_data`
+    /// call inside `svg_to_paths` — so one sentence is true of every input here.
+    ///
+    /// Stated as forwarding, because forwarding is the contract: whatever `IoError`
+    /// writes for these bytes is what the operator reads, character for character. The
+    /// two obvious alternatives each give up one half of that. A `starts_with` on the
+    /// sentence — the first version of this, and Codex's finding — is silent about the
+    /// parenthesised half, which is the whole of what an operator can act on, so a caller
+    /// that kept the sentence and dropped the parser's account would have passed. Pinning
+    /// `usvg`'s own wording would catch that and break on the next parser upgrade instead.
+    ///
+    /// What it therefore pins is this caller's boundary, not `fileio`'s wording: an
+    /// `IoError` whose payload stopped being `usvg`'s account would satisfy this and is
+    /// `fileio`'s own tests' to catch.
+    ///
+    /// The seven were chosen to reach four of `usvg::Error`'s five variants at the version
+    /// in `Cargo.toml`, which is a fact about the fixtures rather than one this asserts —
+    /// the sentence is the contract, and pinning a variant would pin a parser's internals.
+    /// The first four all land on `ParsingFailed`, two of them on the same message; they
+    /// are here as the shapes an operator hands a cutter by accident, not as branches.
+    /// The fifth variant, `ElementsLimitReached`, is not reachable at all: usvg 0.44
+    /// declares it and writes a sentence for it and constructs it nowhere, since the
+    /// million-node cap raises its own `NodesLimitReached`, which arrives here as
+    /// `ParsingFailed`.
+    /// The UTF-16 and `.svgz` cases are why the list is not shorter: their payloads say
+    /// "provided data" and never the word SVG, so they are the cases the dropped
+    /// `SVG parse: ` prefix is a decision about rather than a formality.
+    #[test]
+    fn an_svg_that_cannot_be_parsed_reads_as_a_sentence() {
+        let refused: [(&str, &[u8]); 7] = [
+            ("not markup at all", b"this is not an SVG"),
+            ("truncated mid-element", br#"<svg xmlns="http://www.w3.org/2000/svg"><rect"#),
+            ("well-formed XML that is not SVG", br#"<html><body/></html>"#),
+            ("nothing at all", b""),
+            // A byte-order mark and UTF-16 code units: what a text editor writes when it is
+            // asked for "Unicode" on Windows, and the whole file is unreadable to a parser
+            // that takes UTF-8 only.
+            ("UTF-16, which usvg does not read", b"\xff\xfe<\x00s\x00v\x00g\x00 \x00/\x00>\x00"),
+            // The gzip magic makes `from_data` inflate rather than parse, so a damaged
+            // `.svgz` fails before any XML is seen.
+            ("an .svgz that will not inflate", b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03junkjunk"),
+            // Well-formed SVG that usvg declines rather than corrects: the same class of
+            // refusal as the element cap, and the reason the changelog says the CLI now
+            // says *why* a file could not be imported rather than what is wrong with it.
+            (
+                "an SVG whose own size is zero",
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0"/>"#,
+            ),
+        ];
+
+        for (what, bytes) in refused {
+            let mut doc = document::Document::new();
+            let sentence = fileio::import_svg(bytes, &mut doc.ids, doc.root)
+                .err()
+                .unwrap_or_else(|| panic!("{what} is not an importable SVG"))
+                .to_string();
+            let err = doc_from_svg(bytes).expect_err(what);
+            assert_eq!(err, sentence, "{what}: the CLI reworded what `IoError` wrote");
+
+            let detail = err
+                .strip_prefix("the file could not be understood (")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{what}: not the sentence `IoError` writes: {err}"));
+            assert!(!detail.is_empty(), "{what}: the parser's own account was dropped");
+            assert!(!detail.contains("Parse("), "{what}: a `Debug` rendering came back: {err}");
+        }
     }
 }

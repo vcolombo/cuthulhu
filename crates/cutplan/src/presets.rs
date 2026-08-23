@@ -40,9 +40,9 @@ const PRESETS_VERSION: u32 = 1;
 #[derive(Debug, PartialEq)]
 pub enum PresetError {
     /// The file's bytes arrived and did not make sense. `Display` forwards the payload
-    /// verbatim, so every site that builds one owes a finished sentence: the three that exist
-    /// say three different things — not JSON at all, no version stated, no usable presets list
-    /// — and no single wrapper could say all three.
+    /// verbatim, so every site that builds one owes a finished sentence: the four that exist
+    /// say four different things — not text at all, not JSON, no version stated, no usable
+    /// presets list — and no single wrapper could say all four.
     Corrupt(String),
     /// A version other than `PRESETS_VERSION`. Carries what was found; what this build reads is
     /// a build constant, so `Display` takes it from there rather than from the payload.
@@ -65,7 +65,7 @@ pub enum PresetError {
 /// Two of the four wrap their payload here and two do not, and which is which follows from the
 /// sites. `Unreadable` and `Unwritable` state one fact at every site that raises them, so one
 /// wrapper says it once and the payload stays the raw diagnostic it is. `Corrupt` states a
-/// different fact at each of its three, so the sentence is written there and forwarded — a
+/// different fact at each of its four, so the sentence is written there and forwarded — a
 /// wrapper in front of one would read twice, the reason #90 dropped `"preflight: "`.
 impl std::fmt::Display for PresetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -382,8 +382,8 @@ mod tests {
     /// variant fails to compile `Display` and `code`; a reworded or re-coded one fails here.
     ///
     /// `Corrupt`'s sentence column is `None` on purpose: `Display` forwards that payload
-    /// verbatim, so a row here would compare a literal with itself and pass however the three
-    /// real sites are worded. Those three are pinned where they are built, by the
+    /// verbatim, so a row here would compare a literal with itself and pass however the four
+    /// real sites are worded. Those four are pinned where they are built, by the
     /// construction-path tests below. The other three variants compose their sentence here, so
     /// a row is the whole contract for every site that raises them.
     #[test]
@@ -567,10 +567,11 @@ mod tests {
     }
 
     /// `Unwritable` through `create_dir_all`, the first of the five sites the save path can fail
-    /// at: the parent is an ordinary file, so the directory cannot be made. The other four
-    /// (the temp file, the encode, the write, the rename) need a full disk or a mid-flight
-    /// unmount to force, and do not need forcing here — `Display` wraps this variant rather
-    /// than forwarding it, so one sentence covers all five and the table above pins it.
+    /// at: the parent is an ordinary file, so the directory cannot be made. Of the other four,
+    /// three (the temp file, the write, the rename) need a full disk or a mid-flight unmount to
+    /// force and the encode cannot be made to fail at all — and none of them needs forcing here,
+    /// because `Display` wraps this variant rather than forwarding it, so one sentence covers
+    /// all five and the table above pins it.
     #[test]
     fn a_presets_file_that_cannot_be_written_is_refused_in_words() {
         let dir = tempfile::tempdir().unwrap();

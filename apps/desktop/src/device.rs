@@ -3311,10 +3311,24 @@ mod tests {
         std::fs::write(&blocker, "not a directory").expect("wrote the blocker");
         let path = blocker.join("presets.json");
 
-        let nameless = MaterialPreset { name: "  ".into(), ..a_user_preset("cameo5", "mine", 12) };
-        let err = save_preset(&path, nameless).unwrap_err();
-        assert_eq!(err.code, "invalid_preset",
-            "an unsavable entry was reported as a disk fault: {}", err.message);
+        // Every refusal `save_preset` makes without touching the file, not just one: with only
+        // the blank name asserted, moving any of the other four below the read left this green
+        // while those saves reported a disk fault (Codex on PR #280).
+        let mine = || a_user_preset("cameo5", "mine", 12);
+        let builtin = cutplan::presets::builtin_presets().into_iter()
+            .find(|p| p.machine_id == "cameo5").expect("premise: the Cameo ships builtins");
+        let unsavable = [
+            ("a blank name", MaterialPreset { name: "  ".into(), ..mine() }, "invalid_preset"),
+            ("an empty id", MaterialPreset { id: String::new(), ..mine() }, "invalid_preset"),
+            ("no machine", MaterialPreset { machine_id: String::new(), ..mine() }, "invalid_preset"),
+            ("a force out of range", a_user_preset("cameo5", "mine", 99), "invalid_preset"),
+            ("a builtin's pair", a_user_preset("cameo5", &builtin.id, 12), "builtin_preset"),
+        ];
+        for (what, preset, code) in unsavable {
+            let err = save_preset(&path, preset).unwrap_err();
+            assert_eq!(err.code, code,
+                "{what} was reported as a disk fault: {}", err.message);
+        }
 
         // And the file really is unusable, so the assertion above is not vacuous: a valid entry
         // is refused by it. `presets_unreadable`, not `presets_unwritable`, because `save_preset`

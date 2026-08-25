@@ -230,7 +230,9 @@ finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — 
 apply to what changed, which is `code-reviewer` always plus `pr-test-analyzer`,
 `silent-failure-hunter`, `type-design-analyzer` and `comment-analyzer` as the diff calls for them —
 then **Codex, adversarially**, via `/codex:rescue` or `codex exec review --commit <sha>` directly,
-since Codex is not a PR bot on this repo.
+since Codex is not a PR bot on this repo. `code-simplifier` is reachable from the same command and
+is deliberately not in the gate: it rewrites rather than reports, so what it produces is a fix, and
+a fix restarts the cycle.
 
 Triage, escalation, the posting format, head invalidation and the five-push cap are the machine-wide
 rules in `~/.claude/CLAUDE.md`. This section is repo detail on top of that floor, not a replacement
@@ -244,9 +246,10 @@ for it, and three things are the repo's own:
   found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
   so an unposted pass is a gate nobody after you can see.
 - **A stacked PR is reviewed against its parent branch**, and the parent merging is not the end of
-  it: retargeting to `main` and syncing produces a new head, which restarts the cycle unless the
-  tree is identical to the sha already reviewed. #289 is the worked example — and the one that got
-  it wrong, merging on a head no pass had named.
+  it: retargeting to `main` and syncing produces a new head, which restarts the cycle unless its
+  tree is identical to the sha already reviewed. #289 is the worked example, and the one that got it
+  half wrong: the tree did match, so no pass was owed on the new head — but nothing on the PR said
+  so, which leaves a reader unable to tell a safe sync from an unreviewed merge.
 
 Three reviewers, three different blind spots, kept prospectively rather than because the history
 proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first

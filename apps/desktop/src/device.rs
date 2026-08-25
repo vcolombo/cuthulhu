@@ -96,6 +96,40 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
     IpcError::new(code, e.to_string())
 }
 
+/// What an operator is told when a dispatch failed with something of this Job still outstanding.
+///
+/// Not a promise that pressing Cut again cannot cut twice, which is what this said until #286.
+/// Nothing on this side can know that: a Cut Host forgets an accepted id past its retention and
+/// past its capacity cap, and `in_doubt` is process-local, so a desktop restarted between the two
+/// presses has no id left to reuse at all. What is true is narrower, and is the whole of the
+/// protection — the retry goes out under the id the first attempt used, and a host that still
+/// remembers that id reads it as this Job rather than starting a second one. Which of the two
+/// happened is a fact about the cutter, so the cutter is where it is answered.
+///
+/// The bounds are not enumerated. They are why the promise cannot be made, not something an
+/// operator standing over a cutter can act on.
+///
+/// `retry_holds_the_id` is read rather than assumed, because an answer that settles *this* attempt
+/// clears the entry while leaving an earlier one unaccounted for (#288): something is still in
+/// doubt, and there is no longer an id for the next press to send it under, so that press earns the
+/// opposite advice.
+fn unconfirmed(failure: &IpcError, retry_holds_the_id: bool) -> IpcError {
+    IpcError::new(
+        "dispatch_unconfirmed",
+        format!(
+            "{} — the Job may already be cutting there, and only the cutter can tell you. {}",
+            failure.message,
+            if retry_holds_the_id {
+                "Press Cut again to send it under the same id: a host that still remembers that id \
+                 reads it as this Job rather than starting a second one."
+            } else {
+                "Pressing Cut again dispatches it as a new Job rather than a retry, so check the \
+                 cutter first."
+            }
+        ),
+    )
+}
+
 #[derive(Deserialize)]
 pub struct CutRequest {
     pub device_instance_id: String,
@@ -1076,6 +1110,7 @@ impl DeviceManagerHandle {
                 self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let reached_the_host = std::sync::atomic::AtomicBool::new(false);
+                let answer_settled = std::sync::atomic::AtomicBool::new(false);
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
                     let sent = c.dispatch(&dispatch_id, &device, &machine_id, passes);
@@ -1096,14 +1131,19 @@ impl DeviceManagerHandle {
                     // known, not more: a wrong variant at least came from a peer answering this
                     // request badly, while an `Accepted` naming another Job says nothing about
                     // this one at all (#285).
-                    if !matches!(
+                    let settled = !matches!(
                         sent,
                         Err(cut_host::client::ClientError::Transport(_)
                             | cut_host::client::ClientError::WrongReply { .. }
                             | cut_host::client::ClientError::WrongDispatch)
-                    ) {
+                    );
+                    if settled {
                         self.in_doubt.lock().unwrap().remove(&key);
                     }
+                    // The same fact decides what the operator is told below, which is why it is
+                    // carried out rather than re-derived there: an answer that settled what the
+                    // host did is the whole of what happened to this attempt (#288).
+                    answer_settled.store(settled, std::sync::atomic::Ordering::SeqCst);
                     // A refusal is the host saying it started nothing, so it is not something the
                     // close guard should hold the window for.
                     if matches!(sent, Err(cut_host::client::ClientError::Refused(_))) {
@@ -1138,24 +1178,26 @@ impl DeviceManagerHandle {
                         job_id: 0,
                         duplicate: admitted == cut_host::protocol::Admitted::AlreadyAccepted,
                     }),
-                    // Never reached the host, and nothing of this Job was outstanding before it:
-                    // there is nothing in doubt, so this stays the plain error it is. Both halves
-                    // matter — a first press against an offline Pi must not claim the Job may be
-                    // cutting, and a press made while an earlier dispatch is unsettled must.
+                    // Whether this call left anything of this Job outstanding. An answer that said
+                    // what the host did settles it, and a call that never reached a host settles it
+                    // too — there was nothing there to have started anything.
+                    //
+                    // Nothing outstanding at all, and the failure is the whole of what happened, so
+                    // it stays the plain error it is. Both halves matter, and a refusal is why the
+                    // second one is not enough on its own: it settles this attempt while saying
+                    // nothing about an earlier one, so it is plain only when there was no earlier
+                    // one (#288). A first press against an offline Pi must not claim the Job may be
+                    // cutting; a press made while an earlier dispatch is unsettled must.
                     Err(e)
                         if first_attempt
-                            && !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) =>
+                            && (!reached_the_host.load(std::sync::atomic::Ordering::SeqCst)
+                                || answer_settled.load(std::sync::atomic::Ordering::SeqCst)) =>
                     {
                         Err(e)
                     }
-                    Err(e) => Err(IpcError::new(
-                        "dispatch_unconfirmed",
-                        format!(
-                            "{} — the Job may already be cutting there. Press Cut again to retry \
-                             it: the host recognizes the same Job and will not cut it twice.",
-                            e.message
-                        ),
-                    )),
+                    // What the next press can do about it is a fact about this desktop's own
+                    // record, so it is read from it rather than inferred from the failure.
+                    Err(e) => Err(unconfirmed(&e, self.in_doubt.lock().unwrap().contains_key(&key))),
                 }
             }
         }
@@ -3272,6 +3314,126 @@ mod tests {
             view.unreachable.as_deref(),
             Some("this host answered about a different dispatch than the one it was sent")
         );
+    }
+
+    /// A refusal reached the host — that is what a refusal is — and the guard keeping a plain error
+    /// plain asked only whether the host had been reached. So every remote refusal was reported as a
+    /// dispatch that might be cutting: an off-the-bed cut on a *first* press lost its own code and
+    /// told the operator their Job may already be running and to press Cut again (#288). A
+    /// mis-scaled document is the ordinary way to arrive here.
+    #[test]
+    fn a_refused_remote_cut_is_reported_as_the_refusal_it_is() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        // 400 mm square on the test Cameo's 300x200 bed.
+        let err = dev.execute_cut(aimed, a_square(400.0)).expect_err("a cut off the bed is refused");
+        assert_eq!(err.code, "host_refused", "got {err:?}");
+        assert!(
+            err.message.contains("outside the 300 x 200 mm cutting area"),
+            "the refusal lost its own sentence: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("may already be cutting"),
+            "a refusal invented a cut in flight: {}",
+            err.message
+        );
+        // And the same refusal holds nothing: a host that refused started nothing, so the
+        // window-close guard has no dispatch of this to warn about either.
+        assert!(dev.remote_dispatched.lock().unwrap().is_empty(), "a refusal held the window open");
+    }
+
+    /// What an unconfirmed dispatch is allowed to promise. The sentence used to end "the host
+    /// recognizes the same Job and will not cut it twice", which three bounds can make false — the
+    /// host forgets an accepted id past its retention and past its capacity cap, and `in_doubt` is
+    /// process-local, so a desktop restarted between the two presses has nothing to reuse. That is
+    /// the one message in the app telling an operator it is safe to press a button that starts a
+    /// blade, and it promised an outcome this side cannot know (#286).
+    ///
+    /// What is left is what is true: the retry goes out under the same id, a host that still
+    /// remembers that id reads it as this Job, and the cutter is the only place to learn which
+    /// happened.
+    #[test]
+    fn an_unconfirmed_dispatch_promises_no_more_than_the_same_id() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Ok,
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let err = dev
+            .execute_cut(aimed, a_square(10.0))
+            .expect_err("`Ok` is not a dispatch this desktop can read as accepted");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            !err.message.contains("will not cut it twice"),
+            "the promise survived: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("only the cutter can tell you"),
+            "the one way to find out is not offered: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("under the same id"),
+            "the retry's one protection is not stated: {}",
+            err.message
+        );
+    }
+
+    /// A refusal on a press made while an earlier dispatch is unsettled settles *this* attempt and
+    /// says nothing about that one, so it stays unconfirmed — and clears the entry, which leaves no
+    /// id for the next press to send. The advice inverts with it: pressing Cut again is a new Job,
+    /// not the retry the other branch describes, and telling the operator otherwise is the promise
+    /// this stopped making (#286, #288).
+    #[test]
+    fn an_unconfirmed_dispatch_with_no_id_left_offers_no_retry() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        // An earlier dispatch of this Job is outstanding when the press below is made.
+        let key = JobKey {
+            host: id.clone(),
+            device: aimed.instance_id.clone(),
+            digest: job_digest(&aimed.machine_id, &a_square(400.0)),
+        };
+        dev.reserve_dispatch_id(&key);
+
+        let err = dev.execute_cut(aimed, a_square(400.0)).expect_err("a cut off the bed is refused");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            err.message.contains("new Job rather than a retry"),
+            "a press with no id left was offered a retry: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("same id"),
+            "an id the refusal cleared was offered anyway: {}",
+            err.message
+        );
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "the refusal settled this attempt");
     }
 
     /// The window-close guard has to see a dispatch that has not been polled yet. The newest

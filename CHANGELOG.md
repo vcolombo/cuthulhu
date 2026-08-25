@@ -66,6 +66,24 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A Cut Host that refuses a cut says so, instead of reporting one that may be running.** Every
+  refusal a host sent — a cut off the bed, the wrong cutter attached, a cutter already busy —
+  reached the operator as `dispatch_unconfirmed` with "the Job may already be cutting there. Press
+  Cut again", because the test for whether anything was outstanding asked only whether the host had
+  been reached, and a refusal is a host that was reached. A mis-scaled document on a first press was
+  told its Job might be cutting and to press the button that starts a blade again. A refusal now
+  keeps its own code and its own sentence; a press made while an earlier dispatch really is
+  unsettled still warns.
+
+- **An unconfirmed dispatch no longer promises that pressing Cut again cannot cut twice.** It said
+  "the host recognizes the same Job and will not cut it twice", which nothing on this side can
+  know: a host forgets an accepted id past its retention and past its capacity cap, and the
+  desktop's record of it is process-local, so a restart between the two presses leaves no id to
+  reuse. It now says what is true — the Job may be cutting, only the cutter can tell you, and the
+  retry goes out under the same id, which is what lets a host that still remembers it read it as
+  this Job rather than starting a second one. Where the failure cleared that id, it says the next
+  press is a new Job rather than offering a retry it cannot make.
+
 - **A Cut Host's acceptance has to name the dispatch it is answering.** `Accepted` carries the
   dispatch id the host is answering about, and the desktop discarded it — so a reply naming some
   other Job was read as this one's acceptance: the operator was told their cut had started, and the

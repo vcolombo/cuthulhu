@@ -227,9 +227,10 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 
 Three stages, in order, and each one coming back clean is the trigger for the next rather than the
 finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents that
-apply to what changed, which is `code-reviewer` always plus `silent-failure-hunter`,
-`type-design-analyzer` and `comment-analyzer` as the diff calls for them — then **Codex,
-adversarially**, via `/codex:adversarial-review --base <ref>` or `codex exec review --base <base>`.
+apply to what changed, which is `code-reviewer` always, `silent-failure-hunter`,
+`type-design-analyzer` and `comment-analyzer` as the diff calls for them, and `pr-test-analyzer`
+whenever behaviour changed (asked for by name — see below) — then **Codex, adversarially**, via
+`/codex:adversarial-review --base <ref>` or `codex exec review --base <ref>`.
 Not `/codex:rescue`: that hands a task to Codex through the generic companion path, takes no
 `--base`, and returns a job id rather than a review.
 Codex comments nowhere on its own. `code-simplifier` is reachable from the same command and
@@ -247,9 +248,10 @@ for it, and four things are the repo's own:
 - **Give both local stages the pinned range, and ask for the test analyst by name.** Neither stage
   scopes itself to a PR: the toolkit command falls back to a bare `git diff` and its agents to the
   unstaged working tree, so on a committed branch it reviews nothing and reports clean; and
-  `codex exec review --commit <sha>` reads only that commit's own change, which on a multi-commit PR
-  certifies the last fix and never looks at what it was fixing. Name `git diff <base>...<head>` for
-  the toolkit and pass `--base` to Codex. `pr-test-analyzer` needs asking for on any behavioural
+  `codex exec review --commit <sha>` — the invocation to avoid on a PR — reads only that commit's
+  own change, so on a multi-commit PR it certifies the last fix and never looks at what it was
+  fixing. Name `git diff <base>...<head>` for the toolkit and pass `--base` to Codex.
+  `pr-test-analyzer` needs asking for on any behavioural
   change, because the command selects it only when *test files* changed — which skips it in exactly
   the case where the missing test is the finding.
 - **Post every stage-two and stage-three pass, naming the sha it reviewed**, including one that

@@ -231,8 +231,9 @@ apply to what changed, which is `code-reviewer` always, `silent-failure-hunter`,
 `type-design-analyzer` and `comment-analyzer` as the diff calls for them, and `pr-test-analyzer`
 whenever behaviour changed (asked for by name — see below) — then **Codex, adversarially**, via
 `/codex:adversarial-review --base <ref>` or `codex exec review --base <ref>`.
-Not `/codex:rescue`: that hands a task to Codex through the generic companion path, takes no
-`--base`, and returns a job id rather than a review.
+Not `/codex:rescue`: it delegates a *task* through the generic companion path, with no review
+runtime behind it and no `--base` to scope one — and run in the background, as it was here, it hands
+back a job id instead of a review.
 Codex comments nowhere on its own. `code-simplifier` is reachable from the same command and
 is deliberately not in the gate: it rewrites rather than reports, so what it produces is a fix, and
 a fix restarts the cycle.

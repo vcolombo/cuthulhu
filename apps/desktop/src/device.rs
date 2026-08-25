@@ -109,10 +109,12 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
 /// The bounds are not enumerated. They are why the promise cannot be made, not something an
 /// operator standing over a cutter can act on.
 ///
-/// `retry_holds_the_id` is read rather than assumed, because an answer that settles *this* attempt
-/// clears the entry while leaving an earlier one unaccounted for (#288): something is still in
-/// doubt, and there is no longer an id for the next press to send it under, so that press earns the
-/// opposite advice.
+/// `retry_holds_the_id` is asked rather than assumed, because the failure being reported is not
+/// what decides it. Two ways this side has nothing left to retry under while something is still
+/// outstanding: an answer that settled *this* attempt clears the entry and leaves an earlier one
+/// unaccounted for (#288), and an entry this call was reusing can age past the point where reusing
+/// it protects anything while the call is still in flight. Either way the next press is a new Job,
+/// and saying otherwise is the promise this stopped making — see `retry_would_reuse`.
 fn unconfirmed(failure: &IpcError, retry_holds_the_id: bool) -> IpcError {
     IpcError::new(
         "dispatch_unconfirmed",
@@ -128,6 +130,21 @@ fn unconfirmed(failure: &IpcError, retry_holds_the_id: bool) -> IpcError {
             }
         ),
     )
+}
+
+/// Whether an id written at `written` is still one a retry can be sent under.
+///
+/// The one place this desktop decides that, read by `reserve_dispatch_id` — which prunes by it —
+/// and by `retry_would_reuse`, which is how the sentence above learns whether the retry it offers
+/// is one the next press will actually make. Two copies of the rule would be two policies, and the
+/// promise #286 removed was exactly what a disagreement between them produces.
+///
+/// Aligned to the host's own `ID_RETENTION` rather than a number of this side's invention: past it
+/// the host has forgotten the id, so reusing it protects nothing and only hides that it protects
+/// nothing. The two windows do not coincide — this ages from when the id was written, while a
+/// host re-stamps an id every time a duplicate arrives — and neither side's cap is in it at all.
+fn still_reusable(written: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(written) < cut_host::host::ID_RETENTION
 }
 
 #[derive(Deserialize)]
@@ -1196,8 +1213,10 @@ impl DeviceManagerHandle {
                         Err(e)
                     }
                     // What the next press can do about it is a fact about this desktop's own
-                    // record, so it is read from it rather than inferred from the failure.
-                    Err(e) => Err(unconfirmed(&e, self.in_doubt.lock().unwrap().contains_key(&key))),
+                    // record, so it is asked of the record rather than inferred from the failure —
+                    // and asked as the *next press* will answer it, since an entry this one is
+                    // reusing can age out of reuse while the call it is on is still in flight.
+                    Err(e) => Err(unconfirmed(&e, self.retry_would_reuse(&key, std::time::Instant::now()))),
                 }
             }
         }
@@ -1223,16 +1242,10 @@ impl DeviceManagerHandle {
         let mut in_doubt = self.in_doubt.lock().unwrap();
 
         // Entries the host can no longer recognise are not retries any more, whatever they once
-        // were: past `ID_RETENTION` it has forgotten the id, so reusing it protects nothing and
-        // only hides that fact. This is *not* the fifteen-minute expiry that was removed — that
-        // one discarded protection while it still existed. Aligned to the host's own constant so
-        // neither side prunes on a number of its own invention — not so that the two windows
-        // coincide, which they do not: this ages from when the id was *written*, while a host's
-        // `Admission` re-stamps an id every time a duplicate arrives, and either side may also have
-        // evicted it at its own cap by then.
-        in_doubt.retain(|_, (_, written)| {
-            now.saturating_duration_since(*written) < cut_host::host::ID_RETENTION
-        });
+        // were, and `still_reusable` is where that is decided — see there for why the boundary is
+        // the host's own constant. This is *not* the fifteen-minute expiry that was removed; that
+        // one discarded protection while it still existed.
+        in_doubt.retain(|_, (_, written)| still_reusable(*written, now));
         // Looked up before anything is evicted, so the cap can never discard the very entry this
         // call is here to reuse.
         if let Some((id, _)) = in_doubt.get(key) {
@@ -1271,6 +1284,27 @@ impl DeviceManagerHandle {
         ));
         in_doubt.insert(key.clone(), (id.clone(), now));
         (id, true)
+    }
+
+    /// Whether a press made now would send this Job out under the id an unsettled dispatch already
+    /// used, which is the only thing that gives a repeated Cut a chance of being recognised rather
+    /// than cut again.
+    ///
+    /// The retention rule lives here and `reserve_dispatch_id` prunes by it, so the sentence an
+    /// unconfirmed dispatch carries and the id the next press actually mints answer the same
+    /// question. A second copy of that rule would be a second policy, and the two disagreeing is
+    /// exactly how a promise becomes false: an entry can cross `ID_RETENTION` while the call
+    /// offering the retry is still in flight, and `contains_key` alone would offer to reuse an id
+    /// the next press is about to prune (#286).
+    ///
+    /// `now` is a parameter because the boundary is the whole of the behaviour, and a caller that
+    /// can only pass the present cannot ask about either side of it.
+    fn retry_would_reuse(&self, key: &JobKey, now: std::time::Instant) -> bool {
+        self.in_doubt
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|(_, written)| still_reusable(*written, now))
     }
 
     /// Test convenience: `prepare_cut` + `execute_cut` in one call. Production
@@ -3173,6 +3207,36 @@ mod tests {
         // The next press joins it, and the entry is still the only one.
         assert_eq!(dev.reserve_dispatch_id(&key).0, abandoned);
         assert_eq!(dev.in_doubt.lock().unwrap().len(), 1);
+    }
+
+    /// The boundary the offered retry turns on, asked from both sides of it. An entry this call is
+    /// reusing can age past `ID_RETENTION` while the call is still in flight — the reservation is
+    /// taken before the request and the sentence is written after the answer, and a dispatch has a
+    /// 30-second body budget to spend in between — and the next press would then prune it and mint
+    /// a fresh id. Offering to reuse an id that is about to be discarded is the promise #286
+    /// removed, arrived at from the other direction, so the sentence asks the same question
+    /// `reserve_dispatch_id` answers rather than only whether an entry exists.
+    #[test]
+    fn a_retry_is_offered_only_while_the_id_is_one_the_next_press_would_reuse() {
+        use std::time::Duration;
+        let dev = test_device_setup();
+        let key = key_for(&a_square(10.0));
+        dev.reserve_dispatch_id(&key);
+        let written = dev.in_doubt.lock().unwrap().get(&key).map(|(_, w)| *w).expect("just reserved");
+
+        assert!(dev.retry_would_reuse(&key, written), "the id it was just given is not offered");
+        assert!(
+            dev.retry_would_reuse(&key, written + cut_host::host::ID_RETENTION - Duration::from_secs(1)),
+            "an id the host still remembers is not offered"
+        );
+        assert!(
+            !dev.retry_would_reuse(&key, written + cut_host::host::ID_RETENTION),
+            "an id the next press would prune was offered as a retry"
+        );
+        assert!(
+            !dev.retry_would_reuse(&key_for(&a_square(20.0)), written),
+            "a Job with no entry at all was offered a retry"
+        );
     }
 
     /// A dispatch that never reached a host must not drop an *earlier* dispatch's reservation: that

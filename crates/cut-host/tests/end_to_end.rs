@@ -59,7 +59,7 @@ fn a_cut_runs_from_dispatch_to_completion_over_the_wire() {
     let client = HostClient::connect(&host.addr, TOKEN, &host.fingerprint).unwrap();
 
     client
-        .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
+        .dispatch(&DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
         .unwrap();
 
     let parked = await_phase(&client, CAMEO, Phase::AwaitingConfirmation);
@@ -77,7 +77,7 @@ fn a_job_outlives_the_client_that_started_it() {
     {
         let client = HostClient::connect(&host.addr, TOKEN, &host.fingerprint).unwrap();
         client
-            .dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
+            .dispatch(&DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()])
             .unwrap();
         await_job(&client, CAMEO);
     } // the laptop closes
@@ -101,7 +101,7 @@ fn a_refusal_reaches_the_client_as_its_sentence() {
             settings: Settings::default(),
         },
     };
-    match client.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![off_the_bed]) {
+    match client.dispatch(&DispatchId("d-1".into()), CAMEO, "cameo5", vec![off_the_bed]) {
         Err(ClientError::Refused(cut_host::protocol::Refusal::Preflight(fault))) => {
             let message = fault.to_string();
             assert!(message.contains("300 x 200"), "got: {message}");

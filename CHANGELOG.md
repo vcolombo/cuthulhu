@@ -66,6 +66,16 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A Cut Host's acceptance has to name the dispatch it is answering.** `Accepted` carries the
+  dispatch id the host is answering about, and the desktop discarded it — so a reply naming some
+  other Job was read as this one's acceptance: the operator was told their cut had started, and the
+  record a real retry needs was dropped as settled. That id is the whole of the protection against
+  cutting twice, and it was the one field that could prove an answer belonged to this dispatch,
+  since every other correlation on the connection is structural. A reply that names a different
+  dispatch is now refused as a host answering outside the protocol, which drops the connection and
+  leaves the dispatch unconfirmed under the id it went out with — reachable only from a peer that
+  is not this daemon, which is also the only kind that could send one.
+
 - **A Cut Host that answers with the wrong reply names it, instead of calling itself unreachable.**
   A reply arriving where the request could not use it told the operator `the host could not be
   reached (the host answered with Devices([DeviceInfo { instance_id: "usb:1:4", machine_id:

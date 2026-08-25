@@ -226,19 +226,32 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 ### PR review
 
 Three stages, in order, and each one coming back clean is the trigger for the next rather than the
-finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents
-(code-reviewer, pr-test-analyzer, silent-failure-hunter, type-design-analyzer, comment-analyzer)
-run against the diff — then **Codex, adversarially**, via `/codex:rescue` or
-`codex exec review --commit <sha>` directly, since Codex is not a PR bot on this repo. Three
-reviewers, three different blind spots, and this repo's history has each catching what the others
-missed.
+finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents that
+apply to what changed, which is `code-reviewer` always plus `pr-test-analyzer`,
+`silent-failure-hunter`, `type-design-analyzer` and `comment-analyzer` as the diff calls for them —
+then **Codex, adversarially**, via `/codex:rescue` or `codex exec review --commit <sha>` directly,
+since Codex is not a PR bot on this repo.
 
-Brief Codex to attack the change rather than to look it over. The P1 worth having on PR #289 came
-from asking it to enumerate every combination of "reached the host", "the answer settled" and
-"first attempt" and say which arm each landed in; "does this look right" had already returned an
-approval. Stages two and three comment nowhere on their own, so each gets its findings and their
-dispositions posted to the PR — a gate triaged only in a session is invisible to whoever reads the
-PR next.
+Triage, escalation, the posting format, head invalidation and the five-push cap are the machine-wide
+rules in `~/.claude/CLAUDE.md`. This section is repo detail on top of that floor, not a replacement
+for it, and three things are the repo's own:
+
+- **Brief Codex to attack the change rather than to look it over.** The P1 worth having on PR #289
+  came from asking it to enumerate every combination of `reached_the_host`, `answer_settled` and
+  `first_attempt` and say which arm each landed in; "does this look right" had already returned an
+  approval on the same diff.
+- **Post every stage-two and stage-three pass, naming the sha it reviewed**, including one that
+  found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
+  so an unposted pass is a gate nobody after you can see.
+- **A stacked PR is reviewed against its parent branch**, and the parent merging is not the end of
+  it: retargeting to `main` and syncing produces a new head, which restarts the cycle unless the
+  tree is identical to the sha already reviewed. #289 is the worked example — and the one that got
+  it wrong, merging on a head no pass had named.
+
+Three reviewers, three different blind spots, kept prospectively rather than because the history
+proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first
+pass on this repo found five holes in the section you are reading (#292). Nothing yet shows the
+toolkit catching what Codex would have missed, and the gate does not need it to.
 
 Greptile and CodeRabbit are gone, and nothing waits on either. Their findings are still cited
 across comments and tests by PR number — that is provenance and stays — but a wait on an

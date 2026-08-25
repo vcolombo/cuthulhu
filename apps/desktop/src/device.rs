@@ -84,7 +84,13 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         // The host answered, so its reachability is settled — the answer is the proof. What it
         // answered was a reply this request cannot use, which nothing about the network or the
         // pairing will change, and `host_unreachable` sent the operator to check both (#283).
-        ClientError::WrongReply { .. } => "host_wrong_reply",
+        //
+        // One code for both, because a code is what the operator must *do* about it and both ask
+        // the same: the peer on that port does not follow this protocol, so neither the network nor
+        // the pairing is the thing to change. What the two prove differs, and the sentence carries
+        // that difference; a fifth code would sort them for a UI that has never branched on
+        // either (#285).
+        ClientError::WrongReply { .. } | ClientError::WrongDispatch => "host_wrong_reply",
         ClientError::Transport(_) => "host_unreachable",
     };
     IpcError::new(code, e.to_string())
@@ -612,7 +618,8 @@ impl DeviceManagerHandle {
                 let out = f(client);
                 if let Err(
                     e @ (cut_host::client::ClientError::Transport(_)
-                    | cut_host::client::ClientError::WrongReply { .. }),
+                    | cut_host::client::ClientError::WrongReply { .. }
+                    | cut_host::client::ClientError::WrongDispatch),
                 ) = &out
                 {
                     // A connection that broke mid-call stays broken, and `ensure` only redials
@@ -629,6 +636,11 @@ impl DeviceManagerHandle {
                     // second `Response` this call has not read, and the next verb on this socket
                     // would take that one for its own answer. Redialling costs a handshake; reading
                     // a stale reply as the answer to a cut verb does not stop at costing that.
+                    //
+                    // `WrongDispatch` joins them from the other end: it is that hypothesis
+                    // observed rather than feared. An `Accepted` naming a dispatch this call did
+                    // not send is a frame that belongs to somebody else's request, so whatever is
+                    // still on this socket is not this client's to read either (#285).
                     host.last_error = Some(host_error(e));
                     host.client = None;
                 }
@@ -1066,7 +1078,7 @@ impl DeviceManagerHandle {
                 let reached_the_host = std::sync::atomic::AtomicBool::new(false);
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let sent = c.dispatch(dispatch_id.clone(), &device, &machine_id, passes);
+                    let sent = c.dispatch(&dispatch_id, &device, &machine_id, passes);
                     // Cleared by an answer that settles what the host did — a refusal included,
                     // since a host that refused says it started nothing. A reply this request
                     // cannot use settles nothing: it arrived, so nothing was lost, but it does not
@@ -1079,10 +1091,16 @@ impl DeviceManagerHandle {
                     // and a peer answering outside the protocol may dedupe nothing at all — which
                     // is why the refusal below is `unconfirmed` rather than an all-clear. Clearing
                     // the entry would remove the chance rather than improve on it.
+                    //
+                    // A reply about another dispatch stays for the same reason and with less
+                    // known, not more: a wrong variant at least came from a peer answering this
+                    // request badly, while an `Accepted` naming another Job says nothing about
+                    // this one at all (#285).
                     if !matches!(
                         sent,
                         Err(cut_host::client::ClientError::Transport(_)
-                            | cut_host::client::ClientError::WrongReply { .. })
+                            | cut_host::client::ClientError::WrongReply { .. }
+                            | cut_host::client::ClientError::WrongDispatch)
                     ) {
                         self.in_doubt.lock().unwrap().remove(&key);
                     }
@@ -2412,7 +2430,7 @@ mod tests {
         let client = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
         client
             .dispatch(
-                cut_host::protocol::DispatchId("d-1".into()),
+                &cut_host::protocol::DispatchId("d-1".into()),
                 cut_host::host::testing::CAMEO,
                 "cameo5",
                 vec![CutPass {
@@ -3197,6 +3215,62 @@ mod tests {
         assert_eq!(
             view.unreachable.as_deref(),
             Some("this host answered with `Ok` where `Accepted` was expected")
+        );
+    }
+
+    /// The same, for the one reply that would otherwise have been believed. `Accepted` is the
+    /// variant this dispatch asked for, so nothing about its shape refuses it — only the
+    /// `dispatch_id` inside it does. Without that check `Admitted::Started` told the operator
+    /// their Job had begun on a host that was answering about a different one, and cleared the
+    /// entry a real retry needs in the same breath (#285).
+    ///
+    /// The fixture cannot know the id the desktop minted — a digest plus a nonce, chosen inside
+    /// `execute_cut` — which is what makes any id scripted here a mismatch.
+    #[test]
+    fn a_dispatch_answered_about_another_job_stays_in_doubt() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Accepted {
+                dispatch_id: cut_host::protocol::DispatchId("some-other-job".into()),
+                admitted: cut_host::protocol::Admitted::Started,
+            },
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: aimed.instance_id.clone(),
+            digest: job_digest(&aimed.machine_id, &a_square(10.0)),
+        };
+        let err = dev
+            .execute_cut(aimed, a_square(10.0))
+            .expect_err("an `Accepted` about another dispatch is not this Job's start");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            err.message.contains("answered about a different dispatch than the one it was sent"),
+            "the mismatch is not named: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("some-other-job"),
+            "the peer's own id reached the operator: {}",
+            err.message
+        );
+
+        let held = dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone());
+        assert!(held.is_some(), "an answer about another Job settles nothing about this one");
+        assert_eq!(dev.reserve_dispatch_id(&key).0, held.unwrap());
+
+        let view = dev.host_views().pop().expect("the host is still paired");
+        assert_eq!(
+            view.unreachable.as_deref(),
+            Some("this host answered about a different dispatch than the one it was sent")
         );
     }
 

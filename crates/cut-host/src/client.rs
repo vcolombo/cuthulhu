@@ -29,6 +29,16 @@ pub enum ClientError {
     /// the desktop's `host_unreachable` sent the operator to check a network that had just carried
     /// it. Nothing about that network or the pairing is the thing to change (#283).
     WrongReply { expected: &'static str, found: &'static str },
+    /// A reply of the right variant about the wrong dispatch. Distinct from `WrongReply` because
+    /// nothing about the variant is wrong — naming it would say `Accepted` where `Accepted` was
+    /// expected — and the `Admitted` inside it is an answer about some other Job, so believing it
+    /// reports a start this host was never asked for (#285).
+    ///
+    /// Carries neither id, and deliberately. The sent one is the desktop's own and tells an
+    /// operator nothing they can act on; the echoed one is a string from a peer that this client
+    /// never bounds — the 128-character cap is the *host's*, applied to what it receives — and
+    /// putting a peer's payload in front of an operator is the defect #283 was.
+    WrongDispatch,
     Transport(String),
 }
 
@@ -54,6 +64,8 @@ impl std::fmt::Display for ClientError {
                 write!(f, "this host refused the token; pair again with the one in its `cutd.toml`"),
             ClientError::WrongReply { expected, found } =>
                 write!(f, "this host answered with `{found}` where `{expected}` was expected"),
+            ClientError::WrongDispatch =>
+                write!(f, "this host answered about a different dispatch than the one it was sent"),
             ClientError::Transport(m) => write!(f, "the host could not be reached ({m})"),
         }
     }
@@ -418,23 +430,32 @@ impl HostClient {
 
     /// `Admitted` is the answer, not `()`: a host that recognised this id started nothing, and the
     /// caller is the only one who can put that in front of the operator (#121).
+    ///
+    /// Borrowed rather than moved because the id has to outlive the request carrying it: `Accepted`
+    /// echoes back the dispatch it is answering about, and this is the only reply on this
+    /// connection whose subject is not settled by structure. Everywhere else one request is
+    /// written and frames are read until a reply, so a reply of the right variant can only be this
+    /// request's; here it can name another Job, and the id is the whole of what a retry rests
+    /// on (#285). Cloning for the request costs what the caller's own clone used to.
     pub fn dispatch(
         &self,
-        dispatch_id: DispatchId,
+        dispatch_id: &DispatchId,
         device: &str,
         machine_id: &str,
         passes: Vec<CutPass>,
     ) -> Result<Admitted, ClientError> {
         match self.call(
             Request::Dispatch {
-                dispatch_id,
+                dispatch_id: dispatch_id.clone(),
                 device: device.to_string(),
                 machine_id: machine_id.to_string(),
                 passes,
             },
             crate::frame::DEFAULT_BODY_TIMEOUT,
         )? {
-            Response::Accepted { admitted, .. } => Ok(admitted),
+            Response::Accepted { dispatch_id: answered, admitted } if &answered == dispatch_id =>
+                Ok(admitted),
+            Response::Accepted { .. } => Err(ClientError::WrongDispatch),
             other => Err(wrong_reply("Accepted", &other)),
         }
     }
@@ -519,9 +540,10 @@ enum Incoming {
 /// A `Response`'s variant name, which is what a reply of the *wrong variant* is worth saying and
 /// all of it: the value behind it belongs to a reply this request cannot use, and `Devices` carries
 /// every field of every cutter the host knows (#283). It says nothing about a reply of the right
-/// variant carrying the wrong contents — `dispatch` does not check the `dispatch_id` echoed back to
-/// it, and that gap is its own defect rather than something a name would close. Private to this
-/// module, since naming a reply is only useful where one turned out to be the wrong one.
+/// variant carrying the wrong contents, and cannot: `dispatch` compares the `dispatch_id` echoed
+/// back to it and raises `WrongDispatch`, which no variant name distinguishes from a correct
+/// `Accepted` (#285). Private to this module, since naming a reply is only useful where one turned
+/// out to be the wrong one.
 fn response_name(response: &Response) -> &'static str {
     match response {
         Response::Devices(_) => "Devices",
@@ -749,6 +771,10 @@ mod tests {
                 "this host answered with `Devices` where `Snapshots` was expected".into(),
             ),
             (
+                ClientError::WrongDispatch,
+                "this host answered about a different dispatch than the one it was sent".into(),
+            ),
+            (
                 ClientError::Transport("the host closed the connection".into()),
                 "the host could not be reached (the host closed the connection)".into(),
             ),
@@ -833,7 +859,7 @@ mod tests {
 
         assert_eq!(
             client
-                .dispatch(DispatchId("d1".into()), "usb:1:4", "cameo5", Vec::new())
+                .dispatch(&DispatchId("d1".into()), "usb:1:4", "cameo5", Vec::new())
                 .unwrap_err()
                 .to_string(),
             "this host answered with `Ok` where `Accepted` was expected"
@@ -841,6 +867,48 @@ mod tests {
         assert_eq!(
             client.cancel("usb:1:4").unwrap_err().to_string(),
             "this host answered with `Devices` where `Ok` was expected"
+        );
+    }
+
+    /// The one reply of the *right* variant that is still not this request's answer. `Accepted`
+    /// carries the dispatch it is about, and an `Admitted` read out of one that names another Job
+    /// reports a start this host was never asked for — while the entry a real retry needs is
+    /// dropped as settled (#285).
+    ///
+    /// The mismatch is refused without either id reaching the sentence, which is what keeps a
+    /// peer's string out of an operator's message (#283); and the connection is left usable, so the
+    /// second dispatch proves the check refuses a mismatch and nothing else.
+    #[test]
+    fn an_accepted_naming_another_dispatch_is_not_this_dispatch_s_answer() {
+        let host = testing::start_host_answering(vec![
+            Response::Ok,
+            Response::Accepted {
+                dispatch_id: DispatchId("some-other-job".into()),
+                admitted: Admitted::Started,
+            },
+            Response::Accepted {
+                dispatch_id: DispatchId("d1".into()),
+                admitted: Admitted::AlreadyAccepted,
+            },
+        ]);
+        let client = HostClient::connect(&host.addr, "token", &host.fingerprint)
+            .expect("this host greets a client normally; only its replies are wrong");
+
+        let refused = client
+            .dispatch(&DispatchId("d1".into()), "usb:1:4", "cameo5", Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            refused,
+            "this host answered about a different dispatch than the one it was sent"
+        );
+        assert!(!refused.contains("some-other-job"), "the peer's own id reached the operator: {refused}");
+
+        assert_eq!(
+            client
+                .dispatch(&DispatchId("d1".into()), "usb:1:4", "cameo5", Vec::new())
+                .expect("the id this dispatch sent is the id this reply names"),
+            Admitted::AlreadyAccepted
         );
     }
 

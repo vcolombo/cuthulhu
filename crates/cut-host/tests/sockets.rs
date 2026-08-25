@@ -38,7 +38,7 @@ fn a_job_dispatched_on_one_connection_is_confirmed_on_another() {
     let laptop = HostClient::connect(&host.addr, TOKEN, &host.fingerprint).unwrap();
     let workshop = HostClient::connect(&host.addr, TOKEN, &host.fingerprint).unwrap();
 
-    laptop.dispatch(DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
+    laptop.dispatch(&DispatchId("d-1".into()), CAMEO, "cameo5", vec![square_pass()]).unwrap();
 
     // Watched from the second connection too, so the Job is visible to a client that had nothing
     // to do with starting it.

@@ -246,12 +246,15 @@ for it, and three things are the repo's own:
   found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
   so an unposted pass is a gate nobody after you can see.
 - **A stacked PR is reviewed against its parent branch**, so each pass names both ends — the parent
-  sha it was diffed against and the child head — since the parent can advance under an unchanged
-  child head and take the reviewed diff with it. The parent merging is not the end of it either:
-  retargeting to `main` and syncing produces a new head, which restarts the cycle unless its tree is
-  identical to the sha already reviewed. #289 is the worked example, and the one that got it half
-  wrong: the tree did match, so no pass was owed on the new head — but nothing on the PR said so,
-  which leaves a reader unable to tell a safe sync from an unreviewed merge.
+  sha it was diffed against and the child head. Not because the patch changes when the parent moves;
+  it does not, since the three-dot diff is taken from a merge base that stays at the child's branch
+  point. It is that the patch is half of what a merge produces and the other half moved, so a pass
+  that reasoned about the combined state goes stale while every sha in its receipt still checks out.
+  The parent merging is not the end of it either: retargeting to `main` and syncing produces a new
+  head, which restarts the cycle unless its tree is identical to the sha already reviewed. #289 is
+  the worked example, and the one that got it half wrong: the tree did match, so no pass was owed on
+  the new head — but nothing on the PR said so, which leaves a reader unable to tell a safe sync from
+  an unreviewed merge.
 
 Three reviewers, three different blind spots, kept prospectively rather than because the history
 proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first

@@ -225,7 +225,14 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 
 ### PR review
 
-When Greptile and Copilot both come back clean on a PR, run a Codex review before merging
-(via the local `/codex:rescue` plugin — Codex is not a PR bot on this repo). The bots being
-satisfied is the trigger for the third pass, not the finish line: three reviewers, three
-different blind spots, and this repo's history has each catching what the others missed.
+When Copilot comes back clean on a PR, run a Codex review before merging — the local
+`/codex:rescue` plugin, or `codex exec review --commit <sha>` directly, since Codex is not a PR bot
+on this repo. Copilot being satisfied is the trigger for the second pass, not the finish line: two
+reviewers, two different blind spots, and this repo's history has each catching what the other
+missed.
+
+Greptile and CodeRabbit are gone, and nothing waits on either. Their findings are still cited
+across comments and tests by PR number — that is provenance and stays — but a wait on an
+uninstalled bot is how PR #287 sat blocked on `Greptile Review`, a required check that nothing left
+in the repo could produce; it has been dropped from `main`'s protection, which now requires `rust`,
+`python-tools`, `ui` and `cross-pi`.

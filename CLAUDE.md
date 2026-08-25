@@ -225,11 +225,20 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 
 ### PR review
 
-When Copilot comes back clean on a PR, run a Codex review before merging — the local
-`/codex:rescue` plugin, or `codex exec review --commit <sha>` directly, since Codex is not a PR bot
-on this repo. Copilot being satisfied is the trigger for the second pass, not the finish line: two
-reviewers, two different blind spots, and this repo's history has each catching what the other
+Three stages, in order, and each one coming back clean is the trigger for the next rather than the
+finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents
+(code-reviewer, pr-test-analyzer, silent-failure-hunter, type-design-analyzer, comment-analyzer)
+run against the diff — then **Codex, adversarially**, via `/codex:rescue` or
+`codex exec review --commit <sha>` directly, since Codex is not a PR bot on this repo. Three
+reviewers, three different blind spots, and this repo's history has each catching what the others
 missed.
+
+Brief Codex to attack the change rather than to look it over. The P1 worth having on PR #289 came
+from asking it to enumerate every combination of "reached the host", "the answer settled" and
+"first attempt" and say which arm each landed in; "does this look right" had already returned an
+approval. Stages two and three comment nowhere on their own, so each gets its findings and their
+dispositions posted to the PR — a gate triaged only in a session is invisible to whoever reads the
+PR next.
 
 Greptile and CodeRabbit are gone, and nothing waits on either. Their findings are still cited
 across comments and tests by PR number — that is provenance and stays — but a wait on an

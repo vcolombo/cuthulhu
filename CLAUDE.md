@@ -229,19 +229,24 @@ Three stages, in order, and each one coming back clean is the trigger for the ne
 finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents that
 apply to what changed, which is `code-reviewer` always plus `pr-test-analyzer`,
 `silent-failure-hunter`, `type-design-analyzer` and `comment-analyzer` as the diff calls for them —
-then **Codex, adversarially**, via `/codex:rescue` or `codex exec review --commit <sha>` directly,
+then **Codex, adversarially**, via `/codex:rescue` or `codex exec review --base <base>` directly,
 since Codex is not a PR bot on this repo. `code-simplifier` is reachable from the same command and
 is deliberately not in the gate: it rewrites rather than reports, so what it produces is a fix, and
 a fix restarts the cycle.
 
 Triage, escalation, the posting format, head invalidation and the five-push cap are the machine-wide
 rules in `~/.claude/CLAUDE.md`. This section is repo detail on top of that floor, not a replacement
-for it, and three things are the repo's own:
+for it, and four things are the repo's own:
 
 - **Brief Codex to attack the change rather than to look it over.** The P1 worth having on PR #289
   came from asking it to enumerate every combination of `reached_the_host`, `answer_settled` and
   `first_attempt` and say which arm each landed in; "does this look right" had already returned an
   approval on the same diff.
+- **Give both local stages the pinned range.** Neither scopes itself to a PR: the toolkit command
+  falls back to a bare `git diff` and its agents to the unstaged working tree, so on a committed
+  branch it reviews nothing and reports clean; and `codex exec review --commit <sha>` reads only that
+  commit's own change, which on a multi-commit PR certifies the last fix and never looks at what it
+  was fixing. Name `git diff <base>...<head>` for the toolkit and pass `--base` to Codex.
 - **Post every stage-two and stage-three pass, naming the sha it reviewed**, including one that
   found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
   so an unposted pass is a gate nobody after you can see.
@@ -250,10 +255,12 @@ for it, and three things are the repo's own:
   that moves can change the child's patch outright, or leave the patch alone and change only what it
   lands on, depending on how it moved; naming both ends means nobody downstream has to work out
   which happened. The parent merging is not the end of it either: retargeting to `main` and syncing
-  produces a new head, which restarts the cycle unless its tree is identical to the sha already
-  reviewed. #289 is the worked example, and the one that got it half wrong: the tree did match, so no
-  pass was owed on the new head — but nothing on the PR said so, which leaves a reader unable to tell
-  a safe sync from an unreviewed merge.
+  produces a new head, which restarts the cycle unless the *reviewed diff* is unchanged — the
+  base-to-head patch, not the head tree, since a sync that resolves a conflict in the child's favour
+  keeps the reviewed tree while quietly reverting something on the base. #289 is the worked example,
+  and the one that got it half wrong: its diffs were byte-equal, so no pass was owed on the new head
+  — but nothing on the PR said so, which leaves a reader unable to tell a safe sync from an
+  unreviewed merge.
 
 Three reviewers, three different blind spots, kept prospectively rather than because the history
 proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first

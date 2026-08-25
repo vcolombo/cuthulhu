@@ -262,14 +262,21 @@ for it, and four things are the repo's own:
   changes what the PR becomes just as a moved parent does — and a change to either restarts the
   cycle. A parent that moves can change the child's patch outright, or leave the patch alone and
   change only what it lands on, depending on how it moved; naming both ends means nobody downstream
-  has to work out which happened. Retargeting a stacked child to `main` and syncing produces a new
-  head, which restarts the cycle unless **both** equalities hold: the reviewed patch unchanged and
-  the resulting tree unchanged. Either alone waives a real review — a conflict resolved in the
-  child's favour keeps the tree while the patch reverts something on the base, and a base that
-  changes an API the child calls leaves the patch byte-equal while the merged result breaks. #289 is
-  the worked example, and the one that got it half wrong: both equalities held, so no pass was owed
-  on the new head — but nothing on the PR said so, which leaves a reader unable to tell a safe sync
-  from an unreviewed merge.
+  has to work out which happened.
+
+  A moved base is reviewed by **syncing, not by re-running**. Re-run against a new base and the
+  three-dot diff still resolves from the old merge base, so base-only commits are absent from it and
+  the checkout is still the old tree: the reviewer sees nothing it had not already seen. `gh pr
+  update-branch` first, which produces a head whose tree holds the base's changes, and review that.
+  Strict protection forces the sync before merge anyway, so the only question is whether the review
+  happens before it or after.
+
+  The one way out is **both** equalities holding: the reviewed patch unchanged and the resulting tree
+  unchanged. Either alone waives a real review — a conflict resolved in the child's favour keeps the
+  tree while the patch reverts something on the base, and a base that changes an API the child calls
+  leaves the patch byte-equal while the merged result breaks. #289 is the worked example, and the one
+  that got it half wrong: both equalities held, so no pass was owed on the new head — but nothing on
+  the PR said so, which leaves a reader unable to tell a safe sync from an unreviewed merge.
 
 Three reviewers, three different blind spots, kept prospectively rather than because the history
 proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first

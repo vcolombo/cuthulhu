@@ -227,10 +227,12 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 
 Three stages, in order, and each one coming back clean is the trigger for the next rather than the
 finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents that
-apply to what changed, which is `code-reviewer` always plus `pr-test-analyzer`,
-`silent-failure-hunter`, `type-design-analyzer` and `comment-analyzer` as the diff calls for them —
-then **Codex, adversarially**, via `/codex:rescue` or `codex exec review --base <base>` directly,
-since Codex is not a PR bot on this repo. `code-simplifier` is reachable from the same command and
+apply to what changed, which is `code-reviewer` always plus `silent-failure-hunter`,
+`type-design-analyzer` and `comment-analyzer` as the diff calls for them — then **Codex,
+adversarially**, via `/codex:adversarial-review --base <ref>` or `codex exec review --base <base>`.
+Not `/codex:rescue`: that hands a task to Codex through the generic companion path, takes no
+`--base`, and returns a job id rather than a review.
+Codex comments nowhere on its own. `code-simplifier` is reachable from the same command and
 is deliberately not in the gate: it rewrites rather than reports, so what it produces is a fix, and
 a fix restarts the cycle.
 
@@ -242,25 +244,29 @@ for it, and four things are the repo's own:
   came from asking it to enumerate every combination of `reached_the_host`, `answer_settled` and
   `first_attempt` and say which arm each landed in; "does this look right" had already returned an
   approval on the same diff.
-- **Give both local stages the pinned range.** Neither scopes itself to a PR: the toolkit command
-  falls back to a bare `git diff` and its agents to the unstaged working tree, so on a committed
-  branch it reviews nothing and reports clean; and `codex exec review --commit <sha>` reads only that
-  commit's own change, which on a multi-commit PR certifies the last fix and never looks at what it
-  was fixing. Name `git diff <base>...<head>` for the toolkit and pass `--base` to Codex.
+- **Give both local stages the pinned range, and ask for the test analyst by name.** Neither stage
+  scopes itself to a PR: the toolkit command falls back to a bare `git diff` and its agents to the
+  unstaged working tree, so on a committed branch it reviews nothing and reports clean; and
+  `codex exec review --commit <sha>` reads only that commit's own change, which on a multi-commit PR
+  certifies the last fix and never looks at what it was fixing. Name `git diff <base>...<head>` for
+  the toolkit and pass `--base` to Codex. `pr-test-analyzer` needs asking for on any behavioural
+  change, because the command selects it only when *test files* changed — which skips it in exactly
+  the case where the missing test is the finding.
 - **Post every stage-two and stage-three pass, naming the sha it reviewed**, including one that
   found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
   so an unposted pass is a gate nobody after you can see.
-- **A stacked PR is reviewed against its parent branch**, so each pass names both ends — the parent
-  sha it was diffed against and the child head — and a change to either restarts the cycle. A parent
-  that moves can change the child's patch outright, or leave the patch alone and change only what it
-  lands on, depending on how it moved; naming both ends means nobody downstream has to work out
-  which happened. The parent merging is not the end of it either: retargeting to `main` and syncing
-  produces a new head, which restarts the cycle unless the *reviewed diff* is unchanged — the
-  base-to-head patch, not the head tree, since a sync that resolves a conflict in the child's favour
-  keeps the reviewed tree while quietly reverting something on the base. #289 is the worked example,
-  and the one that got it half wrong: its diffs were byte-equal, so no pass was owed on the new head
-  — but nothing on the PR said so, which leaves a reader unable to tell a safe sync from an
-  unreviewed merge.
+- **Every pass names a base and a head, stacked or not** — `main` advancing under an untouched head
+  changes what the PR becomes just as a moved parent does — and a change to either restarts the
+  cycle. A parent that moves can change the child's patch outright, or leave the patch alone and
+  change only what it lands on, depending on how it moved; naming both ends means nobody downstream
+  has to work out which happened. Retargeting a stacked child to `main` and syncing produces a new
+  head, which restarts the cycle unless **both** equalities hold: the reviewed patch unchanged and
+  the resulting tree unchanged. Either alone waives a real review — a conflict resolved in the
+  child's favour keeps the tree while the patch reverts something on the base, and a base that
+  changes an API the child calls leaves the patch byte-equal while the merged result breaks. #289 is
+  the worked example, and the one that got it half wrong: both equalities held, so no pass was owed
+  on the new head — but nothing on the PR said so, which leaves a reader unable to tell a safe sync
+  from an unreviewed merge.
 
 Three reviewers, three different blind spots, kept prospectively rather than because the history
 proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first

@@ -824,16 +824,27 @@ impl DeviceManagerHandle {
             Ok((marks, c.snapshots_within(STATUS_POLL_TIMEOUT)?))
         });
         let marks = match asked {
-            // Every cutter has to be free, not merely unclaimed: `claimed` covers a Job in flight
-            // and a dispatch on its way to the manager, while a cutter whose stop was never
-            // confirmed, or that is disconnected or errored, is claimed by nothing and is still not
-            // something to discard a cancel route over. That is `snapshot_is_free`, the same
-            // predicate a poll clears marks on. `force` does not skip this arm, for the reason
-            // above: a host that answered is a host `cancel` and `reconnect` can still reach.
-            Ok((_, snapshots)) if !snapshots.iter().all(snapshot_is_free) => {
+            // A claimed cutter is a Job in flight or a dispatch on its way to the manager, and
+            // `force` has never been able to pass one: the host is answering, so `cancel` reaches
+            // it and the blade was never orphaned.
+            Ok((_, snapshots)) if snapshots.iter().any(|s| s.claimed) => {
                 return Err(IpcError::new(
                     "host_busy",
-                    "this host has a cutter that is not free; cancel or reconnect it before forgetting",
+                    "a cut is active or starting on this host; cancel it before forgetting",
+                ))
+            }
+            // Not claimed and still not free: a stop nothing confirmed, or a cutter that is
+            // disconnected or errored. `snapshot_is_free` is the same predicate a poll clears marks
+            // on, so forgetting here would drop a warning this desktop refuses to drop itself.
+            //
+            // `force` *does* pass this one, and has to: a cutter whose hardware is gone answers
+            // every reconnect with the same fault and has no cut to cancel, so refusing outright
+            // would leave a host row nothing could ever remove. What force costs is stated where
+            // the operator is standing — the marks go with the token.
+            Ok((_, snapshots)) if !force && !snapshots.iter().all(snapshot_is_free) => {
+                return Err(IpcError::new(
+                    "host_busy",
+                    "this host has a cutter that is not free; cancel or reconnect it, or force past it",
                 ))
             }
             Ok((marks, _)) => marks,
@@ -4812,10 +4823,13 @@ mod tests {
     }
 
     /// A cutter whose stop nothing confirmed is claimed by nothing and still not free, and this
-    /// desktop's own polls refuse to clear its mark. Forgetting the host must refuse it too, or the
-    /// warning and the cancel route go together over a blade that may still be moving.
+    /// desktop's own polls refuse to clear its mark. Forgetting the host refuses it too, or the
+    /// warning and the cancel route go together over a blade that may still be moving — and `force`
+    /// is the way through, because a cutter whose hardware is gone answers every reconnect with the
+    /// same fault and has no cut to cancel. A refusal with no escape is a host row nothing can
+    /// remove.
     #[test]
-    fn forgetting_a_host_refuses_a_cutter_whose_stop_was_never_confirmed() {
+    fn forgetting_a_host_refuses_an_unconfirmed_stop_but_can_be_forced_past_it() {
         let host = start_loopback_host();
         let dir = tempfile::tempdir().unwrap();
         let hosts_path = dir.path().join("hosts.json");
@@ -4835,6 +4849,11 @@ mod tests {
         let err = dev.forget(&id, &hosts_path, false).expect_err("an unconfirmed stop is not idleness");
         assert_eq!(err.code, "host_busy", "got {err:?}");
         assert!(dev.a_cut_may_be_running(), "the refusal must leave the warning standing");
+        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+
+        dev.forget(&id, &hosts_path, true).expect("force is the escape from a cutter that cannot recover");
+        assert!(dev.paired_hosts().is_empty(), "the forced forget left the host paired");
+        assert!(!dev.a_cut_may_be_running(), "the marks go with the token the operator discarded");
     }
 
     /// A host that answered with every cutter free has said the marks it holds are stale, and they

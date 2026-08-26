@@ -237,7 +237,9 @@ impl Host {
     /// before `job_id` is read, because `claims` needs the same two mutexes and holding both here
     /// is what let the two orders cross — a status poll racing the shutdown guard's report
     /// deadlocked the daemon, and a wedged watch thread can never honour SIGTERM.
-    /// **No slot lock is held while another is taken.**
+    /// **Neither of the slot's own two mutexes is held while the other is taken.** The status read
+    /// under `admission` is deliberate and safe: `is_claimed` reads them in that same order, and
+    /// nothing anywhere takes `admission` beneath the status lock.
     pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
         self.order
             .iter()

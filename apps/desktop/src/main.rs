@@ -138,14 +138,22 @@ fn main() {
                     // listener, a successful emit and the refusal are one act.
                     match window.emit("cut-in-progress", ()) {
                         Ok(()) => api.prevent_close(),
-                        Err(e) => eprintln!(
-                            "cuthulhu: a cut may be running and the warning could not be shown: {e}"
-                        ),
+                        Err(e) => {
+                            // The window is going, so the close is a fact whatever the operator
+                            // was told: commit it, or a press queued behind a host's connection
+                            // would still send into a process on its way out.
+                            dev.commit_close_regardless();
+                            eprintln!(
+                                "cuthulhu: a cut may be running and the warning could not be shown: {e}"
+                            );
+                        }
                     }
                 } else {
                     // Fail open by design — a refused close with no listener has no escape — but
                     // not silently: this is the only evidence a startup/listener failure disabled
-                    // the guard when an operator later reports a warning was missing.
+                    // the guard when an operator later reports a warning was missing. Committed
+                    // for the same reason as above: the window goes, so nothing new may start.
+                    dev.commit_close_regardless();
                     eprintln!(
                         "cuthulhu: a cut may be running but the warning listener is not ready; closing"
                     );

@@ -118,7 +118,6 @@ pub fn load_or_warn(path: Option<&Path>, on_error: impl FnOnce(&HostsError)) -> 
     }
 }
 
-
 /// Mark every device as belonging to `id`.
 ///
 /// A Cut Host does not know its own `HostId` — the desktop mints it at pairing and the daemon
@@ -225,7 +224,6 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert!(matches!(load(&path), Err(HostsError::Malformed(_))));
     }
-
 
     /// Pairing a Pi is optional. A corrupt `hosts.json` must not be a reason the app refuses to
     /// start on its local cutter — it must be reported and treated as no hosts, not propagated.

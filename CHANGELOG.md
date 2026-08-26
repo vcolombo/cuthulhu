@@ -75,6 +75,21 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   during that gap. Quitting stops local motion and leaves host-owned Jobs running, as the prompt
   now says.
 
+- **A Cut Host with an offline cutter can be forgotten, and the refusal that stands in the way
+  says so.** A cutter that is disconnected or faulted is claimed by nothing and answers every
+  reconnect with the same fault, so the refusal it earned was one nothing could satisfy — and it
+  arrived under the same code as "a cut is active", which the dialog offers no force for. It now
+  refuses under its own code, so the force appears where it is the only way past, while a cutter
+  that is genuinely cutting, or stopped where nothing saw it stop, still refuses whatever the
+  operator insists.
+
+- **Pressing Cut as the window closes starts nothing, on either cutter.** A press is invisible
+  between the aim check and the machine — the mark a remote dispatch leaves is written inside the
+  host connection, and a local press has none at all — so one queued behind a status poll could
+  send after the guard had already let the window go. Both routes now hold the same gate across
+  the send, and a close the operator confirmed, or one the app stood down over, commits before
+  anything else can start.
+
 - **A Cut Host that refuses a cut says so, instead of reporting one that may be running.** Every
   refusal a host sent — a cut off the bed, the wrong cutter attached, a cutter already busy —
   reached the operator as `dispatch_unconfirmed` with "the Job may already be cutting there. Press

@@ -766,8 +766,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Same, for whether the page has got as far as subscribing: an emit before the listener is
     // registered reaches nobody, and `goto` resolving is not that moment.
     __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
+    // Readiness is recorded with the listener count at the moment it was set, because the ordering
+    // is the whole point of the flag: Rust emits on the strength of it, and `emit` succeeds with
+    // nobody listening — so readiness while no listener exists is a prevented close with no prompt
+    // and no escape. The latest value stays where `emitBackendEvent` reads it.
     set_close_guard_ready: (a) => {
       sessionStorage.setItem("__close_guard_ready__", String(a.ready));
+      const listeners = (eventNameToIds.get("cut-in-progress") ?? []).length;
+      const log = sessionStorage.getItem("__ready_log__") ?? "";
+      sessionStorage.setItem("__ready_log__", `${log}${log ? "," : ""}${a.ready}@${listeners}`);
       return null;
     },
     // Mirrors `main.rs`'s `force_quit` as far as a page can: the real one exits the process hosting
@@ -2312,7 +2319,7 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   await expect(page.getByText("Unknown")).toHaveCount(3);
   // Nothing has been refused yet, so the warning is nowhere — including over the two local
   // cutters, whose section has no host id at all for a refusal to match (#265).
-  const forceWarning = page.getByText(/A cut may still be running on this Cut Host/);
+  const forceWarning = page.getByText(/Forgetting this Cut Host discards the credentials/);
   await expect(forceWarning).toHaveCount(0);
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
@@ -2341,7 +2348,7 @@ test("a desktop with no Cut Host paired shows no force-forget warning", async ({
   // The local cutters are listed — the dialog is populated, so the warning's absence is about the
   // guard rather than about an empty device section.
   await expect(page.getByTestId("device-badge")).toHaveCount(2);
-  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toHaveCount(0);
+  await expect(page.getByText(/Forgetting this Cut Host discards the credentials/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /anyway$/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^Keep / })).toHaveCount(0);
 });
@@ -2844,6 +2851,18 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
   await expect
     .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
     .toBe("asked");
+
+  // The handshake's own ordering, which the prompt above cannot see: readiness is stood down
+  // before anything is subscribed, and never announced while nothing is listening. Rust emits on
+  // the strength of this flag and `emit` succeeds with zero listeners, so a `true` with no listener
+  // is a prevented close the operator cannot answer — and the leading `false` is the only thing
+  // that closes the window a reload leaves open, since no effect cleanup runs on unload.
+  //
+  // A filter over the log rather than an exact sequence: Playwright runs the dev build, whose
+  // `StrictMode` mounts, cleans up and mounts again, so more than two entries is correct here.
+  const readiness = (await page.evaluate(() => sessionStorage.getItem("__ready_log__")))!.split(",");
+  expect(readiness[0]).toBe("false@0");
+  expect(readiness.filter((entry) => entry.startsWith("true"))).not.toContain("true@0");
 });
 
 test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {

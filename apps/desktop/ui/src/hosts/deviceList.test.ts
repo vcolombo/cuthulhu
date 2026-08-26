@@ -86,6 +86,10 @@ const UNCONFIRMED = {
   code: "host_unconfirmed",
   message: "this Cut Host could not be asked whether it is cutting",
 };
+const OFFLINE_CUTTER = {
+  code: "host_cutter_unreachable",
+  message: "a cutter on this host is offline or faulted and cannot be reconnected",
+};
 
 describe("forgetFrom", () => {
   it("keeps a host that refuses to be forgotten, and says why", async () => {
@@ -98,9 +102,11 @@ describe("forgetFrom", () => {
     expect(s.message).toContain("cancel it before forgetting");
   });
 
-  // The two refusals drive different copy because the operator's next move differs: cancel the
-  // cut, versus decide whether an unreachable Pi is really idle. Only the second offers a force.
-  it("offers a force only for the refusal a force could get past", async () => {
+  // The refusals drive different copy because the operator's next move differs: cancel the cut,
+  // versus decide whether a Pi nobody can reach is really idle. Only the ones that would otherwise
+  // leave an unremovable row offer a force, and a code this list does not name never does — the
+  // safe direction for a refusal Rust adds later.
+  it("offers a force only for the refusals a force could get past", async () => {
     const busy = await runForget("host-1", async () => {
       throw BUSY;
     });
@@ -110,6 +116,13 @@ describe("forgetFrom", () => {
       throw UNCONFIRMED;
     });
     expect(unconfirmed.forceable).toBe(true);
+
+    // The host answered, and what it said was that a cutter is offline or faulted: nothing on
+    // either side recovers that, so refusing outright would leave a row nothing could remove.
+    const offline = await runForget("host-1", async () => {
+      throw OFFLINE_CUTTER;
+    });
+    expect(offline.forceable).toBe(true);
   });
 
   // The failed attempt is what tells the operator there is something to think about. A force

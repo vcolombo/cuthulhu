@@ -18,12 +18,14 @@ use desktop::state::AppState;
 ///
 /// A Job on a Cut Host is left running: the host owns it and keeps cutting whether this desktop is
 /// alive or not, while the local cutter's transport dies with this process, so what quitting can
-/// honestly stop is only ever the local one (#158, `docs/adr/0002-...`). The dialog the operator
-/// answered says so.
+/// honestly stop is only ever the local one (#158, and
+/// `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`). The dialog the
+/// operator answered says so.
 ///
-/// async, like every other command here that can touch the network: `shutdown` joins the local
-/// worker, and on the main thread that is the escape hatch from the close guard hanging harder
-/// than the guard it escapes (#116).
+/// async because `shutdown` joins the local worker, and this runs on the main thread — the escape
+/// hatch from the close guard hanging harder than the guard it escapes. It no longer touches the
+/// network at all, which is what ends #116's cause rather than merely bounding it: the remote
+/// cancel that could block the exit is gone.
 #[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     dev.stop_local_motion();
@@ -111,8 +113,16 @@ fn main() {
                 // is aimed at now (#158); a warning about a Job that has since ended costs a
                 // dialog the operator dismisses.
                 if dev.a_cut_may_be_running() {
-                    api.prevent_close();
-                    window.emit("cut-in-progress", ()).ok();
+                    // The refusal and the warning are one act, so the emit decides it. A close held
+                    // with no dialog behind it is a window that will not shut and says nothing
+                    // about why — and the escape hatch out of it, `force_quit`, is only reachable
+                    // *through* that dialog. If the webview cannot be told, the operator keeps the
+                    // close they asked for and the cut keeps running, which is what quitting would
+                    // have left anyway on a Cut Host.
+                    match window.emit("cut-in-progress", ()) {
+                        Ok(()) => api.prevent_close(),
+                        Err(e) => eprintln!("cuthulhu: a cut may be running and the warning could not be shown: {e}"),
+                    }
                 }
             }
         })

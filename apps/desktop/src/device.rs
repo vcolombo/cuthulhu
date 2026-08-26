@@ -305,10 +305,12 @@ pub struct DeviceManagerHandle {
     ///
     /// So an entry does not mean "outcome unknown", and a dispatch that never left this machine is
     /// the case that shows the difference: its outcome is known — nothing started — and the entry
-    /// stays anyway, because the call cannot tell whether the entry is *its* or a concurrent
-    /// press's, and discarding another press's record would send that press's retry out under a
-    /// name the host has never seen (see `execute_cut`). Kept, in other words, wherever letting go
-    /// would risk that, which is a weaker condition than doubt.
+    /// stays anyway, because clearing it buys nothing. A host that was never reached cannot have
+    /// seen the id either, so the next Cut sending it again is cut normally rather than
+    /// deduplicated away (see `execute_cut`). Whose entry it is *is* answerable, by `dispatching`
+    /// below; it is only that the answer changes nothing here. Kept, in other words, wherever
+    /// letting go would buy nothing or risk a press's retry, which is a weaker condition than
+    /// doubt.
     ///
     /// Beyond those two answers an entry leaves only by expiry or by making room, below. An earlier
     /// version aged them out after fifteen minutes, which was the
@@ -338,17 +340,19 @@ pub struct DeviceManagerHandle {
     /// while holding it, and under `dispatching` where a clear has to ask about both at once
     /// (`settle_dispatch`).
     in_doubt: Mutex<HashMap<JobKey, (cut_host::protocol::DispatchId, std::time::Instant)>>,
-    /// Presses of Cut currently dispatching, by the Job they are dispatching.
+    /// The presses of Cut dispatching each Job, and what each of them has been told.
     ///
     /// Ownership, which `in_doubt` cannot express on its own: two presses of the same Job can be
     /// in flight at once, sharing the one entry, and an answer that settles one of them says
     /// nothing about the other. Clearing the entry on the strength of that answer took away the
     /// record the other press's retry sends under, so the next press minted a name the host had
-    /// never seen (#290). A press clears the entry only when this says no other press could still
-    /// need it.
+    /// never seen (#290). The entry is cleared by whichever settling answer finds that every
+    /// press still in flight has had one.
     ///
-    /// **Lock order:** before `in_doubt`, never after.
-    dispatching: Mutex<HashMap<JobKey, HashSet<AttemptId>>>,
+    /// **Lock order:** before `in_doubt`, never after; and like `in_doubt`, never with `hosts` or
+    /// a `HostConnection` acquired while holding it — `settle_dispatch` runs inside `with_host`,
+    /// which means this is taken with a connection already held.
+    dispatching: Mutex<HashMap<JobKey, Presses>>,
     /// The last status each remote cutter actually reported, so something can be said about one
     /// without dialling it.
     last_remote_status: Mutex<HashMap<(HostId, String), CutStatus>>,
@@ -361,14 +365,16 @@ pub struct DeviceManagerHandle {
     /// This says "we started something and nothing has told us it ended" without dialling.
     ///
     /// Per press rather than a boolean per cutter, because a press that learns the host started
-    /// nothing retracts its own mark, and one press's refusal says nothing about a sibling press
-    /// that was accepted and is cutting right now (#290). A status poll clears every mark on a
-    /// cutter at once, which is not the same act: it is the cutter itself saying it would take
-    /// another Job, and no press outranks that.
+    /// nothing retracts its own mark, and one press's refusal says nothing about another press —
+    /// of this Job or of any other on that cutter — that was accepted and is cutting right now
+    /// (#290). A poll that finds the cutter free clears every mark on it at once, which is not the
+    /// same act: it is the cutter itself saying it would take another Job, and no press outranks
+    /// that.
     ///
-    /// Grows only with presses that ended without learning the host started nothing, and any poll
-    /// that finds the cutter free empties it — so it is bounded by what an operator can press
-    /// between two polls, and needs no cap of its own.
+    /// Cleared by any poll that hears a cutter say it would take a Job — `status` for the aimed
+    /// one, `list_devices` for every cutter on every paired host — and by forgetting the host.
+    /// Between those it holds one id per press, so a session that dispatches without ever polling
+    /// again grows this by one entry per press; the numbers are an operator's finger, not a loop.
     remote_dispatched: Mutex<HashMap<(HostId, String), HashSet<AttemptId>>>,
     /// Bumped by every dispatch, so a poll can tell whether what it learned is still current.
     ///
@@ -402,25 +408,52 @@ struct JobKey {
 ///
 /// Both pieces of per-Job dispatch state are shared by presses — the id a retry goes out under,
 /// and the mark that holds the window — and neither had room for two, so an answer about one press
-/// cleared what another was still using (#290). A press clears what carries its own id and
-/// nothing else; the alternatives, and why a count is not one of them, are in
+/// cleared what another was still using (#290). A press retracts only the mark carrying its own
+/// id; the Job's in-doubt entry is shared, and what a press may do to it is `settle_dispatch`.
+/// The alternatives, and why a count is not one of them, are in
 /// `docs/adr/0001-a-dispatch-attempt-owns-what-it-wrote.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct AttemptId(u64);
 
 impl AttemptId {
-    /// Distinct for the life of the process, which is the life of every map keyed by one.
+    /// Distinct for the life of the process, which is the life of every set that holds one. The
+    /// nonce `reserve_dispatch_id` puts in a `DispatchId` counts something else — fresh ids minted,
+    /// not presses made — and the two deliberately do not meet: this identity is private to the
+    /// desktop, and that one goes on the wire.
     fn next() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         AttemptId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 }
 
+/// The presses dispatching one Job, and the id each of them has been answered about.
+///
+/// Both halves are needed to decide a clear. A press still in flight and not yet answered is a
+/// press whose reply may still be lost, so the id it went out under has to stay; and an answer
+/// naming an id the entry no longer holds — pruned and re-minted mid-flight — settles that id and
+/// not the entry's. So the entry goes when every press in flight has been answered and one of
+/// those answers was about the id the entry still holds.
+///
+/// Recording the answers rather than acting on each alone is what stops two presses that both
+/// settle from each deferring to the other and leaving the Job in doubt with nothing outstanding.
+#[derive(Default)]
+struct Presses {
+    in_flight: HashSet<AttemptId>,
+    answered: HashMap<AttemptId, cut_host::protocol::DispatchId>,
+}
+
 /// A press counted as dispatching for exactly as long as it is in flight.
 ///
 /// A guard rather than a pair of calls because the registration is what stops a *sibling* press's
 /// answer from clearing this one's id, so an early return or a panic that skipped the removal
-/// would leave a Job that nothing could ever settle again.
+/// would leave a Job no answer could settle, and every press until `ID_RETENTION` expires the
+/// entry read as a retry rather than cut.
+///
+/// What Drop deliberately does *not* do is clear anything. The mark on the cutter outlives the
+/// press by design — an accepted dispatch whose reply was lost is exactly what the close guard
+/// must still warn about — and an unsettled press's id outlives it for the same reason. Only an
+/// answer clears, and only through `settle_dispatch`.
+#[must_use = "the press stops counting as dispatching as soon as this is dropped"]
 struct Dispatching<'a> {
     dev: &'a DeviceManagerHandle,
     key: JobKey,
@@ -429,12 +462,21 @@ struct Dispatching<'a> {
 
 impl Drop for Dispatching<'_> {
     fn drop(&mut self) {
-        let mut dispatching = self.dev.dispatching.lock().unwrap();
-        if let Some(presses) = dispatching.get_mut(&self.key) {
-            presses.remove(&self.id);
-            if presses.is_empty() {
-                dispatching.remove(&self.key);
-            }
+        // `into_inner` rather than `unwrap`, as everywhere this repo locks in a `Drop`: a panic
+        // here while unwinding aborts the process, so the one path that most needs the press
+        // deregistered would instead take the editor down.
+        let mut dispatching = self.dev.dispatching.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(presses) = dispatching.get_mut(&self.key) else {
+            // Unreachable: this press's own id keeps the entry non-empty, and only a press's Drop
+            // removes an entry. Asserted rather than trusted, because the state it would leave is
+            // silent and durable — a Job no answer can settle.
+            debug_assert!(false, "a press's registration went missing while it was in flight");
+            return;
+        };
+        presses.in_flight.remove(&self.id);
+        presses.answered.remove(&self.id);
+        if presses.in_flight.is_empty() {
+            dispatching.remove(&self.key);
         }
     }
 }
@@ -502,14 +544,37 @@ impl DeviceManagerHandle {
     /// Deliberately still serial, so N unreachable hosts still cost N connect timeouts *for this
     /// call*. What they no longer cost is every other host verb: the map lock is gone before the
     /// first dial, so only calls aimed at the host being dialled wait behind it.
+    ///
+    /// Asks for snapshots rather than the bare device list, because this is the only call that
+    /// hears from *every* cutter this desktop can reach: `status` polls the aimed one, and the
+    /// close guard asks about all of them (#158). Without this a Job dispatched to a Pi the
+    /// operator then aimed away from held the window for the rest of the session, with no verb that
+    /// could ever release it. The cut dialog runs this once a second while a host is paired, which
+    /// is where an operator watching a remote cut finish already is.
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut all = self.local_factory.list_devices();
         for (id, conn) in self.host_conns() {
             let mut guard = conn.lock().unwrap();
             let host = &mut *guard;
             let Some(client) = host.ensure() else { continue };
-            match client.devices() {
-                Ok(devices) => all.extend(crate::hosts::stamp_host(&id, devices)),
+            // Read before the call and compared after, as in `status`: a dispatch that lands while
+            // this is in flight makes what it learned stale, and the stale answer must not be what
+            // clears the mark that dispatch just made.
+            let epoch = self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            match client.snapshots() {
+                Ok(snapshots) => {
+                    if self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                        let mut dispatched = self.remote_dispatched.lock().unwrap();
+                        for free in snapshots.iter().filter(|s| s.status.actions.cut) {
+                            // Every press's mark on that cutter, on the cutter's own authority —
+                            // the same act `status` performs for the aimed one, and for the same
+                            // reason: it says it would take another Job.
+                            dispatched.remove(&(id.clone(), free.info.instance_id.clone()));
+                        }
+                    }
+                    let listed = snapshots.into_iter().map(|s| s.info).collect();
+                    all.extend(crate::hosts::stamp_host(&id, listed));
+                }
                 Err(e) => {
                     // The connection went away between `ensure` and here; drop it so the next
                     // call reconnects rather than reusing a dead one.
@@ -527,18 +592,21 @@ impl DeviceManagerHandle {
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
 
-    /// Drops the host, and with it everything this desktop remembers about its cutters.
+    /// Drops the host and the status its cutters last reported.
     ///
-    /// The dispatch marks go because nothing can ever clear them again: the poll that clears one is
-    /// a call to the host this just removed, so a mark left behind would hold the window shut for
-    /// the rest of the session (#158). `forget` refuses while the host says it is cutting, and
-    /// tells the operator outright what forcing past an unreachable one discards, so the warning
-    /// being dropped here is one they have already been given in the form they can act on. The
-    /// status cache goes for the same reason and with nothing riding on it — `route` already
-    /// refuses a device whose host is unpaired, so it was unreachable rather than merely stale.
+    /// The cache goes because host ids are recycled — `hosts::next_id` counts past the surviving
+    /// hosts — so a Pi paired after this one is forgotten can inherit its name, and with it a
+    /// `Cutting` reading from another machine that would hold the window until the first poll of
+    /// the new one.
+    ///
+    /// The dispatch marks are *not* dropped here, because which of them are stale is not something
+    /// this verb knows: `forget` asks the host and retracts the marks that answer covered, which
+    /// leaves a dispatch accepted after the answer still holding the window (see `retract_marks`).
+    /// The in-doubt ids for the host's Jobs stay too, on `ID_RETENTION`: an unreachable host may
+    /// still remember an id, and a re-pair inside the hour must not mint a fresh name for a Job it
+    /// has.
     pub fn remove_host(&self, id: &HostId) {
         self.hosts.lock().unwrap().remove(id);
-        self.remote_dispatched.lock().unwrap().retain(|(host, _), _| host != id);
         self.last_remote_status.lock().unwrap().retain(|(host, _), _| host != id);
     }
 
@@ -641,6 +709,11 @@ impl DeviceManagerHandle {
     /// this desktop can still reach, so `cancel` is available and the blade was never orphaned;
     /// there is no case for cutting that route while it works.
     pub fn forget(&self, id: &HostId, hosts_path: &Path, force: bool) -> Result<(), IpcError> {
+        // Read before the host is asked, so the retraction below covers exactly the presses this
+        // answer is about. A dispatch accepted while the question was in flight is not one the
+        // answer speaks for, and its mark stays: the warning is the last thing this desktop can
+        // still offer for a Job whose cancel route it is about to discard.
+        let marks = self.marks_for(id);
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
         // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
         // anything else waits on it: this holds only this host's connection lock, so a stall here
@@ -673,6 +746,11 @@ impl DeviceManagerHandle {
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
 
         self.remove_host(id);
+        // A host that answered idle has just said those marks are stale; a host forced past
+        // unreachable had the operator told outright what forgetting discards. Either way the marks
+        // go, because the poll that would otherwise clear them is a call to the host this just
+        // removed — a mark left behind is a quit prompt nothing can ever stop raising.
+        self.retract_marks(&marks);
         // Otherwise `get_connected_device` keeps answering with a device `list_devices` no
         // longer lists: the aim would survive the host it named.
         let mut connected = self.connected.lock().unwrap();
@@ -921,11 +999,13 @@ impl DeviceManagerHandle {
                             // Read from `actions`, never the phase — `Idle` is also what a cutter
                             // reports between the accept and the first motion.
                             //
-                            // Every press's mark goes, not this call's: the cutter has answered
-                            // for the machine, so no press's record of having started something
-                            // there survives it. That is the one clear a press does not own, and
-                            // the reason a mark is attributed rather than counted — a retraction
-                            // arriving after this must not take a later press's mark with it.
+                            // Every press's mark goes: the cutter has answered for the machine, so
+                            // no press's record of having started something there survives it.
+                            // `list_devices` performs the same clear for every cutter it hears
+                            // from, which is what makes a mark on an un-aimed cutter releasable at
+                            // all. Neither is a clear a press owns, and that is the reason a mark
+                            // is attributed rather than counted — a retraction arriving after this
+                            // must not take a later press's mark with it.
                             if status.actions.cut {
                                 self.remote_dispatched.lock().unwrap().remove(&key);
                             }
@@ -981,11 +1061,12 @@ impl DeviceManagerHandle {
     /// reading only that waves the operator past the cut they just started. A dispatch this
     /// desktop sent and has not since seen finish counts, whatever the last status said.
     ///
-    /// Not scoped to the aim, which is the whole of #158: aiming elsewhere, disconnecting or
-    /// forgetting the host are three verbs the UI offers mid-Job, and each of them left a cut this
-    /// desktop had dispatched running behind a guard that had stopped looking at it — the last of
-    /// them clearing the aim outright, so the guard answered `false` however many dispatches were
-    /// outstanding. The aim is where a Job is *sent*, never a statement about what is running.
+    /// Not scoped to the aim, which is the whole of #158: aiming elsewhere and disconnecting are
+    /// both offered mid-Job and both left a cut this desktop had dispatched running behind a guard
+    /// that had stopped looking at it — `disconnect` clearing the aim outright, so the guard
+    /// answered `false` however many dispatches were outstanding. Forgetting the host reached the
+    /// same place from the other side, by refusing until the Job was over and then dropping the
+    /// aim. The aim is where a Job is *sent*, never a statement about what is running.
     ///
     /// Errs toward warning: a Job that has since finished costs a dialog the operator dismisses,
     /// while the other way round loses the only warning there was.
@@ -1023,7 +1104,8 @@ impl DeviceManagerHandle {
     /// be stopped or resumed by anything, while a Cut Host owns its Jobs and keeps cutting whether
     /// this desktop is running or not — which is why `disconnect` never cancelled a remote cutter
     /// either. Cancelling a remote Job stays an addressed act with an acknowledgement to wait for,
-    /// not a side effect of closing a window (`docs/adr/0002-...`).
+    /// not a side effect of closing a window
+    /// (`docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`).
     pub fn stop_local_motion(&self) {
         if let Ok(mgr) = self.manager() {
             mgr.cancel();
@@ -1217,11 +1299,10 @@ impl DeviceManagerHandle {
                 // failure here means. It is deliberately not used to decide whether to undo the
                 // reservation.
                 //
-                // Ownership is `attempt`: counted as dispatching *before* the id is chosen, so a
-                // sibling press that settles in the gap between the two sees this one and leaves
-                // the entry it is about to join (#290).
-                let attempt = self.begin_dispatching(&key);
-                let (dispatch_id, first_attempt) = self.reserve_dispatch_id(&key);
+                // Ownership is `attempt`: the press is counted as dispatching and the id chosen in
+                // one call, so no sibling's settling answer can land between the two and clear the
+                // entry this press is about to dispatch under (#290).
+                let (attempt, dispatch_id, first_attempt) = self.begin_dispatch(&key);
                 // Marked before the request rather than after the answer: an accepted dispatch
                 // whose reply is lost is exactly the case the window-close guard must still warn
                 // about, and by then there is nothing to write it from.
@@ -1280,15 +1361,16 @@ impl DeviceManagerHandle {
 
                 if !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) {
                     // Nothing was started by *this* press, so nothing of this press's holds the
-                    // window. A sibling press's mark is untouched, for the reason above.
+                    // window. Another press's mark is untouched, for the reason above.
                     self.unmark_dispatched(&id, &device, attempt.id);
                     // The reservation stays, and now by choice rather than for want of knowing
-                    // whose it is: `settle_dispatch` could clear it on the same terms as an
-                    // answered dispatch. It is not asked to, because there is nothing to gain —
-                    // a dispatch that never reached a host is one the host cannot have seen
-                    // either, so the next Cut reusing this id is cut normally rather than
-                    // deduplicated away — and one thing to lose: an entry an *earlier* dispatch
-                    // is still unsettled under reads exactly the same to this call.
+                    // whose it is: `first_attempt` says whether the entry is this call's, and
+                    // `settle_dispatch` could clear it on the same terms as an answered dispatch.
+                    // Neither is asked to, because there is nothing to gain — a dispatch that never
+                    // reached a host is one the host cannot have seen either, so the next Cut
+                    // sending this id is cut normally rather than deduplicated away. What it costs
+                    // is that an identical Cut pressed later is reported as a duplicate rather than
+                    // cut, which is the safe direction and the one #121 asked to be visible.
                 }
 
                 match sent {
@@ -1331,43 +1413,60 @@ impl DeviceManagerHandle {
         }
     }
 
-    /// Count this press as dispatching `key` until the guard is dropped.
+    /// Register this press as dispatching `key`, and choose the id it goes out under.
     ///
-    /// The registration a settling answer consults before it clears anything: what one press was
-    /// told is not what another press of the same Job is still waiting to be told (#290).
-    fn begin_dispatching(&self, key: &JobKey) -> Dispatching<'_> {
+    /// One call rather than two, because the order is the invariant: a press that chose an id
+    /// before it was counted could have a sibling's settling answer land in the gap, clear the
+    /// entry it is about to dispatch under, and leave a later retry sending a name the host has
+    /// never seen. Two statements can be swapped by an edit; one cannot.
+    ///
+    /// The `bool` is `reserve_dispatch_id`'s: `true` means this call is what recorded the entry.
+    fn begin_dispatch(&self, key: &JobKey) -> (Dispatching<'_>, cut_host::protocol::DispatchId, bool) {
         let id = AttemptId::next();
-        self.dispatching.lock().unwrap().entry(key.clone()).or_default().insert(id);
-        Dispatching { dev: self, key: key.clone(), id }
+        // Held across the reservation, in the order this pair of locks is declared in: a sibling's
+        // answer cannot run between the two halves and find nobody dispatching.
+        let mut dispatching = self.dispatching.lock().unwrap();
+        dispatching.entry(key.clone()).or_default().in_flight.insert(id);
+        let (dispatch_id, first_attempt) = self.reserve_dispatch_id(key);
+        drop(dispatching);
+        (Dispatching { dev: self, key: key.clone(), id }, dispatch_id, first_attempt)
     }
 
-    /// Drop this Job's in-doubt entry, if this press is the only one that could still need it.
+    /// Account for what this press was told, and drop the Job's in-doubt entry once every press in
+    /// flight has been told something that settles it.
     ///
     /// A settling answer is the host saying what it did with `id`, which is the whole of what this
     /// press has to account for — and none of what a *sibling* press dispatching the same id has:
-    /// its reply may still be lost, and this entry is what its retry would go out under. So the
-    /// clear waits for the last press out, which in the ordinary single-press case is this one.
+    /// its reply may still be lost, and this entry is what its retry would go out under (#290). So
+    /// the answer is recorded rather than acted on alone, and whichever press finds that no
+    /// unanswered press is left is the one that clears. In the ordinary single-press case that is
+    /// this press, in this call.
+    ///
+    /// A press that ends *without* a settling answer takes its record away with it, so it can never
+    /// be the press that satisfies this — which is the point: something may be cutting under that
+    /// id, and the entry is what a retry would send.
     ///
     /// The id is compared as well as the Job, because the entry can be pruned and re-minted while
     /// a dispatch is in flight (`still_reusable`, `MAX_JOBS_IN_DOUBT`): a fresh entry under this
-    /// key belongs to whoever minted it, and an answer about the id it replaced says nothing
-    /// about it.
+    /// key belongs to whoever minted it, and an answer about the id it replaced says nothing about
+    /// it. So one of the answers has to name the id the entry actually holds.
     fn settle_dispatch(&self, key: &JobKey, id: &cut_host::protocol::DispatchId, attempt: AttemptId) {
         // Both locks, in the order `dispatching` declares: asking and clearing have to be one
         // step, or a press beginning between them joins an entry this call is about to delete —
         // and its retry then goes out under a name the host has never seen, which is the failure
         // the whole entry exists to prevent.
-        let dispatching = self.dispatching.lock().unwrap();
+        let mut dispatching = self.dispatching.lock().unwrap();
         let mut in_doubt = self.in_doubt.lock().unwrap();
-        if dispatching.get(key).is_some_and(|presses| presses.iter().any(|p| *p != attempt)) {
-            return;
-        }
-        if in_doubt.get(key).is_some_and(|(held, _)| held == id) {
+        let Some(presses) = dispatching.get_mut(key) else { return };
+        presses.answered.insert(attempt, id.clone());
+        let every_press_answered = presses.in_flight.iter().all(|p| presses.answered.contains_key(p));
+        let Some((held, _)) = in_doubt.get(key) else { return };
+        let held_id_answered = presses.answered.values().any(|answered| answered == held);
+        if every_press_answered && held_id_answered {
             in_doubt.remove(key);
         }
     }
 
-    /// Record that this press started something on a remote cutter and has not seen it end.
     fn mark_dispatched(&self, host: &HostId, device: &str, attempt: AttemptId) {
         self.remote_dispatched
             .lock()
@@ -1380,27 +1479,52 @@ impl DeviceManagerHandle {
     /// Retract this press's mark, having learned the host started nothing for it.
     ///
     /// Only this press's: the mark is what holds the window shut, and a refusal answers for the
-    /// dispatch it refused rather than for a sibling press that was accepted and is cutting (#290).
-    /// The cutter's own "I would take a Job now" is the answer that clears them all, in `status`.
+    /// dispatch it refused rather than for another press that was accepted and is cutting (#290).
+    /// A cutter's own "I would take a Job now" is the answer that clears them all, in `status` and
+    /// `list_devices`.
     fn unmark_dispatched(&self, host: &HostId, device: &str, attempt: AttemptId) {
         let mut dispatched = self.remote_dispatched.lock().unwrap();
         let key = (host.clone(), device.to_owned());
         if let Some(presses) = dispatched.get_mut(&key) {
             presses.remove(&attempt);
-            // An empty set and no entry mean the same thing, and keeping only one of the two
-            // spellings is what lets the close guard ask whether the map is empty at all.
+            // An empty set and no entry mean the same thing, so only one spelling is stored: the
+            // map holds a cutter for exactly as long as some press holds it.
             if presses.is_empty() {
                 dispatched.remove(&key);
             }
         }
     }
 
+    /// Drop exactly the marks named, having learned the presses that wrote them started nothing.
+    ///
+    /// The retraction `forget` makes, and deliberately narrower than "every mark for that host":
+    /// what makes them stale is the host's own answer that it is idle, and a dispatch accepted
+    /// after that answer is not covered by it. That press keeps its mark and the operator keeps the
+    /// warning — which is all this desktop can still offer, having just discarded the token that
+    /// could have stopped it.
+    fn retract_marks(&self, known: &[((HostId, String), AttemptId)]) {
+        for ((host, device), attempt) in known {
+            self.unmark_dispatched(host, device, *attempt);
+        }
+    }
+
+    /// Every mark this desktop is holding for `host`, as the presses that wrote them.
+    fn marks_for(&self, host: &HostId) -> Vec<((HostId, String), AttemptId)> {
+        self.remote_dispatched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((h, _), _)| h == host)
+            .flat_map(|(key, presses)| presses.iter().map(|p| (key.clone(), *p)).collect::<Vec<_>>())
+            .collect()
+    }
+
     /// The id this Job goes out under — the one its unsettled dispatch already used, or a fresh
     /// one — recorded as in doubt in the same breath. `true` means this call is what recorded it,
     /// which is what tells a caller that never reached the host that the entry it would be
-    /// discarding is its own and not an *earlier* dispatch's, the one a retry still needs. Read
-    /// rather than acted on: `execute_cut` deliberately keeps even its own reservation, because a
-    /// concurrent press of Cut on the same Job is using that id (see the comment there).
+    /// discarding is its own and not an *earlier* dispatch's. Read rather than acted on:
+    /// `execute_cut` uses it only to decide what the operator is told, because a never-reached
+    /// dispatch's entry is harmless to leave (see the comment there).
     ///
     /// Get-and-record under one lock, because the gap between them is a Cut pressed twice: both
     /// presses found nothing, minted an id each, and the second overwrote the record of the first
@@ -3720,8 +3844,8 @@ mod tests {
     /// (#290). The operator's advice inverts with it: a retry is still the thing to press.
     ///
     /// The sibling is staged rather than raced, because what is being pinned is the rule and not
-    /// the timing: `begin_dispatching` is exactly what a press mid-dispatch holds, and a thread
-    /// parked inside `with_host` to reproduce it would pin the scheduler instead.
+    /// the timing: `begin_dispatch` is exactly what a press mid-dispatch holds, and a thread parked
+    /// inside `with_host` to reproduce it would pin the scheduler instead.
     #[test]
     fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
         let host = start_loopback_host();
@@ -3740,8 +3864,8 @@ mod tests {
             digest: job_digest(&aimed.machine_id, &a_square(400.0)),
         };
         // A press of the same Job, mid-dispatch and holding the id.
-        let sibling = dev.begin_dispatching(&key);
-        let (held, _) = dev.reserve_dispatch_id(&key);
+        let (sibling, held, first) = dev.begin_dispatch(&key);
+        assert!(first, "the sibling is what reserved the id this test is about");
 
         let err = dev.execute_cut(aimed, a_square(400.0)).expect_err("a cut off the bed is refused");
         assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
@@ -3762,9 +3886,9 @@ mod tests {
         assert!(dev.in_doubt.lock().unwrap().contains_key(&key), "an unsettled press keeps its id");
     }
 
-    /// The same rule for the mark that holds the window: a refused press retracts its own, and a
-    /// sibling press that was accepted is cutting behind it. Clearing the cutter's mark on the
-    /// strength of the refusal waved the operator past a running remote cut, which is #158
+    /// The same rule for the mark that holds the window, and one step wider: the mark is the
+    /// cutter's, so a refused press must not clear one left by an accepted press of *any* Job on
+    /// that cutter. Clearing it waved the operator past a running remote cut, which is #158
     /// arriving by a second route (#290).
     #[test]
     fn a_refusal_leaves_a_concurrent_press_holding_the_window() {
@@ -3836,10 +3960,9 @@ mod tests {
         assert!(dev.a_cut_may_be_running(), "with no aim the guard stopped answering at all");
     }
 
-    /// Quitting stops what only this process can stop. The local cutter's transport dies with the
-    /// process, so a Job parked there is cancelled; a Cut Host owns the Job it accepted and keeps
-    /// cutting, which is the same rule `disconnect` already follows — and the reason `force_quit`
-    /// no longer routes a cancel by whatever happens to be aimed (#158).
+    /// Quitting stops what only this process can stop. A Job parked on the local cutter is
+    /// cancelled here rather than left, because nothing would be able to stop or resume it once
+    /// this process — which owns that transport — is gone.
     #[test]
     fn quitting_cancels_local_motion_and_leaves_a_host_cutting() {
         let mut app = AppState::new();
@@ -3854,6 +3977,9 @@ mod tests {
         assert!(!stopped.actions.cut, "quitting left the local cutter taking Jobs");
     }
 
+    /// The other half, and the load-bearing one: a Cut Host owns the Job it accepted, so quitting
+    /// leaves it cutting. That is the rule `disconnect` already followed, and the reason
+    /// `force_quit` no longer routes a cancel by whatever happens to be aimed (#158).
     #[test]
     fn quitting_leaves_a_cut_host_job_running() {
         let host = start_loopback_host();
@@ -3874,9 +4000,10 @@ mod tests {
         assert!(cameo_is_active(&direct), "quitting reached into a Job the Cut Host owns");
     }
 
-    /// Forgetting a host drops its marks, because nothing can ever clear them again: the poll that
-    /// clears one is a call to the host that has just gone. Left behind, the widened guard would
-    /// hold the window shut for the rest of the session with no verb to satisfy it (#158).
+    /// Forgetting a host retracts the marks its answer covered, because the poll that would
+    /// otherwise clear one is a call to the host that has just gone: left behind, a mark raises the
+    /// quit prompt on every close for the rest of the session with no verb that could ever satisfy
+    /// it (#158). The status cache goes with it, because host ids are recycled.
     #[test]
     fn forgetting_a_host_releases_the_window_its_dispatch_held() {
         let host = start_loopback_host();
@@ -3888,10 +4015,14 @@ mod tests {
             .expect("pairing with the loopback host");
         let aimed = host_cameo(&id);
         *dev.connected.lock().unwrap() = Some(aimed.clone());
+        // Polled before the cut, so the cache holds a reading for the forget to clear. Nothing
+        // polls after it, which is what leaves the mark standing over a Job that has since ended —
+        // the state an operator who closed the dialog is in.
+        dev.status();
         dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
 
         // The Job has to be over before the host can be forgotten at all — `forget` refuses while
-        // it says it is cutting — and the mark outlives it, since nothing has polled since.
+        // it says it is cutting.
         let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
         wait_until(|| cameo_is_active(&direct), "the cut never started");
         direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
@@ -3900,6 +4031,252 @@ mod tests {
 
         dev.forget(&id, &hosts_path, false).expect("an idle host can be forgotten");
         assert!(!dev.a_cut_may_be_running(), "a forgotten host's mark can never be cleared again");
+        assert!(
+            dev.last_remote_status.lock().unwrap().is_empty(),
+            "a recycled host id would inherit this reading"
+        );
+    }
+
+    /// A press that has returned is a press that is no longer dispatching. Nothing in the desktop
+    /// reads that directly, which is why the test does: a registration left behind makes every
+    /// later answer defer to a press that has gone, so the Job stays in doubt and every press until
+    /// `ID_RETENTION` is read as a retry rather than cut.
+    #[test]
+    fn a_finished_press_stops_counting_as_dispatching() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        dev.execute_cut(aimed.clone(), a_square(10.0)).expect("dispatch");
+        assert!(dev.dispatching.lock().unwrap().is_empty(), "a finished press stayed registered");
+
+        // And the settling answer it got really did clear the Job, which is what a leaked
+        // registration would have prevented.
+        let key = JobKey {
+            host: id,
+            device: aimed.instance_id,
+            digest: job_digest(&aimed.machine_id, &a_square(10.0)),
+        };
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "an accepted dispatch settles the Job");
+    }
+
+    /// Two presses of one Job that are both answered before either finishes must not each defer to
+    /// the other: the Job would stay in doubt with nothing outstanding, and every later press would
+    /// be read as a retry and answered "already accepted" while the cutter never moved.
+    #[test]
+    fn two_presses_that_both_settle_leave_nothing_in_doubt() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+
+        let (first, id, _) = dev.begin_dispatch(&key);
+        let (second, joined, _) = dev.begin_dispatch(&key);
+        assert_eq!(id, joined, "the second press joins the id already reserved");
+
+        dev.settle_dispatch(&key, &id, first.id);
+        assert!(
+            dev.in_doubt.lock().unwrap().contains_key(&key),
+            "the first answer said nothing about the press still dispatching"
+        );
+
+        dev.settle_dispatch(&key, &joined, second.id);
+        assert!(
+            !dev.in_doubt.lock().unwrap().contains_key(&key),
+            "with every press answered the Job is no longer in doubt"
+        );
+    }
+
+    /// An answer about an id the entry no longer holds settles that id, not the entry: the entry
+    /// can be pruned and re-minted while a dispatch is in flight, and whoever minted the
+    /// replacement may still need it.
+    #[test]
+    fn an_answer_about_a_replaced_id_leaves_the_replacement() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+
+        let (press, stale, _) = dev.begin_dispatch(&key);
+        // What pruning plus a later press leaves behind: the same Job, a different id.
+        let minted = cut_host::protocol::DispatchId("minted-by-someone-else".into());
+        dev.in_doubt.lock().unwrap().insert(key.clone(), (minted.clone(), std::time::Instant::now()));
+
+        dev.settle_dispatch(&key, &stale, press.id);
+        assert_eq!(
+            dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone()),
+            Some(minted),
+            "an answer about the id that was replaced deleted its replacement"
+        );
+    }
+
+    /// A local cut holds the window too, through the arm of the guard that involves no mark at all.
+    #[test]
+    fn a_local_cut_holds_the_window() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        assert!(!dev.a_cut_may_be_running(), "nothing has been cut yet");
+
+        app.add_rect(10.0, 10.0);
+        let plan = plan_for(&app);
+        dev.cut_from_request(&app, request_from(plan)).expect("cut");
+        assert!(dev.a_cut_may_be_running(), "the guard waved through a local cut in progress");
+    }
+
+    /// A press that never reached a host retracts its own mark and no other — the same rule the
+    /// refusal branch follows, in separate code, so it is a separate test.
+    #[test]
+    fn a_press_that_never_reached_a_host_leaves_another_press_holding_the_window() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        // An accepted press on this cutter, not yet seen to end.
+        dev.mark_dispatched(&HostId("host-1".into()), &aimed.instance_id, AttemptId::next());
+
+        dev.execute_cut(aimed, a_square(10.0)).expect_err("nothing answers this host");
+        assert!(
+            dev.a_cut_may_be_running(),
+            "a press that never left the machine cleared a running cut's mark"
+        );
+    }
+
+    /// The mark is written before the request precisely so a dispatch whose reply is lost still
+    /// holds the window: by the time the reply fails to arrive there is nothing left to write it
+    /// from, and the Job may be cutting on the Pi.
+    #[test]
+    fn a_dispatch_whose_reply_was_lost_holds_the_window() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Ok,
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+        let aimed = host_cameo(&HostId("host-1".into()));
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("`Ok` is not an accepted dispatch");
+        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
+        assert!(
+            dev.a_cut_may_be_running(),
+            "a dispatch nothing confirmed left the window free to close"
+        );
+    }
+
+    /// Polling one cutter says nothing about another: the clear is keyed to the cutter that
+    /// answered, or a dialog open on an idle cutter would wipe the mark of the Pi cutting next to
+    /// it — #158 by way of its own fix.
+    #[test]
+    fn a_poll_of_one_cutter_leaves_another_holding_the_window() {
+        let idle = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let watched = dev
+            .pair("Idle Pi".into(), idle.addr.clone(), HOST_TOKEN.into(), idle.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the idle host");
+        let elsewhere = HostId("host-elsewhere".into());
+        dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
+
+        // A press outstanding on the *other* host's cutter.
+        dev.mark_dispatched(&elsewhere, cut_host::host::testing::CAMEO, AttemptId::next());
+
+        *dev.connected.lock().unwrap() = Some(host_cameo(&watched));
+        assert!(dev.status().actions.cut, "the aimed cutter is free, which is what makes it clear marks");
+        assert!(dev.a_cut_may_be_running(), "polling one cutter cleared a mark belonging to another");
+        // And the same for the wide clear `list_devices` performs.
+        dev.list_devices();
+        assert!(dev.a_cut_may_be_running(), "the device-list poll cleared a mark for an unreachable host");
+    }
+
+    /// The clear has to be as wide as the guard: a Job dispatched to a Pi the operator then aimed
+    /// away from is released by the device-list poll the cut dialog already runs, and by nothing
+    /// else. Without it the mark stood for the rest of the session and every close raised a prompt
+    /// no verb could satisfy (#158).
+    #[test]
+    fn a_poll_of_every_cutter_releases_a_mark_the_aim_left_behind() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        dev.connect(aimed.clone()).expect("aiming at a host is bookkeeping only");
+        dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
+
+        // The operator goes back to their own cutter while the Pi finishes.
+        dev.connect(test_instance()).expect("aiming back at the local cutter");
+        assert!(dev.a_cut_may_be_running(), "the dispatch stopped counting when the aim moved");
+
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        wait_until(|| cameo_is_active(&direct), "the cut never started");
+        direct.confirm_pass_done(cut_host::host::testing::CAMEO).unwrap();
+        wait_until(|| !cameo_is_active(&direct), "the cut never finished");
+
+        wait_until(
+            || {
+                dev.list_devices();
+                !dev.a_cut_may_be_running()
+            },
+            "a finished cut on an un-aimed cutter still held the window",
+        );
+    }
+
+    /// Forgetting one host says nothing about another's cutters.
+    #[test]
+    fn forgetting_one_host_leaves_another_holding_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let cutting = HostId("host-cutting".into());
+        dev.add_host(a_paired_host("host-cutting", "127.0.0.1:1"));
+        dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
+        dev.mark_dispatched(&cutting, cut_host::host::testing::CAMEO, AttemptId::next());
+
+        dev.forget(&HostId("host-elsewhere".into()), &hosts_path, true).expect("forced past unreachable");
+        assert!(
+            dev.a_cut_may_be_running(),
+            "forgetting an unrelated host discarded the warning about the one that is cutting"
+        );
+    }
+
+    /// A mark written while the forget's own question was in flight is not one that answer speaks
+    /// for, so it survives: the operator keeps the warning about a Job whose cancel route this
+    /// desktop has just discarded, which is the last thing it can still offer.
+    #[test]
+    fn forgetting_a_host_keeps_a_mark_its_answer_did_not_cover() {
+        let dev = test_device_setup();
+        let id = HostId("host-1".into());
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+
+        dev.mark_dispatched(&id, cut_host::host::testing::CAMEO, AttemptId::next());
+        let answered_for = dev.marks_for(&id);
+        // The press that lands between the host's answer and the retraction.
+        dev.mark_dispatched(&id, cut_host::host::testing::CAMEO, AttemptId::next());
+
+        dev.retract_marks(&answered_for);
+        assert!(
+            dev.a_cut_may_be_running(),
+            "a dispatch the host's answer never covered lost its warning anyway"
+        );
     }
 
     // --- presets: identity is (machine_id, id), so one cutter's entry cannot destroy another's ---

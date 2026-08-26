@@ -1227,10 +1227,10 @@ mod tests {
     ///
     /// Pinned from the second lock, not the first: parking a reader on the lock it takes *first*
     /// proves nothing, because it holds nothing yet. Holding `job_id` here forces the poll to park
-    /// on `job_id`, and `admission` staying free is the whole of the property — one direction
-    /// removed is a cycle removed, whichever order the other reader uses. `claims` takes one lock
-    /// per statement for the same reason, which its own `is_claimed` filter makes untestable from
-    /// outside: it parks on `admission` before it ever reaches `job_id`.
+    /// on `job_id`, and `admission` being free once it is parked is the whole of the property —
+    /// one direction removed is a cycle removed, whichever order the other reader uses. `claims`
+    /// takes one lock per statement for the same reason, which its own `is_claimed` filter makes
+    /// untestable from outside: it parks on `admission` before it ever reaches `job_id`.
     #[test]
     fn a_status_poll_does_not_hold_admission_while_it_takes_a_job_id() {
         use std::time::{Duration, Instant};
@@ -1240,23 +1240,18 @@ mod tests {
         let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
         let polling = std::thread::spawn(move || parked.snapshots());
 
-        // The poll takes `admission` on its way to `job_id`, so the property is that it *lets go*:
-        // wait for the lock to come free, then require it to stay free while the poll is still
-        // parked. Asserting from the first iteration would fail whenever the thread happened to be
-        // inside that short critical section — a test flaking on correct code.
-        let free_by = Instant::now() + Duration::from_secs(2);
-        while host.slot(CAMEO).unwrap().admission.try_lock().is_err() {
-            assert!(
-                Instant::now() < free_by,
-                "the poll never let go of `admission` while it waited for `job_id`, which is half a deadlock"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // One long beat, then a single question. The poll's `admission` section is microseconds, so
+        // by now it can only be parked on `job_id` — and `is_finished` proves it is parked rather
+        // than never started. Catching the transient instead, in either direction, is a test that
+        // has to win a race to be right.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!polling.is_finished(), "the poll never parked on `job_id`, so this proves nothing");
+
         let deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < deadline {
             assert!(
                 host.slot(CAMEO).unwrap().admission.try_lock().is_ok(),
-                "the poll took `admission` again while it waited for `job_id`"
+                "the poll held `admission` while it waited for `job_id`, which is half a deadlock"
             );
             std::thread::sleep(Duration::from_millis(2));
         }

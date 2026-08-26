@@ -1204,16 +1204,19 @@ impl DeviceManagerHandle {
 
     /// Commit to closing once the operator has answered the prompt.
     ///
-    /// Waits out a press that is mid-send, so a dispatch that has not begun cannot start after the
-    /// answer — but only up to `CLOSE_GATE_WAIT`, because "quit anyway" must not hang behind a Pi
-    /// that is timing out. Past that the send may still be accepted, which is what the prompt the
-    /// operator answered already says about a Job sent to a Cut Host.
+    /// Set first, waited second, and that order is the point: while this waited to become the
+    /// writer, a press could still take the gate for reading and send, which is the new Job after
+    /// the answer that the gate exists to prevent. With the flag already set, no press that has yet
+    /// to check it can send, and the wait is only for one already in progress — bounded, because
+    /// "quit anyway" must not hang behind a Pi that is timing out. A send that outlasts the wait
+    /// may still be accepted, which is what the prompt the operator answered says about a Job sent
+    /// to a Cut Host.
     pub fn commit_close_after_confirmation(&self) {
+        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
         let deadline = std::time::Instant::now() + CLOSE_GATE_WAIT;
         while self.send_gate.try_write().is_err() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_close_guard_ready(&self, ready: bool) {

@@ -766,6 +766,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Same, for whether the page has got as far as subscribing: an emit before the listener is
     // registered reaches nobody, and `goto` resolving is not that moment.
     __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
+    set_close_guard_ready: (a) => {
+      sessionStorage.setItem("__close_guard_ready__", String(a.ready));
+      return null;
+    },
     // Mirrors `main.rs`'s `force_quit` as far as a page can: the real one exits the process hosting
     // this webview, which a fake cannot do, so all a test can observe is that it was asked.
     // Recorded rather than counted, because the question is whether confirming reached it at all.
@@ -2807,6 +2811,9 @@ const emitBackendEvent = async (page: Page, event: string) => {
       }, event),
     )
     .toBeGreaterThan(0);
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__close_guard_ready__")))
+    .toBe("true");
   await page.evaluate((e) => {
     const internals = window as unknown as {
       __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };

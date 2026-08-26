@@ -221,6 +221,10 @@ export async function getConnectedDevice(): Promise<DeviceInfo | null> {
   return invoke("get_connected_device", {});
 }
 
+export async function setCloseGuardReady(ready: boolean): Promise<void> {
+  return invoke("set_close_guard_ready", { ready });
+}
+
 export async function forceQuit(): Promise<void> {
   return invoke("force_quit", {});
 }

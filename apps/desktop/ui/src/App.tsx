@@ -240,15 +240,16 @@ export function App() {
   }, []);
 
   // Backend refuses to close the window while a cut it started may still be running (main.rs's
-  // on_window_event calls prevent_close and emits this instead) — ask the operator, then
-  // force_quit if they confirm. No-op on cancel, so the window just stays open.
+  // on_window_event emits this and then calls prevent_close) — ask the operator, then force_quit
+  // if they confirm. No-op on cancel, so the window just stays open.
   //
-  // The prompt says what quitting does and does not stop, because the two differ and only one of
-  // them is this process's to stop: a Cut Host owns the Jobs it accepted and keeps cutting once
-  // this app is gone (#158). Naming the cutter would need the guard to report which one, which is
-  // #59's addressing work.
+  // Readiness is acknowledged only after `listen` resolves. Tauri's emit succeeds with zero
+  // listeners, so without the acknowledgement a close during startup/reload could be refused with
+  // no prompt and no route to force_quit. Cleanup clears it before removing the listener.
   useEffect(() => {
-    const unlisten = listen("cut-in-progress", () => {
+    let active = true;
+    let stopListening: (() => void) | null = null;
+    const showQuitPrompt = () => {
       const quit = window.confirm(
         "A cut may still be running — quit anyway? Cutting on this computer stops; a Job already " +
           "sent to a Cut Host keeps running there.",
@@ -256,9 +257,25 @@ export function App() {
       if (quit) {
         ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
       }
-    });
+    };
+
+    ipc
+      .setCloseGuardReady(false)
+      .then(() => listen("cut-in-progress", showQuitPrompt))
+      .then((unlisten) => {
+        if (!active) {
+          unlisten();
+          return;
+        }
+        stopListening = unlisten;
+        return ipc.setCloseGuardReady(true);
+      })
+      .catch((e) => setError(ipc.ipcErrorMessage(e)));
+
     return () => {
-      unlisten.then((f) => f());
+      active = false;
+      ipc.setCloseGuardReady(false).catch((e) => console.error(e));
+      stopListening?.();
     };
   }, []);
 

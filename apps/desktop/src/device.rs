@@ -284,6 +284,14 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
+    /// Every HostId minted or loaded in this process, including hosts since forgotten.
+    ///
+    /// A forgotten host can still have a close-guard mark — a dispatch accepted after the host's
+    /// idle answer keeps the warning because its cancel route is gone. Reusing that HostId for a
+    /// new Pi wired at the same socket would give both the same `(HostId, instance_id)` key, and an
+    /// idle poll of the new Pi would erase the old one's warning. Ids therefore remain claimed for
+    /// the process lifetime, which is also the lifetime of those marks.
+    claimed_host_ids: Mutex<HashSet<HostId>>,
     /// The dispatch id a Job's next press goes out under while an entry for it stands, by the Job it
     /// names.
     ///
@@ -340,14 +348,14 @@ pub struct DeviceManagerHandle {
     /// while holding it, and under `dispatching` where a clear has to ask about both at once
     /// (`settle_dispatch`).
     in_doubt: Mutex<HashMap<JobKey, (cut_host::protocol::DispatchId, std::time::Instant)>>,
-    /// The presses of Cut dispatching each Job, and what each of them has been told.
+    /// Presses of Cut dispatching each Job, grouped by the wire id they use.
     ///
     /// Ownership, which `in_doubt` cannot express on its own: two presses of the same Job can be
     /// in flight at once, sharing the one entry, and an answer that settles one of them says
     /// nothing about the other. Clearing the entry on the strength of that answer took away the
     /// record the other press's retry sends under, so the next press minted a name the host had
-    /// never seen (#290). The entry is cleared by whichever settling answer finds that every
-    /// press still in flight has had one.
+    /// never seen (#290). `Presses` retains both settling and non-settling outcomes across guard
+    /// drops, and scopes them to the DispatchId they concern.
     ///
     /// **Lock order:** before `in_doubt`, never after; and like `in_doubt`, never with `hosts` or
     /// a `HostConnection` acquired while holding it — `settle_dispatch` runs inside `with_host`,
@@ -376,13 +384,19 @@ pub struct DeviceManagerHandle {
     /// Between those it holds one id per press, so a session that dispatches without ever polling
     /// again grows this by one entry per press; the numbers are an operator's finger, not a loop.
     remote_dispatched: Mutex<HashMap<(HostId, String), HashSet<AttemptId>>>,
-    /// Bumped by every dispatch, so a poll can tell whether what it learned is still current.
+    /// Bumped around every dispatch while its HostConnection is held.
     ///
-    /// A poll reads the host's status without holding anything across the network call, so a
-    /// dispatch can land while it is in flight — and the `Idle` it then wrote would clear the
-    /// entry that dispatch just made. Comparing the count either side of the call is what makes
-    /// the write conditional on nothing having happened meanwhile.
+    /// The connection lock is the same-host boundary: a poll runs before the mark exists or after
+    /// the request has finished, never between them. The epoch covers a different-host overlap in
+    /// the all-host sweep; a dispatch landing anywhere while a snapshot is in flight makes that
+    /// sweep conservatively keep its marks until the next tick.
     dispatch_epoch: std::sync::atomic::AtomicU64,
+    /// Whether the webview has installed the one listener that makes a prevented close escapable.
+    ///
+    /// `emit` succeeding says only that Tauri serialized the event; it also returns success with
+    /// zero listeners. The listener sets this after registration and clears it before teardown, so
+    /// the native handler never refuses a close on the strength of an event nobody can receive.
+    close_guard_ready: std::sync::atomic::AtomicBool,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -426,20 +440,28 @@ impl AttemptId {
     }
 }
 
-/// The presses dispatching one Job, and the id each of them has been answered about.
+/// Presses of one Job, grouped by the wire id each press is dispatching.
 ///
-/// Both halves are needed to decide a clear. A press still in flight and not yet answered is a
-/// press whose reply may still be lost, so the id it went out under has to stay; and an answer
-/// naming an id the entry no longer holds — pruned and re-minted mid-flight — settles that id and
-/// not the entry's. So the entry goes when every press in flight has been answered and one of
-/// those answers was about the id the entry still holds.
+/// The id is the settlement boundary. Two presses can share it, while expiry or capacity pruning
+/// can mint a replacement with a press under the old one still in flight. An answer about the old
+/// id must not block or clear the replacement; an answer about the current id must wait for every
+/// press already dispatching *that id*.
 ///
-/// Recording the answers rather than acting on each alone is what stops two presses that both
-/// settle from each deferring to the other and leaving the Job in doubt with nothing outstanding.
+/// A group remains after its last press returns only when one returned without a settling answer.
+/// The next press of that id is then the retry: its settling answer resolves the group and can
+/// clear the in-doubt entry. That preserves #121's second intentional Cut while keeping #290's
+/// concurrent press from losing the id its retry needs.
 #[derive(Default)]
 struct Presses {
+    by_dispatch: HashMap<cut_host::protocol::DispatchId, DispatchGroup>,
+}
+
+#[derive(Default)]
+struct DispatchGroup {
     in_flight: HashSet<AttemptId>,
-    answered: HashMap<AttemptId, cut_host::protocol::DispatchId>,
+    answered: HashSet<AttemptId>,
+    unsettled: HashSet<AttemptId>,
+    retries: HashSet<AttemptId>,
 }
 
 /// A press counted as dispatching for exactly as long as it is in flight.
@@ -449,15 +471,17 @@ struct Presses {
 /// would leave a Job no answer could settle, and every press until `ID_RETENTION` expires the
 /// entry read as a retry rather than cut.
 ///
-/// What Drop deliberately does *not* do is clear anything. The mark on the cutter outlives the
-/// press by design — an accepted dispatch whose reply was lost is exactly what the close guard
-/// must still warn about — and an unsettled press's id outlives it for the same reason. Only an
-/// answer clears, and only through `settle_dispatch`.
+/// Drop records a press that returned without a settling answer rather than forgetting it. A
+/// future press that begins after the group has no in-flight presses is its retry; only that
+/// retry's settling answer removes the unresolved record. A settled answer is kept until the
+/// group is removed, because a sibling can be the press that finally proves every dispatch of
+/// this id has been answered.
 #[must_use = "the press stops counting as dispatching as soon as this is dropped"]
 struct Dispatching<'a> {
     dev: &'a DeviceManagerHandle,
     key: JobKey,
-    id: AttemptId,
+    attempt: AttemptId,
+    dispatch_id: cut_host::protocol::DispatchId,
 }
 
 impl Drop for Dispatching<'_> {
@@ -467,15 +491,35 @@ impl Drop for Dispatching<'_> {
         // deregistered would instead take the editor down.
         let mut dispatching = self.dev.dispatching.lock().unwrap_or_else(|e| e.into_inner());
         let Some(presses) = dispatching.get_mut(&self.key) else {
-            // Unreachable: this press's own id keeps the entry non-empty, and only a press's Drop
-            // removes an entry. Asserted rather than trusted, because the state it would leave is
-            // silent and durable — a Job no answer can settle.
             debug_assert!(false, "a press's registration went missing while it was in flight");
             return;
         };
-        presses.in_flight.remove(&self.id);
-        presses.answered.remove(&self.id);
-        if presses.in_flight.is_empty() {
+        let Some(group) = presses.by_dispatch.get_mut(&self.dispatch_id) else {
+            debug_assert!(false, "a dispatch group went missing while its press was in flight");
+            return;
+        };
+        group.in_flight.remove(&self.attempt);
+        group.retries.remove(&self.attempt);
+        if !group.answered.contains(&self.attempt) {
+            group.unsettled.insert(self.attempt);
+        }
+
+        if group.in_flight.is_empty() {
+            // `dispatching` -> `in_doubt`, the one declared order. A group for an id the Job no
+            // longer holds can never be retried and is dead state; a current unresolved group is
+            // kept so the next press can be identified as the retry that resolves it.
+            let current = self
+                .dev
+                .in_doubt
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&self.key)
+                .is_some_and(|(held, _)| held == &self.dispatch_id);
+            if !current || group.unsettled.is_empty() {
+                presses.by_dispatch.remove(&self.dispatch_id);
+            }
+        }
+        if presses.by_dispatch.is_empty() {
             dispatching.remove(&self.key);
         }
     }
@@ -505,11 +549,13 @@ impl DeviceManagerHandle {
             local_factory: factory,
             local_manager: Mutex::new(Some(Arc::new(mgr))),
             hosts: Mutex::new(HashMap::new()),
+            claimed_host_ids: Mutex::new(HashSet::new()),
             in_doubt: Mutex::new(HashMap::new()),
             dispatching: Mutex::new(HashMap::new()),
             last_remote_status: Mutex::new(HashMap::new()),
             remote_dispatched: Mutex::new(HashMap::new()),
             dispatch_epoch: std::sync::atomic::AtomicU64::new(0),
+            close_guard_ready: std::sync::atomic::AtomicBool::new(false),
             connected: Mutex::new(None),
         };
         (handle, events)
@@ -557,9 +603,9 @@ impl DeviceManagerHandle {
             let mut guard = conn.lock().unwrap();
             let host = &mut *guard;
             let Some(client) = host.ensure() else { continue };
-            // Read before the call and compared after, as in `status`: a dispatch that lands while
-            // this is in flight makes what it learned stale, and the stale answer must not be what
-            // clears the mark that dispatch just made.
+            // Same-host dispatches cannot overlap this call: both hold this connection. The epoch
+            // comparison catches a dispatch on another host during the sweep and conservatively
+            // leaves this host's marks for the next tick.
             let epoch = self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst);
             match client.snapshots() {
                 Ok(snapshots) => {
@@ -589,22 +635,36 @@ impl DeviceManagerHandle {
     pub fn add_host(&self, paired: PairedHost) {
         let id = paired.id.clone();
         let conn = HostConnection { paired, client: None, last_error: None };
+        self.claimed_host_ids.lock().unwrap().insert(id.clone());
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
+    }
+
+    /// Mint a HostId that no host or surviving mark in this process has ever meant.
+    fn claim_next_host_id(&self) -> HostId {
+        let mut claimed = self.claimed_host_ids.lock().unwrap();
+        let highest = claimed
+            .iter()
+            .filter_map(|id| id.0.strip_prefix("host-"))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        let id = HostId(format!("host-{}", highest + 1));
+        claimed.insert(id.clone());
+        id
     }
 
     /// Drops the host and the status its cutters last reported.
     ///
-    /// The cache goes because host ids are recycled — `hosts::next_id` counts past the surviving
-    /// hosts — so a Pi paired after this one is forgotten can inherit its name, and with it a
-    /// `Cutting` reading from another machine that would hold the window until the first poll of
+    /// The cache goes because a later pairing can present the same cutter identity; keeping a
+    /// `Cutting` reading from the forgotten machine would hold the window until the first poll of
     /// the new one.
     ///
     /// The dispatch marks are *not* dropped here, because which of them are stale is not something
     /// this verb knows: `forget` asks the host and retracts the marks that answer covered, which
     /// leaves a dispatch accepted after the answer still holding the window (see `retract_marks`).
-    /// The in-doubt ids for the host's Jobs stay too, on `ID_RETENTION`: an unreachable host may
-    /// still remember an id, and a re-pair inside the hour must not mint a fresh name for a Job it
-    /// has.
+    /// The HostId remains claimed for the process lifetime so no later host can inherit that mark's
+    /// `(HostId, instance_id)` key. In-doubt ids also stay until `ID_RETENTION`; they help only if
+    /// the same HostId is deliberately restored, not as a guarantee across a fresh pairing.
     pub fn remove_host(&self, id: &HostId) {
         self.hosts.lock().unwrap().remove(id);
         self.last_remote_status.lock().unwrap().retain(|(host, _), _| host != id);
@@ -675,12 +735,12 @@ impl DeviceManagerHandle {
         // Prove it before writing it down, so a saved host has always worked at least once.
         HostClient::pair_check(&address, &token, &fingerprint).map_err(|e| host_error(&e))?;
 
-        // ponytail: reads paired_hosts() once, mints, saves, then add_hosts — three separate lock
-        // acquisitions, so two concurrent pair() calls can mint the same id and one save can
-        // overwrite the other's add_host. Fine for a single modal pairing dialog; if that stops
-        // being true, hold `hosts` across mint-and-save or mint from a counter that isn't a re-read.
+        // Claimed separately from the paired map because a forgotten host can leave a close-guard
+        // mark behind. Reusing its id would let an idle cutter on a new Pi erase that warning.
+        // ponytail: pairing is one modal dialog, so the prospective-file save is still a re-read;
+        // the id itself is unique even if a second call overlaps this one.
         let mut prospective = self.paired_hosts();
-        let id = crate::hosts::next_id(&prospective);
+        let id = self.claim_next_host_id();
         let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
         prospective.push(paired.clone());
         crate::hosts::save(hosts_path, &prospective)
@@ -973,9 +1033,9 @@ impl DeviceManagerHandle {
             // reach, offering a cut that `execute_cut` would then refuse.
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => {
-                // Read before the network call, compared after: a dispatch landing while this poll
-                // is in flight makes what it learns stale, and the stale answer must not be the
-                // thing that clears the dispatch's own mark.
+                // The connection serializes this poll with dispatches to the same host. The global
+                // epoch can still change for another host while this call is in flight; in that
+                // case the conservative answer is to keep this cutter's marks until the next tick.
                 let epoch = self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst);
                 let polled = self
                     // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
@@ -1078,6 +1138,14 @@ impl DeviceManagerHandle {
             return true;
         }
         self.remote_dispatched.lock().unwrap().values().any(|presses| !presses.is_empty())
+    }
+
+    pub fn set_close_guard_ready(&self, ready: bool) {
+        self.close_guard_ready.store(ready, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn close_guard_ready(&self) -> bool {
+        self.close_guard_ready.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
@@ -1309,20 +1377,20 @@ impl DeviceManagerHandle {
                 // one call, so no sibling's settling answer can land between the two and clear the
                 // entry this press is about to dispatch under (#290).
                 let (attempt, dispatch_id, first_attempt) = self.begin_dispatch(&key);
-                // Marked before the request rather than after the answer: an accepted dispatch
-                // whose reply is lost is exactly the case the window-close guard must still warn
-                // about, and by then there is nothing to write it from.
-                self.mark_dispatched(&id, &device, attempt.id);
-                // Bumped either side of the call, not just before it. A poll that begins after the
-                // mark but before the host has the Job sees a cutter that would still take one,
-                // and clearing on that reading throws away the mark the dispatch just made. Only a
-                // poll that ran entirely after the dispatch finished sees an unchanged count.
-                self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Marked immediately before the request, *under the HostConnection lock*. A poll
+                // that already owns that lock therefore runs before the mark exists; a poll that
+                // sees the mark runs after the dispatch has released the lock. This is the boundary
+                // the epoch alone could not express.
 
                 let reached_the_host = std::sync::atomic::AtomicBool::new(false);
                 let answer_settled = std::sync::atomic::AtomicBool::new(false);
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.mark_dispatched(&id, &device, attempt.attempt);
+                    // The global epoch is still useful across different hosts: a sweep can be
+                    // reading host B while a dispatch lands on host A. Equality makes that sweep
+                    // conservatively keep B's marks for its next tick.
+                    self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let sent = c.dispatch(&dispatch_id, &device, &machine_id, passes);
                     // Cleared by an answer that settles what the host did — a refusal included,
                     // since a host that refused says it started nothing. A reply this request
@@ -1348,7 +1416,7 @@ impl DeviceManagerHandle {
                             | cut_host::client::ClientError::WrongDispatch)
                     );
                     if settled {
-                        self.settle_dispatch(&key, &dispatch_id, attempt.id);
+                        self.settle_dispatch(&key, &dispatch_id, attempt.attempt);
                     }
                     // The same fact decides what the operator is told below, which is why it is
                     // carried out rather than re-derived there: an answer that settled what the
@@ -1359,24 +1427,18 @@ impl DeviceManagerHandle {
                     // A sibling press of the same Job may have been accepted and be cutting right
                     // now, and this answer is not about that one (#290).
                     if matches!(sent, Err(cut_host::client::ClientError::Refused(_))) {
-                        self.unmark_dispatched(&id, &device, attempt.id);
+                        self.unmark_dispatched(&id, &device, attempt.attempt);
                     }
+                    self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     sent
                 });
-                self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 if !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) {
-                    // Nothing was started by *this* press, so nothing of this press's holds the
-                    // window. Another press's mark is untouched, for the reason above.
-                    self.unmark_dispatched(&id, &device, attempt.id);
-                    // The reservation stays, and now by choice rather than for want of knowing
-                    // whose it is: `first_attempt` says whether the entry is this call's, and
-                    // `settle_dispatch` could clear it on the same terms as an answered dispatch.
-                    // Neither is asked to, because there is nothing to gain — a dispatch that never
-                    // reached a host is one the host cannot have seen either, so the next Cut
-                    // sending this id is cut normally rather than deduplicated away. What it costs
-                    // is that an identical Cut pressed later is reported as a duplicate rather than
-                    // cut, which is the safe direction and the one #121 asked to be visible.
+                    // The mark is written inside the closure, so nothing reached means there is
+                    // nothing to retract. The reservation stays by choice: a host that was never
+                    // reached cannot have seen the id either, so the next Cut sends that first-seen
+                    // id and is cut normally. Retaining it is harmless; it is not the visible
+                    // duplicate case of a reply that may have been lost.
                 }
 
                 match sent {
@@ -1428,48 +1490,64 @@ impl DeviceManagerHandle {
     ///
     /// The `bool` is `reserve_dispatch_id`'s: `true` means this call is what recorded the entry.
     fn begin_dispatch(&self, key: &JobKey) -> (Dispatching<'_>, cut_host::protocol::DispatchId, bool) {
-        let id = AttemptId::next();
+        let attempt = AttemptId::next();
         // `dispatching` first and `in_doubt` under it — the order stated on both fields, and not
         // the order they are declared in — held across the reservation so a sibling's answer cannot
         // run between the two halves and find nobody dispatching.
         let mut dispatching = self.dispatching.lock().unwrap();
-        dispatching.entry(key.clone()).or_default().in_flight.insert(id);
         let (dispatch_id, first_attempt) = self.reserve_dispatch_id(key);
+        let group = dispatching
+            .entry(key.clone())
+            .or_default()
+            .by_dispatch
+            .entry(dispatch_id.clone())
+            .or_default();
+        // A press beginning after every earlier press of this id returned is the retry that can
+        // resolve their unconfirmed outcomes. A concurrent sibling is not: its answer belongs only
+        // to itself, which is the distinction #290 was missing.
+        if group.in_flight.is_empty() && !group.unsettled.is_empty() {
+            group.retries.insert(attempt);
+        }
+        group.in_flight.insert(attempt);
         drop(dispatching);
-        (Dispatching { dev: self, key: key.clone(), id }, dispatch_id, first_attempt)
+        (
+            Dispatching {
+                dev: self,
+                key: key.clone(),
+                attempt,
+                dispatch_id: dispatch_id.clone(),
+            },
+            dispatch_id,
+            first_attempt,
+        )
     }
 
-    /// Account for what this press was told, and drop the Job's in-doubt entry once every press in
-    /// flight has been told something that settles it.
+    /// Account for what this press was told, and clear only the DispatchId that answer concerned.
     ///
-    /// A settling answer is the host saying what it did with `id`, which is the whole of what this
-    /// press has to account for — and none of what a *sibling* press dispatching the same id has:
-    /// its reply may still be lost, and this entry is what its retry would go out under (#290). So
-    /// the answer is recorded rather than acted on alone, and whichever press finds that no
-    /// unanswered press is left is the one that clears. In the ordinary single-press case that is
-    /// this press, in this call.
-    ///
-    /// A press that ends *without* a settling answer takes its record away with it, so it can never
-    /// be the press that satisfies this — which is the point: something may be cutting under that
-    /// id, and the entry is what a retry would send.
-    ///
-    /// The id is compared as well as the Job, because the entry can be pruned and re-minted while
-    /// a dispatch is in flight (`still_reusable`, `MAX_JOBS_IN_DOUBT`): a fresh entry under this
-    /// key belongs to whoever minted it, and an answer about the id it replaced says nothing about
-    /// it. So one of the answers has to name the id the entry actually holds.
+    /// A concurrent sibling under the same id still blocks: its reply may be lost, and the entry
+    /// is what its retry would send (#290). A retry that began after every earlier press returned
+    /// resolves those unconfirmed outcomes when it gets a settling answer, preserving the second
+    /// intentional Cut #121 requires. Groups under replaced ids neither block nor clear the current
+    /// one.
     fn settle_dispatch(&self, key: &JobKey, id: &cut_host::protocol::DispatchId, attempt: AttemptId) {
         // Both locks, `dispatching` then `in_doubt` as both fields state: asking and clearing have
         // to be one step, or a press beginning between them joins an entry this call is about to
-        // delete — and its retry then goes out under a name the host has never seen, which is the
-        // failure the whole entry exists to prevent.
+        // delete — and its retry then goes out under a name the host has never seen.
         let mut dispatching = self.dispatching.lock().unwrap();
         let mut in_doubt = self.in_doubt.lock().unwrap();
-        let Some(presses) = dispatching.get_mut(key) else { return };
-        presses.answered.insert(attempt, id.clone());
-        let every_press_answered = presses.in_flight.iter().all(|p| presses.answered.contains_key(p));
-        let Some((held, _)) = in_doubt.get(key) else { return };
-        let held_id_answered = presses.answered.values().any(|answered| answered == held);
-        if every_press_answered && held_id_answered {
+        let Some(group) = dispatching
+            .get_mut(key)
+            .and_then(|presses| presses.by_dispatch.get_mut(id))
+        else {
+            return;
+        };
+        group.answered.insert(attempt);
+        if group.retries.contains(&attempt) {
+            group.unsettled.clear();
+        }
+        let every_press_answered = group.in_flight.iter().all(|p| group.answered.contains(p));
+        let current_id = in_doubt.get(key).is_some_and(|(held, _)| held == id);
+        if every_press_answered && group.unsettled.is_empty() && current_id {
             in_doubt.remove(key);
         }
     }
@@ -4090,13 +4168,13 @@ mod tests {
         let (second, joined, _) = dev.begin_dispatch(&key);
         assert_eq!(id, joined, "the second press joins the id already reserved");
 
-        dev.settle_dispatch(&key, &id, first.id);
+        dev.settle_dispatch(&key, &id, first.attempt);
         assert!(
             dev.in_doubt.lock().unwrap().contains_key(&key),
             "the first answer said nothing about the press still dispatching"
         );
 
-        dev.settle_dispatch(&key, &joined, second.id);
+        dev.settle_dispatch(&key, &joined, second.attempt);
         assert!(
             !dev.in_doubt.lock().unwrap().contains_key(&key),
             "with every press answered the Job is no longer in doubt"
@@ -4121,12 +4199,85 @@ mod tests {
         let minted = cut_host::protocol::DispatchId("minted-by-someone-else".into());
         dev.in_doubt.lock().unwrap().insert(key.clone(), (minted.clone(), std::time::Instant::now()));
 
-        dev.settle_dispatch(&key, &stale, press.id);
+        dev.settle_dispatch(&key, &stale, press.attempt);
         assert_eq!(
             dev.in_doubt.lock().unwrap().get(&key).map(|(id, _)| id.clone()),
             Some(minted),
             "an answer about the id that was replaced deleted its replacement"
         );
+    }
+
+    /// The production order, unlike the test above: one answered press returns before its sibling
+    /// is answered. Its evidence must outlive its guard, or the last answer cannot finish the Job.
+    #[test]
+    fn a_settled_press_answer_outlives_its_guard() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+
+        let (first, id, _) = dev.begin_dispatch(&key);
+        let (second, joined, _) = dev.begin_dispatch(&key);
+        dev.settle_dispatch(&key, &id, first.attempt);
+        drop(first);
+        assert!(dev.in_doubt.lock().unwrap().contains_key(&key), "the sibling is still unanswered");
+
+        dev.settle_dispatch(&key, &joined, second.attempt);
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "the returned press's answer was forgotten");
+    }
+
+    /// A concurrent press that returns without a settling answer remains unresolved. A sibling's
+    /// answer cannot clear it; the next press after the group is idle is the retry that can.
+    #[test]
+    fn an_unsettled_returned_press_keeps_the_id_until_a_retry_settles() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+
+        let (answered, id, _) = dev.begin_dispatch(&key);
+        let (unsettled, joined, _) = dev.begin_dispatch(&key);
+        drop(unsettled);
+        dev.settle_dispatch(&key, &id, answered.attempt);
+        drop(answered);
+        assert!(dev.in_doubt.lock().unwrap().contains_key(&key), "a sibling erased the retry id");
+
+        let (retry, retried, first_attempt) = dev.begin_dispatch(&key);
+        assert!(!first_attempt);
+        assert_eq!(retried, joined);
+        dev.settle_dispatch(&key, &retried, retry.attempt);
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "the settling retry did not resolve the id");
+    }
+
+    /// A current-id answer can return before a stale-id press. The groups are independent: the
+    /// current id settles, and the later stale answer neither restores nor clears anything.
+    #[test]
+    fn a_current_id_answer_survives_a_later_stale_answer() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let key = JobKey {
+            host: HostId("host-1".into()),
+            device: cut_host::host::testing::CAMEO.into(),
+            digest: job_digest("cameo5", &a_square(10.0)),
+        };
+
+        let (stale_press, stale, _) = dev.begin_dispatch(&key);
+        dev.in_doubt.lock().unwrap().remove(&key);
+        let (current_press, current, _) = dev.begin_dispatch(&key);
+        assert_ne!(stale, current);
+
+        dev.settle_dispatch(&key, &current, current_press.attempt);
+        drop(current_press);
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "the current answer did not settle its id");
+
+        dev.settle_dispatch(&key, &stale, stale_press.attempt);
+        assert!(!dev.in_doubt.lock().unwrap().contains_key(&key), "a stale answer recreated state");
     }
 
     /// A local cut holds the window too, through the arm of the guard that involves no mark at all.
@@ -4284,6 +4435,142 @@ mod tests {
             dev.a_cut_may_be_running(),
             "a dispatch the host's answer never covered lost its warning anyway"
         );
+    }
+
+    /// Switching the host sweep from `devices` to `snapshots` must not change the list it returns:
+    /// the statuses are extra information for the guard, not a reason remote cutters disappear.
+    #[test]
+    fn a_reachable_hosts_cutters_are_still_listed() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+
+        let listed = dev.list_devices();
+        let remote: Vec<_> = listed.iter().filter(|d| d.host.as_ref() == Some(&id)).collect();
+        assert_eq!(remote.len(), 2, "both of the host's cutters must be listed: {listed:?}");
+        assert!(remote.iter().any(|d| d.instance_id == cut_host::host::testing::CAMEO), "{remote:?}");
+        assert!(remote.iter().any(|d| d.instance_id == cut_host::host::testing::PUMA), "{remote:?}");
+        assert_eq!(listed.len(), TestFactory.list_devices().len() + 2, "the local cutter must survive the host's");
+    }
+
+    /// A peer that misanswers the new Snapshot request is named on its row and its client is
+    /// discarded, just as a failed bare-device request was before the switch.
+    #[test]
+    fn a_host_that_misanswers_the_snapshot_is_recorded_as_unreachable() {
+        let host = cut_host::client::testing::start_host_answering(vec![
+            cut_host::protocol::Response::Ok,
+            cut_host::protocol::Response::Ok,
+        ]);
+        let dev = test_device_setup();
+        dev.add_host(PairedHost {
+            fingerprint: host.fingerprint.clone(),
+            ..a_paired_host("host-1", &host.addr)
+        });
+
+        let listed = dev.list_devices();
+        assert!(listed.iter().all(|d| d.host.is_none()), "a host that misanswered contributes none");
+        let view = dev.host_views().pop().expect("the host is still paired");
+        assert_eq!(
+            view.unreachable.as_deref(),
+            Some("this host answered with `Ok` where `Snapshots` was expected"),
+            "the row claimed a healthy host"
+        );
+        assert!(
+            dev.host_conn(&HostId("host-1".into())).unwrap().lock().unwrap().client.is_none(),
+            "the dead client was kept for the next call to reuse"
+        );
+    }
+
+    /// An idle cutter clears its own marks, not every mark on its host. A Puma beside a cutting
+    /// Cameo must not wave the operator past the Cameo when the once-per-second sweep sees both.
+    #[test]
+    fn an_idle_cutter_does_not_release_its_neighbours_mark() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+        dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
+
+        let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+        wait_until(|| cameo_is_active(&direct), "the cut never started");
+        dev.list_devices();
+        assert!(dev.a_cut_may_be_running(), "the idle Puma released the cutting Cameo's mark");
+    }
+
+    /// A dispatch queues behind a poll on their shared HostConnection without writing its mark
+    /// first. Once it owns the connection it writes the mark immediately before the request, so a
+    /// stale free snapshot can run before the mark or a later poll can run after the dispatch —
+    /// never clear a mark for a request that has not been sent yet.
+    #[test]
+    fn a_dispatch_marks_only_after_it_owns_the_host_connection() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+        dev.list_devices(); // establish the connection before this test takes its lock
+        let conn = dev.host_conn(&id).unwrap();
+        let held = conn.lock().unwrap();
+
+        std::thread::scope(|s| {
+            let cut = s.spawn(|| dev.execute_cut(aimed, a_square(10.0)));
+            wait_until(
+                || !dev.dispatching.lock().unwrap().is_empty(),
+                "the dispatch never reached the host-connection boundary",
+            );
+            assert!(
+                dev.remote_dispatched.lock().unwrap().is_empty(),
+                "a request blocked behind a stale poll wrote a mark the poll could clear"
+            );
+            drop(held);
+            cut.join().unwrap().expect("dispatch");
+        });
+        assert!(dev.a_cut_may_be_running(), "the accepted dispatch left no mark");
+    }
+
+    /// Host ids remain claimed after forget. A surviving mark is keyed by that id, so recycling it
+    /// for an idle new Pi would let the new Pi's snapshot erase the old Pi's warning.
+    #[test]
+    fn a_forgotten_host_id_is_not_recycled_while_its_marks_can_survive() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let first = dev
+            .pair("First Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("first pairing");
+        dev.mark_dispatched(&first, cut_host::host::testing::CAMEO, AttemptId::next());
+        dev.remove_host(&first);
+
+        let second = dev
+            .pair("Second Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("second pairing");
+        assert_ne!(first, second, "a new host inherited a surviving mark's identity");
+        dev.list_devices();
+        assert!(dev.a_cut_may_be_running(), "the new host's idle cutter erased the forgotten host's warning");
+    }
+
+    #[test]
+    fn the_close_guard_is_ready_only_after_the_webview_acknowledges_it() {
+        let dev = test_device_setup();
+        assert!(!dev.close_guard_ready());
+        dev.set_close_guard_ready(true);
+        assert!(dev.close_guard_ready());
+        dev.set_close_guard_ready(false);
+        assert!(!dev.close_guard_ready());
     }
 
     // --- presets: identity is (machine_id, id), so one cutter's entry cannot destroy another's ---

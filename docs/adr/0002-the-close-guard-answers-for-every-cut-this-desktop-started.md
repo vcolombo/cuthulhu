@@ -34,5 +34,14 @@ The clear has to be as wide as the question. A guard that asks about every cutte
 hears from every cutter, or a mark on one the operator has aimed away from stands for the rest of
 the session: not a window that cannot be closed — the prompt always offers the quit — but a prompt
 that can never stop being raised, which is how a warning becomes something to click through. So the
-device-list poll clears marks for every cutter that says it would take a Job, and forgetting a host
-retracts the marks its own answer covered.
+device-list poll clears marks for every cutter that says it would take a Job. A dispatch writes its
+mark only after it owns the same host-connection lock as that poll, so an idle answer precedes the
+mark or follows the request; it can never clear a request still queued behind it.
+
+Forgetting a host retracts the marks its answer covered. A dispatch that gets the connection after
+that answer keeps its mark even though the host's cancel route is gone, and the HostId remains
+claimed for the process lifetime so an idle newly-paired host cannot inherit and erase the warning.
+
+A prevented close also needs a positively known listener. Tauri reports a successful emit with
+zero listeners, so the webview acknowledges the listener after registration and clears that
+readiness before teardown; outside that lifetime the requested close proceeds.

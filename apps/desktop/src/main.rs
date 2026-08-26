@@ -33,6 +33,16 @@ fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     app.exit(0);
 }
 
+/// The webview's acknowledgement that its quit-warning listener is installed.
+///
+/// Tauri's `emit` returns success with zero listeners, so delivery cannot be inferred from the
+/// result. The webview sets this only after `listen` resolves and clears it before teardown; a
+/// close arriving outside that lifetime proceeds instead of becoming a refusal with no escape.
+#[tauri::command]
+fn set_close_guard_ready(dev: tauri::State<DeviceManagerHandle>, ready: bool) {
+    dev.set_close_guard_ready(ready);
+}
+
 fn main() {
     let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
 
@@ -96,6 +106,7 @@ fn main() {
             ipc::list_fonts,
             ipc::load_image_preview,
             ipc::pick_image,
+            set_close_guard_ready,
             force_quit,
         ])
         .on_window_event(|window, event| {
@@ -112,13 +123,11 @@ fn main() {
                 // dispatch this desktop sent and has not seen finish, on any cutter and whatever
                 // is aimed at now (#158); a warning about a Job that has since ended costs a
                 // dialog the operator dismisses.
-                if dev.a_cut_may_be_running() {
-                    // The refusal and the warning are one act, so the emit decides it. A close held
-                    // with no dialog behind it is a window that will not shut and says nothing
-                    // about why — and the escape hatch out of it, `force_quit`, is only reachable
-                    // *through* that dialog. If the webview cannot be told, the operator keeps the
-                    // close they asked for and the cut keeps running, which is what quitting would
-                    // have left anyway on a Cut Host.
+                if dev.a_cut_may_be_running() && dev.close_guard_ready() {
+                    // Readiness is the delivery fact: `emit` only proves serialization and returns
+                    // success even with nobody listening. Once the webview has acknowledged its
+                    // listener, a successful emit and the refusal are one act. A serialization
+                    // failure logs and preserves the close the operator asked for.
                     match window.emit("cut-in-progress", ()) {
                         Ok(()) => api.prevent_close(),
                         Err(e) => eprintln!("cuthulhu: a cut may be running and the warning could not be shown: {e}"),

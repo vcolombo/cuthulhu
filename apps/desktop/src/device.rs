@@ -527,13 +527,15 @@ impl DeviceManagerHandle {
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
 
-    /// Drops the host, and with it the dispatch marks naming it.
+    /// Drops the host, and with it everything this desktop remembers about its cutters.
     ///
-    /// The marks go because nothing can ever clear them again: the poll that clears one is a call
-    /// to the host this just removed, so a mark left behind would hold the window shut for the
-    /// rest of the session (#158). `forget` refuses while the host says it is cutting, and tells
-    /// the operator outright what forcing past an unreachable one discards, so the warning being
-    /// dropped here is one they have already been given in the form they can act on.
+    /// The dispatch marks go because nothing can ever clear them again: the poll that clears one is
+    /// a call to the host this just removed, so a mark left behind would hold the window shut for
+    /// the rest of the session (#158). `forget` refuses while the host says it is cutting, and
+    /// tells the operator outright what forcing past an unreachable one discards, so the warning
+    /// being dropped here is one they have already been given in the form they can act on. The
+    /// status cache goes for the same reason and with nothing riding on it — `route` already
+    /// refuses a device whose host is unpaired, so it was unreachable rather than merely stale.
     pub fn remove_host(&self, id: &HostId) {
         self.hosts.lock().unwrap().remove(id);
         self.remote_dispatched.lock().unwrap().retain(|(host, _), _| host != id);

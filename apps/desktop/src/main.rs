@@ -28,6 +28,9 @@ use desktop::state::AppState;
 /// cancel that could block the exit is gone.
 #[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
+    // The operator has answered the prompt, so nothing new may start: a press already queued for a
+    // host's connection must not send a Job into a process that is exiting.
+    dev.commit_close_after_confirmation();
     dev.stop_local_motion();
     dev.shutdown();
     app.exit(0);
@@ -123,25 +126,29 @@ fn main() {
                 // dispatch this desktop sent and has not seen finish, on any cutter and whatever
                 // is aimed at now (#158); a warning about a Job that has since ended costs a
                 // dialog the operator dismisses.
-                if dev.a_cut_may_be_running() {
-                    if dev.should_warn_before_closing() {
-                        // Readiness is the delivery fact: `emit` only proves serialization and
-                        // returns success even with nobody listening. Once the webview has
-                        // acknowledged its listener, a successful emit and the refusal are one act.
-                        match window.emit("cut-in-progress", ()) {
-                            Ok(()) => api.prevent_close(),
-                            Err(e) => eprintln!(
-                                "cuthulhu: a cut may be running and the warning could not be shown: {e}"
-                            ),
-                        }
-                    } else {
-                        // Fail open by design — a refused close with no listener has no escape —
-                        // but not silently: this is the only evidence a startup/listener failure
-                        // disabled the guard when an operator later reports a warning was missing.
-                        eprintln!(
-                            "cuthulhu: a cut may be running but the warning listener is not ready; closing"
-                        );
+                // `commit_close` answers and commits in one step, so a press queued behind a poll
+                // for a host's connection cannot cross into its dispatch after the window has been
+                // let go: the Job it would start outlives the process that started it.
+                if dev.commit_close() {
+                    return;
+                }
+                if dev.close_guard_ready() {
+                    // Readiness is the delivery fact: `emit` only proves serialization and returns
+                    // success even with nobody listening. Once the webview has acknowledged its
+                    // listener, a successful emit and the refusal are one act.
+                    match window.emit("cut-in-progress", ()) {
+                        Ok(()) => api.prevent_close(),
+                        Err(e) => eprintln!(
+                            "cuthulhu: a cut may be running and the warning could not be shown: {e}"
+                        ),
                     }
+                } else {
+                    // Fail open by design — a refused close with no listener has no escape — but
+                    // not silently: this is the only evidence a startup/listener failure disabled
+                    // the guard when an operator later reports a warning was missing.
+                    eprintln!(
+                        "cuthulhu: a cut may be running but the warning listener is not ready; closing"
+                    );
                 }
             }
         })

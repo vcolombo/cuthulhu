@@ -232,21 +232,27 @@ impl Host {
 
     /// Everything a reattaching client needs, for every cutter, in one value.
     ///
-    /// `claimed` is read with `Admission` held across the status read. A dispatch therefore sets
-    /// `starting` before a snapshot can call the cutter free, and its `StartingClaim` clears that
-    /// bit only after `manager.cut` has published the Job.
+    /// `claimed` is one reading: `Admission` is held across the status read, so a dispatch that has
+    /// claimed the cutter cannot be reported free before its worker publishes. The guard is dropped
+    /// before `job_id` is read, because `claims` needs the same two mutexes and holding both here
+    /// is what let the two orders cross — a status poll racing the shutdown guard's report
+    /// deadlocked the daemon, and a wedged watch thread can never honour SIGTERM.
+    /// **No slot lock is held while another is taken.**
     pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
         self.order
             .iter()
             .filter_map(|id| self.slots.get(id))
             .map(|s| {
-                let admission = s.admission.lock().unwrap();
-                let status = s.manager.status();
+                let (claimed, status) = {
+                    let admission = s.admission.lock().unwrap();
+                    let status = s.manager.status();
+                    (admission.starting || status.is_active(), status)
+                };
                 DeviceSnapshot {
                     info: s.info.clone(),
-                    claimed: admission.starting || status.is_active(),
                     status,
                     job_id: *s.job_id.lock().unwrap(),
+                    claimed,
                 }
             })
             .collect()
@@ -406,11 +412,14 @@ impl Host {
             .iter()
             .filter_map(|id| self.slots.get(id))
             .filter(|s| s.is_claimed())
-            .map(|s| Claim {
-                device: s.info.instance_id.clone(),
-                phase: s.manager.status().phase,
-                job_id: *s.job_id.lock().unwrap(),
-                starting: s.admission.lock().unwrap().starting,
+            .map(|s| {
+                // One lock per statement, so nothing here is held while another is taken. Written
+                // as a struct expression, the `job_id` temporary lived to the end of that
+                // expression and was still held when `admission` was locked — the opposite of
+                // `snapshots`' order, which is a cycle between the poll and this report.
+                let job_id = *s.job_id.lock().unwrap();
+                let starting = s.admission.lock().unwrap().starting;
+                Claim { device: s.info.instance_id.clone(), phase: s.manager.status().phase, job_id, starting }
             })
             .collect()
     }
@@ -1207,6 +1216,41 @@ mod tests {
         let from_devices: Vec<String> = host.devices().into_iter().map(|d| d.instance_id).collect();
         let from_snaps: Vec<String> = host.snapshots().into_iter().map(|s| s.info.instance_id).collect();
         assert_eq!(from_devices, from_snaps);
+    }
+
+    /// `snapshots` must not hold a slot's `admission` while it takes that slot's `job_id`. It did,
+    /// and `claims` — written as a struct expression whose `job_id` temporary outlived its own
+    /// statement — took the two the other way round, so a status poll racing the shutdown guard's
+    /// report wedged both threads. A daemon in that state holds `admission` forever: every later
+    /// dispatch blocks on it, and the watch thread that is the only caller of `exit` can no longer
+    /// honour SIGTERM, which is exactly the abandoned-cut outcome the guard exists to prevent.
+    ///
+    /// Pinned from the second lock, not the first: parking a reader on the lock it takes *first*
+    /// proves nothing, because it holds nothing yet. Holding `job_id` here forces the poll to park
+    /// on `job_id`, and `admission` staying free is the whole of the property — one direction
+    /// removed is a cycle removed, whichever order the other reader uses. `claims` takes one lock
+    /// per statement for the same reason, which its own `is_claimed` filter makes untestable from
+    /// outside: it parks on `admission` before it ever reaches `job_id`.
+    #[test]
+    fn a_status_poll_does_not_hold_admission_while_it_takes_a_job_id() {
+        use std::time::{Duration, Instant};
+
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let parked = Arc::clone(&host);
+        let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+        let polling = std::thread::spawn(move || parked.snapshots());
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            assert!(
+                host.slot(CAMEO).unwrap().admission.try_lock().is_ok(),
+                "the poll held `admission` while it waited for `job_id`, which is half a deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        drop(job_id);
+        polling.join().expect("the poll must finish once `job_id` is free");
     }
 
     #[test]

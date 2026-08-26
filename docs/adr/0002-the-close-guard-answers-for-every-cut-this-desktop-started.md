@@ -38,6 +38,21 @@ device-list poll clears marks for every cutter that says it would take a Job. A 
 mark only after it owns the same host-connection lock as that poll, so an idle answer precedes the
 mark or follows the request; it can never clear a request still queued behind it.
 
+A close is a commitment, not an answer. Between choosing an id and reaching the host's connection a
+press has written nothing, so it is invisible to any mark, and an async command can still cross
+into its dispatch after the guard has let the window go — starting a Job that outlives the process
+that started it. So the guard's question and the close are one step: the decision is taken while a
+send cannot begin, and a press that reaches the connection afterwards sends nothing. "Quit anyway"
+waits briefly for a send already in progress rather than forever, because a prompt whose answer
+hangs behind a timing-out Pi is its own failure; past that the send may land, which is what the
+prompt already says about a Job sent to a Cut Host.
+
+Free is two facts, not one. A cutter is only free to have its warning dropped when nothing claims
+it *and* it says it would take another Job: disconnected, errored, and stopped-without-confirmation
+are all unclaimed and none of them are free. Forgetting a reachable host therefore refuses until
+every cutter is free, and `force` remains what it always was — the way past a host that cannot
+answer at all, never past one that did.
+
 Forgetting a host retracts the marks its answer covered. A dispatch that gets the connection after
 that answer keeps its mark even though the host's cancel route is gone, and the HostId remains
 claimed for the process lifetime so an idle newly-paired host cannot inherit and erase the warning.

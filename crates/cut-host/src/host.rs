@@ -1233,19 +1233,33 @@ mod tests {
     /// untestable from outside: it parks on `admission` before it ever reaches `job_id`.
     #[test]
     fn a_status_poll_does_not_hold_admission_while_it_takes_a_job_id() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
 
         let host = Host::start(Arc::new(TwoCutterFactory));
-        let parked = Arc::clone(&host);
         let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
-        let polling = std::thread::spawn(move || parked.snapshots());
 
-        // One long beat, then a single question. The poll's `admission` section is microseconds, so
-        // by now it can only be parked on `job_id` — and `is_finished` proves it is parked rather
-        // than never started. Catching the transient instead, in either direction, is a test that
-        // has to win a race to be right.
+        // The thread says when it is inside the call, so "not finished" cannot mean "never
+        // scheduled" — that reading would let the assertion below pass without the poll ever
+        // reaching a lock, which is a test that cannot fail rather than one that does not flake.
+        let entered = Arc::new(AtomicBool::new(false));
+        let polling = {
+            let (parked, entered) = (Arc::clone(&host), Arc::clone(&entered));
+            std::thread::spawn(move || {
+                entered.store(true, Ordering::SeqCst);
+                parked.snapshots()
+            })
+        };
+
+        let started_by = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < started_by, "the poll thread never ran");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Its `admission` section is microseconds, so one long beat past entering the call leaves
+        // exactly one place it can be: parked on the `job_id` this test holds.
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!polling.is_finished(), "the poll never parked on `job_id`, so this proves nothing");
+        assert!(!polling.is_finished(), "the poll finished without ever taking the held `job_id`");
 
         let deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < deadline {

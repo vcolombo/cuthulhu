@@ -763,6 +763,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       }
       return null;
     },
+    // Same, for whether the page has got as far as subscribing: an emit before the listener is
+    // registered reaches nobody, and `goto` resolving is not that moment.
+    __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
     // Mirrors `main.rs`'s `force_quit` as far as a page can: the process it exits is not this one,
     // so what is observable is that it was asked. Recorded rather than counted, because the
     // question a test asks is whether confirming the prompt reached it at all.
@@ -2786,6 +2789,32 @@ test("trace dialog: a failed source thumbnail surfaces instead of blanking", asy
   await expect(page.getByRole("button", { name: "Insert" })).toBeEnabled();
 });
 
+// Emits an event the *backend* sends, once the page is actually listening for it.
+//
+// The wait is on the fake's own registration rather than on an element being visible: `goto`
+// resolves at load, `App` subscribes from a `useEffect`, and an emit that arrives before that has
+// no listener to reach — which is a test that fails for its timing rather than for the sentence it
+// is about. A rendered button is a proxy for the same commit having happened; the registration is
+// the thing itself.
+const emitBackendEvent = async (page: Page, event: string) => {
+  await expect
+    .poll(() =>
+      page.evaluate((e) => {
+        const internals = window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return internals.__TAURI_INTERNALS__.invoke("__test_backend_listeners", { event: e });
+      }, event),
+    )
+    .toBeGreaterThan(0);
+  await page.evaluate((e) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: e });
+  }, event);
+};
+
 // The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
 // quitting stops what this process drives and leaves a Cut Host's Job cutting, so a prompt that
 // implies the quit stops everything would be telling the operator the opposite of what happens.
@@ -2799,12 +2828,7 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
     d.accept().catch(() => {});
   });
 
-  await page.evaluate(() => {
-    const internals = window as unknown as {
-      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
-    };
-    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: "cut-in-progress" });
-  });
+  await emitBackendEvent(page, "cut-in-progress");
 
   await expect.poll(() => prompts.length).toBe(1);
   expect(prompts[0]).toContain("Cutting on this computer stops");
@@ -2819,19 +2843,17 @@ test("dismissing the quit prompt leaves the window open and quits nothing", asyn
   await page.addInitScript(installMockTauri);
   await page.goto("/");
 
+  const prompts: string[] = [];
   page.on("dialog", (d) => {
+    prompts.push(d.message());
     d.dismiss().catch(() => {});
   });
 
-  await page.evaluate(() => {
-    const internals = window as unknown as {
-      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
-    };
-    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: "cut-in-progress" });
-  });
+  await emitBackendEvent(page, "cut-in-progress");
 
-  // Nothing to wait for but the absence of a call, so the editor answering at all is the beat:
-  // the prompt is handled synchronously inside the listener that the evaluate above triggered.
-  await expect(page.getByRole("button", { name: "Cut" })).toBeVisible();
+  // The prompt having been shown and dismissed is the beat to wait on: `window.confirm` returns
+  // inside the listener, so by the time it is recorded here the decision has already been acted on.
+  await expect.poll(() => prompts.length).toBe(1);
   expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await expect(page.getByRole("button", { name: "Cut" })).toBeVisible();
 });

@@ -174,6 +174,16 @@ fn snapshot_is_free(snapshot: &cut_host::protocol::DeviceSnapshot) -> bool {
     !snapshot.claimed && snapshot.status.actions.cut
 }
 
+/// A cutter that stopped where nothing saw it stop.
+///
+/// Claimed by nothing and not free, and the one state in that class with a way back: the host's own
+/// `Reconnect` re-opens the transport and clears it. So it is a refusal with an exit rather than
+/// something for `force` to pass — the blade may still be moving, and the token being discarded is
+/// the only thing that could stop it.
+fn a_stop_nothing_confirmed(snapshot: &cut_host::protocol::DeviceSnapshot) -> bool {
+    snapshot.status.ended == Some(driver_core::Ended::Cancelled) && !snapshot.status.actions.cut
+}
+
 #[derive(Deserialize)]
 pub struct CutRequest {
     pub device_instance_id: String,
@@ -833,18 +843,25 @@ impl DeviceManagerHandle {
                     "a cut is active or starting on this host; cancel it before forgetting",
                 ))
             }
-            // Not claimed and still not free: a stop nothing confirmed, or a cutter that is
-            // disconnected or errored. `snapshot_is_free` is the same predicate a poll clears marks
-            // on, so forgetting here would drop a warning this desktop refuses to drop itself.
-            //
-            // `force` *does* pass this one, and has to: a cutter whose hardware is gone answers
-            // every reconnect with the same fault and has no cut to cancel, so refusing outright
-            // would leave a host row nothing could ever remove. What force costs is stated where
-            // the operator is standing — the marks go with the token.
+            // Claimed by nothing, not free, and recoverable: the host's own `Reconnect` clears a
+            // stop nothing confirmed, so this refusal has an exit and `force` is not it. Forcing
+            // here would discard the token to a blade that may still be moving while a verb that
+            // fixes it is one click away.
+            Ok((_, snapshots)) if snapshots.iter().any(a_stop_nothing_confirmed) => {
+                return Err(IpcError::new(
+                    "host_busy",
+                    "a cutter on this host stopped where nothing saw it stop; reconnect it before forgetting",
+                ))
+            }
+            // Claimed by nothing, not free, and nothing here can recover it: disconnected or
+            // errored. `snapshot_is_free` is the predicate a poll clears marks on, so the ordinary
+            // path still refuses — but `force` passes this one, and has to. A cutter whose hardware
+            // is gone answers every reconnect with the same fault and has no cut to cancel, so
+            // refusing outright would leave a host row nothing could ever remove.
             Ok((_, snapshots)) if !force && !snapshots.iter().all(snapshot_is_free) => {
                 return Err(IpcError::new(
                     "host_busy",
-                    "this host has a cutter that is not free; cancel or reconnect it, or force past it",
+                    "this host has a cutter that is not free; reconnect it, or force past it",
                 ))
             }
             Ok((marks, _)) => marks,
@@ -1251,9 +1268,7 @@ impl DeviceManagerHandle {
             }
         }
     }
-    pub fn should_warn_before_closing(&self) -> bool {
-        self.a_cut_may_be_running() && self.close_guard_ready()
-    }
+
 
     /// Stop what this process is driving, and leave a Cut Host's Jobs to the host.
     ///
@@ -4733,19 +4748,28 @@ mod tests {
         assert!(dev.a_cut_may_be_running(), "the new host's idle cutter erased the forgotten host's warning");
     }
 
+    /// The rule the close path actually runs, asked of the two calls `main.rs` makes: `commit_close`
+    /// says whether the window may go, and readiness decides whether a refusal has a prompt behind
+    /// it. A fresh handle per case, because committing is a state change rather than a question.
     #[test]
-    fn a_close_warning_requires_both_a_cut_and_the_webview_acknowledgement() {
-        let dev = test_device_setup();
-        assert!(!dev.should_warn_before_closing(), "an idle cutter needs no warning");
+    fn a_close_is_let_go_only_with_nothing_outstanding_and_warned_only_with_a_listener() {
+        let idle = test_device_setup();
+        assert!(idle.commit_close(), "an idle desktop may close");
 
-        dev.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
-        assert!(!dev.should_warn_before_closing(), "a listener-less warning has no escape hatch");
+        let unarmed = test_device_setup();
+        unarmed.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        assert!(!unarmed.commit_close(), "the window was let go over an outstanding cut");
+        assert!(!unarmed.close_guard_ready(), "a warning with no listener behind it has no escape hatch");
 
-        dev.set_close_guard_ready(true);
-        assert!(dev.should_warn_before_closing(), "an outstanding cut with a listener was waved through");
-        dev.set_close_guard_ready(false);
-        assert!(!dev.should_warn_before_closing(), "teardown left the native guard armed");
+        let armed = test_device_setup();
+        armed.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        armed.set_close_guard_ready(true);
+        assert!(!armed.commit_close(), "the window was let go over an outstanding cut");
+        assert!(armed.close_guard_ready(), "the prompt the refusal needs was not armed");
+        armed.set_close_guard_ready(false);
+        assert!(!armed.close_guard_ready(), "teardown left the native guard armed");
     }
+
 
     /// An admitted dispatch is not free merely because the worker still publishes Idle. This is
     /// the one bit the host added to Snapshot for the accept-to-worker-publication gap.
@@ -4823,13 +4847,11 @@ mod tests {
     }
 
     /// A cutter whose stop nothing confirmed is claimed by nothing and still not free, and this
-    /// desktop's own polls refuse to clear its mark. Forgetting the host refuses it too, or the
-    /// warning and the cancel route go together over a blade that may still be moving — and `force`
-    /// is the way through, because a cutter whose hardware is gone answers every reconnect with the
-    /// same fault and has no cut to cancel. A refusal with no escape is a host row nothing can
-    /// remove.
+    /// desktop's own polls refuse to clear its mark. Forgetting refuses it — with or without
+    /// `force`, because the blade may still be moving and the host's own `Reconnect` is a verb that
+    /// fixes it. Force is for a state nothing can recover, not for one click away from recovery.
     #[test]
-    fn forgetting_a_host_refuses_an_unconfirmed_stop_but_can_be_forced_past_it() {
+    fn forgetting_a_host_refuses_a_stop_nothing_confirmed_until_a_reconnect() {
         let host = start_loopback_host();
         let dir = tempfile::tempdir().unwrap();
         let hosts_path = dir.path().join("hosts.json");
@@ -4846,14 +4868,53 @@ mod tests {
         wait_for_remote(&dev, |s| s.ended == Some(driver_core::Ended::Cancelled), "the cancel to land");
         assert!(!dev.status().actions.cut, "nothing saw the machine stop, so it is not free");
 
-        let err = dev.forget(&id, &hosts_path, false).expect_err("an unconfirmed stop is not idleness");
-        assert_eq!(err.code, "host_busy", "got {err:?}");
-        assert!(dev.a_cut_may_be_running(), "the refusal must leave the warning standing");
-        assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+        for forced in [false, true] {
+            let err = dev.forget(&id, &hosts_path, forced).expect_err("an unconfirmed stop is not idleness");
+            assert_eq!(err.code, "host_busy", "force={forced}, got {err:?}");
+            assert!(err.message.contains("reconnect"), "the way out is not named: {}", err.message);
+            assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+        }
+        assert!(dev.a_cut_may_be_running(), "the refusals must leave the warning standing");
 
-        dev.forget(&id, &hosts_path, true).expect("force is the escape from a cutter that cannot recover");
-        assert!(dev.paired_hosts().is_empty(), "the forced forget left the host paired");
-        assert!(!dev.a_cut_may_be_running(), "the marks go with the token the operator discarded");
+        // The verb the refusal names, and then the host can go.
+        dev.reconnect().expect("the host re-opens its own cutter");
+        dev.forget(&id, &hosts_path, false).expect("a reconnected cutter is free");
+        assert!(dev.paired_hosts().is_empty(), "the host stayed paired after its cutter came back");
+        assert!(!dev.a_cut_may_be_running(), "the marks go with a host that answered every cutter free");
+    }
+
+    /// Which states `force` may pass, asked of the two predicates rather than of hardware this test
+    /// cannot unplug: a claimed cutter and a stop nothing confirmed both refuse whatever the
+    /// operator insists, while a cutter that is merely disconnected is the unrecoverable case force
+    /// exists for.
+    #[test]
+    fn only_an_unrecoverable_cutter_is_something_force_may_pass() {
+        let claimed = cut_host::protocol::DeviceSnapshot {
+            info: test_instance(),
+            status: CutStatus::disconnected(),
+            job_id: None,
+            claimed: true,
+        };
+        assert!(!snapshot_is_free(&claimed));
+        assert!(!a_stop_nothing_confirmed(&claimed), "a claimed cutter refuses on its own arm");
+
+        let mut stopped = claimed.clone();
+        stopped.claimed = false;
+        stopped.status.ended = Some(driver_core::Ended::Cancelled);
+        assert!(!snapshot_is_free(&stopped));
+        assert!(a_stop_nothing_confirmed(&stopped), "a stop nothing saw is the recoverable refusal");
+
+        let disconnected = cut_host::protocol::DeviceSnapshot {
+            info: test_instance(),
+            status: CutStatus::disconnected(),
+            job_id: None,
+            claimed: false,
+        };
+        assert!(!snapshot_is_free(&disconnected), "a disconnected cutter is not free");
+        assert!(
+            !a_stop_nothing_confirmed(&disconnected),
+            "nothing here recovers a cutter whose hardware is gone, which is what force is for"
+        );
     }
 
     /// A host that answered with every cutter free has said the marks it holds are stale, and they

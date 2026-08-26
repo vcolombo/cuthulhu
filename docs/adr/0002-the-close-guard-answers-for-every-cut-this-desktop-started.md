@@ -49,12 +49,17 @@ prompt already says about a Job sent to a Cut Host.
 
 Free is two facts, not one. A cutter is only free to have its warning dropped when nothing claims
 it *and* it says it would take another Job: disconnected, errored, and stopped-without-confirmation
-are all unclaimed and none of them are free. Forgetting a reachable host therefore refuses while
-any cutter is not free — but `force` passes that refusal, because a cutter whose hardware is gone
-answers every reconnect with the same fault and has no cut to cancel, and a refusal with no escape
-is a host row nothing can ever remove. What `force` still cannot pass is a *claimed* cutter: a Job
-in flight or a dispatch on its way to the manager is reachable by `cancel`, so the blade was never
-orphaned and there is no case for discarding the route to it.
+are all unclaimed and none of them are free. Forgetting a reachable host therefore refuses while any
+cutter is not free, and what `force` may pass is decided by whether anything can recover the state:
+
+- **Claimed** — a Job in flight, or a dispatch on its way to the manager. Refused whatever the
+  operator insists, as it always was: the host is answering, so `cancel` reaches the blade.
+- **Stopped where nothing saw it stop** — refused too, because the host's own `Reconnect` clears it.
+  A refusal with a verb one click away is not something to force past.
+- **Disconnected or errored** — refused on the ordinary path and passable with `force`, because a
+  cutter whose hardware is gone answers every reconnect with the same fault and has no cut to
+  cancel. Without that escape the host row could never be removed, which is worse than the warning
+  it would have kept.
 
 Forgetting a host retracts the marks its answer covered. A dispatch that gets the connection after
 that answer keeps its mark even though the host's cancel route is gone, and the HostId remains

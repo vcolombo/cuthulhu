@@ -426,7 +426,14 @@ pub struct DeviceManagerHandle {
     /// commits only while no send holds this, and a press that acquires it after a commit sends
     /// nothing.
     send_gate: std::sync::RwLock<()>,
-    /// Set once a close is committed. Read under `send_gate`, so it cannot change mid-send.
+    /// Set once a close is committed, and read by a press under `send_gate`.
+    ///
+    /// `commit_close` sets it while holding the gate for writing, so no send can be between its
+    /// check and its request. `commit_close_after_confirmation` sets it anyway once its bounded
+    /// wait runs out, because "quit anyway" must not hang behind a Pi that is timing out — so a
+    /// send already in progress at that moment can still land, which is exactly what the prompt the
+    /// operator answered says about a Job sent to a Cut Host. What the flag always guarantees is
+    /// the other direction: a press that has not yet checked it sends nothing.
     closing: std::sync::atomic::AtomicBool,
     pub connected: Mutex<Option<DeviceInfo>>,
 }

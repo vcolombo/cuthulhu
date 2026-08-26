@@ -1240,11 +1240,23 @@ mod tests {
         let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
         let polling = std::thread::spawn(move || parked.snapshots());
 
-        let deadline = Instant::now() + Duration::from_millis(200);
+        // The poll takes `admission` on its way to `job_id`, so the property is that it *lets go*:
+        // wait for the lock to come free, then require it to stay free while the poll is still
+        // parked. Asserting from the first iteration would fail whenever the thread happened to be
+        // inside that short critical section — a test flaking on correct code.
+        let free_by = Instant::now() + Duration::from_secs(2);
+        while host.slot(CAMEO).unwrap().admission.try_lock().is_err() {
+            assert!(
+                Instant::now() < free_by,
+                "the poll never let go of `admission` while it waited for `job_id`, which is half a deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < deadline {
             assert!(
                 host.slot(CAMEO).unwrap().admission.try_lock().is_ok(),
-                "the poll held `admission` while it waited for `job_id`, which is half a deadlock"
+                "the poll took `admission` again while it waited for `job_id`"
             );
             std::thread::sleep(Duration::from_millis(2));
         }

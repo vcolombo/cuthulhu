@@ -21,14 +21,18 @@ Cut Host owns, on cutters the operator is not looking at, and it would make quit
 that survives a quit today. A cancel of a remote Job is worth having as its own deliberate,
 addressed action with an acknowledgement to wait for; it is not a side effect of closing a window.
 
-**Keep cancelling whatever happens to be aimed** was rejected as the incoherence that produced
-#158: it cancels a host-owned Job when the operator happens to be looking at it and leaves an
+**Keep cancelling whatever happens to be aimed** was rejected as the same incoherence #158 is
+about: it cancels a host-owned Job when the operator happens to be looking at it and leaves an
 identical one running when they are not, and the aim is not a statement about either.
 
 ## Consequences
 
 An operator who quits with a remote Job outstanding is warned and then leaves it cutting, so the
-warning has to say that rather than implying the quit stops it. A mark for a host that has since
-been forgotten is dropped with the host, because nothing can ever clear it again — a guard that
-can never be satisfied is a window that can never be closed, which is worse than the warning it
-was giving.
+warning has to say that rather than implying the quit stops it.
+
+The clear has to be as wide as the question. A guard that asks about every cutter needs a poll that
+hears from every cutter, or a mark on one the operator has aimed away from stands for the rest of
+the session: not a window that cannot be closed — the prompt always offers the quit — but a prompt
+that can never stop being raised, which is how a warning becomes something to click through. So the
+device-list poll clears marks for every cutter that says it would take a Job, and forgetting a host
+retracts the marks its own answer covered.

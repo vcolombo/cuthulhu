@@ -766,9 +766,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // Same, for whether the page has got as far as subscribing: an emit before the listener is
     // registered reaches nobody, and `goto` resolving is not that moment.
     __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
-    // Mirrors `main.rs`'s `force_quit` as far as a page can: the process it exits is not this one,
-    // so what is observable is that it was asked. Recorded rather than counted, because the
-    // question a test asks is whether confirming the prompt reached it at all.
+    // Mirrors `main.rs`'s `force_quit` as far as a page can: the real one exits the process hosting
+    // this webview, which a fake cannot do, so all a test can observe is that it was asked.
+    // Recorded rather than counted, because the question is whether confirming reached it at all.
     force_quit: () => {
       sessionStorage.setItem("__force_quit__", "asked");
       return null;
@@ -2851,8 +2851,9 @@ test("dismissing the quit prompt leaves the window open and quits nothing", asyn
 
   await emitBackendEvent(page, "cut-in-progress");
 
-  // The prompt having been shown and dismissed is the beat to wait on: `window.confirm` returns
-  // inside the listener, so by the time it is recorded here the decision has already been acted on.
+  // The prompt having been *seen* is the beat to wait on. The assertion below is safe because
+  // `page.evaluate` cannot run while the page is blocked in `window.confirm`, so it necessarily
+  // lands after the dismissal returned — not because recording the message implies that.
   await expect.poll(() => prompts.length).toBe(1);
   expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
   await expect(page.getByRole("button", { name: "Cut" })).toBeVisible();

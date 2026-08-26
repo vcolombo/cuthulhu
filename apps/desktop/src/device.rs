@@ -1106,6 +1106,12 @@ impl DeviceManagerHandle {
     /// either. Cancelling a remote Job stays an addressed act with an acknowledgement to wait for,
     /// not a side effect of closing a window
     /// (`docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`).
+    ///
+    /// `shutdown` would cancel the local Job too — it sets the flag and sends `Cancel` before it
+    /// joins — so this is not the only thing stopping the blade. It is here because the decision is
+    /// worth saying out loud in the code that makes it: what quitting stops and what it leaves are
+    /// two different answers, and one of them is a `shutdown` side effect nobody reading
+    /// `force_quit` would see.
     pub fn stop_local_motion(&self) {
         if let Ok(mgr) = self.manager() {
             mgr.cancel();
@@ -1478,7 +1484,7 @@ impl DeviceManagerHandle {
 
     /// Retract this press's mark, having learned the host started nothing for it.
     ///
-    /// Only this press's: the mark is what holds the window shut, and a refusal answers for the
+    /// Only this press's: the mark is what raises the quit prompt, and a refusal answers for the
     /// dispatch it refused rather than for another press that was accepted and is cutting (#290).
     /// A cutter's own "I would take a Job now" is the answer that clears them all, in `status` and
     /// `list_devices`.

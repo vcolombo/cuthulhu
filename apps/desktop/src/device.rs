@@ -628,17 +628,20 @@ impl DeviceManagerHandle {
     }
 
     /// Mint a HostId that no host or surviving mark in this process has ever meant.
-    fn claim_next_host_id(&self) -> HostId {
+    fn claim_next_host_id(&self) -> Result<HostId, IpcError> {
         let mut claimed = self.claimed_host_ids.lock().unwrap();
         let highest = claimed
             .iter()
             .filter_map(|id| id.0.strip_prefix("host-"))
-            .filter_map(|n| n.parse::<u32>().ok())
+            .filter_map(|n| n.parse::<u128>().ok())
             .max()
             .unwrap_or(0);
-        let id = HostId(format!("host-{}", highest + 1));
+        let next = highest.checked_add(1).ok_or_else(|| {
+            IpcError::new("host_id_exhausted", "no numeric Cut Host id remains available")
+        })?;
+        let id = HostId(format!("host-{next}"));
         claimed.insert(id.clone());
-        id
+        Ok(id)
     }
 
     /// Drops the host and the status its cutters last reported.
@@ -728,7 +731,7 @@ impl DeviceManagerHandle {
         // ponytail: pairing is one modal dialog, so the prospective-file save is still a re-read;
         // the id itself is unique even if a second call overlaps this one.
         let mut prospective = self.paired_hosts();
-        let id = self.claim_next_host_id();
+        let id = self.claim_next_host_id()?;
         let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
         prospective.push(paired.clone());
         crate::hosts::save(hosts_path, &prospective)
@@ -2697,8 +2700,15 @@ mod tests {
     fn pairing_mints_an_id_that_does_not_collide() {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
-        let next = crate::hosts::next_id(&dev.paired_hosts());
-        assert_eq!(next, HostId("host-2".into()));
+        assert_eq!(dev.claim_next_host_id().unwrap(), HostId("host-2".into()));
+    }
+
+    #[test]
+    fn an_exhausted_host_id_suffix_is_a_refusal_not_an_overflow() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host(&format!("host-{}", u128::MAX), "127.0.0.1:1"));
+        let err = dev.claim_next_host_id().expect_err("there is no larger numeric suffix");
+        assert_eq!(err.code, "host_id_exhausted");
     }
 
     // --- pair()/forget(): network refusals, persist-then-mutate, busy-host refusal ---

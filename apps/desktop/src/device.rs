@@ -147,6 +147,14 @@ fn still_reusable(written: std::time::Instant, now: std::time::Instant) -> bool 
     now.saturating_duration_since(written) < cut_host::host::ID_RETENTION
 }
 
+/// The Cut Host's complete answer that a cutter would take another Job.
+///
+/// `actions.cut` is the manager's published state; `claimed` covers an admitted dispatch whose
+/// worker has not published yet. Either one alone calls that admission window free (#158).
+fn snapshot_is_free(snapshot: &cut_host::protocol::DeviceSnapshot) -> bool {
+    !snapshot.claimed && snapshot.status.actions.cut
+}
+
 #[derive(Deserialize)]
 pub struct CutRequest {
     pub device_instance_id: String,
@@ -600,10 +608,10 @@ impl DeviceManagerHandle {
             match client.snapshots() {
                 Ok(snapshots) => {
                     let mut dispatched = self.remote_dispatched.lock().unwrap();
-                    for free in snapshots.iter().filter(|s| s.status.actions.cut) {
-                        // Every press's mark on that cutter, on the cutter's own authority — the
-                        // same act `status` performs for the aimed one, and for the same reason:
-                        // it says it would take another Job.
+                    for free in snapshots.iter().filter(|s| snapshot_is_free(s)) {
+                        // Both facts are the cutter's authority for "nothing of ours is running":
+                        // status says it would take a Job, and `claimed` closes the admitted-
+                        // dispatch-before-worker-publication gap status cannot represent.
                         dispatched.remove(&(id.clone(), free.info.instance_id.clone()));
                     }
                     let listed = snapshots.into_iter().map(|s| s.info).collect();
@@ -772,10 +780,10 @@ impl DeviceManagerHandle {
         // usually forgetting a host *precisely* because it has stopped answering, and making them
         // wait 30s before they can even be offered the force is the wrong answer to that.
         match self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT)) {
-            Ok(snapshots) if snapshots.iter().any(|s| s.status.is_active()) => {
+            Ok(snapshots) if snapshots.iter().any(|s| s.claimed) => {
                 return Err(IpcError::new(
                     "host_busy",
-                    "a cut is active on this host; cancel it before forgetting",
+                    "a cut is active or starting on this host; cancel it before forgetting",
                 ))
             }
             Ok(_) => {}
@@ -1024,48 +1032,32 @@ impl DeviceManagerHandle {
             // reach, offering a cut that `execute_cut` would then refuse.
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => {
-                // The connection serializes this poll with dispatches to the same host, so a mark
-                // is written after this snapshot or the snapshot reports after the request.
-                let polled = self
-                    // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
-                    // body read: a stale snapshot is fine when the next poll is a second away.
-                    // The real total is roughly 2x `STATUS_POLL_TIMEOUT` (4s), not one, and it
-                    // starts only once this host's connection lock is in hand — which is why the
-                    // window-close guard reads `status_without_dialling` instead of this (#115).
-                    // Overrunning it costs a late status for this host and nothing else: only this
-                    // host's connection is held here.
-                    .with_host_within(&id, STATUS_POLL_TIMEOUT, |c| c.snapshots_within(STATUS_POLL_TIMEOUT))
-                    .ok()
-                    .and_then(|snaps| {
-                        snaps.into_iter().find(|s| s.info.instance_id == device.instance_id).map(|s| s.status)
-                    });
-                match polled {
-                    Some(status) => {
-                        let key = (id, device.instance_id.clone());
-                        // `actions.cut` is the cutter saying it would take a Job right now,
-                        // which is the only authority for "nothing of ours is running there".
-                        // Read from `actions`, never the phase — `Idle` is also what a cutter
-                        // reports between the accept and the first motion.
-                        //
-                        // Every press's mark goes: the cutter has answered for the machine, so
-                        // no press's record of having started something there survives it.
-                        // `list_devices` performs the same clear for every cutter it hears
-                        // from, which is what makes a mark on an un-aimed cutter releasable at
-                        // all. Neither is a clear a press owns, and that is the reason a mark
-                        // is attributed rather than counted — a retraction arriving after this
-                        // must not take a later press's mark with it.
-                        if status.actions.cut {
+                // The status-derived bookkeeping belongs inside the same connection closure as the
+                // snapshot. Returning the snapshot first would release the lock and let a dispatch
+                // write a mark before this poll acted on its older free answer.
+                let key = (id.clone(), device.instance_id.clone());
+                self.with_host_within(&id, STATUS_POLL_TIMEOUT, |c| {
+                    let snapshot = c
+                        .snapshots_within(STATUS_POLL_TIMEOUT)?
+                        .into_iter()
+                        .find(|s| s.info.instance_id == device.instance_id);
+                    if let Some(snapshot) = &snapshot {
+                        if snapshot_is_free(snapshot) {
                             self.remote_dispatched.lock().unwrap().remove(&key);
                         }
-                        self.last_remote_status.lock().unwrap().insert(key, status.clone());
-                        status
+                        self.last_remote_status
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), snapshot.status.clone());
                     }
-                    // A host that cannot be reached mid-cut is not a finished cut: the Job is
-                    // still running on the Pi, and saying `Idle` here would invite a second
-                    // dispatch. The last known status is deliberately *not* substituted here —
-                    // this is the live read, and a caller asking it wants what is true now.
-                    None => CutStatus::disconnected(),
-                }
+                    Ok(snapshot.map(|s| s.status))
+                })
+                .ok()
+                .flatten()
+                // A host that cannot be reached mid-cut is not a finished cut: the Job is still
+                // running on the Pi, and saying `Idle` here would invite a second dispatch. The
+                // last known status is deliberately *not* substituted — this is the live read.
+                .unwrap_or_else(CutStatus::disconnected)
             }
         }
     }
@@ -1147,6 +1139,9 @@ impl DeviceManagerHandle {
                 self.with_host(&id, |c| c.cancel(&device))
             }
         }
+    }
+    pub fn should_warn_before_closing(&self) -> bool {
+        self.a_cut_may_be_running() && self.close_guard_ready()
     }
 
     /// Stop what this process is driving, and leave a Cut Host's Jobs to the host.
@@ -2697,10 +2692,15 @@ mod tests {
     }
 
     #[test]
-    fn pairing_mints_an_id_that_does_not_collide() {
+    fn pairing_mints_past_the_highest_id_instead_of_filling_a_gap() {
         let dev = test_device_setup();
         dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
-        assert_eq!(dev.claim_next_host_id().unwrap(), HostId("host-2".into()));
+        dev.add_host(a_paired_host("host-3", "127.0.0.1:1"));
+        assert_eq!(
+            dev.claim_next_host_id().unwrap(),
+            HostId("host-4".into()),
+            "a gap is not an id made safe to reuse"
+        );
     }
 
     #[test]
@@ -2709,6 +2709,13 @@ mod tests {
         dev.add_host(a_paired_host(&format!("host-{}", u128::MAX), "127.0.0.1:1"));
         let err = dev.claim_next_host_id().expect_err("there is no larger numeric suffix");
         assert_eq!(err.code, "host_id_exhausted");
+    }
+
+    #[test]
+    fn a_non_numeric_host_id_does_not_derail_minting() {
+        let dev = test_device_setup();
+        dev.add_host(a_paired_host("imported-by-hand", "127.0.0.1:1"));
+        assert_eq!(dev.claim_next_host_id().unwrap(), HostId("host-1".into()));
     }
 
     // --- pair()/forget(): network refusals, persist-then-mutate, busy-host refusal ---
@@ -4566,13 +4573,34 @@ mod tests {
     }
 
     #[test]
-    fn the_close_guard_is_ready_only_after_the_webview_acknowledges_it() {
+    fn a_close_warning_requires_both_a_cut_and_the_webview_acknowledgement() {
         let dev = test_device_setup();
-        assert!(!dev.close_guard_ready());
+        assert!(!dev.should_warn_before_closing(), "an idle cutter needs no warning");
+
+        dev.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        assert!(!dev.should_warn_before_closing(), "a listener-less warning has no escape hatch");
+
         dev.set_close_guard_ready(true);
-        assert!(dev.close_guard_ready());
+        assert!(dev.should_warn_before_closing(), "an outstanding cut with a listener was waved through");
         dev.set_close_guard_ready(false);
-        assert!(!dev.close_guard_ready());
+        assert!(!dev.should_warn_before_closing(), "teardown left the native guard armed");
+    }
+
+    /// An admitted dispatch is not free merely because the worker still publishes Idle. This is
+    /// the one bit the host added to Snapshot for the accept-to-worker-publication gap.
+    #[test]
+    fn a_claimed_idle_snapshot_does_not_release_a_mark() {
+        let dev = test_device_setup();
+        let mut snapshot = cut_host::protocol::DeviceSnapshot {
+            info: test_instance(),
+            status: dev.status(),
+            job_id: None,
+            claimed: true,
+        };
+        assert!(snapshot.status.actions.cut, "status alone calls the cutter free");
+        assert!(!snapshot_is_free(&snapshot), "an admitted dispatch was treated as idle");
+        snapshot.claimed = false;
+        assert!(snapshot_is_free(&snapshot), "the genuinely idle cutter did not clear");
     }
 
     // --- presets: identity is (machine_id, id), so one cutter's entry cannot destroy another's ---

@@ -231,14 +231,23 @@ impl Host {
     }
 
     /// Everything a reattaching client needs, for every cutter, in one value.
+    ///
+    /// `claimed` is read with `Admission` held across the status read. A dispatch therefore sets
+    /// `starting` before a snapshot can call the cutter free, and its `StartingClaim` clears that
+    /// bit only after `manager.cut` has published the Job.
     pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
         self.order
             .iter()
             .filter_map(|id| self.slots.get(id))
-            .map(|s| DeviceSnapshot {
-                info: s.info.clone(),
-                status: s.manager.status(),
-                job_id: *s.job_id.lock().unwrap(),
+            .map(|s| {
+                let admission = s.admission.lock().unwrap();
+                let status = s.manager.status();
+                DeviceSnapshot {
+                    info: s.info.clone(),
+                    claimed: admission.starting || status.is_active(),
+                    status,
+                    job_id: *s.job_id.lock().unwrap(),
+                }
             })
             .collect()
     }
@@ -1188,6 +1197,7 @@ mod tests {
             assert_eq!(s.status.phase, driver_core::Phase::Idle, "{} should be connected", s.info.instance_id);
             assert!(s.status.actions.cut, "an idle cutter accepts a cut");
             assert_eq!(s.job_id, None, "nothing has run yet");
+            assert!(!s.claimed, "an idle cutter is not held for a dispatch");
         }
     }
 
@@ -1356,6 +1366,13 @@ mod tests {
         assert!(!host.is_any_cut_active());
 
         host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+        let snapshot = host
+            .snapshots()
+            .into_iter()
+            .find(|s| s.info.instance_id == CAMEO)
+            .unwrap();
+        assert!(snapshot.status.actions.cut, "status alone still calls it free");
+        assert!(snapshot.claimed, "the admission gap must travel over Snapshot");
 
         assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
         assert!(host.is_any_cut_active(), "and the daemon must not exit past it either");

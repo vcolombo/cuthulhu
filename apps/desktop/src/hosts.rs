@@ -118,23 +118,6 @@ pub fn load_or_warn(path: Option<&Path>, on_error: impl FnOnce(&HostsError)) -> 
     }
 }
 
-/// The next unused id.
-///
-/// Counts past the highest ever used rather than filling gaps: a saved reference to a host the
-/// operator forgot must not quietly start meaning a different Pi.
-///
-// ponytail: ids are `host-N` because a handful of hosts on one desktop cannot exhaust them and
-// they read well in a log. If hosts ever sync between machines this needs to be random instead,
-// since two desktops would both mint `host-1`.
-pub fn next_id(existing: &[PairedHost]) -> HostId {
-    let highest = existing
-        .iter()
-        .filter_map(|h| h.id.0.strip_prefix("host-"))
-        .filter_map(|n| n.parse::<u32>().ok())
-        .max()
-        .unwrap_or(0);
-    HostId(format!("host-{}", highest + 1))
-}
 
 /// Mark every device as belonging to `id`.
 ///
@@ -243,20 +226,6 @@ mod tests {
         assert!(matches!(load(&path), Err(HostsError::Malformed(_))));
     }
 
-    #[test]
-    fn a_new_id_never_collides_with_one_already_paired() {
-        assert_eq!(next_id(&[]), HostId("host-1".into()));
-        assert_eq!(next_id(&[a_host("host-1", "a")]), HostId("host-2".into()));
-        // A gap left by a forgotten host must not be reused: a stale reference to `host-2`
-        // would silently start meaning a different Pi.
-        assert_eq!(next_id(&[a_host("host-1", "a"), a_host("host-3", "c")]), HostId("host-4".into()));
-    }
-
-    /// An id nobody minted must not derail minting the next one.
-    #[test]
-    fn an_unrecognised_id_shape_does_not_stop_a_new_one() {
-        assert_eq!(next_id(&[a_host("imported-by-hand", "a")]), HostId("host-1".into()));
-    }
 
     /// Pairing a Pi is optional. A corrupt `hosts.json` must not be a reason the app refuses to
     /// start on its local cutter — it must be reported and treated as no hosts, not propagated.

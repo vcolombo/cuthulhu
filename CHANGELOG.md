@@ -66,6 +66,15 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Fixed
 
+- **A refused Cut press no longer erases state another press or cutter still needs, and quitting
+  warns about every remote cut this desktop started.** Dispatch attempts now own their own
+  window-guard marks, while retry ids remain grouped by the wire id they were sent under. A
+  refusal or lost connection can therefore retract only its own attempt. The close guard is no
+  longer scoped to the aimed cutter, and Cut Host snapshots carry the admitted-before-worker
+  state that ordinary status cannot see, so neither a poll nor a host forget can call a Job free
+  during that gap. Quitting stops local motion and leaves host-owned Jobs running, as the prompt
+  now says.
+
 - **A Cut Host that refuses a cut says so, instead of reporting one that may be running.** Every
   refusal a host sent — a cut off the bed, the wrong cutter attached, a cutter already busy —
   reached the operator as `dispatch_unconfirmed` with "the Job may already be cutting there. Press

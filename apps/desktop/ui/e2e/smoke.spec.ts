@@ -753,6 +753,23 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       failNextCut = true;
       return null;
     },
+    // Test hook (no production counterpart): fires an event the *backend* emits, which no command
+    // of the fake's does. `cut-in-progress` is emitted from `on_window_event` when the close guard
+    // refuses a close, and a window Playwright asks to close never reaches that guard here.
+    __test_emit_backend_event: (a) => {
+      const event = a.event as string;
+      for (const id of eventNameToIds.get(event) ?? []) {
+        callbacksById.get(id)?.({ event, id, payload: null });
+      }
+      return null;
+    },
+    // Mirrors `main.rs`'s `force_quit` as far as a page can: the process it exits is not this one,
+    // so what is observable is that it was asked. Recorded rather than counted, because the
+    // question a test asks is whether confirming the prompt reached it at all.
+    force_quit: () => {
+      sessionStorage.setItem("__force_quit__", "asked");
+      return null;
+    },
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
     confirm_pass_done: () => {
@@ -2767,4 +2784,54 @@ test("trace dialog: a failed source thumbnail surfaces instead of blanking", asy
   // The trace itself still succeeded, so the dialog stays usable.
   await expect(page.getByText("1 path")).toBeVisible();
   await expect(page.getByRole("button", { name: "Insert" })).toBeEnabled();
+});
+
+// The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
+// quitting stops what this process drives and leaves a Cut Host's Job cutting, so a prompt that
+// implies the quit stops everything would be telling the operator the opposite of what happens.
+test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const prompts: string[] = [];
+  page.on("dialog", (d) => {
+    prompts.push(d.message());
+    d.accept().catch(() => {});
+  });
+
+  await page.evaluate(() => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: "cut-in-progress" });
+  });
+
+  await expect.poll(() => prompts.length).toBe(1);
+  expect(prompts[0]).toContain("Cutting on this computer stops");
+  expect(prompts[0]).toContain("Cut Host keeps running there");
+  // Accepting it is what quits, and the fake records having been asked.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
+    .toBe("asked");
+});
+
+test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  page.on("dialog", (d) => {
+    d.dismiss().catch(() => {});
+  });
+
+  await page.evaluate(() => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: "cut-in-progress" });
+  });
+
+  // Nothing to wait for but the absence of a call, so the editor answering at all is the beat:
+  // the prompt is handled synchronously inside the listener that the evaluate above triggered.
+  await expect(page.getByRole("button", { name: "Cut" })).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
 });

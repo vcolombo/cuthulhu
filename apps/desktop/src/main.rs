@@ -13,16 +13,20 @@ use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
 
-/// Cancels + shuts down the device manager and exits the process. Used by the
-/// UI after the user confirms they want to quit with a cut in progress.
+/// Stops what this process is driving, shuts the device manager down and exits. Used by the UI
+/// after the operator confirms they want to quit with a cut outstanding.
 ///
-/// async, like every other command here that can touch the network: aimed at a Cut Host, `cancel`
-/// waits for that host's connection lock, may reconnect, and then waits out a reply — on the main
-/// thread that is the escape hatch from the close guard hanging harder than the guard it escapes
-/// (#116).
+/// A Job on a Cut Host is left running: the host owns it and keeps cutting whether this desktop is
+/// alive or not, while the local cutter's transport dies with this process, so what quitting can
+/// honestly stop is only ever the local one (#158, `docs/adr/0002-...`). The dialog the operator
+/// answered says so.
+///
+/// async, like every other command here that can touch the network: `shutdown` joins the local
+/// worker, and on the main thread that is the escape hatch from the close guard hanging harder
+/// than the guard it escapes (#116).
 #[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
-    dev.cancel().ok();
+    dev.stop_local_motion();
     dev.shutdown();
     app.exit(0);
 }
@@ -102,9 +106,10 @@ fn main() {
                 // the window for the listing plus the poll plus an unbounded resolve (#115).
                 // What this asks is whether to warn, which a status alone cannot answer: a
                 // dispatch accepted a second ago has not been polled yet, so the newest status
-                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts a
-                // dispatch this desktop sent and has not seen finish; a warning about a Job that
-                // has since ended costs a dialog the operator dismisses.
+                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts every
+                // dispatch this desktop sent and has not seen finish, on any cutter and whatever
+                // is aimed at now (#158); a warning about a Job that has since ended costs a
+                // dialog the operator dismisses.
                 if dev.a_cut_may_be_running() {
                     api.prevent_close();
                     window.emit("cut-in-progress", ()).ok();

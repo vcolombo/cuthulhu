@@ -239,12 +239,21 @@ export function App() {
     };
   }, []);
 
-  // Backend refuses to close the window mid-cut (main.rs's on_window_event calls
-  // prevent_close and emits this instead) — ask the user, then force_quit if they
-  // confirm. No-op on cancel, so the window just stays open.
+  // Backend refuses to close the window while a cut it started may still be running (main.rs's
+  // on_window_event calls prevent_close and emits this instead) — ask the operator, then
+  // force_quit if they confirm. No-op on cancel, so the window just stays open.
+  //
+  // The prompt says what quitting does and does not stop, because the two differ and only one of
+  // them is this process's to stop: a Cut Host owns the Jobs it accepted and keeps cutting once
+  // this app is gone (#158). Naming the cutter would need the guard to report which one, which is
+  // #59's addressing work.
   useEffect(() => {
     const unlisten = listen("cut-in-progress", () => {
-      if (window.confirm("A cut is in progress — quit anyway?")) {
+      const quit = window.confirm(
+        "A cut may still be running — quit anyway? Cutting on this computer stops; a Job already " +
+          "sent to a Cut Host keeps running there.",
+      );
+      if (quit) {
         ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
       }
     });

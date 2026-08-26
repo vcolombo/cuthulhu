@@ -1429,8 +1429,9 @@ impl DeviceManagerHandle {
     /// The `bool` is `reserve_dispatch_id`'s: `true` means this call is what recorded the entry.
     fn begin_dispatch(&self, key: &JobKey) -> (Dispatching<'_>, cut_host::protocol::DispatchId, bool) {
         let id = AttemptId::next();
-        // Held across the reservation, in the order this pair of locks is declared in: a sibling's
-        // answer cannot run between the two halves and find nobody dispatching.
+        // `dispatching` first and `in_doubt` under it — the order stated on both fields, and not
+        // the order they are declared in — held across the reservation so a sibling's answer cannot
+        // run between the two halves and find nobody dispatching.
         let mut dispatching = self.dispatching.lock().unwrap();
         dispatching.entry(key.clone()).or_default().in_flight.insert(id);
         let (dispatch_id, first_attempt) = self.reserve_dispatch_id(key);
@@ -1457,10 +1458,10 @@ impl DeviceManagerHandle {
     /// key belongs to whoever minted it, and an answer about the id it replaced says nothing about
     /// it. So one of the answers has to name the id the entry actually holds.
     fn settle_dispatch(&self, key: &JobKey, id: &cut_host::protocol::DispatchId, attempt: AttemptId) {
-        // Both locks, in the order `dispatching` declares: asking and clearing have to be one
-        // step, or a press beginning between them joins an entry this call is about to delete —
-        // and its retry then goes out under a name the host has never seen, which is the failure
-        // the whole entry exists to prevent.
+        // Both locks, `dispatching` then `in_doubt` as both fields state: asking and clearing have
+        // to be one step, or a press beginning between them joins an entry this call is about to
+        // delete — and its retry then goes out under a name the host has never seen, which is the
+        // failure the whole entry exists to prevent.
         let mut dispatching = self.dispatching.lock().unwrap();
         let mut in_doubt = self.in_doubt.lock().unwrap();
         let Some(presses) = dispatching.get_mut(key) else { return };

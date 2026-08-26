@@ -274,8 +274,13 @@ export function App() {
 
     return () => {
       active = false;
-      ipc.setCloseGuardReady(false).catch((e) => console.error(e));
-      stopListening?.();
+      const unlisten = stopListening;
+      // Keep the listener until Rust acknowledges `false`: readiness must never be true while the
+      // route out of the prevented close has already been removed.
+      ipc
+        .setCloseGuardReady(false)
+        .then(() => unlisten?.())
+        .catch((e) => console.error(e));
     };
   }, []);
 

@@ -384,13 +384,6 @@ pub struct DeviceManagerHandle {
     /// Between those it holds one id per press, so a session that dispatches without ever polling
     /// again grows this by one entry per press; the numbers are an operator's finger, not a loop.
     remote_dispatched: Mutex<HashMap<(HostId, String), HashSet<AttemptId>>>,
-    /// Bumped around every dispatch while its HostConnection is held.
-    ///
-    /// The connection lock is the same-host boundary: a poll runs before the mark exists or after
-    /// the request has finished, never between them. The epoch covers a different-host overlap in
-    /// the all-host sweep; a dispatch landing anywhere while a snapshot is in flight makes that
-    /// sweep conservatively keep its marks until the next tick.
-    dispatch_epoch: std::sync::atomic::AtomicU64,
     /// Whether the webview has installed the one listener that makes a prevented close escapable.
     ///
     /// `emit` succeeding says only that Tauri serialized the event; it also returns success with
@@ -554,7 +547,6 @@ impl DeviceManagerHandle {
             dispatching: Mutex::new(HashMap::new()),
             last_remote_status: Mutex::new(HashMap::new()),
             remote_dispatched: Mutex::new(HashMap::new()),
-            dispatch_epoch: std::sync::atomic::AtomicU64::new(0),
             close_guard_ready: std::sync::atomic::AtomicBool::new(false),
             connected: Mutex::new(None),
         };
@@ -603,20 +595,16 @@ impl DeviceManagerHandle {
             let mut guard = conn.lock().unwrap();
             let host = &mut *guard;
             let Some(client) = host.ensure() else { continue };
-            // Same-host dispatches cannot overlap this call: both hold this connection. The epoch
-            // comparison catches a dispatch on another host during the sweep and conservatively
-            // leaves this host's marks for the next tick.
-            let epoch = self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            // Same-host dispatches cannot overlap this call: both hold this connection. A mark is
+            // therefore written after this snapshot or the snapshot reports after the request.
             match client.snapshots() {
                 Ok(snapshots) => {
-                    if self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
-                        let mut dispatched = self.remote_dispatched.lock().unwrap();
-                        for free in snapshots.iter().filter(|s| s.status.actions.cut) {
-                            // Every press's mark on that cutter, on the cutter's own authority —
-                            // the same act `status` performs for the aimed one, and for the same
-                            // reason: it says it would take another Job.
-                            dispatched.remove(&(id.clone(), free.info.instance_id.clone()));
-                        }
+                    let mut dispatched = self.remote_dispatched.lock().unwrap();
+                    for free in snapshots.iter().filter(|s| s.status.actions.cut) {
+                        // Every press's mark on that cutter, on the cutter's own authority — the
+                        // same act `status` performs for the aimed one, and for the same reason:
+                        // it says it would take another Job.
+                        dispatched.remove(&(id.clone(), free.info.instance_id.clone()));
                     }
                     let listed = snapshots.into_iter().map(|s| s.info).collect();
                     all.extend(crate::hosts::stamp_host(&id, listed));
@@ -1033,10 +1021,8 @@ impl DeviceManagerHandle {
             // reach, offering a cut that `execute_cut` would then refuse.
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => {
-                // The connection serializes this poll with dispatches to the same host. The global
-                // epoch can still change for another host while this call is in flight; in that
-                // case the conservative answer is to keep this cutter's marks until the next tick.
-                let epoch = self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst);
+                // The connection serializes this poll with dispatches to the same host, so a mark
+                // is written after this snapshot or the snapshot reports after the request.
                 let polled = self
                     // Bounded well under `DEFAULT_BODY_TIMEOUT` (30s) on both legs, reconnect and
                     // body read: a stale snapshot is fine when the next poll is a second away.
@@ -1052,25 +1038,23 @@ impl DeviceManagerHandle {
                     });
                 match polled {
                     Some(status) => {
-                        if self.dispatch_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch {
-                            let key = (id, device.instance_id.clone());
-                            // `actions.cut` is the cutter saying it would take a Job right now,
-                            // which is the only authority for "nothing of ours is running there".
-                            // Read from `actions`, never the phase — `Idle` is also what a cutter
-                            // reports between the accept and the first motion.
-                            //
-                            // Every press's mark goes: the cutter has answered for the machine, so
-                            // no press's record of having started something there survives it.
-                            // `list_devices` performs the same clear for every cutter it hears
-                            // from, which is what makes a mark on an un-aimed cutter releasable at
-                            // all. Neither is a clear a press owns, and that is the reason a mark
-                            // is attributed rather than counted — a retraction arriving after this
-                            // must not take a later press's mark with it.
-                            if status.actions.cut {
-                                self.remote_dispatched.lock().unwrap().remove(&key);
-                            }
-                            self.last_remote_status.lock().unwrap().insert(key, status.clone());
+                        let key = (id, device.instance_id.clone());
+                        // `actions.cut` is the cutter saying it would take a Job right now,
+                        // which is the only authority for "nothing of ours is running there".
+                        // Read from `actions`, never the phase — `Idle` is also what a cutter
+                        // reports between the accept and the first motion.
+                        //
+                        // Every press's mark goes: the cutter has answered for the machine, so
+                        // no press's record of having started something there survives it.
+                        // `list_devices` performs the same clear for every cutter it hears
+                        // from, which is what makes a mark on an un-aimed cutter releasable at
+                        // all. Neither is a clear a press owns, and that is the reason a mark
+                        // is attributed rather than counted — a retraction arriving after this
+                        // must not take a later press's mark with it.
+                        if status.actions.cut {
+                            self.remote_dispatched.lock().unwrap().remove(&key);
                         }
+                        self.last_remote_status.lock().unwrap().insert(key, status.clone());
                         status
                     }
                     // A host that cannot be reached mid-cut is not a finished cut: the Job is
@@ -1379,18 +1363,13 @@ impl DeviceManagerHandle {
                 let (attempt, dispatch_id, first_attempt) = self.begin_dispatch(&key);
                 // Marked immediately before the request, *under the HostConnection lock*. A poll
                 // that already owns that lock therefore runs before the mark exists; a poll that
-                // sees the mark runs after the dispatch has released the lock. This is the boundary
-                // the epoch alone could not express.
+                // sees the mark runs after the dispatch has released the lock.
 
                 let reached_the_host = std::sync::atomic::AtomicBool::new(false);
                 let answer_settled = std::sync::atomic::AtomicBool::new(false);
                 let sent = self.with_host(&id, |c| {
                     reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
                     self.mark_dispatched(&id, &device, attempt.attempt);
-                    // The global epoch is still useful across different hosts: a sweep can be
-                    // reading host B while a dispatch lands on host A. Equality makes that sweep
-                    // conservatively keep B's marks for its next tick.
-                    self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let sent = c.dispatch(&dispatch_id, &device, &machine_id, passes);
                     // Cleared by an answer that settles what the host did — a refusal included,
                     // since a host that refused says it started nothing. A reply this request
@@ -1429,7 +1408,6 @@ impl DeviceManagerHandle {
                     if matches!(sent, Err(cut_host::client::ClientError::Refused(_))) {
                         self.unmark_dispatched(&id, &device, attempt.attempt);
                     }
-                    self.dispatch_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     sent
                 });
 
@@ -1496,6 +1474,20 @@ impl DeviceManagerHandle {
         // run between the two halves and find nobody dispatching.
         let mut dispatching = self.dispatching.lock().unwrap();
         let (dispatch_id, first_attempt) = self.reserve_dispatch_id(key);
+        // `in_doubt` prunes and evicts ids independently. An unresolved group for an id it no
+        // longer holds cannot be retried, so keeping it would make `dispatching` grow past the map
+        // whose bound it mirrors. Active groups stay until their guards drop; inactive replaced
+        // groups go here.
+        {
+            let in_doubt = self.in_doubt.lock().unwrap();
+            dispatching.retain(|job, presses| {
+                presses.by_dispatch.retain(|wire_id, group| {
+                    !group.in_flight.is_empty()
+                        || in_doubt.get(job).is_some_and(|(held, _)| held == wire_id)
+                });
+                !presses.by_dispatch.is_empty()
+            });
+        }
         let group = dispatching
             .entry(key.clone())
             .or_default()

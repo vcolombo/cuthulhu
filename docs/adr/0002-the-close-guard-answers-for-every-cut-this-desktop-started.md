@@ -34,9 +34,10 @@ The clear has to be as wide as the question. A guard that asks about every cutte
 hears from every cutter, or a mark on one the operator has aimed away from stands for the rest of
 the session: not a window that cannot be closed — the prompt always offers the quit — but a prompt
 that can never stop being raised, which is how a warning becomes something to click through. So the
-device-list poll clears marks for every cutter that says it would take a Job. A dispatch writes its
-mark only after it owns the same host-connection lock as that poll, so an idle answer precedes the
-mark or follows the request; it can never clear a request still queued behind it.
+device-list poll clears marks for every cutter that nothing claims and that says it would take a
+Job. A dispatch writes its mark only after it owns the same host-connection lock as that poll, so
+an idle answer precedes the mark or follows the request; it can never clear a request still queued
+behind it.
 
 A close is a commitment, not an answer. Between choosing an id and reaching the host's connection a
 press has written nothing, so it is invisible to any mark, and an async command can still cross

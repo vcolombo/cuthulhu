@@ -23,13 +23,17 @@ use desktop::state::AppState;
 /// operator answered says so.
 ///
 /// async because `shutdown` joins the local worker, and this runs on the main thread — the escape
-/// hatch from the close guard hanging harder than the guard it escapes. It no longer touches the
-/// network at all, which is what ends #116's cause rather than merely bounding it: the remote
-/// cancel that could block the exit is gone.
+/// hatch from the close guard hanging harder than the guard it escapes. It initiates no network
+/// call of its own: the remote cancel that could block the exit is gone. What remains is a bounded
+/// wait — `commit_close_after_confirmation` gives a send already in flight up to `CLOSE_GATE_WAIT`
+/// before exiting anyway — so #116's cause is bounded rather than removed.
 #[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     // The operator has answered the prompt, so nothing new may start: a press already queued for a
     // host's connection must not send a Job into a process that is exiting.
+    //
+    // Committed before the cancel, and the order matters: swapping these two reopens the window
+    // between stopping what is moving and refusing what would start next.
     dev.commit_close_after_confirmation();
     dev.stop_local_motion();
     dev.shutdown();

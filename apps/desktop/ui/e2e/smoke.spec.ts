@@ -2862,7 +2862,10 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
   // `StrictMode` mounts, cleans up and mounts again, so more than two entries is correct here.
   const readiness = (await page.evaluate(() => sessionStorage.getItem("__ready_log__")))!.split(",");
   expect(readiness[0]).toBe("false@0");
-  expect(readiness.filter((entry) => entry.startsWith("true"))).not.toContain("true@0");
+  expect(readiness).not.toContain("true@0");
+
+  // The teardown direction is not observable here — Playwright cannot unmount React — and is
+  // pinned instead by `closeGuard.test.ts`, over the same handshake this page runs.
 });
 
 test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {

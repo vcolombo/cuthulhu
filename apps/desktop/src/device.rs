@@ -200,14 +200,25 @@ fn classify(snapshot: &cut_host::protocol::DeviceSnapshot) -> CutterState {
 }
 
 /// The state that decides for the whole host: the worst any of its cutters is in.
+///
+/// The order is `severity`'s match rather than a list here, so a state added later cannot
+/// aggregate as `Free` — which would make a host `forget` must refuse silently forgettable, with
+/// the mark that raises the quit prompt discarded on the way out.
 fn worst_state(snapshots: &[cut_host::protocol::DeviceSnapshot]) -> CutterState {
-    [CutterState::Claimed, CutterState::Stalled, CutterState::Unreachable]
-        .into_iter()
-        .find(|worst| snapshots.iter().any(|s| classify(s) == *worst))
-        .unwrap_or(CutterState::Free)
+    snapshots.iter().map(classify).max_by_key(severity).unwrap_or(CutterState::Free)
 }
 
-/// Whether a poll may clear this cutter's dispatch marks: only its own "I would take a Job".
+fn severity(state: &CutterState) -> u8 {
+    match state {
+        CutterState::Free => 0,
+        CutterState::Unreachable => 1,
+        CutterState::Stalled => 2,
+        CutterState::Claimed => 3,
+    }
+}
+
+/// Whether a poll may clear this cutter's dispatch marks: only when nothing claims it and its own
+/// status says it would take a Job. Either half alone clears the mark of a blade that may be moving.
 fn snapshot_is_free(snapshot: &cut_host::protocol::DeviceSnapshot) -> bool {
     classify(snapshot) == CutterState::Free
 }
@@ -228,61 +239,82 @@ const CLOSED_MID_PRESS: &str =
 /// poll has written nothing and no mark can answer for it; a local press is invisible between the
 /// aim check and the worker. Both are a Job about to start, and both must not start into a process
 /// on its way out (#158).
-#[derive(Default)]
-struct CloseGate {
-    sends: std::sync::RwLock<()>,
-    closing: std::sync::atomic::AtomicBool,
+mod close_gate {
+    /// The barrier itself: private fields, so `permit` is the only way to hold one.
+    ///
+    /// A module rather than two fields on the handle, because the obligations are only correct
+    /// together and the compiler is what has to keep them that way. Reachable from the flat module
+    /// this lives in, a permit could be built straight from the lock — blocking a close, which
+    /// looks right, while never reading the flag, which is the whole check.
+    #[derive(Default)]
+    pub(super) struct CloseGate {
+        sends: std::sync::RwLock<()>,
+        closing: std::sync::atomic::AtomicBool,
+    }
+
+    /// Permission to start a cut, held until the request is away.
+    #[must_use = "the permit must be held across whatever starts the cut"]
+    pub(super) struct SendPermit<'a>(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>);
+
+    impl CloseGate {
+        /// Permission for one press, or `None` if the window has already gone.
+        pub(super) fn permit(&self) -> Option<SendPermit<'_>> {
+            let sends = self.sends.read().unwrap();
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            Some(SendPermit(sends))
+        }
+
+        /// Commit to a close if `idle` agrees nothing is outstanding, answering and committing as
+        /// one step so a press cannot cross into a send in between.
+        ///
+        /// `try_write` rather than `write`: a send in flight is a warning owed, not something for
+        /// the main thread to wait out.
+        pub(super) fn commit_if(&self, idle: impl FnOnce() -> bool) -> bool {
+            let Ok(_sends) = self.sends.try_write() else { return false };
+            if !idle() {
+                return false;
+            }
+            self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+
+        /// Commit to a close that is happening whatever is outstanding — the two stand-downs, where
+        /// the window goes because the webview could not be told.
+        ///
+        /// Nothing is waited for, because this runs on the main thread inside the close callback,
+        /// where waiting is the freeze the guard exists to avoid (#115). So it stops every press
+        /// that has yet to ask and no others: a permit already out will finish its send, exactly as
+        /// one that outlasts the confirmed quit's wait does.
+        pub(super) fn commit_regardless(&self) {
+            self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Commit once the operator has answered the prompt.
+        ///
+        /// Set first, waited second: with the flag already set no press that has yet to ask can
+        /// send, and the wait is only for one already in progress. Bounded, because "quit anyway"
+        /// must not hang behind a Pi that is timing out — a send that outlasts it may still land,
+        /// which is what the prompt says about a Job sent to a Cut Host.
+        pub(super) fn commit_after_confirmation(&self) {
+            self.commit_regardless();
+            let deadline = std::time::Instant::now() + super::CLOSE_GATE_WAIT;
+            while self.sends.try_write().is_err() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// Whether a close has been committed. For the test that pins the commit-before-wait order;
+        /// production asks by taking a permit.
+        #[cfg(test)]
+        pub(super) fn is_closing(&self) -> bool {
+            self.closing.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 }
 
-/// Permission to start a cut, held until the request is away.
-#[must_use = "the permit must be held across whatever starts the cut"]
-struct SendPermit<'a>(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>);
-
-impl CloseGate {
-    /// Permission for one press, or `None` if the window has already gone.
-    fn permit(&self) -> Option<SendPermit<'_>> {
-        let sends = self.sends.read().unwrap();
-        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
-            return None;
-        }
-        Some(SendPermit(sends))
-    }
-
-    /// Commit to a close if `idle` agrees nothing is outstanding, answering and committing as one
-    /// step so a press cannot cross into a send in between.
-    ///
-    /// `try_write` rather than `write`: a send in flight is a warning owed, not something for the
-    /// main thread to wait out.
-    fn commit_if(&self, idle: impl FnOnce() -> bool) -> bool {
-        let Ok(_sends) = self.sends.try_write() else { return false };
-        if !idle() {
-            return false;
-        }
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
-        true
-    }
-
-    /// Commit to a close that is happening whatever is outstanding — the two stand-downs, where the
-    /// window goes because the webview could not be told. Nothing is waited for: this runs on the
-    /// main thread inside the close callback.
-    fn commit_regardless(&self) {
-        self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Commit once the operator has answered the prompt.
-    ///
-    /// Set first, waited second: with the flag already set no press that has yet to ask can send,
-    /// and the wait is only for one already in progress. Bounded, because "quit anyway" must not
-    /// hang behind a Pi that is timing out — a send that outlasts it may still land, which is what
-    /// the prompt says about a Job sent to a Cut Host.
-    fn commit_after_confirmation(&self) {
-        self.commit_regardless();
-        let deadline = std::time::Instant::now() + CLOSE_GATE_WAIT;
-        while self.sends.try_write().is_err() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-}
+use close_gate::{CloseGate, SendPermit};
 
 #[derive(Deserialize)]
 pub struct CutRequest {
@@ -598,7 +630,8 @@ struct DispatchGroup {
     /// Presses that returned with nothing settled. Emptied only by a settling answer from a press
     /// in `retries`, which is what makes an unresolved outcome one press's to resolve.
     unsettled: HashSet<AttemptId>,
-    /// Presses that began with `in_flight` empty: a retry rather than a concurrent sibling.
+    /// Presses that began with `in_flight` empty and something left `unsettled`: a retry that can
+    /// resolve those outcomes, rather than a concurrent sibling or a Job's first press.
     retries: HashSet<AttemptId>,
 }
 
@@ -901,12 +934,14 @@ impl DeviceManagerHandle {
     /// back — the one machine that could stop the blade throws away the key. The second half is
     /// still true, which is why the escape hatch is `force` rather than absent.
     ///
-    /// The two refusals carry different codes because the operator's next move differs: cancel
-    /// the cut, versus decide whether an unreachable Pi is really idle.
+    /// Four refusals over three codes, because the operator's next move differs: cancel the cut,
+    /// reconnect the cutter, forget past a cutter nothing can recover, or decide whether a host
+    /// that cannot be asked is really idle. The last two carry codes of their own because the
+    /// dialog offers the force from the code.
     ///
-    /// `force` skips nothing but the *unconfirmed* case. A host that answers "busy" is a host
-    /// this desktop can still reach, so `cancel` is available and the blade was never orphaned;
-    /// there is no case for cutting that route while it works.
+    /// `force` skips those two and nothing else. A host that answers "busy" — cutting, or stopped
+    /// where nothing saw it stop — is reachable, so `cancel` or the host's own `Reconnect` still
+    /// works there, and there is no case for cutting a route while it works.
     pub fn forget(&self, id: &HostId, hosts_path: &Path, force: bool) -> Result<(), IpcError> {
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
         // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
@@ -920,6 +955,12 @@ impl DeviceManagerHandle {
         // about, and a press that gets the connection afterwards keeps its own — the warning is
         // the last thing this desktop can still offer for a Job whose cancel route it is
         // discarding.
+        //
+        // Read once more before the question for the forced path below, which has no answer to
+        // scope anything by: a press that marks *while* the question is in flight is not covered by
+        // a silence that cannot speak for it, and re-reading afterwards would retract the only
+        // warning that press left behind.
+        let before_asking = self.marks_for(id);
         let asked = self.with_host_within(id, STATUS_POLL_TIMEOUT, |c| {
             let marks = self.marks_for(id);
             Ok((marks, c.snapshots_within(STATUS_POLL_TIMEOUT)?))
@@ -965,15 +1006,16 @@ impl DeviceManagerHandle {
                     ),
                 ))
             }
-            // Forced past a host that said nothing, so there is no answer to scope the retraction
-            // by: what this desktop holds now is what it will never be able to clear.
-            Err(_) => self.marks_for(id),
+            // Forced past a host that said nothing. Silence covers only what this desktop already
+            // held when it asked: those marks can never be cleared by a poll, since the poll is a
+            // call to the host being removed. A dispatch that landed during the question keeps its
+            // mark and its warning — an unclosable prompt is the answer that errs toward the blade.
+            Err(_) => before_asking,
         };
 
         let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
         crate::hosts::save(hosts_path, &prospective)
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
-
         self.remove_host(id);
         // A host that reported every cutter free has just said those marks are stale; a host forced
         // past unreachable had the operator told outright what forgetting discards. Either way the
@@ -4565,8 +4607,10 @@ mod tests {
         assert!(dev.a_cut_may_be_running(), "the guard waved through a local cut in progress");
     }
 
-    /// A press that never reached a host retracts its own mark and no other — the same rule the
-    /// refusal branch follows, in separate code, so it is a separate test.
+    /// A press that never reached a host wrote no mark, so it has nothing to retract and another
+    /// press's mark stands. Separate from the refusal branch because it reaches the same outcome by
+    /// writing nothing rather than by retracting one thing: `with_host` never enters the closure,
+    /// so the mark and its retraction are both absent.
     #[test]
     fn a_press_that_never_reached_a_host_leaves_another_press_holding_the_window() {
         let dev = test_device_setup();
@@ -5007,6 +5051,16 @@ mod tests {
         assert_eq!(classify(&free), CutterState::Free);
         assert!(snapshot_is_free(&free), "the only state a poll clears a mark on");
 
+        // A cancel something actually saw come to rest is idleness, not a stall: the cutter says it
+        // would take another Job, and that outranks how the last one ended. The ordinary confirmed
+        // cancel for any pollable cutter lands here, and reading `ended` first would make it
+        // unforgettable and its mark unclearable.
+        let mut confirmed_stop = stopped.clone();
+        confirmed_stop.status.actions.cut = true;
+        assert_eq!(classify(&confirmed_stop), CutterState::Free);
+        assert!(snapshot_is_free(&confirmed_stop), "a confirmed cancel must let its mark clear");
+        assert_eq!(worst_state(&[confirmed_stop]), CutterState::Free);
+
         // A host is judged by its worst cutter, in that order — one free cutter does not speak for
         // the one beside it that is still holding a Job.
         assert_eq!(worst_state(&[free.clone(), disconnected.clone()]), CutterState::Unreachable);
@@ -5014,6 +5068,44 @@ mod tests {
         assert_eq!(worst_state(&[stopped, claimed]), CutterState::Claimed);
         assert_eq!(worst_state(&[free]), CutterState::Free);
         assert_eq!(worst_state(&[]), CutterState::Free, "a host with no cutters holds nothing");
+    }
+
+    /// The gate's other half: a press holding the window refuses the close outright, whatever
+    /// `a_cut_may_be_running` says. It has to be the lock and not a count, because a local press
+    /// between the aim check and the worker is invisible to every count there is.
+    #[test]
+    fn a_close_is_refused_while_a_press_holds_the_send_window() {
+        let dev = test_device_setup();
+        let permit = dev.close_gate.permit().expect("an open window");
+
+        assert!(!dev.a_cut_may_be_running(), "nothing is outstanding, so only the permit can refuse");
+        assert!(!dev.commit_close(), "the window was let go over a press already sending");
+        drop(permit);
+        assert!(dev.commit_close(), "and it must go once the press is away");
+    }
+
+    /// The stand-down arms: the webview could not be told, so the window goes anyway — and a press
+    /// that has not yet asked must still start nothing. The third member of a pair this branch
+    /// wrote for `commit_close` and for the confirmed quit.
+    #[test]
+    fn a_press_after_a_stood_down_close_sends_nothing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+        let direct =
+            cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+
+        dev.commit_close_regardless();
+
+        let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("a stood-down close sends nothing");
+        assert_eq!(err.code, "closing", "got {err:?}");
+        stays_false(|| cameo_is_active(&direct), "a Job started after the window was let go");
     }
 
     /// A local press is gated the same way, and has to be: nothing sees it between the aim check
@@ -5062,8 +5154,9 @@ mod tests {
     ///
     /// "Before" has to be measured, not merely observed: the wait is bounded, so a flag set after
     /// it is still set eventually and any assertion that waits for it passes either way. The
-    /// separation is four orders of magnitude — a store is immediate, the wait is seconds — so a
-    /// fraction of the bound tells them apart without racing anything.
+    /// two timescales are orders of magnitude apart — the store is observed in microseconds, the
+    /// wait is two seconds — so asserting against a quarter of the bound tells them apart without
+    /// racing anything.
     #[test]
     fn a_confirmed_quit_commits_before_it_waits_and_the_wait_ends() {
         let dev = test_device_setup();
@@ -5073,7 +5166,7 @@ mod tests {
             let began = std::time::Instant::now();
             let quit = s.spawn(|| dev.commit_close_after_confirmation());
             wait_until(
-                || dev.close_gate.closing.load(std::sync::atomic::Ordering::SeqCst),
+                || dev.close_gate.is_closing(),
                 "the close was never committed",
             );
             let took = began.elapsed();
@@ -5082,9 +5175,24 @@ mod tests {
                 "the close was committed only after the wait it should precede, in {took:?}"
             );
             assert!(dev.close_gate.permit().is_none(), "a later press was not refused during the wait");
-            wait_until(|| quit.is_finished(), "the confirmed quit waited on a send with no deadline");
+
+            // The wait's floor, which the two assertions above cannot see: they are upper bounds, so
+            // a wait deleted outright satisfies both. A thread cannot finish early, and a correct
+            // one cannot finish at all while this permit stands.
+            std::thread::sleep(CLOSE_GATE_WAIT / 4);
+            assert!(!quit.is_finished(), "the confirmed quit did not wait for the send in flight");
+
+            // Not `wait_until`: its own deadline is `CLOSE_GATE_WAIT`, the very bound being waited
+            // out, so the margin would be one poll interval of luck.
+            let ends_by = std::time::Instant::now() + CLOSE_GATE_WAIT * 2;
+            while !quit.is_finished() {
+                assert!(
+                    std::time::Instant::now() < ends_by,
+                    "the confirmed quit waited on a send with no deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             drop(permit);
-            quit.join().unwrap();
         });
     }
 

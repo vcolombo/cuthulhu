@@ -20,8 +20,9 @@ pub struct DispatchId(pub String);
 /// Everything a reattaching client needs about one cutter in a single value.
 ///
 /// `job_id` rides alongside `CutStatus` because the status alone cannot say *whose* finished Job it
-/// is describing. `claimed` covers the other fact status cannot publish: a dispatch admitted and
-/// on its way to `manager.cut`, before the worker has changed `actions`.
+/// is describing. `claimed` is true while a cut is in flight and also across the fact status cannot
+/// publish: a dispatch admitted and on its way to `manager.cut`, before the worker has changed
+/// `actions`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub info: DeviceInfo,

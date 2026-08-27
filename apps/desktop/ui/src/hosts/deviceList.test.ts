@@ -123,6 +123,20 @@ describe("forgetFrom", () => {
       throw OFFLINE_CUTTER;
     });
     expect(offline.forceable).toBe(true);
+
+    // Neither: the save failed after every state check passed, and no amount of forcing writes the
+    // file. A code this list does not name is a plain refusal — the direction that matters, since
+    // Rust can add one at any time and "Discard anyway" would discard the credentials over a
+    // problem the force cannot address.
+    const unwritable = await runForget("host-1", async () => {
+      throw { code: "hosts_unwritable", message: "permission denied" };
+    });
+    expect(unwritable.forceable).toBe(false);
+
+    const noCode = await runForget("host-1", async () => {
+      throw new Error("boom");
+    });
+    expect(noCode.forceable).toBe(false);
   });
 
   // The failed attempt is what tells the operator there is something to think about. A force

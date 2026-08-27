@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import * as ipc from "./ipc";
+import { armCloseGuard } from "./closeGuard";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { hitTest, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
@@ -243,46 +244,24 @@ export function App() {
   // on_window_event emits this and then calls prevent_close) — ask the operator, then force_quit
   // if they confirm. No-op on cancel, so the window just stays open.
   //
-  // Readiness is acknowledged only after `listen` resolves. Tauri's emit succeeds with zero
-  // listeners, so without the acknowledgement a close during startup/reload could be refused with
-  // no prompt and no route to force_quit. Cleanup clears it before removing the listener.
-  useEffect(() => {
-    let active = true;
-    let stopListening: (() => void) | null = null;
-    const showQuitPrompt = () => {
-      const quit = window.confirm(
-        "A cut may still be running — quit anyway? Cutting on this computer stops; a Job already " +
-          "sent to a Cut Host keeps running there.",
-      );
-      if (quit) {
-        ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
-      }
-    };
-
-    ipc
-      .setCloseGuardReady(false)
-      .then(() => listen("cut-in-progress", showQuitPrompt))
-      .then((unlisten) => {
-        if (!active) {
-          unlisten();
-          return;
-        }
-        stopListening = unlisten;
-        return ipc.setCloseGuardReady(true);
-      })
-      .catch((e) => setError(ipc.ipcErrorMessage(e)));
-
-    return () => {
-      active = false;
-      const unlisten = stopListening;
-      // Keep the listener until Rust acknowledges `false`: readiness must never be true while the
-      // route out of the prevented close has already been removed.
-      ipc
-        .setCloseGuardReady(false)
-        .then(() => unlisten?.())
-        .catch((e) => console.error(e));
-    };
-  }, []);
+  // The handshake itself lives in `closeGuard.ts`: its ordering is the invariant, and an effect
+  // body is not something a test in this UI can observe.
+  useEffect(
+    () =>
+      armCloseGuard({
+        setReady: ipc.setCloseGuardReady,
+        listen: (onWarning) => listen("cut-in-progress", onWarning),
+        onWarning: () => {
+          const quit = window.confirm(
+            "A cut may still be running — quit anyway? Cutting on this computer stops; a Job already " +
+              "sent to a Cut Host keeps running there.",
+          );
+          if (quit) ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
+        },
+        onError: (e) => setError(ipc.ipcErrorMessage(e)),
+      }),
+    [],
+  );
 
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");

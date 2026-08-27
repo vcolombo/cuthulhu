@@ -123,6 +123,10 @@ fn once(result: Result<(), crate::protocol::Refusal>) -> Response {
 /// Self-signed on purpose: a client pins its fingerprint at pairing, which needs
 /// no authority and no name that resolves.
 fn load_or_make_cert(dir: &Path) -> io::Result<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)> {
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if dir.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid input: {}", dir.display())));
+    }
     std::fs::create_dir_all(dir)?;
     let cert_path = dir.join("cutd.crt");
     let key_path = dir.join("cutd.key");

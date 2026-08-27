@@ -72,8 +72,8 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   refusal or lost connection can therefore retract only its own attempt. The close guard is no
   longer scoped to the aimed cutter, and Cut Host snapshots carry the admitted-before-worker
   state that ordinary status cannot see, so neither a poll nor a host forget can call a Job free
-  during that gap. Quitting stops local motion and leaves host-owned Jobs running, as the prompt
-  now says.
+  during that gap. Quitting stops what this desktop sends and leaves host-owned Jobs running, as
+  the prompt now says — including that a local cutter finishes the moves it has already buffered.
 
 - **A Cut Host with an offline cutter can be forgotten, and the refusal that stands in the way
   says so.** A cutter that is disconnected or faulted is claimed by nothing and answers every

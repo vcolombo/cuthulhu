@@ -1241,9 +1241,17 @@ mod tests {
         let host = Host::start(Arc::new(TwoCutterFactory));
         let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
 
-        // The thread says when it is inside the call, so "not finished" cannot mean "never
-        // scheduled" — that reading would let the assertion below pass without the poll ever
+        // The thread says when it is about to be inside the call, so "not finished" cannot mean
+        // "never scheduled" — that reading would let the assertion below pass without the poll ever
         // reaching a lock, which is a test that cannot fail rather than one that does not flake.
+        //
+        // The signal is necessarily *before* the call: nothing outside `snapshots` can observe entry
+        // into it without a seam in production code, which is not worth a lock-order test. What
+        // closes the gap instead is the length of the window against what it would take to survive
+        // it. A mutant holding `admission` across the `job_id` wait holds it from microseconds after
+        // this store until the wait ends, so every check below fails; for the mutant to pass, the
+        // thread's first statement after the store would have to go unscheduled for the whole
+        // half-second, having just been scheduled to run the store.
         let entered = Arc::new(AtomicBool::new(false));
         let polling = {
             let (parked, entered) = (Arc::clone(&host), Arc::clone(&entered));
@@ -1263,7 +1271,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert!(!polling.is_finished(), "the poll finished without ever taking the held `job_id`");
 
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             assert!(
                 host.slot(CAMEO).unwrap().admission.try_lock().is_ok(),

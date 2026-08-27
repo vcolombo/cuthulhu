@@ -17,10 +17,11 @@ use desktop::state::AppState;
 /// after the operator confirms they want to quit with a cut outstanding.
 ///
 /// A Job on a Cut Host is left running: the host owns it and keeps cutting whether this desktop is
-/// alive or not, while the local cutter's transport dies with this process, so what quitting can
-/// honestly stop is only ever the local one (#158, and
-/// `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`). The dialog the
-/// operator answered says so.
+/// alive or not, while the local cutter's transport dies with this process. So what quitting stops
+/// is what this process *sends* — `cancel` is cooperative, and a Silhouette has no abort command,
+/// so the cutter finishes whatever moves it has already buffered either way (#158,
+/// `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`, and
+/// `apps/desktop/MANUAL-CHECKLIST.md`). The dialog the operator answered says so.
 ///
 /// async because `shutdown` joins the local worker, and this runs on the main thread — the escape
 /// hatch from the close guard hanging harder than the guard it escapes. It initiates no network

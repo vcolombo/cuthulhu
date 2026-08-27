@@ -182,8 +182,11 @@ enum CutterState {
     /// has a verb one click away and is not something to force past: the blade may still be moving
     /// and the token is the only thing that could stop it.
     Stalled,
-    /// Disconnected or faulted. Nothing on either side recovers it, so this is the one refusal
-    /// `force` has to be able to pass — otherwise the host row could never be removed.
+    /// Disconnected or faulted. The host's `Reconnect` may still fix it — `Command::Connect`
+    /// accepts an errored cutter — but it may equally be hardware that is gone, which answers every
+    /// reconnect with the same fault and has no cut to cancel. Nothing in a snapshot tells those
+    /// two apart, so this is the one refusal `force` has to be able to pass: otherwise the host row
+    /// could never be removed.
     Unreachable,
 }
 
@@ -985,13 +988,15 @@ impl DeviceManagerHandle {
                         "a cutter on this host stopped where nothing saw it stop; reconnect it before forgetting",
                     ))
                 }
-                // Nothing recovers this one, so refusing outright would leave a host row that could
-                // never be removed. Its own code, which is what makes the force reachable.
+                // A reconnect may still fix this, or the hardware may be gone; a snapshot cannot
+                // say which. So the refusal names the verb to try and stays passable — refusing
+                // outright would leave a host row that could never be removed. Its own code, which
+                // is what makes the force reachable.
                 CutterState::Unreachable if !force => {
                     return Err(IpcError::new(
                         "host_cutter_unreachable",
-                        "a cutter on this host is offline or faulted and cannot be reconnected; \
-                         forgetting the host is the only way past it",
+                        "a cutter on this host is offline or faulted; reconnect it, or forget the \
+                         host anyway if it is gone for good",
                     ))
                 }
                 CutterState::Unreachable | CutterState::Free => marks,
@@ -5226,7 +5231,8 @@ mod tests {
 
         let err = dev.forget(&id, &hosts_path, false).expect_err("a cutter that is not free is not idle");
         assert_eq!(err.code, "host_cutter_unreachable", "got {err:?}");
-        assert!(err.message.contains("only way past it"), "the refusal must name its escape: {err:?}");
+        assert!(err.message.contains("reconnect it"), "the refusal must name the verb to try: {err:?}");
+        assert!(err.message.contains("forget the host anyway"), "and the escape: {err:?}");
         assert_eq!(dev.paired_hosts().len(), 1, "a refusal left the host half-removed");
 
         dev.forget(&id, &hosts_path, true).expect("a cutter nothing can recover must stay forgettable");

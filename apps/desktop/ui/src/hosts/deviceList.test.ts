@@ -88,7 +88,7 @@ const UNCONFIRMED = {
 };
 const OFFLINE_CUTTER = {
   code: "host_cutter_unreachable",
-  message: "a cutter on this host is offline or faulted and cannot be reconnected",
+  message: "a cutter on this host is offline or faulted; reconnect it, or forget the host anyway",
 };
 
 describe("forgetFrom", () => {

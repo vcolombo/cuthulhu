@@ -12,7 +12,9 @@ also what `force_quit` cancelled. It cancels local motion and nothing else: the 
 transport is owned by this process and dies with it, so a Job left mid-motion there could never be
 resumed or stopped, while a Cut Host owns its Jobs by design and keeps cutting whether this desktop
 is running or not — which is the same rule `disconnect` already follows for a remote cutter. So
-quitting stops what only this process can stop, and leaves what the host owns to the host.
+quitting stops what only this process can stop — the sending — and leaves what the host owns to the
+host. Even locally that is transmission rather than motion: `cancel` is cooperative and a Silhouette
+has no abort command, so the cutter finishes its buffered moves.
 
 ## Considered options
 

@@ -2830,8 +2830,10 @@ const emitBackendEvent = async (page: Page, event: string) => {
 };
 
 // The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
-// quitting stops what this process drives and leaves a Cut Host's Job cutting, so a prompt that
-// implies the quit stops everything would be telling the operator the opposite of what happens.
+// quitting stops what this process sends and leaves a Cut Host's Job cutting, so a prompt that
+// implies the quit stops everything would be telling the operator the opposite of what happens —
+// and `cancel` is cooperative, so even the local cutter finishes its buffered moves (the Silhouette
+// has no abort command; see apps/desktop/MANUAL-CHECKLIST.md).
 test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
@@ -2845,7 +2847,8 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
   await emitBackendEvent(page, "cut-in-progress");
 
   await expect.poll(() => prompts.length).toBe(1);
-  expect(prompts[0]).toContain("Cutting on this computer stops");
+  expect(prompts[0]).toContain("Sending to the cutter on this computer stops");
+  expect(prompts[0]).toContain("already buffered");
   expect(prompts[0]).toContain("Cut Host keeps running there");
   // Accepting it is what quits, and the fake records having been asked.
   await expect

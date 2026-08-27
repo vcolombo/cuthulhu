@@ -253,8 +253,9 @@ export function App() {
         listen: (onWarning) => listen("cut-in-progress", onWarning),
         onWarning: () => {
           const quit = window.confirm(
-            "A cut may still be running — quit anyway? Cutting on this computer stops; a Job already " +
-              "sent to a Cut Host keeps running there.",
+            "A cut may still be running — quit anyway? Sending to the cutter on this computer " +
+              "stops, but it finishes whatever moves it has already buffered; a Job already sent " +
+              "to a Cut Host keeps running there.",
           );
           if (quit) ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
         },

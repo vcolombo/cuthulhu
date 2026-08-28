@@ -352,6 +352,14 @@ pub(crate) struct HostConnection {
     /// what tells "the token was refused" from "the Pi is asleep", and flattening it here was one
     /// of the two places that distinction used to be thrown away (#112).
     pub last_error: Option<IpcError>,
+    /// Set when this host is forgotten, under this connection's own lock.
+    ///
+    /// A press lifts the connection out of the map before it queues on this lock, so removing the
+    /// map entry cannot stop one that is already waiting: it would acquire a live `Arc`, dispatch,
+    /// and start a Job on a host whose token has just been discarded — with no cancel route, and a
+    /// mark no poll can ever clear because the poll is a call to the host that was removed. The
+    /// connection mutex is the one thing both sides pass through, so the answer lives here.
+    pub forgotten: bool,
 }
 
 impl HostConnection {
@@ -804,7 +812,7 @@ impl DeviceManagerHandle {
 
     pub fn add_host(&self, paired: PairedHost) {
         let id = paired.id.clone();
-        let conn = HostConnection { paired, client: None, last_error: None };
+        let conn = HostConnection { paired, client: None, last_error: None, forgotten: false };
         self.claimed_host_ids.lock().unwrap().insert(id.clone());
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
@@ -959,6 +967,17 @@ impl DeviceManagerHandle {
         // the last thing this desktop can still offer for a Job whose cancel route it is
         // discarding.
         //
+        // A press that is already inside its dispatch cannot be stopped by anything here: it owns
+        // the connection, and the `forgotten` flag below is only read on the way in. So the one
+        // press this verb cannot answer for is refused rather than raced — the operator's next
+        // click gets the real answer a moment later, and the alternative is a Job started on a host
+        // whose token this call discarded.
+        if self.a_press_is_dispatching_to(id) {
+            return Err(IpcError::new(
+                "host_busy",
+                "a cut is being sent to this host right now; forget it once that press has finished",
+            ));
+        }
         // Read once more before the question for the forced path below, which has no answer to
         // scope anything by: a press that marks *while* the question is in flight is not covered by
         // a silence that cannot speak for it, and re-reading afterwards would retract the only
@@ -1021,6 +1040,26 @@ impl DeviceManagerHandle {
         let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
         crate::hosts::save(hosts_path, &prospective)
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
+        // Written through the connection mutex before the map entry goes, because the map is not
+        // what a queued press is holding: it lifted the `Arc` out before queueing, so removal alone
+        // leaves it free to dispatch onto a token this call has just discarded. Set here, the press
+        // finds it the moment it owns the lock and sends nothing.
+        if let Ok(conn) = self.host_conn(id) {
+            // `try_lock`, never `lock`: this runs on an IPC command, and the holder of that lock is
+            // a call to a Pi — a dispatch, or a poll with a 30s body budget. Blocking here would
+            // make forgetting a host wait out whatever that call is doing. Held by anything at all,
+            // the honest answer is "not now": the press this cannot answer for was refused above,
+            // so what remains is a poll, and a moment later the lock is free.
+            match conn.try_lock() {
+                Ok(mut guard) => guard.forgotten = true,
+                Err(_) => {
+                    return Err(IpcError::new(
+                        "host_busy",
+                        "this Cut Host is mid-call right now; forget it again in a moment",
+                    ))
+                }
+            }
+        }
         self.remove_host(id);
         // A host that reported every cutter free has just said those marks are stale; a host forced
         // past unreachable had the operator told outright what forgetting discards. Either way the
@@ -1091,6 +1130,14 @@ impl DeviceManagerHandle {
         let conn = self.host_conn(id)?;
         let mut guard = conn.lock().unwrap();
         let host = &mut *guard;
+        // Asked under the connection lock, which is where `forget` writes it: a press that queued
+        // here before the host was forgotten would otherwise dispatch onto a discarded token.
+        if host.forgotten {
+            return Err(IpcError::new(
+                "unknown_host",
+                "this Cut Host was forgotten while this call was waiting for it; pair it again",
+            ));
+        }
         // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
         // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
         // in place lets the borrow end with the arm that doesn't need it.
@@ -1350,6 +1397,13 @@ impl DeviceManagerHandle {
             .unwrap()
             .values()
             .any(|presses| presses.by_dispatch.values().any(|group| !group.in_flight.is_empty()))
+    }
+
+    /// The same question asked of one host, for the verb that is about to discard its token.
+    fn a_press_is_dispatching_to(&self, id: &HostId) -> bool {
+        self.dispatching.lock().unwrap().iter().any(|(key, presses)| {
+            &key.host == id && presses.by_dispatch.values().any(|group| !group.in_flight.is_empty())
+        })
     }
 
     /// Permission for one press to start a cut, or the refusal if the window has gone.
@@ -4961,6 +5015,95 @@ mod tests {
             drop(held);
             cut.join().unwrap().expect("dispatch");
         });
+    }
+
+    /// A press queued for a host's connection is not stopped by the map entry going: it lifted the
+    /// `Arc` out before it queued. So a forget racing one is refused outright, and a press that gets
+    /// the connection after a forget completed sends nothing — the two halves of the same gap.
+    ///
+    /// What is at stake is a Job started on a host whose token has just been discarded: no cancel
+    /// route, and a mark no poll can clear, because the poll is a call to the host that was removed.
+    #[test]
+    fn a_forget_and_a_queued_press_cannot_cross() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+        dev.list_devices(); // establish the connection before this test holds it
+        let conn = dev.host_conn(&id).unwrap();
+        let held = conn.lock().unwrap();
+
+        std::thread::scope(|s| {
+            let cut = s.spawn(|| dev.execute_cut(aimed.clone(), a_square(10.0)));
+            wait_until(
+                || dev.a_press_is_dispatching_to(&id),
+                "the press never reached the host-connection boundary",
+            );
+
+            // Mid-send is the one press this verb cannot answer for, so it is refused rather than
+            // raced. Forced makes no difference: the force is about what a host said, not about a
+            // press this desktop is still making.
+            for forced in [false, true] {
+                let err = dev
+                    .forget(&id, &hosts_path, forced)
+                    .expect_err("a forget crossed a press that was already sending");
+                assert_eq!(err.code, "host_busy", "got {err:?}");
+                assert!(err.message.contains("being sent"), "the refusal must say why: {err:?}");
+            }
+
+            drop(held);
+            cut.join().unwrap().expect("dispatch");
+        });
+
+        // The other half, and the reason the flag exists rather than the map lookup: a press that
+        // has already lifted the `Arc` is not reached by the map entry going. Written here through
+        // the same lock `forget` writes it under, which is the only ordering that can stop one.
+        let conn = dev.host_conn(&id).unwrap();
+        let mut held = conn.lock().unwrap();
+        std::thread::scope(|s| {
+            let cut = s.spawn(|| dev.execute_cut(host_cameo(&id), a_square(10.0)));
+            wait_until(
+                || dev.a_press_is_dispatching_to(&id),
+                "the second press never reached the boundary",
+            );
+            held.forgotten = true;
+            drop(held);
+            let err = cut.join().unwrap().expect_err("a forgotten host must not be dispatched to");
+            assert_eq!(err.code, "unknown_host", "got {err:?}");
+        });
+    }
+
+    /// The production writer for the flag above: a forget leaves the connection itself answering, so
+    /// a press that lifted the `Arc` before the map entry went finds the refusal rather than a send.
+    #[test]
+    fn a_forget_leaves_the_connection_refusing() {
+        let host = start_loopback_host();
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts.json");
+        let dev = test_device_setup();
+        let id = dev
+            .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+            .expect("pairing with the loopback host");
+        let conn = dev.host_conn(&id).unwrap();
+        assert!(!conn.lock().unwrap().forgotten, "a fresh pairing starts answering");
+        // Aimed before the forget, because the press below has to fail on the host rather than on
+        // the aim: `forget` clears an aim that named the host it removed.
+        let aimed = host_cameo(&id);
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        dev.forget(&id, &hosts_path, false).expect("an idle host is forgettable");
+        *dev.connected.lock().unwrap() = Some(aimed.clone());
+
+        assert!(conn.lock().unwrap().forgotten, "the forget left the connection answering");
+        let err = dev
+            .execute_cut(aimed, a_square(10.0))
+            .expect_err("a forgotten host must not be dispatched to");
+        assert_eq!(err.code, "unknown_host", "got {err:?}");
     }
 
     /// Once a close is committed, a press that reaches the connection afterwards sends nothing: a

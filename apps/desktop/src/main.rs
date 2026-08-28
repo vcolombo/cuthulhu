@@ -117,6 +117,15 @@ fn main() {
             set_close_guard_ready,
             force_quit,
         ])
+        // A reload replaces the page but not this process, and React runs no cleanup on unload — so
+        // readiness would still be `true` from the page before it, with nothing subscribed on the
+        // new one. A close in that gap is refused and the warning emitted to a page that is gone:
+        // no prompt, and a window the operator cannot shut. The webview's own leading stand-down
+        // races the same gap because it is an async command; this one is native and precedes any
+        // close the new page could see.
+        .on_page_load(|webview, _| {
+            webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();

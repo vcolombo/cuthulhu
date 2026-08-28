@@ -1037,29 +1037,33 @@ impl DeviceManagerHandle {
             Err(_) => before_asking,
         };
 
+        // The connection is taken *before* anything is written down, because a refusal after the
+        // save would leave the file saying forgotten while this desktop still held the host.
+        //
+        // `try_lock`, never `lock`: this runs on an IPC command, and the holder of that lock is a
+        // call to a Pi — a dispatch, or a poll with a 30s body budget. Blocking here would make
+        // forgetting a host wait out whatever that call is doing. Held by anything at all, the
+        // honest answer is "not now": the press this cannot answer for was refused above, so what
+        // remains is a poll, and a moment later the lock is free.
+        // Read before the connection is taken: `paired_hosts` locks every connection in turn,
+        // including this one, so gathering it under the guard would be this verb deadlocking itself.
         let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
+        let conn = self.host_conn(id)?;
+        let Ok(mut guard) = conn.try_lock() else {
+            return Err(IpcError::new(
+                "host_busy",
+                "this Cut Host is mid-call right now; forget it again in a moment",
+            ));
+        };
         crate::hosts::save(hosts_path, &prospective)
             .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
-        // Written through the connection mutex before the map entry goes, because the map is not
-        // what a queued press is holding: it lifted the `Arc` out before queueing, so removal alone
-        // leaves it free to dispatch onto a token this call has just discarded. Set here, the press
-        // finds it the moment it owns the lock and sends nothing.
-        if let Ok(conn) = self.host_conn(id) {
-            // `try_lock`, never `lock`: this runs on an IPC command, and the holder of that lock is
-            // a call to a Pi — a dispatch, or a poll with a 30s body budget. Blocking here would
-            // make forgetting a host wait out whatever that call is doing. Held by anything at all,
-            // the honest answer is "not now": the press this cannot answer for was refused above,
-            // so what remains is a poll, and a moment later the lock is free.
-            match conn.try_lock() {
-                Ok(mut guard) => guard.forgotten = true,
-                Err(_) => {
-                    return Err(IpcError::new(
-                        "host_busy",
-                        "this Cut Host is mid-call right now; forget it again in a moment",
-                    ))
-                }
-            }
-        }
+
+        // Held from here to the end of the verb, so a press cannot acquire this connection between
+        // the file being written and the flag being set. The map is not what such a press holds: it
+        // lifted the `Arc` out before queueing, so removal alone would leave it free to dispatch
+        // onto a token this call has just discarded.
+        guard.forgotten = true;
+        drop(guard);
         self.remove_host(id);
         // A host that reported every cutter free has just said those marks are stale; a host forced
         // past unreachable had the operator told outright what forgetting discards. Either way the

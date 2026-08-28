@@ -123,8 +123,14 @@ fn main() {
         // no prompt, and a window the operator cannot shut. The webview's own leading stand-down
         // races the same gap because it is an async command; this one is native and precedes any
         // close the new page could see.
-        .on_page_load(|webview, _| {
-            webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
+        //
+        // `Started` only. `Finished` arrives after the page's scripts have run, so clearing there
+        // would disarm a listener the new page had already installed and acknowledged — the guard
+        // failing open, which is the one direction it must not fail in.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
+            }
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

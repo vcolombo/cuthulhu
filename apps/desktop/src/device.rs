@@ -340,6 +340,18 @@ pub struct ConfiguredPassDto {
     pub repeat_count: Option<u32>,
 }
 
+/// Whether a lifted host connection may still serve a call.
+///
+/// `Forgetting` refuses new calls while `hosts.json` is written without holding the host-control
+/// mutex across filesystem I/O. A failed save returns it to `Active`; a successful one advances it
+/// to `Forgotten` before the map entry is removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostLifecycle {
+    Active,
+    Forgetting,
+    Forgotten,
+}
+
 /// One paired Cut Host: what was saved about it, its connection if it has one, and why it has
 /// none if it does not.
 ///
@@ -352,14 +364,14 @@ pub(crate) struct HostConnection {
     /// what tells "the token was refused" from "the Pi is asleep", and flattening it here was one
     /// of the two places that distinction used to be thrown away (#112).
     pub last_error: Option<IpcError>,
-    /// Set when this host is forgotten, under this connection's own lock.
+    /// The state a call lifted out of the paired-host map must still check.
     ///
-    /// A press lifts the connection out of the map before it queues on this lock, so removing the
-    /// map entry cannot stop one that is already waiting: it would acquire a live `Arc`, dispatch,
-    /// and start a Job on a host whose token has just been discarded — with no cancel route, and a
-    /// mark no poll can ever clear because the poll is a call to the host that was removed. The
-    /// connection mutex is the one thing both sides pass through, so the answer lives here.
-    pub forgotten: bool,
+    /// A press lifts this connection out before it queues on the mutex, so removing the map entry
+    /// cannot stop one already waiting: it would acquire a live `Arc`, dispatch, and start a Job on
+    /// a host whose token has just been discarded — with no cancel route, and a mark no poll can
+    /// clear because that poll is a call to the host that was removed. The mutex is the one thing
+    /// both sides pass through, so the answer lives here.
+    lifecycle: HostLifecycle,
 }
 
 impl HostConnection {
@@ -812,7 +824,7 @@ impl DeviceManagerHandle {
 
     pub fn add_host(&self, paired: PairedHost) {
         let id = paired.id.clone();
-        let conn = HostConnection { paired, client: None, last_error: None, forgotten: false };
+        let conn = HostConnection { paired, client: None, last_error: None, lifecycle: HostLifecycle::Active };
         self.claimed_host_ids.lock().unwrap().insert(id.clone());
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
@@ -954,6 +966,17 @@ impl DeviceManagerHandle {
     /// where nothing saw it stop — is reachable, so `cancel` or the host's own `Reconnect` still
     /// works there, and there is no case for cutting a route while it works.
     pub fn forget(&self, id: &HostId, hosts_path: &Path, force: bool) -> Result<(), IpcError> {
+        self.forget_with_save(id, force, |prospective| crate::hosts::save(hosts_path, prospective))
+    }
+
+    /// The same transition with the persistence boundary injected, so its lock/state ordering can
+    /// be asserted without making a real filesystem write stall on demand.
+    fn forget_with_save(
+        &self,
+        id: &HostId,
+        force: bool,
+        save: impl FnOnce(&[PairedHost]) -> Result<(), crate::hosts::HostsError>,
+    ) -> Result<(), IpcError> {
         // Bounded the same way `status()` is (`STATUS_POLL_TIMEOUT`, not the full
         // `DEFAULT_BODY_TIMEOUT`) — on *both* legs, the reconnect and the body read. Not because
         // anything else waits on it: this holds only this host's connection lock, so a stall here
@@ -1037,17 +1060,11 @@ impl DeviceManagerHandle {
             Err(_) => before_asking,
         };
 
-        // The connection is taken *before* anything is written down, because a refusal after the
-        // save would leave the file saying forgotten while this desktop still held the host.
-        //
-        // `try_lock`, never `lock`: this runs on an IPC command, and the holder of that lock is a
-        // call to a Pi — a dispatch, or a poll with a 30s body budget. Blocking here would make
-        // forgetting a host wait out whatever that call is doing. Held by anything at all, the
-        // honest answer is "not now": the press this cannot answer for was refused above, so what
-        // remains is a poll, and a moment later the lock is free.
         // Read before the connection is taken: `paired_hosts` locks every connection in turn,
-        // including this one, so gathering it under the guard would be this verb deadlocking itself.
-        let prospective: Vec<PairedHost> = self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
+        // including this one, so gathering it under the guard would deadlock this verb against
+        // itself.
+        let prospective: Vec<PairedHost> =
+            self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
         let conn = self.host_conn(id)?;
         let Ok(mut guard) = conn.try_lock() else {
             return Err(IpcError::new(
@@ -1055,15 +1072,27 @@ impl DeviceManagerHandle {
                 "this Cut Host is mid-call right now; forget it again in a moment",
             ));
         };
-        crate::hosts::save(hosts_path, &prospective)
-            .map_err(|e| IpcError::new("hosts_unwritable", e.to_string()))?;
-
-        // Held from here to the end of the verb, so a press cannot acquire this connection between
-        // the file being written and the flag being set. The map is not what such a press holds: it
-        // lifted the `Arc` out before queueing, so removal alone would leave it free to dispatch
-        // onto a token this call has just discarded.
-        guard.forgotten = true;
+        if guard.lifecycle != HostLifecycle::Active {
+            return Err(IpcError::new(
+                "host_busy",
+                "this Cut Host is already being forgotten",
+            ));
+        }
+        // Publish the transition before filesystem I/O, then release host control. Calls queued on
+        // this connection wake, see `Forgetting`, and refuse immediately; no cancel, poll or
+        // dispatch is held behind a slow configuration filesystem.
+        guard.lifecycle = HostLifecycle::Forgetting;
         drop(guard);
+
+        if let Err(e) = save(&prospective) {
+            // The file still names the host, so this process must answer for it again too.
+            conn.lock().unwrap().lifecycle = HostLifecycle::Active;
+            return Err(IpcError::new("hosts_unwritable", e.to_string()));
+        }
+
+        // Save succeeded: no call can cross this transition, because every lifted `Arc` checks the
+        // same state under the same mutex before it reaches the client.
+        conn.lock().unwrap().lifecycle = HostLifecycle::Forgotten;
         self.remove_host(id);
         // A host that reported every cutter free has just said those marks are stale; a host forced
         // past unreachable had the operator told outright what forgetting discards. Either way the
@@ -1134,13 +1163,22 @@ impl DeviceManagerHandle {
         let conn = self.host_conn(id)?;
         let mut guard = conn.lock().unwrap();
         let host = &mut *guard;
-        // Asked under the connection lock, which is where `forget` writes it: a press that queued
-        // here before the host was forgotten would otherwise dispatch onto a discarded token.
-        if host.forgotten {
-            return Err(IpcError::new(
-                "unknown_host",
-                "this Cut Host was forgotten while this call was waiting for it; pair it again",
-            ));
+        // Asked under the connection lock, which is where `forget` transitions it: a press that
+        // queued here before the map entry went would otherwise dispatch onto a discarded token.
+        match host.lifecycle {
+            HostLifecycle::Active => {}
+            HostLifecycle::Forgetting => {
+                return Err(IpcError::new(
+                    "host_busy",
+                    "this Cut Host is being forgotten; try the call again if the save fails",
+                ))
+            }
+            HostLifecycle::Forgotten => {
+                return Err(IpcError::new(
+                    "unknown_host",
+                    "this Cut Host was forgotten while this call was waiting for it; pair it again",
+                ))
+            }
         }
         // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
         // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
@@ -3188,6 +3226,51 @@ mod tests {
         let err = dev.forget(&HostId("host-1".into()), &hosts_path, true);
         assert_eq!(err.unwrap_err().code, "hosts_unwritable");
         assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
+        let conn = dev.host_conn(&HostId("host-1".into())).expect("the host remains paired");
+        assert_eq!(
+            conn.lock().unwrap().lifecycle,
+            HostLifecycle::Active,
+            "a failed save left the connection refusing calls"
+        );
+    }
+
+    /// The persistence seam owns this ordering: calls are refused while the file is written, but
+    /// the host-control mutex is not held behind the disk; a failed write restores the old pairing.
+    #[test]
+    fn a_forget_transition_refuses_calls_without_holding_host_control_behind_the_save() {
+        let dev = test_device_setup();
+        let id = HostId("host-1".into());
+        dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+        let conn = dev.host_conn(&id).unwrap();
+
+        let err = dev
+            .forget_with_save(&id, true, |prospective| {
+                assert!(prospective.is_empty(), "the saved list still carried the forgotten host");
+                let lifecycle = conn
+                    .try_lock()
+                    .expect("the filesystem save was holding the host-control mutex")
+                    .lifecycle;
+                assert_eq!(
+                    lifecycle,
+                    HostLifecycle::Forgetting,
+                    "calls were not stood down before the save"
+                );
+                let call = dev.with_host(&id, |_| Ok(()));
+                assert_eq!(
+                    call.unwrap_err().code,
+                    "host_busy",
+                    "a call crossed the save into the host"
+                );
+                Err(crate::hosts::HostsError::Unwritable("simulated".into()))
+            })
+            .expect_err("the simulated save succeeded");
+
+        assert_eq!(err.code, "hosts_unwritable");
+        assert_eq!(
+            conn.lock().unwrap().lifecycle,
+            HostLifecycle::Active,
+            "a failed save left the pairing stood down"
+        );
     }
 
     /// The reversal: a host that cannot be asked is not a host known to be idle. Drop Wi-Fi
@@ -5064,9 +5147,10 @@ mod tests {
             cut.join().unwrap().expect("dispatch");
         });
 
-        // The other half, and the reason the flag exists rather than the map lookup: a press that
-        // has already lifted the `Arc` is not reached by the map entry going. Written here through
-        // the same lock `forget` writes it under, which is the only ordering that can stop one.
+        // The other half, and the reason the transition lives on the connection rather than in the
+        // map: a press that has already lifted the `Arc` is not reached by the entry going. During
+        // the filesystem write it wakes, sees `Forgetting`, and returns immediately — host control
+        // is not held behind the disk and nothing crosses into a send.
         let conn = dev.host_conn(&id).unwrap();
         let mut held = conn.lock().unwrap();
         std::thread::scope(|s| {
@@ -5075,15 +5159,23 @@ mod tests {
                 || dev.a_press_is_dispatching_to(&id),
                 "the second press never reached the boundary",
             );
-            held.forgotten = true;
+            held.lifecycle = HostLifecycle::Forgetting;
             drop(held);
-            let err = cut.join().unwrap().expect_err("a forgotten host must not be dispatched to");
-            assert_eq!(err.code, "unknown_host", "got {err:?}");
+            let err = cut
+                .join()
+                .unwrap()
+                .expect_err("a host being forgotten must not be dispatched to");
+            assert_eq!(err.code, "host_busy", "got {err:?}");
+            assert!(
+                err.message.contains("being forgotten"),
+                "the transition was hidden: {err:?}"
+            );
         });
     }
 
-    /// The production writer for the flag above: a forget leaves the connection itself answering, so
-    /// a press that lifted the `Arc` before the map entry went finds the refusal rather than a send.
+    /// The production writer for the flag above: a forget leaves the connection itself answering,
+    /// so a press that lifted the `Arc` before the map entry went finds the refusal rather than a
+    /// send.
     #[test]
     fn a_forget_leaves_the_connection_refusing() {
         let host = start_loopback_host();
@@ -5094,7 +5186,11 @@ mod tests {
             .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
             .expect("pairing with the loopback host");
         let conn = dev.host_conn(&id).unwrap();
-        assert!(!conn.lock().unwrap().forgotten, "a fresh pairing starts answering");
+        assert_eq!(
+            conn.lock().unwrap().lifecycle,
+            HostLifecycle::Active,
+            "a fresh pairing starts answering"
+        );
         // Aimed before the forget, because the press below has to fail on the host rather than on
         // the aim: `forget` clears an aim that named the host it removed.
         let aimed = host_cameo(&id);
@@ -5103,7 +5199,11 @@ mod tests {
         dev.forget(&id, &hosts_path, false).expect("an idle host is forgettable");
         *dev.connected.lock().unwrap() = Some(aimed.clone());
 
-        assert!(conn.lock().unwrap().forgotten, "the forget left the connection answering");
+        assert_eq!(
+            conn.lock().unwrap().lifecycle,
+            HostLifecycle::Forgotten,
+            "the forget left the connection answering"
+        );
         let err = dev
             .execute_cut(aimed, a_square(10.0))
             .expect_err("a forgotten host must not be dispatched to");

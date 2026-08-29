@@ -8,10 +8,10 @@ use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
 use desktop::device::DeviceManagerHandle;
-use driver_registry::HardwareBackendFactory;
 use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
+use driver_registry::HardwareBackendFactory;
 
 /// Stops what this process is driving, shuts the device manager down and exits. Used by the UI
 /// after the operator confirms they want to quit with a cut outstanding.
@@ -51,8 +51,17 @@ fn set_close_guard_ready(dev: tauri::State<DeviceManagerHandle>, ready: bool) {
     dev.set_close_guard_ready(ready);
 }
 
+/// Whether a page-load event invalidates the previous page's listener acknowledgement.
+///
+/// `Started`, not `Finished`: scripts can arm the new listener before the latter arrives, so
+/// clearing on completion disarms a listener that is already live.
+fn page_load_stands_down_close_guard(event: tauri::webview::PageLoadEvent) -> bool {
+    matches!(event, tauri::webview::PageLoadEvent::Started)
+}
+
 fn main() {
-    let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
+    let (dev_handle, events) =
+        DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
 
     // A host that fails to load is not a reason to refuse to start — the desktop still cuts on
     // local hardware, and the operator can re-pair. Say so once rather than failing silently.
@@ -128,7 +137,7 @@ fn main() {
         // would disarm a listener the new page had already installed and acknowledged — the guard
         // failing open, which is the one direction it must not fail in.
         .on_page_load(|webview, payload| {
-            if payload.event() == tauri::webview::PageLoadEvent::Started {
+            if page_load_stands_down_close_guard(payload.event()) {
                 webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
             }
         })
@@ -195,7 +204,9 @@ fn main() {
         for event in events {
             if matches!(event.kind, DeviceEventKind::Progress { .. }) {
                 let now = Instant::now();
-                if last_progress.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
+                if last_progress
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+                {
                     continue;
                 }
                 last_progress = Some(now);
@@ -209,4 +220,17 @@ fn main() {
             app_handle.state::<DeviceManagerHandle>().shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_page_start_stands_down_the_previous_listener() {
+        assert!(super::page_load_stands_down_close_guard(
+            tauri::webview::PageLoadEvent::Started
+        ));
+        assert!(!super::page_load_stands_down_close_guard(
+            tauri::webview::PageLoadEvent::Finished
+        ));
+    }
 }

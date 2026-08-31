@@ -8,27 +8,60 @@ use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
 use desktop::device::DeviceManagerHandle;
-use driver_registry::HardwareBackendFactory;
 use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
+use driver_registry::HardwareBackendFactory;
 
-/// Cancels + shuts down the device manager and exits the process. Used by the
-/// UI after the user confirms they want to quit with a cut in progress.
+/// Stops what this process is driving, shuts the device manager down and exits. Used by the UI
+/// after the operator confirms they want to quit with a cut outstanding.
 ///
-/// async, like every other command here that can touch the network: aimed at a Cut Host, `cancel`
-/// waits for that host's connection lock, may reconnect, and then waits out a reply — on the main
-/// thread that is the escape hatch from the close guard hanging harder than the guard it escapes
-/// (#116).
+/// A Job on a Cut Host is left running: the host owns it and keeps cutting whether this desktop is
+/// alive or not, while the local cutter's transport dies with this process. So what quitting stops
+/// is what this process *sends* — `cancel` is cooperative, and a Silhouette has no abort command,
+/// so the cutter finishes whatever moves it has already buffered either way (#158,
+/// `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`, and
+/// `apps/desktop/MANUAL-CHECKLIST.md`). The dialog the operator answered says so.
+///
+/// async because `shutdown` joins the local worker, and this runs on the main thread — the escape
+/// hatch from the close guard hanging harder than the guard it escapes. It initiates no network
+/// call of its own: the remote cancel that could block the exit is gone. What remains is a bounded
+/// wait — `commit_close_after_confirmation` gives a send already in flight up to `CLOSE_GATE_WAIT`
+/// before exiting anyway — so #116's cause is bounded rather than removed.
 #[tauri::command(async)]
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
-    dev.cancel().ok();
+    // The operator has answered the prompt, so nothing new may start: a press already queued for a
+    // host's connection must not send a Job into a process that is exiting.
+    //
+    // Committed before the cancel, and the order matters: swapping these two reopens the window
+    // between stopping what is moving and refusing what would start next.
+    dev.commit_close_after_confirmation();
+    dev.stop_local_motion();
     dev.shutdown();
     app.exit(0);
 }
 
+/// The webview's acknowledgement that its quit-warning listener is installed.
+///
+/// Tauri's `emit` returns success with zero listeners, so delivery cannot be inferred from the
+/// result. The webview sets this only after `listen` resolves and clears it before teardown; a
+/// close arriving outside that lifetime proceeds instead of becoming a refusal with no escape.
+#[tauri::command]
+fn set_close_guard_ready(dev: tauri::State<DeviceManagerHandle>, ready: bool) {
+    dev.set_close_guard_ready(ready);
+}
+
+/// Whether a page-load event invalidates the previous page's listener acknowledgement.
+///
+/// `Started`, not `Finished`: scripts can arm the new listener before the latter arrives, so
+/// clearing on completion disarms a listener that is already live.
+fn page_load_stands_down_close_guard(event: tauri::webview::PageLoadEvent) -> bool {
+    matches!(event, tauri::webview::PageLoadEvent::Started)
+}
+
 fn main() {
-    let (dev_handle, events) = DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
+    let (dev_handle, events) =
+        DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
 
     // A host that fails to load is not a reason to refuse to start — the desktop still cuts on
     // local hardware, and the operator can re-pair. Say so once rather than failing silently.
@@ -90,8 +123,24 @@ fn main() {
             ipc::list_fonts,
             ipc::load_image_preview,
             ipc::pick_image,
+            set_close_guard_ready,
             force_quit,
         ])
+        // A reload replaces the page but not this process, and React runs no cleanup on unload — so
+        // readiness would still be `true` from the page before it, with nothing subscribed on the
+        // new one. A close in that gap is refused and the warning emitted to a page that is gone:
+        // no prompt, and a window the operator cannot shut. The webview's own leading stand-down
+        // races the same gap because it is an async command; this one is native and precedes any
+        // close the new page could see.
+        //
+        // `Started` only. `Finished` arrives after the page's scripts have run, so clearing there
+        // would disarm a listener the new page had already installed and acknowledged — the guard
+        // failing open, which is the one direction it must not fail in.
+        .on_page_load(|webview, payload| {
+            if page_load_stands_down_close_guard(payload.event()) {
+                webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
+            }
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
@@ -102,12 +151,41 @@ fn main() {
                 // the window for the listing plus the poll plus an unbounded resolve (#115).
                 // What this asks is whether to warn, which a status alone cannot answer: a
                 // dispatch accepted a second ago has not been polled yet, so the newest status
-                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts a
-                // dispatch this desktop sent and has not seen finish; a warning about a Job that
-                // has since ended costs a dialog the operator dismisses.
-                if dev.a_cut_may_be_running() {
-                    api.prevent_close();
-                    window.emit("cut-in-progress", ()).ok();
+                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts every
+                // dispatch this desktop sent and has not seen finish, on any cutter and whatever
+                // is aimed at now (#158); a warning about a Job that has since ended costs a
+                // dialog the operator dismisses.
+                // `commit_close` answers and commits in one step, so a press queued behind a poll
+                // for a host's connection cannot cross into its dispatch after the window has been
+                // let go: the Job it would start outlives the process that started it.
+                if dev.commit_close() {
+                    return;
+                }
+                if dev.close_guard_ready() {
+                    // Readiness is the delivery fact: `emit` only proves serialization and returns
+                    // success even with nobody listening. Once the webview has acknowledged its
+                    // listener, a successful emit and the refusal are one act.
+                    match window.emit("cut-in-progress", ()) {
+                        Ok(()) => api.prevent_close(),
+                        Err(e) => {
+                            // The window is going, so the close is a fact whatever the operator
+                            // was told: commit it, or a press queued behind a host's connection
+                            // would still send into a process on its way out.
+                            dev.commit_close_regardless();
+                            eprintln!(
+                                "cuthulhu: a cut may be running and the warning could not be shown: {e}"
+                            );
+                        }
+                    }
+                } else {
+                    // Fail open by design — a refused close with no listener has no escape — but
+                    // not silently: this is the only evidence a startup/listener failure disabled
+                    // the guard when an operator later reports a warning was missing. Committed
+                    // for the same reason as above: the window goes, so nothing new may start.
+                    dev.commit_close_regardless();
+                    eprintln!(
+                        "cuthulhu: a cut may be running but the warning listener is not ready; closing"
+                    );
                 }
             }
         })
@@ -126,7 +204,9 @@ fn main() {
         for event in events {
             if matches!(event.kind, DeviceEventKind::Progress { .. }) {
                 let now = Instant::now();
-                if last_progress.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
+                if last_progress
+                    .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+                {
                     continue;
                 }
                 last_progress = Some(now);
@@ -140,4 +220,17 @@ fn main() {
             app_handle.state::<DeviceManagerHandle>().shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_page_start_stands_down_the_previous_listener() {
+        assert!(super::page_load_stands_down_close_guard(
+            tauri::webview::PageLoadEvent::Started
+        ));
+        assert!(!super::page_load_stands_down_close_guard(
+            tauri::webview::PageLoadEvent::Finished
+        ));
+    }
 }

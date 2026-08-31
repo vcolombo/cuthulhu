@@ -35,6 +35,7 @@
   "resume_cut": [],
   "save_preset": ["p"],
   "save_project": ["path"],
+  "set_close_guard_ready": ["ready"],
   "set_cut_line_type": ["ids", "value"],
   "set_machine": ["machineId"],
   "set_material_preset": ["ids", "value"],

@@ -753,6 +753,37 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       failNextCut = true;
       return null;
     },
+    // Test hook (no production counterpart): fires an event the *backend* emits, which no command
+    // of the fake's does. `cut-in-progress` is emitted from `on_window_event` when the close guard
+    // refuses a close, and a window Playwright asks to close never reaches that guard here.
+    __test_emit_backend_event: (a) => {
+      const event = a.event as string;
+      for (const id of eventNameToIds.get(event) ?? []) {
+        callbacksById.get(id)?.({ event, id, payload: null });
+      }
+      return null;
+    },
+    // Same, for whether the page has got as far as subscribing: an emit before the listener is
+    // registered reaches nobody, and `goto` resolving is not that moment.
+    __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
+    // Readiness is recorded with the listener count at the moment it was set, because the ordering
+    // is the whole point of the flag: Rust emits on the strength of it, and `emit` succeeds with
+    // nobody listening — so readiness while no listener exists is a prevented close with no prompt
+    // and no escape. The latest value stays where `emitBackendEvent` reads it.
+    set_close_guard_ready: (a) => {
+      sessionStorage.setItem("__close_guard_ready__", String(a.ready));
+      const listeners = (eventNameToIds.get("cut-in-progress") ?? []).length;
+      const log = sessionStorage.getItem("__ready_log__") ?? "";
+      sessionStorage.setItem("__ready_log__", `${log}${log ? "," : ""}${a.ready}@${listeners}`);
+      return null;
+    },
+    // Mirrors `main.rs`'s `force_quit` as far as a page can: the real one exits the process hosting
+    // this webview, which a fake cannot do, so all a test can observe is that it was asked.
+    // Recorded rather than counted, because the question is whether confirming reached it at all.
+    force_quit: () => {
+      sessionStorage.setItem("__force_quit__", "asked");
+      return null;
+    },
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
     confirm_pass_done: () => {
@@ -2288,7 +2319,7 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   await expect(page.getByText("Unknown")).toHaveCount(3);
   // Nothing has been refused yet, so the warning is nowhere — including over the two local
   // cutters, whose section has no host id at all for a refusal to match (#265).
-  const forceWarning = page.getByText(/A cut may still be running on this Cut Host/);
+  const forceWarning = page.getByText(/Forgetting this Cut Host discards the credentials/);
   await expect(forceWarning).toHaveCount(0);
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
@@ -2317,7 +2348,7 @@ test("a desktop with no Cut Host paired shows no force-forget warning", async ({
   // The local cutters are listed — the dialog is populated, so the warning's absence is about the
   // guard rather than about an empty device section.
   await expect(page.getByTestId("device-badge")).toHaveCount(2);
-  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toHaveCount(0);
+  await expect(page.getByText(/Forgetting this Cut Host discards the credentials/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /anyway$/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^Keep / })).toHaveCount(0);
 });
@@ -2767,4 +2798,95 @@ test("trace dialog: a failed source thumbnail surfaces instead of blanking", asy
   // The trace itself still succeeded, so the dialog stays usable.
   await expect(page.getByText("1 path")).toBeVisible();
   await expect(page.getByRole("button", { name: "Insert" })).toBeEnabled();
+});
+
+// Emits an event the *backend* sends, once the page is actually listening for it.
+//
+// The wait is on the fake's own registration rather than on an element being visible: `goto`
+// resolves at load, `App` subscribes from a `useEffect`, and an emit that arrives before that has
+// no listener to reach — which is a test that fails for its timing rather than for the sentence it
+// is about. A rendered button is a proxy for the same commit having happened; the registration is
+// the thing itself.
+const emitBackendEvent = async (page: Page, event: string) => {
+  await expect
+    .poll(() =>
+      page.evaluate((e) => {
+        const internals = window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return internals.__TAURI_INTERNALS__.invoke("__test_backend_listeners", { event: e });
+      }, event),
+    )
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__close_guard_ready__")))
+    .toBe("true");
+  await page.evaluate((e) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: e });
+  }, event);
+};
+
+// The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
+// quitting stops what this process sends and leaves a Cut Host's Job cutting, so a prompt that
+// implies the quit stops everything would be telling the operator the opposite of what happens —
+// and `cancel` is cooperative, so even the local cutter finishes its buffered moves (the Silhouette
+// has no abort command; see apps/desktop/MANUAL-CHECKLIST.md).
+test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const prompts: string[] = [];
+  page.on("dialog", (d) => {
+    prompts.push(d.message());
+    d.accept().catch(() => {});
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  await expect.poll(() => prompts.length).toBe(1);
+  expect(prompts[0]).toContain("Sending to the cutter on this computer stops");
+  expect(prompts[0]).toContain("already buffered");
+  expect(prompts[0]).toContain("Cut Host keeps running there");
+  // Accepting it is what quits, and the fake records having been asked.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
+    .toBe("asked");
+
+  // The handshake's own ordering, which the prompt above cannot see: readiness is stood down
+  // before anything is subscribed, and never announced while nothing is listening. Rust emits on
+  // the strength of this flag and `emit` succeeds with zero listeners, so a `true` with no listener
+  // is a prevented close the operator cannot answer — and the leading `false` is the only thing
+  // that closes the window a reload leaves open, since no effect cleanup runs on unload.
+  //
+  // A filter over the log rather than an exact sequence: Playwright runs the dev build, whose
+  // `StrictMode` mounts, cleans up and mounts again, so more than two entries is correct here.
+  const readiness = (await page.evaluate(() => sessionStorage.getItem("__ready_log__")))!.split(",");
+  expect(readiness[0]).toBe("false@0");
+  expect(readiness).not.toContain("true@0");
+
+  // The teardown direction is not observable here — Playwright cannot unmount React — and is
+  // pinned instead by `closeGuard.test.ts`, over the same handshake this page runs.
+});
+
+test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const prompts: string[] = [];
+  page.on("dialog", (d) => {
+    prompts.push(d.message());
+    d.dismiss().catch(() => {});
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  // The prompt having been *seen* is the beat to wait on. The assertion below is safe because
+  // `page.evaluate` cannot run while the page is blocked in `window.confirm`, so it necessarily
+  // lands after the dismissal returned — not because recording the message implies that.
+  await expect.poll(() => prompts.length).toBe(1);
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await expect(page.getByRole("button", { name: "Cut" })).toBeVisible();
 });

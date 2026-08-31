@@ -817,19 +817,23 @@ export function CutDialog({
               {section.unreachable ? (
                 <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
               ) : null}
-              {/* Says what is being accepted rather than asking "are you sure": the risk is not
-                  that the host is gone, it is that it is still cutting and this is the only
-                  desktop that could stop it. Shown only after the plain Forget was refused —
-                  hence the explicit `null` check. The local section's `hostId` is `null` too, so
-                  bare equality also matched it with nothing refused: a desktop that had never
-                  paired a host carried this warning over its local cutters, and that
-                  `Discard anyway` called `forget_host` for no host (#265). */}
+              {/* Says what is being accepted rather than asking "are you sure". The two refusals
+                  this appears for differ in why — a host that could not be asked, or one whose
+                  cutter nothing can reach — and each states its own reason in the Rust side's
+                  prose, which `onError` has already put in front of the operator. What is stated
+                  here is the part that is the same either way and is the actual decision: the
+                  credentials go, and with them every route to a blade that may still be moving.
+                  Shown only after the plain Forget was refused — hence the explicit `null` check.
+                  The local section's `hostId` is `null` too, so bare equality also matched it with
+                  nothing refused: a desktop that had never paired a host carried this warning over
+                  its local cutters, and that `Discard anyway` called `forget_host` for no host
+                  (#265). */}
               {forceHost !== null && forceHost === section.hostId ? (
                 <div style={{ fontSize: 12, color: "var(--cut)", display: "flex", alignItems: "center", gap: 8 }}>
                   <span>
-                    A cut may still be running on this Cut Host. Forgetting it discards the
-                    credentials this desktop needs to cancel, resume or confirm that cut — it will
-                    not be able to stop it.
+                    Forgetting this Cut Host discards the credentials this desktop needs to cancel,
+                    resume or confirm a cut on it. If one is running, this desktop will not be able
+                    to stop it.
                   </span>
                   {/* Not "Forget <name> anyway": that name contains this section's own Forget
                       button's, and a selector for one would match both. */}

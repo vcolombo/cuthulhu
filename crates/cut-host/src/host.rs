@@ -231,14 +231,31 @@ impl Host {
     }
 
     /// Everything a reattaching client needs, for every cutter, in one value.
+    ///
+    /// `claimed` is one reading: `Admission` is held across the status read, so a dispatch that has
+    /// claimed the cutter cannot be reported free before its worker publishes. The guard is dropped
+    /// before `job_id` is read, because `claims` needs the same two mutexes and holding both here
+    /// is what let the two orders cross — a status poll racing the shutdown guard's report
+    /// deadlocked the daemon, and a wedged watch thread can never honour SIGTERM.
+    /// **Neither of the slot's own two mutexes is held while the other is taken.** The status read
+    /// under `admission` is deliberate and safe: `is_claimed` reads them in that same order, and
+    /// nothing anywhere takes `admission` beneath the status lock.
     pub fn snapshots(&self) -> Vec<DeviceSnapshot> {
         self.order
             .iter()
             .filter_map(|id| self.slots.get(id))
-            .map(|s| DeviceSnapshot {
-                info: s.info.clone(),
-                status: s.manager.status(),
-                job_id: *s.job_id.lock().unwrap(),
+            .map(|s| {
+                let (claimed, status) = {
+                    let admission = s.admission.lock().unwrap();
+                    let status = s.manager.status();
+                    (admission.starting || status.is_active(), status)
+                };
+                DeviceSnapshot {
+                    info: s.info.clone(),
+                    status,
+                    job_id: *s.job_id.lock().unwrap(),
+                    claimed,
+                }
             })
             .collect()
     }
@@ -397,11 +414,14 @@ impl Host {
             .iter()
             .filter_map(|id| self.slots.get(id))
             .filter(|s| s.is_claimed())
-            .map(|s| Claim {
-                device: s.info.instance_id.clone(),
-                phase: s.manager.status().phase,
-                job_id: *s.job_id.lock().unwrap(),
-                starting: s.admission.lock().unwrap().starting,
+            .map(|s| {
+                // One lock per statement, so nothing here is held while another is taken. Written
+                // as a struct expression, the `job_id` temporary lived to the end of that
+                // expression and was still held when `admission` was locked — the opposite of
+                // `snapshots`' order, which is a cycle between the poll and this report.
+                let job_id = *s.job_id.lock().unwrap();
+                let starting = s.admission.lock().unwrap().starting;
+                Claim { device: s.info.instance_id.clone(), phase: s.manager.status().phase, job_id, starting }
             })
             .collect()
     }
@@ -1188,6 +1208,7 @@ mod tests {
             assert_eq!(s.status.phase, driver_core::Phase::Idle, "{} should be connected", s.info.instance_id);
             assert!(s.status.actions.cut, "an idle cutter accepts a cut");
             assert_eq!(s.job_id, None, "nothing has run yet");
+            assert!(!s.claimed, "an idle cutter is not held for a dispatch");
         }
     }
 
@@ -1197,6 +1218,70 @@ mod tests {
         let from_devices: Vec<String> = host.devices().into_iter().map(|d| d.instance_id).collect();
         let from_snaps: Vec<String> = host.snapshots().into_iter().map(|s| s.info.instance_id).collect();
         assert_eq!(from_devices, from_snaps);
+    }
+
+    /// `snapshots` must not hold a slot's `admission` while it takes that slot's `job_id`. It did,
+    /// and `claims` — written as a struct expression whose `job_id` temporary outlived its own
+    /// statement — took the two the other way round, so a status poll racing the shutdown guard's
+    /// report wedged both threads. A daemon in that state holds `admission` forever: every later
+    /// dispatch blocks on it, and the watch thread that is the only caller of `exit` can no longer
+    /// honour SIGTERM, which is exactly the abandoned-cut outcome the guard exists to prevent.
+    ///
+    /// Pinned from the second lock, not the first: parking a reader on the lock it takes *first*
+    /// proves nothing, because it holds nothing yet. Holding `job_id` here forces the poll to park
+    /// on `job_id`, and `admission` being free once it is parked is the whole of the property —
+    /// one direction removed is a cycle removed, whichever order the other reader uses. `claims`
+    /// takes one lock per statement for the same reason, which its own `is_claimed` filter makes
+    /// untestable from outside: it parks on `admission` before it ever reaches `job_id`.
+    #[test]
+    fn a_status_poll_does_not_hold_admission_while_it_takes_a_job_id() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let host = Host::start(Arc::new(TwoCutterFactory));
+        let job_id = host.slot(CAMEO).unwrap().job_id.lock().unwrap();
+
+        // The thread says when it is about to be inside the call, so "not finished" cannot mean
+        // "never scheduled" — that reading would let the assertion below pass without the poll ever
+        // reaching a lock, which is a test that cannot fail rather than one that does not flake.
+        //
+        // The signal is necessarily *before* the call: nothing outside `snapshots` can observe entry
+        // into it without a seam in production code, which is not worth a lock-order test. What
+        // closes the gap instead is the length of the window against what it would take to survive
+        // it. A mutant holding `admission` across the `job_id` wait holds it from microseconds after
+        // this store until the wait ends, so every check below fails; for the mutant to pass, the
+        // thread's first statement after the store would have to go unscheduled for the whole
+        // half-second, having just been scheduled to run the store.
+        let entered = Arc::new(AtomicBool::new(false));
+        let polling = {
+            let (parked, entered) = (Arc::clone(&host), Arc::clone(&entered));
+            std::thread::spawn(move || {
+                entered.store(true, Ordering::SeqCst);
+                parked.snapshots()
+            })
+        };
+
+        let started_by = Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < started_by, "the poll thread never ran");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Its `admission` section is microseconds, so one long beat past entering the call leaves
+        // exactly one place it can be: parked on the `job_id` this test holds.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!polling.is_finished(), "the poll finished without ever taking the held `job_id`");
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            assert!(
+                host.slot(CAMEO).unwrap().admission.try_lock().is_ok(),
+                "the poll held `admission` while it waited for `job_id`, which is half a deadlock"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        drop(job_id);
+        polling.join().expect("the poll must finish once `job_id` is free");
     }
 
     #[test]
@@ -1356,6 +1441,13 @@ mod tests {
         assert!(!host.is_any_cut_active());
 
         host.slot(CAMEO).unwrap().admission.lock().unwrap().starting = true;
+        let snapshot = host
+            .snapshots()
+            .into_iter()
+            .find(|s| s.info.instance_id == CAMEO)
+            .unwrap();
+        assert!(snapshot.status.actions.cut, "status alone still calls it free");
+        assert!(snapshot.claimed, "the admission gap must travel over Snapshot");
 
         assert!(matches!(host.reconnect(CAMEO), Err(Refusal::Device(DeviceError::Busy))));
         assert!(host.is_any_cut_active(), "and the daemon must not exit past it either");

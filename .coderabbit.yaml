@@ -11,7 +11,8 @@ reviews:
     - "!docs/**"
     - "!**/*.png"
     - "!**/*.svg"
-    - "!Cargo.lock"
+    - "!**/Cargo.lock"
+    - "!**/package-lock.json"
   path_instructions:
     - path: "crates/**"
       instructions: |

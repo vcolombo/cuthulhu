@@ -1,0 +1,28 @@
+# CodeRabbit review configuration for cuthulhu.
+#
+# Rust workspace (crates) + TypeScript apps. Root CLAUDE.md / AGENTS.md are
+# auto-ingested by CodeRabbit as review criteria; this file adds path
+# filters and per-area focus. Docs and lockfiles are excluded from review.
+language: en-US
+reviews:
+  auto_review:
+    drafts: false
+  path_filters:
+    - "!docs/**"
+    - "!**/*.png"
+    - "!**/*.svg"
+    - "!Cargo.lock"
+  path_instructions:
+    - path: "crates/**"
+      instructions: |
+        Rust code. Focus on ownership/borrowing errors, unwrap/expect
+        outside tests, and error propagation. Do not flag idiomatic
+        Result/Option handling as style issues.
+    - path: "apps/**"
+      instructions: |
+        TypeScript apps. Focus on null-safety, async error handling, and
+        type correctness. Do not comment on import order or formatting.
+    - path: "tools/**"
+      instructions: |
+        One-off tooling scripts. Lighter bar: flag security issues and
+        destructive operations only.

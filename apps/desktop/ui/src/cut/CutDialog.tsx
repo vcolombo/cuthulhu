@@ -1110,6 +1110,9 @@ export function CutDialog({
               // Until the defaults arrive there is nothing to fill the fields with, and a border
               // ticked then would start from an empty margin.
               disabled={weed === null && ranges === null}
+              title={weed !== null || ranges !== null ? undefined
+                : rangesError !== null ? `Weeding is unavailable: ${rangesError}`
+                : "Waiting for the weed defaults"}
               onChange={(e) => changeWeed({ ...weedDraft, border: e.target.checked })}
             />
             Border

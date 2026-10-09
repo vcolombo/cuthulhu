@@ -65,7 +65,8 @@ From `main` at `2057e75`:
 
     Pieces shorter than `MIN_WEED_PIECE_MM` (2 mm) are dropped. A nick that short weeds nothing
     and costs a blade lift. A pass that would need more than `MAX_WEED_LINES` (10 000) lines on
-    one axis is refused before any is built: lines are generated before preflight, under the
+    one axis, or whose lines would cost more than `MAX_WEED_WORK` (50 million) segment tests, is
+    refused before any is built, with its size in the sentence: lines are generated before preflight, under the
     document lock, and a stray scale would otherwise build millions (added in gate 1).
     (`// ponytail:` straight lines at a fixed spacing. Ceiling: no diagonal lines, and no lines
     that bend around shapes. Upgrade: #222's line-fill engine.)

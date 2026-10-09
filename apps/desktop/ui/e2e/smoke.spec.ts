@@ -481,6 +481,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // is out while the operator keeps typing, and then refused.
   let refuseHeldPlans = false;
   const heldPlans: (() => void)[] = [];
+  // The weed controls start from the defaults `settings_ranges` carries, so a test needs the window
+  // before they arrive, and the case where they never do.
+  let holdingRanges = false;
+  let rangesFail = false;
+  const heldRanges: (() => void)[] = [];
   const heldTravel: (() => void)[] = [];
   const release = (queue: (() => void)[]) => {
     queue.splice(0).forEach((f) => f());
@@ -523,6 +528,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     __armHold: () => { holding = true; },
     __releasePlans: () => release(heldPlans),
     __refuseHeldPlans: () => { refuseHeldPlans = true; },
+    __holdRanges: () => { holdingRanges = true; },
+    __releaseRanges: () => release(heldRanges),
+    __failRanges: () => { rangesFail = true; },
     __releaseTravel: () => release(heldTravel),
   });
 
@@ -611,7 +619,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   }
 
   // Mirrors cutplan::weed::weed_geometry for what the fixtures hold: axis-aligned rects. For a
-  // closed axis-aligned rect, the band clipping plus the even-odd test reduce exactly to blocking
+  // closed axis-aligned rect, the band clipping plus the winding test reduce exactly to blocking
   // the rect's box grown by the clearance, so this is the real output, not an approximation of it.
   type Box = { x: number; y: number; w: number; h: number };
   function weedFor(boxes: Box[], w: WeedOptions): [number, number][][] {
@@ -1087,13 +1095,18 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
     // to answer something; the casing and the numbers are pinned on the Rust side.
-    settings_ranges: () => ({
-      speed: { min: 1, max: 30 },
-      force: { min: 1, max: 33 },
-      repeatCount: { min: 1, max: 10 },
-      weed: WEED_RANGES,
-      weedDefaults: { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
-    }),
+    settings_ranges: () => {
+      const ranges = {
+        speed: { min: 1, max: 30 },
+        force: { min: 1, max: 33 },
+        repeatCount: { min: 1, max: 10 },
+        weed: WEED_RANGES,
+        weedDefaults: { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
+      };
+      if (rangesFail) throw ipcError("io", "settings ranges could not be read");
+      if (holdingRanges) return new Promise((resolve) => heldRanges.push(() => resolve(ranges)));
+      return ranges;
+    },
     // Every refusal `desktop::device::save_preset` makes, because the editor is what must never
     // send one: an entry under a builtin's pair shadows a shipped material with no way back, an
     // id-less entry is dropped on load (a save the operator never gets back), and a setting out of
@@ -1591,6 +1604,27 @@ test("changing the grouping keeps the weed", async ({ page }) => {
   await page.getByLabel("Group passes by").selectOption("Single");
   // One pass over both rects, so one border around both.
   await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+test("Border waits for the weed defaults, and says why while it waits or when they fail", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.evaluate(() => (window as unknown as { __holdRanges: () => void }).__holdRanges());
+  await page.getByRole("button", { name: "Cut" }).click();
+  const border = page.getByLabel("Weed border");
+  // Ticked now it would start from an empty margin.
+  await expect(border).toBeDisabled();
+  await expect(border).toHaveAttribute("title", "Waiting for the weed defaults");
+  await page.evaluate(() => (window as unknown as { __releaseRanges: () => Promise<void> }).__releaseRanges());
+  await border.check();
+  await expect(page.getByLabel("Weed margin")).toHaveValue("3");
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.reload();
+  await page.evaluate(() => (window as unknown as { __failRanges: () => void }).__failRanges());
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByLabel("Weed border")).toBeDisabled();
+  await expect(page.getByLabel("Weed border")).toHaveAttribute("title", /Weeding is unavailable: settings ranges could not be read/);
 });
 
 test("reopening the cut dialog keeps the weed controls as they were left", async ({ page }) => {

@@ -641,6 +641,21 @@ mod tests {
         assert!((red_right - 33.0).abs() < 1e-9, "red border right edge {red_right}");
     }
 
+    /// The cap is refused through the plan, not swallowed: a pass that would build too many lines
+    /// fails `plan_passes_for` with the weed's own sentence.
+    #[test]
+    fn a_pass_too_large_for_weed_lines_refuses_the_plan() {
+        let mut doc = two_colour_rects();
+        let id = doc.nodes[&doc.root].children[0];
+        let mut node = doc.nodes[&id].clone();
+        node.transform = geometry::Affine([1.0e8, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        doc.nodes.insert(id, node);
+        let opts = WeedOptions { margin_mm: 3.0, lines: crate::weed::WeedLines::Vertical, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let err = plan_passes_for(&doc, Grouping::Color, Some(&opts)).unwrap_err();
+        assert!(matches!(err, PlanError::Weed(_)), "{err:?}");
+        assert!(err.to_string().contains("too large or detailed for weed lines 5 mm apart"), "{err}");
+    }
+
     #[test]
     fn weed_options_out_of_range_refuse_the_plan() {
         let opts = WeedOptions { margin_mm: 0.1, lines: crate::weed::WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.5 };

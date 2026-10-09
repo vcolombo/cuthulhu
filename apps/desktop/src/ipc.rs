@@ -446,7 +446,12 @@ mod tests {
         let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["force", "repeatCount", "speed", "weed", "weedDefaults"]);
-        assert_eq!(json["weed"]["margin_mm"], serde_json::json!({ "min": 0.5, "max": 50.0 }));
+        // All of it, since the e2e fake hardcodes the same numbers and would drift silently.
+        assert_eq!(json["weed"], serde_json::json!({
+            "margin_mm": { "min": 0.5, "max": 50.0 },
+            "spacing_mm": { "min": 5.0, "max": 500.0 },
+            "clearance_mm": { "min": 0.2, "max": 20.0 },
+        }));
         assert_eq!(json["weedDefaults"], serde_json::json!({
             "margin_mm": 3.0, "lines": "None", "spacing_mm": 25.0, "clearance_mm": 1.5,
         }));

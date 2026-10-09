@@ -16,8 +16,8 @@ use crate::passes::PlannedShape;
 pub enum WeedLines { None, Horizontal, Vertical, Both }
 
 /// What to weed, in millimetres. One value per cut, applied to every pass in it.
-/// (`ponytail:` no per-pass options. Ceiling: one cut cannot border the red sheet and leave the
-/// blue one bare. Upgrade: a weed field on the dialog's pass row.)
+// ponytail: no per-pass options. Ceiling: one cut cannot border the red sheet and leave the blue
+// one bare. Upgrade: a weed field on the dialog's pass row.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct WeedOptions {
     /// How far the border stands off the pass's bounds.
@@ -63,6 +63,11 @@ pub const MIN_WEED_PIECE_MM: f64 = 2.0;
 /// minimum spacing is a 50 m roll, past any cutter here.
 pub const MAX_WEED_LINES: f64 = 10_000.0;
 
+/// The most segment tests one pass's lines may cost (each line is scanned against every segment).
+/// The line cap alone left a dense trace on a wide pass at billions of tests, on every keystroke
+/// in the dialog. Fifty million is a fraction of a second.
+pub const MAX_WEED_WORK: f64 = 50_000_000.0;
+
 /// Weed options refused, as a sentence naming the field. Never clamped: a margin quietly cut to
 /// 50 mm is a border the operator did not ask for.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,27 +109,37 @@ impl WeedOptions {
 /// The weed geometry for one pass: lines first, then the border, which is cut last so the sheet
 /// stays held while the blade still has detail to cut. Nothing for a pass with no points, or
 /// with bounds that are not finite: preflight then refuses the shape by its id. Refused when the
-/// pass is so large that its lines would pass `MAX_WEED_LINES`.
+/// pass is so large or detailed that its lines would pass `MAX_WEED_LINES` or `MAX_WEED_WORK`.
 /// `opts` is assumed valid (`WeedOptions::validate`).
-///
-/// (`ponytail:` the border is the bounding box grown by the margin, not a contour. Ceiling: an
-/// L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
-/// from #159's path offset.)
-/// (`ponytail:` straight lines at a fixed spacing, each scanned against every segment, so the cost
-/// is lines × segments and the dialog pays it per keystroke. Ceiling: no diagonal lines, no lines
-/// that bend around shapes, and a slow replan on a dense trace. Upgrade: #222's line-fill engine.)
 pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<Polyline>, WeedError> {
+    // ponytail: the border is the bounding box grown by the margin, not a contour. Ceiling: an
+    // L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
+    // from #159's path offset.
+    // ponytail: straight lines at a fixed spacing, each scanned against every segment, so the cost
+    // is lines × segments and the dialog pays it per keystroke (`MAX_WEED_WORK` bounds it). Ceiling:
+    // no diagonal lines, no lines that bend around shapes. Upgrade: #222's line-fill engine.
     let Some((x0, y0, x1, y1)) = bounds(shapes) else { return Ok(vec![]) };
     let m = opts.margin_mm;
     let (left, top, right, bottom) = (x0 - m, y0 - m, x1 + m, y1 + m);
-    if opts.lines != WeedLines::None && ((right - left).max(bottom - top) / opts.spacing_mm).abs() > MAX_WEED_LINES {
-        return Err(WeedError(format!(
-            "this pass is too large for weed lines {} mm apart; raise the spacing or leave the lines off",
-            opts.spacing_mm,
-        )));
+    let horizontal = matches!(opts.lines, WeedLines::Horizontal | WeedLines::Both);
+    let vertical = matches!(opts.lines, WeedLines::Vertical | WeedLines::Both);
+    if horizontal || vertical {
+        let across = |extent: f64, on: bool| if on { extent / opts.spacing_mm } else { 0.0 };
+        let (rows, columns) = (across(bottom - top, horizontal), across(right - left, vertical));
+        let segments = shapes.iter().flat_map(|s| &s.polylines).map(|p| p.len().saturating_sub(1)).sum::<usize>();
+        // `!(n <= cap)` rather than `n > cap`, so a NaN from a spacing nobody validated is refused too.
+        let within = |n: f64, cap: f64| n <= cap;
+        if !(within(rows, MAX_WEED_LINES) && within(columns, MAX_WEED_LINES)
+            && within((rows + columns) * segments as f64, MAX_WEED_WORK))
+        {
+            return Err(WeedError(format!(
+                "this pass ({:.0} × {:.0} mm, {segments} segments) is too large or detailed for weed lines {} mm apart; raise the spacing or leave the lines off",
+                right - left, bottom - top, opts.spacing_mm,
+            )));
+        }
     }
     let mut out = vec![];
-    if matches!(opts.lines, WeedLines::Horizontal | WeedLines::Both) {
+    if horizontal {
         let outlines: Vec<Vec<&Polyline>> = shapes.iter().map(|s| s.polylines.iter().collect()).collect();
         for y in steps(top, bottom, opts.spacing_mm) {
             for (a, b) in pieces(&outlines, y, left, right, opts.clearance_mm) {
@@ -132,7 +147,7 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<
             }
         }
     }
-    if matches!(opts.lines, WeedLines::Vertical | WeedLines::Both) {
+    if vertical {
         // The same scan with the axes swapped, so one clipping routine serves both directions.
         let swapped: Vec<Vec<Polyline>> = shapes.iter()
             .map(|s| s.polylines.iter().map(|p| p.iter().map(|q| Point { x: q.y, y: q.x }).collect()).collect())
@@ -394,17 +409,42 @@ mod tests {
     /// of lines under the document lock.
     #[test]
     fn a_pass_too_large_for_its_line_spacing_is_refused_before_any_line_is_built() {
-        let huge = [shape(vec![rect(0.0, 0.0, 1.0e9, 10.0)])];
-        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let wide = [shape(vec![rect(0.0, 0.0, 1.0e9, 10.0)])];
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Vertical, spacing_mm: 5.0, clearance_mm: 1.5 };
         assert_eq!(
-            weed_geometry(&huge, &o).unwrap_err().to_string(),
-            "this pass is too large for weed lines 5 mm apart; raise the spacing or leave the lines off",
+            weed_geometry(&wide, &o).unwrap_err().to_string(),
+            "this pass (1000000006 × 16 mm, 4 segments) is too large or detailed for weed lines 5 mm apart; raise the spacing or leave the lines off",
         );
+        // Each axis counts its own lines: a tall pass refuses horizontal lines, and its few vertical
+        // ones are fine.
+        let tall = [shape(vec![rect(0.0, 0.0, 10.0, 1.0e9)])];
+        assert!(weed_geometry(&tall, &WeedOptions { lines: WeedLines::Horizontal, ..o }).is_err());
+        assert!(weed_geometry(&tall, &o).is_ok());
         // The border alone is still built: it is one polyline at any size, and preflight refuses it.
-        assert_eq!(weed_geometry(&huge, &WeedOptions { lines: WeedLines::None, ..o }).unwrap().len(), 1);
+        assert_eq!(weed_geometry(&wide, &WeedOptions { lines: WeedLines::None, ..o }).unwrap().len(), 1);
         // 10 000 lines exactly is allowed: a 50 m pass at 5 mm.
         let roll = [shape(vec![rect(3.0, 3.0, 49_994.0, 10.0)])];
-        assert!(weed_geometry(&roll, &WeedOptions { lines: WeedLines::Horizontal, ..o }).is_ok());
+        assert!(weed_geometry(&roll, &o).is_ok());
+        let longer = [shape(vec![rect(3.0, 3.0, 49_995.0, 10.0)])];
+        assert!(weed_geometry(&longer, &o).is_err());
+    }
+
+    /// A pass of ordinary size can still be too detailed: lines × segments is the cost.
+    #[test]
+    fn a_pass_too_detailed_for_its_line_spacing_is_refused() {
+        // 300 000 segments zigzagging inside 500 mm, and about 200 lines at 5 mm: 60 million tests.
+        let trace: Polyline = (0..=300_000).map(|i| Point { x: (i % 500) as f64, y: (i % 499) as f64 }).collect();
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let err = weed_geometry(&[shape(vec![trace.clone()])], &o).unwrap_err().to_string();
+        assert!(err.contains("300000 segments") && err.contains("too large or detailed"), "{err}");
+        // A wider spacing means fewer lines and brings it under.
+        assert!(weed_geometry(&[shape(vec![trace])], &WeedOptions { spacing_mm: 20.0, ..o }).is_ok());
+    }
+
+    #[test]
+    fn a_spacing_that_is_not_a_number_is_refused_not_looped_on() {
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: f64::NAN, clearance_mm: 1.5 };
+        assert!(weed_geometry(&[shape(vec![rect(0.0, 0.0, 10.0, 10.0)])], &o).is_err());
     }
 
     #[test]

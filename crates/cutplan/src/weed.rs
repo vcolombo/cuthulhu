@@ -49,6 +49,11 @@ pub const WEED_RANGES: WeedRanges = WeedRanges {
     clearance_mm: WeedRange { min: 0.2, max: 20.0 },
 };
 
+/// Where the dialog and the CLI start: a border only. Starting values like the ranges, tuned by the
+/// hardware checks, and kept here so neither caller restates them.
+pub const WEED_DEFAULTS: WeedOptions =
+    WeedOptions { margin_mm: 3.0, lines: WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.5 };
+
 /// A line piece shorter than this is dropped: it weeds nothing and costs a blade lift.
 pub const MIN_WEED_PIECE_MM: f64 = 2.0;
 
@@ -385,6 +390,12 @@ mod tests {
         assert_eq!(WeedOptions { margin_mm: 0.5, lines: WeedLines::None, ..ok }.validate(), Ok(()));
         assert_eq!(WeedOptions { margin_mm: 50.0, spacing_mm: 500.0, clearance_mm: 20.0, ..ok }.validate(), Ok(()));
         assert_eq!(WeedOptions { spacing_mm: 5.0, clearance_mm: 0.2, ..ok }.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_defaults_are_valid_with_lines_on_too() {
+        assert_eq!(WEED_DEFAULTS.validate(), Ok(()));
+        assert_eq!(WeedOptions { lines: WeedLines::Both, ..WEED_DEFAULTS }.validate(), Ok(()));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHand
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 use cutplan::Grouping;
+use cutplan::weed::WeedOptions;
 
 pub type AppStateHandle = Mutex<AppState>;
 
@@ -155,8 +156,8 @@ pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Op
 }
 
 #[tauri::command]
-pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping) -> Result<PlanCutResponse, IpcError> {
-    plan_cut_response(&state.lock().unwrap().editor.doc, grouping)
+pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping, weed: Option<WeedOptions>) -> Result<PlanCutResponse, IpcError> {
+    plan_cut_response(&state.lock().unwrap().editor.doc, grouping, weed.as_ref())
 }
 
 #[tauri::command]
@@ -164,10 +165,11 @@ pub fn travel_for_order(
     state: tauri::State<AppStateHandle>,
     doc_revision: String,
     grouping: Grouping,
+    weed: Option<WeedOptions>,
     passes: Vec<TravelPassDto>,
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Fully qualified because the command and the function it forwards to share a name.
-    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, &passes)
+    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, weed.as_ref(), &passes)
 }
 
 // async: prepare_cut briefly locks the document (plan + preflight), then the
@@ -211,9 +213,23 @@ pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) 
 
 /// The preset editor is told the bounds rather than restating them: a second copy in TypeScript
 /// offers the operator a speed `cutplan` then refuses (the arrangement `trace_controls` uses).
+/// Both sets of bounds in one answer, flattened so the settings keep the shape the preset editor
+/// already reads, with the weed bounds and starting values beside them.
+#[derive(serde::Serialize)]
+pub struct Ranges {
+    #[serde(flatten)]
+    settings: cutplan::preflight::SettingsRanges,
+    weed: cutplan::weed::WeedRanges,
+    weed_defaults: cutplan::weed::WeedOptions,
+}
+
 #[tauri::command]
-pub fn settings_ranges() -> Result<cutplan::preflight::SettingsRanges, IpcError> {
-    Ok(cutplan::preflight::SETTINGS_RANGES)
+pub fn settings_ranges() -> Result<Ranges, IpcError> {
+    Ok(Ranges {
+        settings: cutplan::preflight::SETTINGS_RANGES,
+        weed: cutplan::weed::WEED_RANGES,
+        weed_defaults: cutplan::weed::WEED_DEFAULTS,
+    })
 }
 
 #[tauri::command]

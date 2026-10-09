@@ -165,5 +165,7 @@ real network can confirm the swap end to end.
       values that weed cleanly here.
 - [ ] Lines: Both at 25 mm on the densest real job at hand (a full sheet of small lettering, a
       trace): it is planned without "too large or detailed", and typing in a weed field does not
-      lag. The work budget (`cutplan::weed::MAX_WEED_WORK`) leaves about 5x a 300-letter sheet by
-      estimate, unmeasured; raise it, or take the sorted-crossing upgrade, if a real job hits it.
+      lag. The work budget (`cutplan::weed::MAX_WEED_WORK`, 50M tests) measured about 2.9M for a
+      synthetic trace of 1000 closed 100-sided blobs over 300 mm at the defaults (test
+      `a_dense_trace_at_the_default_spacing_is_weeded_not_refused`); raise it, or take the
+      sorted-crossing upgrade, if a real job hits it.

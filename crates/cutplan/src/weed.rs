@@ -64,7 +64,7 @@ pub const MIN_WEED_PIECE_MM: f64 = 2.0;
 pub const MAX_WEED_LINES: f64 = 10_000.0;
 
 /// The most segment tests one pass's lines may cost: the scan of each line against every segment,
-/// and the inside test of each piece left over against every closed outline. Charged as the work
+/// and the inside test of each piece left over against the outlines whose box holds it. Charged as the work
 /// is done (`Budget`), so it bounds the time whatever the shapes look like; the line cap alone left
 /// a dense trace on a wide pass at billions of tests, on every keystroke in the dialog. Fifty
 /// million is a fraction of a second.
@@ -158,8 +158,8 @@ fn weed_geometry_within(shapes: &[PlannedShape], opts: &WeedOptions, budget: &mu
     // L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
     // from #159's path offset.
     // ponytail: straight lines at a fixed spacing, each scanned against every segment and sorted,
-    // and each piece tested inside against every closed outline, so the cost is about
-    // lines × (segments log segments + pieces × closed segments), paid per keystroke in the dialog
+    // and each piece tested inside against the filled shapes whose box holds it, so the cost is about
+    // lines × (segments log segments + pieces × (shapes + nearby segments)), paid per keystroke in the dialog
     // (`MAX_WEED_WORK` bounds it, refusing the densest designs).
     // Ceiling: no diagonal lines, no lines that bend around shapes, and a dense comb is refused
     // rather than weeded. Upgrade: #222's line-fill engine, or a sorted sweep of each line's signed
@@ -181,14 +181,12 @@ fn weed_geometry_within(shapes: &[PlannedShape], opts: &WeedOptions, budget: &mu
             return Err(too_much());
         }
     }
-    let closed = shapes.iter().flat_map(|s| &s.polylines)
-        .filter(|p| is_closed(p)).map(|p| p.len() - 1).sum::<usize>();
     let mut out = vec![];
     if horizontal {
         let outlines: Vec<Vec<&Polyline>> = shapes.iter().map(|s| s.polylines.iter().collect()).collect();
         let fills = filled(&outlines);
         for y in steps(top, bottom, opts.spacing_mm) {
-            let line = pieces(&outlines, &fills, y, left, right, opts.clearance_mm, (segments, closed), budget);
+            let line = pieces(&outlines, &fills, y, left, right, opts.clearance_mm, segments, budget);
             for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x: a, y }, Point { x: b, y }]);
             }
@@ -202,7 +200,7 @@ fn weed_geometry_within(shapes: &[PlannedShape], opts: &WeedOptions, budget: &mu
         let outlines: Vec<Vec<&Polyline>> = swapped.iter().map(|s| s.iter().collect()).collect();
         let fills = filled(&outlines);
         for x in steps(left, right, opts.spacing_mm) {
-            let line = pieces(&outlines, &fills, x, top, bottom, opts.clearance_mm, (segments, closed), budget);
+            let line = pieces(&outlines, &fills, x, top, bottom, opts.clearance_mm, segments, budget);
             for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x, y: a }, Point { x, y: b }]);
             }
@@ -240,10 +238,10 @@ fn steps(from: f64, to: f64, spacing: f64) -> impl Iterator<Item = f64> {
 
 /// The parts of the horizontal line `y` between `lo` and `hi` that keep `clearance` from every
 /// outline and lie outside every shape's filled area, or None once `budget` runs out. `counts` is
-/// the pass's (segments, closed-outline segments): what the scan and each inside test cost.
+/// the pass's segment count, what the scan costs.
 fn pieces(
-    shapes: &[Vec<&Polyline>], fills: &[Vec<&Polyline>], y: f64, lo: f64, hi: f64, clearance: f64,
-    (segments, closed): (usize, usize), budget: &mut Budget,
+    shapes: &[Vec<&Polyline>], fills: &[Fill], y: f64, lo: f64, hi: f64, clearance: f64,
+    segments: usize, budget: &mut Budget,
 ) -> Option<Vec<(f64, f64)>> {
     budget.spend(segments)?;
     let mut blocked: Vec<(f64, f64)> = vec![];
@@ -275,9 +273,19 @@ fn pieces(
     // not a hole in the shape around it, so the waste between them is not weeded.
     let mut kept = vec![];
     for (a, b) in free.into_iter().filter(|&(a, b)| b - a >= MIN_WEED_PIECE_MM) {
-        budget.spend(closed)?;
         let mid = Point { x: (a + b) / 2.0, y };
-        if !fills.iter().any(|outline| winding(outline, mid) != 0) {
+        // One box check per shape, and a winding count only where the box holds the point: a piece
+        // is near one or two shapes of a trace, not all thousand of them.
+        budget.spend(fills.len())?;
+        let mut inside = false;
+        for fill in fills.iter().filter(|f| f.holds(mid)) {
+            budget.spend(fill.segments)?;
+            if winding(&fill.outlines, mid) != 0 {
+                inside = true;
+                break;
+            }
+        }
+        if !inside {
             budget.keep_piece()?;
             kept.push((a, b));
         }
@@ -308,12 +316,29 @@ fn band_span(a: Point, b: Point, y: f64, c: f64) -> Option<(f64, f64)> {
 /// Whether a polyline is closed: flattening pushes a subpath's exact start point on `Close`.
 fn is_closed(p: &Polyline) -> bool { p.len() > 2 && p.first() == p.last() }
 
+/// A shape's closed polylines with their box and segment count, for the inside test.
+struct Fill<'a> { outlines: Vec<&'a Polyline>, x0: f64, y0: f64, x1: f64, y1: f64, segments: usize }
+
+impl Fill<'_> {
+    /// Outside its box a point winds zero, so only shapes whose box holds it are asked.
+    fn holds(&self, p: Point) -> bool { p.x >= self.x0 && p.x <= self.x1 && p.y >= self.y0 && p.y <= self.y1 }
+}
+
 /// Each shape's closed polylines, and only shapes that have one: an open path has no inside, so the
 /// inside test (`winding`) never needs to visit it, and its cost is then what `Budget` charges.
-fn filled<'a>(shapes: &[Vec<&'a Polyline>]) -> Vec<Vec<&'a Polyline>> {
+fn filled<'a>(shapes: &[Vec<&'a Polyline>]) -> Vec<Fill<'a>> {
     shapes.iter()
-        .map(|s| s.iter().copied().filter(|p| is_closed(p)).collect::<Vec<_>>())
-        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let outlines: Vec<&Polyline> = s.iter().copied().filter(|p| is_closed(p)).collect();
+            let points = || outlines.iter().flat_map(|p| p.iter());
+            let first = points().next()?;
+            let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+            for q in points() {
+                (x0, y0, x1, y1) = (x0.min(q.x), y0.min(q.y), x1.max(q.x), y1.max(q.y));
+            }
+            let segments = outlines.iter().map(|p| p.len() - 1).sum();
+            Some(Fill { outlines, x0, y0, x1, y1, segments })
+        })
         .collect()
 }
 
@@ -594,9 +619,29 @@ mod tests {
         let c = cost(&shapes, &o);
         let lines = steps(-3.0, 103.0, 5.0).count() as f64;
         let segments = 1999.0;
-        // Without the sort charge the cost is the scans plus one test per piece (nothing is closed).
+        // Without the sort charge the cost is the scans plus one test per piece (nothing is closed,
+        // so each piece pays only the minimum charge for its box checks).
         let scans_and_pieces = lines * segments + c.pieces as f64;
         assert!(c.tests > 3.0 * scans_and_pieces, "{} tests against {scans_and_pieces} for scans and pieces", c.tests);
+    }
+
+    /// A traced design at the defaults must fit the budget: 1000 closed 100-sided blobs (100 000
+    /// segments) over 300 × 300 mm, lines both ways at 25 mm. Each piece's inside test must not
+    /// walk every outline in the pass, or a trace like this is refused at the default spacing.
+    #[test]
+    fn a_dense_trace_at_the_default_spacing_is_weeded_not_refused() {
+        let blobs: Vec<PlannedShape> = (0..1000).map(|i| {
+            let (cx, cy) = (5.0 + 9.5 * (i % 32) as f64, 5.0 + 9.5 * (i / 32) as f64);
+            let mut ring: Polyline = (0..100).map(|k| {
+                let t = k as f64 * std::f64::consts::TAU / 100.0;
+                Point { x: cx + 3.0 * t.cos(), y: cy + 3.0 * t.sin() }
+            }).collect();
+            ring.push(ring[0]);
+            shape(vec![ring])
+        }).collect();
+        let o = WeedOptions { lines: WeedLines::Both, ..WEED_DEFAULTS };
+        let c = cost(&blobs, &o);
+        assert!(c.tests < MAX_WEED_WORK / 5.0, "{} tests: too close to the budget for a routine job", c.tests);
     }
 
     /// The output is bounded too: open sticks cost one test per piece, but there can be too many.

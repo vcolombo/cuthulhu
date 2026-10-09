@@ -27,7 +27,11 @@ import {
   presetIdForKey,
   presetPicker,
   rowPresetLookup,
+  readWeedDraft,
+  weedDraftFrom,
   type AimedPresets,
+  type WeedDraft,
+  type WeedField,
   type PassVm,
   type Caps,
   type Preset,
@@ -38,7 +42,12 @@ import {
 // machine does not support, so an optimistic default here cannot mis-send anything.
 const ALL_ENABLED: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };
 
-type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[] };
+type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[]; weed: [number, number][][] };
+
+/** Before the ranges (and so the defaults) arrive: no weeding, with nothing typed. */
+const NO_WEED: WeedDraft = { border: false, margin: "", lines: "None", spacing: "", clearance: "" };
+
+const sameWeed = (a: ipc.WeedOptions | null, b: ipc.WeedOptions | null) => JSON.stringify(a) === JSON.stringify(b);
 
 /** A plan the dialog is showing: the mode that produced it, the revision it was planned
  *  against, its rows, its skipped count, and the travel between those rows. One value because
@@ -54,6 +63,8 @@ type PassRow = PassVm & { nodeIds: number[]; starts: ([number, number] | null)[]
  */
 type InstalledPlan = {
   grouping: ipc.Grouping;
+  /** The weed options the rows were planned with, held here for the same reason as the mode. */
+  weed: ipc.WeedOptions | null;
   revision: string;
   rows: PassRow[];
   skippedNotCut: number;
@@ -69,6 +80,10 @@ type Props = {
   onConvertMachine: (machineId: string) => void;
   onError: (msg: string) => void;
   onClose: () => void;
+  /** The weed controls as last left, kept by App for the session; null until first changed, when
+   *  they start from the backend's defaults. */
+  weed: WeedDraft | null;
+  onWeedChange: (draft: WeedDraft) => void;
 };
 
 const panelStyle: CSSProperties = {
@@ -126,6 +141,8 @@ export function CutDialog({
   onConvertMachine,
   onError,
   onClose,
+  weed,
+  onWeedChange,
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
   const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
@@ -178,6 +195,12 @@ export function CutDialog({
    *  previous mode would otherwise be sendable under this one. */
   const [grouping, setGrouping] = useState<ipc.Grouping>("Color");
   const [replanning, setReplanning] = useState(false);
+  const weedDraft: WeedDraft = weed ?? (ranges ? weedDraftFrom(ranges.weedDefaults, false) : NO_WEED);
+  const weedRead = readWeedDraft(weedDraft, ranges?.weed ?? null);
+  /** The weed on screen is the weed the rows were planned with. Cut waits for both: a draft that
+   *  does not read must not cut without its border, and one that reads differently from the plan
+   *  has not been previewed. */
+  const weedSettled = weedRead.ok && sameWeed(weedRead.options, plan?.weed ?? null);
   const [stalePlan, setStalePlan] = useState(false);
   /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
    *  started. Cleared by the next press of Cut, which is the thing that makes it untrue. */
@@ -241,7 +264,8 @@ export function CutDialog({
   /** Serial number of the newest Replan, so two in flight cannot install out of order. */
   const planSeq = useRef(0);
 
-  const replan = (mode: ipc.Grouping = grouping) => {
+  // A draft that does not read plans with the weed already installed, so Replan still works.
+  const replan = (mode: ipc.Grouping = grouping, weedOptions: ipc.WeedOptions | null = weedRead.ok ? weedRead.options : plan?.weed ?? null) => {
     const seq = ++planSeq.current;
     setReplanning(true);
     // Nothing is cleared or orphaned on the way out. The previous plan stays installed until this
@@ -255,7 +279,7 @@ export function CutDialog({
     // rows a pending reply was computed for stop being the rows on screen. A reply landing before
     // then was asked for against the plan that is still installed, so it is not stale at all.
     ipc
-      .planCut(mode)
+      .planCut(mode, weedOptions)
       .then((response) => {
         if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
         // The rows are about to change, so every travel reply owed to the old ones is stale from
@@ -265,6 +289,7 @@ export function CutDialog({
         travelSeq.current++;
         setPlan({
           grouping: mode,
+          weed: weedOptions,
           revision: response.doc_revision,
           skippedNotCut: response.skipped_not_cut,
           rows: response.passes.map((p) => ({
@@ -272,6 +297,7 @@ export function CutDialog({
             shapeCount: p.shape_count,
             nodeIds: p.node_ids,
             starts: p.starts,
+            weed: p.weed,
             enabled: true,
             // A preset-keyed pass starts with the preset it is keyed on, or it would be cut
             // with defaults — the one thing grouping by material exists to avoid.
@@ -291,6 +317,8 @@ export function CutDialog({
         // plan, the dialog would offer a Cut it cannot keep: the operator reads "one pass" and
         // the machine does the split the old plan still holds.
         setGrouping(plan?.grouping ?? "Color");
+        // The weed controls go back to the installed plan's too, for the same reason.
+        if (plan !== null) onWeedChange(plan.weed ? weedDraftFrom(plan.weed, true) : { ...weedDraft, border: false });
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => {
@@ -302,6 +330,39 @@ export function CutDialog({
     replan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Replanned at once, like a grouping change, whenever the draft reads: the preview has to show
+  // the border before it can be cut. Every reading change replans, even back to the installed
+  // weed, because an earlier replan may still be in flight and `planSeq` lets only the newest
+  // install. A draft that does not read plans nothing, and Cut waits (`weedSettled`).
+  const changeWeed = (next: WeedDraft) => {
+    onWeedChange(next);
+    const read = readWeedDraft(next, ranges?.weed ?? null);
+    if (read.ok) replan(grouping, read.options);
+  };
+
+  // Not disabled while a replan is in flight, unlike the row controls: every keystroke replans,
+  // and a field that locked itself mid-word would lose the caret. These fields are not rows, so
+  // nothing typed here is discarded by the plan that lands.
+  const weedInput = (field: WeedField, label: string, off: boolean, range: ipc.SettingRange | undefined) => {
+    const error = weedRead.ok ? undefined : weedRead.errors[field];
+    return (
+      <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+        {label}
+        <input
+          aria-label={`Weed ${field}`}
+          type="number"
+          step="0.1"
+          value={weedDraft[field]}
+          disabled={off}
+          aria-invalid={error !== undefined}
+          title={range ? `${range.min}–${range.max} mm` : undefined}
+          style={{ width: 56, ...(error ? { borderColor: "var(--cut)" } : {}) }}
+          onChange={(e) => changeWeed({ ...weedDraft, [field]: e.target.value })}
+        />
+      </label>
+    );
+  };
 
   // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
   // request/reply connection, so this interval is the only thing that moves a remote cutter's
@@ -678,8 +739,8 @@ export function CutDialog({
     // `replanning` guards the window a mode change opens: the rows on screen still belong to
     // the previous grouping until the new plan installs, and sending them under the new one
     // would cut whatever that mode happens to key the same way.
-    if (!connected || plan === null || replanning) return;
-    const request = toCutRequest(connected.instance_id, plan.revision, plan.grouping, plan.rows);
+    if (!connected || plan === null || replanning || !weedSettled) return;
+    const request = toCutRequest(connected.instance_id, plan.revision, plan.grouping, plan.weed, plan.rows);
     setAlreadyAccepted(false);
     setCutInFlight(true);
     ipc
@@ -734,7 +795,7 @@ export function CutDialog({
     if (plan === null) return;
     const seq = ++travelSeq.current;
     ipc
-      .travelForOrder(plan.revision, plan.grouping, toTravelPasses(next))
+      .travelForOrder(plan.revision, plan.grouping, plan.weed, toTravelPasses(next))
       .then((t) => {
         // Onto whatever plan is installed when the reply lands, not the one captured when it was
         // asked for: the sequence guard has already established they are the same plan.
@@ -1012,6 +1073,42 @@ export function CutDialog({
           </select>
         </label>
 
+        <fieldset style={{ border: "1px solid var(--border)", padding: 8, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, fontSize: 12 }}>
+          <legend>Weeding</legend>
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <input
+              type="checkbox"
+              aria-label="Weed border"
+              checked={weedDraft.border}
+              onChange={(e) => changeWeed({ ...weedDraft, border: e.target.checked })}
+            />
+            Border
+          </label>
+          {weedInput("margin", "Margin (mm)", !weedDraft.border, ranges?.weed.margin_mm)}
+          {/* Lines without a border would stop in the open sheet, so they wait for one. */}
+          <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            Lines
+            <select
+              aria-label="Weed lines"
+              value={weedDraft.lines}
+              disabled={!weedDraft.border}
+              onChange={(e) => changeWeed({ ...weedDraft, lines: e.target.value as ipc.WeedLines })}
+            >
+              <option value="None">None</option>
+              <option value="Horizontal">Horizontal</option>
+              <option value="Vertical">Vertical</option>
+              <option value="Both">Both</option>
+            </select>
+          </label>
+          {weedInput("spacing", "Spacing (mm)", !weedDraft.border || weedDraft.lines === "None", ranges?.weed.spacing_mm)}
+          {weedInput("clearance", "Clearance (mm)", !weedDraft.border || weedDraft.lines === "None", ranges?.weed.clearance_mm)}
+          {!weedRead.ok ? (
+            <div role="alert" style={{ color: "var(--cut)", width: "100%" }}>
+              {Object.values(weedRead.errors).join(". ")}.
+            </div>
+          ) : null}
+        </fieldset>
+
         {/* Every row control below is unavailable while `replanning`: these rows belong to the
             previous grouping, and the arriving plan replaces them wholesale — an edit accepted
             in that window is discarded without a trace (Greptile reproduced exactly that). */}
@@ -1145,7 +1242,7 @@ export function CutDialog({
             aria-label="Start Cut"
             style={btn}
             disabled={!status.actions.cut || !connected || machineMismatch || plan === null
-              || plan.rows.length === 0 || replanning || cutInFlight}
+              || plan.rows.length === 0 || replanning || cutInFlight || !weedSettled}
             onClick={startCut}
           >
             Start Cut

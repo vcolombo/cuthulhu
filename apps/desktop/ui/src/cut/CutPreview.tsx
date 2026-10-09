@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useRef } from "react";
 import type { Scene } from "../render/hittest";
-import { clippedEdges, contentBounds, fitViewport, parsePassKey } from "./viewmodel";
+import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds } from "./viewmodel";
 import type { PassKey } from "../ipc";
 
 const FALLBACK_BORDER = "#2E2E34";
@@ -23,6 +23,8 @@ export type PreviewPass = {
   /** Each shape's first world-space point from the plan, parallel to nodeIds. */
   starts: ([number, number] | null)[];
   enabled: boolean;
+  /** The pass's weed lines then its border, in world mm, cut after its shapes. */
+  weed: [number, number][][];
 };
 
 type Props = {
@@ -56,8 +58,10 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     const drawn = passes.flatMap((p) => p.nodeIds)
       .map((id) => nodesById.get(id)?.bounds)
       .filter((b): b is NonNullable<typeof b> => b !== undefined);
+    // The border stands outside every shape by its margin, so a fit to the shapes alone would crop it.
+    const weedBoxes = passes.flatMap((p) => polylineBounds(p.weed));
     const size = { w: canvas.width, h: canvas.height };
-    const vp = fitViewport(contentBounds(drawn, travel), artboard, size, 16);
+    const vp = fitViewport(contentBounds([...drawn, ...weedBoxes], travel), artboard, size, 16);
 
     ctx.setTransform(vp.scale, 0, 0, vp.scale, vp.tx, vp.ty);
     ctx.fillStyle = panel;
@@ -102,6 +106,18 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
           screen.addPath(local, vpM);
         }
         ctx.stroke(screen);
+      }
+      // In the pass's colour because it is cut with the pass, at a lighter alpha so it reads as
+      // added around the design rather than part of it.
+      ctx.globalAlpha = pass.enabled ? 0.55 : 0.2;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      for (const line of pass.weed) {
+        if (line.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(line[0][0] * vp.scale + vp.tx, line[0][1] * vp.scale + vp.ty);
+        for (const [x, y] of line.slice(1)) ctx.lineTo(x * vp.scale + vp.tx, y * vp.scale + vp.ty);
+        ctx.stroke();
       }
     });
     ctx.globalAlpha = 1;
@@ -171,9 +187,11 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
   // Counted from the same two arrays the effect above draws, so the sentence cannot drift from
   // the picture.
   const cutting = passes.filter((p) => p.enabled).length;
+  const weedPaths = passes.filter((p) => p.enabled).reduce((n, p) => n + p.weed.length, 0);
   const label =
     `Cut preview: ${cutting} ${cutting === 1 ? "pass" : "passes"}, ` +
-    `${travel.length} travel ${travel.length === 1 ? "move" : "moves"}`;
+    `${travel.length} travel ${travel.length === 1 ? "move" : "moves"}` +
+    (weedPaths > 0 ? `, ${weedPaths} weed ${weedPaths === 1 ? "path" : "paths"}` : "");
   return (
     <canvas
       ref={canvasRef}

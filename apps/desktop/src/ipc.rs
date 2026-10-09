@@ -215,7 +215,10 @@ pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) 
 /// offers the operator a speed `cutplan` then refuses (the arrangement `trace_controls` uses).
 /// Both sets of bounds in one answer, flattened so the settings keep the shape the preset editor
 /// already reads, with the weed bounds and starting values beside them.
+/// Keys in camelCase like `SettingsRanges`'s own. The weed values inside keep `WeedOptions`'s
+/// snake_case, the shape the dialog sends back in its requests.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Ranges {
     #[serde(flatten)]
     settings: cutplan::preflight::SettingsRanges,

@@ -596,8 +596,8 @@ mod tests {
     #[test]
     fn a_comb_that_passes_the_estimate_is_refused_by_the_work_it_actually_costs() {
         // 2000 closed 0.5 × 100 mm teeth 6 mm apart (2.5 mm left in each gap after the clearance):
-        // about 21 lines, each with 2000 pieces, each tested against 8000 segments, so about 340
-        // million tests while the estimate says 170 000.
+        // about 21 lines, each with 2000 pieces, each checked against 2000 boxes (no tooth's box
+        // holds a gap), so about 84 million tests while the estimate says 170 000.
         let teeth: Vec<PlannedShape> = (0..2000).map(|i| shape(vec![rect(6.0 * i as f64, 0.0, 0.5, 100.0)])).collect();
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
         let err = weed_geometry(&teeth, &o).unwrap_err().to_string();
@@ -630,18 +630,87 @@ mod tests {
     /// walk every outline in the pass, or a trace like this is refused at the default spacing.
     #[test]
     fn a_dense_trace_at_the_default_spacing_is_weeded_not_refused() {
+        // 2 mm blobs 9.5 mm apart leave 2.5 mm between neighbours after the clearance, so the
+        // lines that cross a row make real pieces there, each beside a box it must check.
         let blobs: Vec<PlannedShape> = (0..1000).map(|i| {
             let (cx, cy) = (5.0 + 9.5 * (i % 32) as f64, 5.0 + 9.5 * (i / 32) as f64);
-            let mut ring: Polyline = (0..100).map(|k| {
-                let t = k as f64 * std::f64::consts::TAU / 100.0;
-                Point { x: cx + 3.0 * t.cos(), y: cy + 3.0 * t.sin() }
-            }).collect();
-            ring.push(ring[0]);
-            shape(vec![ring])
+            shape(vec![circle(cx, cy, 2.0, 100, false)])
         }).collect();
         let o = WeedOptions { lines: WeedLines::Both, ..WEED_DEFAULTS };
         let c = cost(&blobs, &o);
         assert!(c.tests < MAX_WEED_WORK / 5.0, "{} tests: too close to the budget for a routine job", c.tests);
+        assert!(c.pieces > 100, "only {} pieces: the test would exercise little", c.pieces);
+        assert_no_piece_inside(&weed_geometry(&blobs, &o).unwrap(), &blobs);
+    }
+
+    /// A closed `n`-gon around (cx, cy), wound the other way when `hole`.
+    fn circle(cx: f64, cy: f64, r: f64, n: usize, hole: bool) -> Polyline {
+        let mut ring: Polyline = (0..n).map(|k| {
+            let t = k as f64 * std::f64::consts::TAU / n as f64;
+            Point { x: cx + r * t.cos(), y: cy + r * t.sin() }
+        }).collect();
+        if hole { ring.reverse(); }
+        ring.push(ring[0]);
+        ring
+    }
+
+    /// The inside test without the box filter: every line piece's midpoint winds zero for every
+    /// shape. The box can only skip a test, never add one, so a wrong box shows up here as a kept
+    /// piece inside a shape.
+    fn assert_no_piece_inside(out: &[Polyline], shapes: &[PlannedShape]) {
+        for piece in &out[..out.len() - 1] {
+            let mid = Point { x: (piece[0].x + piece[1].x) / 2.0, y: (piece[0].y + piece[1].y) / 2.0 };
+            for s in shapes {
+                // Lines run either way, so ask in the frame the piece was clipped in: a vertical
+                // piece is tested with the axes swapped, as `weed_geometry` does.
+                let vertical = piece[0].x == piece[1].x && piece[0].y != piece[1].y;
+                let swap = |p: &Point| if vertical { Point { x: p.y, y: p.x } } else { *p };
+                let polys: Vec<Polyline> = s.polylines.iter().filter(|p| is_closed(p))
+                    .map(|p| p.iter().map(swap).collect()).collect();
+                let refs: Vec<&Polyline> = polys.iter().collect();
+                assert_eq!(winding(&refs, swap(&mid)), 0, "piece {piece:?} lies inside a shape");
+            }
+        }
+    }
+
+    /// A piece inside a shape's box but outside the shape pays for the shape's outline: the box
+    /// only decides who is asked.
+    #[test]
+    fn a_piece_inside_a_shape_box_pays_for_its_outline() {
+        // One ring of 4000 + 4000 segments with a 160 mm hole: every piece in the hole is inside the
+        // ring's box and must wind its 8000 segments to learn it is outside.
+        let ring = [shape(vec![circle(100.0, 100.0, 100.0, 4000, false), circle(100.0, 100.0, 80.0, 4000, true)])];
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 10.0, clearance_mm: 1.5 };
+        let c = cost(&ring, &o);
+        assert!(c.pieces > 10, "{} pieces", c.pieces);
+        assert!(c.tests >= c.pieces as f64 * 8000.0, "{} tests for {} pieces", c.tests, c.pieces);
+        assert_no_piece_inside(&weed_geometry(&ring, &o).unwrap(), &ring);
+    }
+
+    /// The first shape that says inside decides, whichever order they come in: a ring's hole that a
+    /// second shape fills is not weeded.
+    #[test]
+    fn a_hole_filled_by_another_shape_is_not_weeded_in_either_order() {
+        let ring = shape(vec![rect(0.0, 0.0, 60.0, 60.0), hole(10.0, 10.0, 40.0, 40.0)]);
+        let plug = shape(vec![rect(10.0, 10.0, 40.0, 40.0)]);
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 7.0, clearance_mm: 1.5 };
+        for shapes in [[ring.clone(), plug.clone()], [plug.clone(), ring.clone()]] {
+            let out = weed_geometry(&shapes, &o).unwrap();
+            assert_no_piece_inside(&out, &shapes);
+            let in_hole = |p: &Point| p.x > 10.0 && p.x < 50.0 && p.y > 10.0 && p.y < 50.0;
+            assert!(out[..out.len() - 1].iter().all(|l| !(in_hole(&l[0]) && in_hole(&l[1]))), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn the_hole_cases_keep_no_piece_inside_a_shape_in_either_direction() {
+        let ring = [shape(vec![rect(0.0, 0.0, 60.0, 60.0), hole(10.0, 10.0, 40.0, 40.0)])];
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 7.0, clearance_mm: 1.5 };
+        let out = weed_geometry(&ring, &o).unwrap();
+        // Both directions find the hole.
+        assert!(out.iter().any(|l| l.len() == 2 && l[0].x == l[1].x && l[0].x > 10.0 && l[0].x < 50.0));
+        assert!(out.iter().any(|l| l.len() == 2 && l[0].y == l[1].y && l[0].y > 10.0 && l[0].y < 50.0));
+        assert_no_piece_inside(&out, &ring);
     }
 
     /// The output is bounded too: open sticks cost one test per piece, but there can be too many.

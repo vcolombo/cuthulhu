@@ -526,7 +526,8 @@ mod tests {
     fn the_early_check_refuses_a_spacing_that_is_not_positive() {
         assert!(lines_fit(2.0, 2.0, 4, 5.0));
         assert!(!lines_fit(-2.0, -2.0, 4, -5.0));
-        assert!(!lines_fit(f64::INFINITY, 0.0, 4, 0.0));
+        // Line counts every cap admits, so only the spacing refuses it.
+        assert!(!lines_fit(1.0, 1.0, 4, 0.0));
         assert!(!lines_fit(f64::NAN, 0.0, 4, f64::NAN));
     }
 
@@ -538,17 +539,21 @@ mod tests {
     }
 
     /// A grid of closed squares, so lines in both directions find pieces and pay for inside tests.
-    fn grid(n: usize) -> Vec<PlannedShape> {
-        (0..n * n).map(|i| shape(vec![rect(6.0 * (i % n) as f64, 6.0 * (i / n) as f64, 1.0, 1.0)])).collect()
+    /// Not square, so the two directions cost differently and a charge to the wrong one would show.
+    fn grid(columns: usize, rows: usize) -> Vec<PlannedShape> {
+        (0..columns * rows)
+            .map(|i| shape(vec![rect(6.0 * (i % columns) as f64, 6.0 * (i / columns) as f64, 1.0, 1.0)]))
+            .collect()
     }
 
     /// Horizontal and vertical lines draw on one budget, and a pass that fits it exactly is kept.
     #[test]
     fn both_directions_share_one_budget_and_a_pass_that_fits_it_exactly_is_kept() {
-        let shapes = grid(12);
+        let shapes = grid(12, 8);
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 1.5 };
         let (h, v) = (cost(&shapes, &WeedOptions { lines: WeedLines::Horizontal, ..o }), cost(&shapes, &WeedOptions { lines: WeedLines::Vertical, ..o }));
         let both = cost(&shapes, &o);
+        assert_ne!(h, v, "the grid must cost differently each way");
         assert_eq!(both, Budget { tests: h.tests + v.tests, pieces: h.pieces + v.pieces });
         assert!(both.pieces > 0 && both.tests > 0.0);
 
@@ -565,13 +570,33 @@ mod tests {
     /// each piece an inside test against every outline. The budget charges that as it is spent.
     #[test]
     fn a_comb_that_passes_the_estimate_is_refused_by_the_work_it_actually_costs() {
-        // 2000 closed 0.5 × 100 mm teeth 6 mm apart (gaps of 2.5 mm once the clearance is off):
+        // 2000 closed 0.5 × 100 mm teeth 6 mm apart (2.5 mm left in each gap after the clearance):
         // about 21 lines, each with 2000 pieces, each tested against 8000 segments, so about 340
         // million tests while the estimate says 170 000.
         let teeth: Vec<PlannedShape> = (0..2000).map(|i| shape(vec![rect(6.0 * i as f64, 0.0, 0.5, 100.0)])).collect();
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
         let err = weed_geometry(&teeth, &o).unwrap_err().to_string();
         assert!(err.contains("8000 segments") && err.contains("too large or detailed"), "{err}");
+    }
+
+    /// Each line's sort is charged, not only its scan: an open zigzag that every line crosses a
+    /// thousand times costs mostly sorting, which the scan and the pieces alone would not count.
+    #[test]
+    fn each_line_pays_for_sorting_what_blocks_it() {
+        // 1000 uprights 6 mm apart, joined top and bottom alternately: about 2000 segments, about
+        // 1000 of them across every line, so each sort is about 1000 × 9 comparisons.
+        let zigzag: Polyline = (0..1000).flat_map(|i| {
+            let x = 6.0 * i as f64;
+            if i % 2 == 0 { [Point { x, y: 0.0 }, Point { x, y: 100.0 }] } else { [Point { x, y: 100.0 }, Point { x, y: 0.0 }] }
+        }).collect();
+        let shapes = [shape(vec![zigzag])];
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let c = cost(&shapes, &o);
+        let lines = steps(-3.0, 103.0, 5.0).count() as f64;
+        let segments = 1999.0;
+        // Without the sort charge the cost is the scans plus one test per piece (nothing is closed).
+        let scans_and_pieces = lines * segments + c.pieces as f64;
+        assert!(c.tests > 3.0 * scans_and_pieces, "{} tests against {scans_and_pieces} for scans and pieces", c.tests);
     }
 
     /// The output is bounded too: open sticks cost one test per piece, but there can be too many.

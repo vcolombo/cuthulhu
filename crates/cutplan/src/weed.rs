@@ -57,6 +57,12 @@ pub const WEED_DEFAULTS: WeedOptions =
 /// A line piece shorter than this is dropped: it weeds nothing and costs a blade lift.
 pub const MIN_WEED_PIECE_MM: f64 = 2.0;
 
+/// The most weed lines one pass may have on one axis. Lines are generated before preflight sees
+/// the geometry, so a pass a kilometre wide (a stray scale, a huge SVG width) would otherwise
+/// build millions of them while the desktop holds the document lock. Ten thousand at the 5 mm
+/// minimum spacing is a 50 m roll, past any cutter here.
+pub const MAX_WEED_LINES: f64 = 10_000.0;
+
 /// Weed options refused, as a sentence naming the field. Never clamped: a margin quietly cut to
 /// 50 mm is a border the operator did not ask for.
 #[derive(Clone, Debug, PartialEq)]
@@ -84,8 +90,12 @@ impl WeedOptions {
         check("line clearance", self.clearance_mm, WEED_RANGES.clearance_mm)?;
         // A line runs to the border, so a clearance as wide as the margin would cut it off
         // against the border itself.
+        // Both values in the sentence: from the CLI, the clearance may be a default nobody typed.
         if self.clearance_mm >= self.margin_mm {
-            return Err(WeedError("the weed line clearance must be less than the margin".into()));
+            return Err(WeedError(format!(
+                "the weed line clearance ({} mm) must be less than the margin ({} mm)",
+                self.clearance_mm, self.margin_mm,
+            )));
         }
         Ok(())
     }
@@ -93,12 +103,26 @@ impl WeedOptions {
 
 /// The weed geometry for one pass: lines first, then the border, which is cut last so the sheet
 /// stays held while the blade still has detail to cut. Nothing for a pass with no points, or
-/// with bounds that are not finite: preflight then refuses the shape by its id.
+/// with bounds that are not finite: preflight then refuses the shape by its id. Refused when the
+/// pass is so large that its lines would pass `MAX_WEED_LINES`.
 /// `opts` is assumed valid (`WeedOptions::validate`).
-pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Vec<Polyline> {
-    let Some((x0, y0, x1, y1)) = bounds(shapes) else { return vec![] };
+///
+/// (`ponytail:` the border is the bounding box grown by the margin, not a contour. Ceiling: an
+/// L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
+/// from #159's path offset.)
+/// (`ponytail:` straight lines at a fixed spacing, each scanned against every segment, so the cost
+/// is lines × segments and the dialog pays it per keystroke. Ceiling: no diagonal lines, no lines
+/// that bend around shapes, and a slow replan on a dense trace. Upgrade: #222's line-fill engine.)
+pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<Polyline>, WeedError> {
+    let Some((x0, y0, x1, y1)) = bounds(shapes) else { return Ok(vec![]) };
     let m = opts.margin_mm;
     let (left, top, right, bottom) = (x0 - m, y0 - m, x1 + m, y1 + m);
+    if opts.lines != WeedLines::None && ((right - left).max(bottom - top) / opts.spacing_mm).abs() > MAX_WEED_LINES {
+        return Err(WeedError(format!(
+            "this pass is too large for weed lines {} mm apart; raise the spacing or leave the lines off",
+            opts.spacing_mm,
+        )));
+    }
     let mut out = vec![];
     if matches!(opts.lines, WeedLines::Horizontal | WeedLines::Both) {
         let outlines: Vec<Vec<&Polyline>> = shapes.iter().map(|s| s.polylines.iter().collect()).collect();
@@ -127,7 +151,7 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Vec<Polylin
         Point { x: left, y: bottom },
         Point { x: left, y: top },
     ]);
-    out
+    Ok(out)
 }
 
 fn bounds(shapes: &[PlannedShape]) -> Option<(f64, f64, f64, f64)> {
@@ -175,12 +199,14 @@ fn pieces(shapes: &[Vec<&Polyline>], y: f64, lo: f64, hi: f64, clearance: f64) -
         free.push((at, hi));
     }
     // A free piece crosses no outline (crossing one is within clearance of it), so it is wholly
-    // inside or wholly outside each shape, and its midpoint says which.
+    // inside or wholly outside each shape, and its midpoint says which. Each shape is asked on its
+    // own, since each is cut as its own piece: a hole drawn as a separate node is a disc of its own,
+    // not a hole in the shape around it, so the waste between them is not weeded.
     free.into_iter()
         .filter(|&(a, b)| b - a >= MIN_WEED_PIECE_MM)
         .filter(|&(a, b)| {
             let mid = Point { x: (a + b) / 2.0, y };
-            !shapes.iter().any(|outline| inside_even_odd(outline, mid))
+            !shapes.iter().any(|outline| winding(outline, mid) != 0)
         })
         .collect()
 }
@@ -205,23 +231,25 @@ fn band_span(a: Point, b: Point, y: f64, c: f64) -> Option<(f64, f64)> {
     Some((xa.min(xb) - c, xa.max(xb) + c))
 }
 
-/// Whether `p` lies inside a shape's filled area by the even-odd rule, over its closed polylines
-/// only: an open path has no inside. Even-odd, so the counter of an O is outside and the waste
-/// there is weeded too.
-fn inside_even_odd(outline: &[&Polyline], p: Point) -> bool {
-    let mut inside = false;
+/// The winding number of a shape's closed polylines around `p`; non-zero is inside its filled
+/// area. Non-zero, not even-odd, because that is how the app fills (`geometry::boolean`, and
+/// SVG's default): a pentagram's centre is filled, and a line there would cut through the decal.
+/// A glyph's counter winds the other way, so the waste inside an O is still weeded. An open path
+/// has no inside.
+fn winding(outline: &[&Polyline], p: Point) -> i32 {
+    let mut w = 0;
     for poly in outline.iter().filter(|q| q.len() > 2 && q.first() == q.last()) {
         for seg in poly.windows(2) {
             let (a, b) = (seg[0], seg[1]);
-            if (a.y > p.y) != (b.y > p.y) {
-                let x = a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x);
-                if x > p.x {
-                    inside = !inside;
-                }
+            let side = (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y);
+            if a.y <= p.y && b.y > p.y && side > 0.0 {
+                w += 1;
+            } else if b.y <= p.y && a.y > p.y && side < 0.0 {
+                w -= 1;
             }
         }
     }
-    inside
+    w
 }
 
 #[cfg(test)]
@@ -269,22 +297,22 @@ mod tests {
     #[test]
     fn the_border_is_the_bounds_grown_by_the_margin_and_comes_last() {
         let shapes = [shape(vec![rect(10.0, 20.0, 30.0, 5.0)]), shape(vec![rect(50.0, 22.0, 4.0, 10.0)])];
-        let out = weed_geometry(&shapes, &opts(WeedLines::None));
+        let out = weed_geometry(&shapes, &opts(WeedLines::None)).unwrap();
         assert_eq!(out, vec![rect(7.0, 17.0, 50.0, 18.0)]);
     }
 
     #[test]
     fn no_geometry_and_non_finite_bounds_give_nothing() {
-        assert!(weed_geometry(&[], &opts(WeedLines::Both)).is_empty());
+        assert!(weed_geometry(&[], &opts(WeedLines::Both)).unwrap().is_empty());
         let bad = shape(vec![vec![Point { x: 0.0, y: 0.0 }, Point { x: f64::NAN, y: 1.0 }]]);
-        assert!(weed_geometry(&[bad], &opts(WeedLines::Both)).is_empty());
+        assert!(weed_geometry(&[bad], &opts(WeedLines::Both)).unwrap().is_empty());
     }
 
     #[test]
     fn lines_are_spaced_from_the_border_edge_and_stop_short_of_the_far_edge() {
         // Two small rects far apart: the border spans 0..100 x 0..40 with margin 3.
         let shapes = [shape(vec![rect(3.0, 3.0, 2.0, 2.0)]), shape(vec![rect(95.0, 35.0, 2.0, 2.0)])];
-        let out = weed_geometry(&shapes, &opts(WeedLines::Horizontal));
+        let out = weed_geometry(&shapes, &opts(WeedLines::Horizontal)).unwrap();
         let ys: Vec<f64> = out[..out.len() - 1].iter().map(|l| l[0].y).collect();
         let mut distinct = ys.clone();
         distinct.dedup();
@@ -299,7 +327,7 @@ mod tests {
         // Three 10 mm squares 10 mm apart on y 0..10; the line at y = 7 runs through all three.
         let shapes: Vec<PlannedShape> = (0..3).map(|i| shape(vec![rect(20.0 * i as f64, 0.0, 10.0, 10.0)])).collect();
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 10.0, clearance_mm: 1.5 };
-        let out = weed_geometry(&shapes, &o);
+        let out = weed_geometry(&shapes, &o).unwrap();
         let lines = &out[..out.len() - 1];
         // Only the gaps survive: 10..20 and 30..40, each narrowed by the clearance.
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -318,22 +346,65 @@ mod tests {
         let diag = vec![Point { x: 70.0, y: 5.0 }, Point { x: 120.0, y: 80.0 }];
         let shapes = [shape(vec![tri]), shape(vec![diag])];
         let o = WeedOptions { margin_mm: 4.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 2.0 };
-        let out = weed_geometry(&shapes, &o);
+        let out = weed_geometry(&shapes, &o).unwrap();
         let lines = &out[..out.len() - 1];
         assert!(lines.len() > 10, "expected lines around the shapes, got {}", lines.len());
         assert!(closest_approach(lines, &shapes) >= 2.0 - 1e-9);
     }
 
+    /// `rect` wound the other way, as a glyph's counter is.
+    fn hole(x: f64, y: f64, w: f64, h: f64) -> Polyline {
+        let mut r = rect(x, y, w, h);
+        r.reverse();
+        r
+    }
+
     #[test]
     fn no_piece_inside_a_filled_shape_but_one_inside_a_hole_stays() {
         // A 60 mm square ring with a 40 mm hole: the line at y = 30 crosses ring, hole, ring.
-        let ring = shape(vec![rect(0.0, 0.0, 60.0, 60.0), rect(10.0, 10.0, 40.0, 40.0)]);
+        let ring = shape(vec![rect(0.0, 0.0, 60.0, 60.0), hole(10.0, 10.0, 40.0, 40.0)]);
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 33.0, clearance_mm: 1.5 };
-        let out = weed_geometry(&[ring], &o);
+        let out = weed_geometry(&[ring], &o).unwrap();
         let lines = &out[..out.len() - 1];
         // y = 30: the 1.5 mm strips between border and ring are under 2 mm, the ring's body is
-        // inside, the hole is outside by even-odd. Only the hole survives.
+        // inside, and the hole winds back to zero. Only the hole survives.
         assert_eq!(lines, &[vec![Point { x: 11.5, y: 30.0 }, Point { x: 48.5, y: 30.0 }]]);
+    }
+
+    /// Non-zero, as the app fills: an inner contour wound the same way as the outer one is filled,
+    /// like a pentagram's centre, so a line there would cut through the decal.
+    #[test]
+    fn an_inner_contour_wound_the_same_way_is_filled_not_weeded() {
+        let doubled = shape(vec![rect(0.0, 0.0, 60.0, 60.0), rect(10.0, 10.0, 40.0, 40.0)]);
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 33.0, clearance_mm: 1.5 };
+        let out = weed_geometry(&[doubled], &o).unwrap();
+        assert_eq!(out.len(), 1, "only the border: {out:?}");
+    }
+
+    /// Two overlapping subpaths of one shape fill their overlap too.
+    #[test]
+    fn the_overlap_of_two_subpaths_is_filled_not_weeded() {
+        let overlapping = shape(vec![rect(0.0, 0.0, 40.0, 40.0), rect(20.0, 0.0, 40.0, 40.0)]);
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 23.0, clearance_mm: 1.5 };
+        let out = weed_geometry(&[overlapping], &o).unwrap();
+        assert_eq!(out.len(), 1, "only the border: {out:?}");
+    }
+
+    /// Generated before preflight, so a huge pass must be refused here rather than build millions
+    /// of lines under the document lock.
+    #[test]
+    fn a_pass_too_large_for_its_line_spacing_is_refused_before_any_line_is_built() {
+        let huge = [shape(vec![rect(0.0, 0.0, 1.0e9, 10.0)])];
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 1.5 };
+        assert_eq!(
+            weed_geometry(&huge, &o).unwrap_err().to_string(),
+            "this pass is too large for weed lines 5 mm apart; raise the spacing or leave the lines off",
+        );
+        // The border alone is still built: it is one polyline at any size, and preflight refuses it.
+        assert_eq!(weed_geometry(&huge, &WeedOptions { lines: WeedLines::None, ..o }).unwrap().len(), 1);
+        // 10 000 lines exactly is allowed: a 50 m pass at 5 mm.
+        let roll = [shape(vec![rect(3.0, 3.0, 49_994.0, 10.0)])];
+        assert!(weed_geometry(&roll, &WeedOptions { lines: WeedLines::Horizontal, ..o }).is_ok());
     }
 
     #[test]
@@ -343,7 +414,7 @@ mod tests {
             Point { x: 0.0, y: 0.0 }, Point { x: 0.0, y: 40.0 }, Point { x: 40.0, y: 40.0 }, Point { x: 40.0, y: 0.0 },
         ];
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 23.0, clearance_mm: 1.5 };
-        let out = weed_geometry(&[shape(vec![u])], &o);
+        let out = weed_geometry(&[shape(vec![u])], &o).unwrap();
         let lines = &out[..out.len() - 1];
         // The strips outside the arms are 1.5 mm, under the minimum.
         assert_eq!(lines, &[vec![Point { x: 1.5, y: 20.0 }, Point { x: 38.5, y: 20.0 }]]);
@@ -354,7 +425,7 @@ mod tests {
         // Squares 4 mm apart with clearance 1.5 leave a 1 mm gap: too short to keep.
         let shapes = [shape(vec![rect(0.0, 0.0, 10.0, 10.0)]), shape(vec![rect(14.0, 0.0, 10.0, 10.0)])];
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 8.0, clearance_mm: 1.5 };
-        let out = weed_geometry(&shapes, &o);
+        let out = weed_geometry(&shapes, &o).unwrap();
         assert_eq!(out.len(), 1, "only the border: {out:?}");
     }
 
@@ -362,7 +433,7 @@ mod tests {
     fn vertical_lines_mirror_horizontal_ones() {
         let shapes: Vec<PlannedShape> = (0..3).map(|i| shape(vec![rect(0.0, 20.0 * i as f64, 10.0, 10.0)])).collect();
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Vertical, spacing_mm: 10.0, clearance_mm: 1.5 };
-        let out = weed_geometry(&shapes, &o);
+        let out = weed_geometry(&shapes, &o).unwrap();
         let lines = &out[..out.len() - 1];
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!((lines[0][0], lines[0][1]), (Point { x: 7.0, y: 11.5 }, Point { x: 7.0, y: 18.5 }));
@@ -381,7 +452,7 @@ mod tests {
             (WeedOptions { spacing_mm: 500.1, ..ok }, "the weed line spacing must be 5–500 mm"),
             (WeedOptions { clearance_mm: 0.1, ..ok }, "the weed line clearance must be 0.2–20 mm"),
             (WeedOptions { margin_mm: 20.0, clearance_mm: 20.1, ..ok }, "the weed line clearance must be 0.2–20 mm"),
-            (WeedOptions { clearance_mm: 3.0, ..ok }, "the weed line clearance must be less than the margin"),
+            (WeedOptions { clearance_mm: 3.0, ..ok }, "the weed line clearance (3 mm) must be less than the margin (3 mm)"),
         ];
         for (o, want) in cases {
             assert_eq!(o.validate().unwrap_err().to_string(), want, "{o:?}");

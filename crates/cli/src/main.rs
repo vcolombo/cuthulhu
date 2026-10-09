@@ -100,10 +100,10 @@ enum Command {
         /// Also cut weed lines inside the border (needs --weed-margin)
         #[arg(long, value_enum)]
         weed_lines: Option<WeedLinesArg>,
-        /// Distance between weed lines, in mm (default 25)
+        /// Distance between weed lines, in mm (needs --weed-lines)
         #[arg(long, value_name = "MM")]
         weed_spacing: Option<f64>,
-        /// The closest a weed line comes to the design, in mm (default 1.5)
+        /// The closest a weed line comes to the design, in mm (needs --weed-lines)
         #[arg(long, value_name = "MM")]
         weed_clearance: Option<f64>,
     },

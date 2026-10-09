@@ -175,9 +175,10 @@ fn describe_cut_error(e: cutplan::CutError) -> String {
     }
 }
 
-/// The `--weed-*` flags as options for `plan_passes_for`, or none without `--weed-margin`. A line
-/// flag without a margin is refused rather than ignored: lines without a border would stop in the
-/// open sheet, which is why the dialog does not offer them either. Ranges are `cutplan`'s to check.
+/// The `--weed-*` flags as options for `plan_passes_for`, or none without `--weed-margin`. A flag
+/// that would do nothing is refused rather than ignored: line flags without a margin (lines
+/// without a border would stop in the open sheet, which is why the dialog does not offer them
+/// either), and spacing or clearance without `--weed-lines`. Ranges are `cutplan`'s to check.
 pub fn weed_options(
     margin_mm: Option<f64>,
     lines: Option<cutplan::weed::WeedLines>,
@@ -191,6 +192,9 @@ pub fn weed_options(
         }
         return Ok(None);
     };
+    if lines.is_none() && (spacing_mm.is_some() || clearance_mm.is_some()) {
+        return Err("--weed-spacing and --weed-clearance shape weed lines, so they need --weed-lines".into());
+    }
     Ok(Some(cutplan::weed::WeedOptions {
         margin_mm,
         lines: lines.unwrap_or(defaults.lines),
@@ -261,6 +265,10 @@ mod tests {
         for (lines, spacing, clearance) in [(Some(WeedLines::Horizontal), None, None), (None, Some(30.0), None), (None, None, Some(1.0))] {
             let err = weed_options(None, lines, spacing, clearance).unwrap_err();
             assert!(err.contains("need --weed-margin"), "{err}");
+        }
+        for (spacing, clearance) in [(Some(30.0), None), (None, Some(1.0))] {
+            let err = weed_options(Some(3.0), None, spacing, clearance).unwrap_err();
+            assert!(err.contains("need --weed-lines"), "{err}");
         }
     }
 

@@ -477,6 +477,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // Armed by the test rather than by a call count — StrictMode plans twice on mount, so
   // "hold from the second call" holds the dialog's own opening plan and it never gets rows.
   let holding = false;
+  // Set by a test that needs a held plan to fail when released rather than install: a replan that
+  // is out while the operator keeps typing, and then refused.
+  let refuseHeldPlans = false;
   const heldPlans: (() => void)[] = [];
   const heldTravel: (() => void)[] = [];
   const release = (queue: (() => void)[]) => {
@@ -519,6 +522,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     __releaseCommits: () => { holdingCommits = false; return release(heldCommits); },
     __armHold: () => { holding = true; },
     __releasePlans: () => release(heldPlans),
+    __refuseHeldPlans: () => { refuseHeldPlans = true; },
     __releaseTravel: () => release(heldTravel),
   });
 
@@ -601,7 +605,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     if (w.lines === "None") return;
     check("line spacing", w.spacing_mm, WEED_RANGES.spacing_mm);
     check("line clearance", w.clearance_mm, WEED_RANGES.clearance_mm);
-    if (w.clearance_mm >= w.margin_mm) throw ipcError("plan_error", "the weed line clearance must be less than the margin");
+    if (w.clearance_mm >= w.margin_mm) {
+      throw ipcError("plan_error", `the weed line clearance (${w.clearance_mm} mm) must be less than the margin (${w.margin_mm} mm)`);
+    }
   }
 
   // Mirrors cutplan::weed::weed_geometry for what the fixtures hold: axis-aligned rects. For a
@@ -878,7 +884,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // is the whole subject of the race test, and a timing race cannot state it.
       const plan = planFromDoc(a.grouping as Grouping, (a.weed as WeedOptions | null | undefined) ?? null);
       if (!holding) return plan;
-      return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
+      return new Promise((resolve, reject) => heldPlans.push(() =>
+        refuseHeldPlans ? reject(ipcError("plan_error", "shape #2: no fonts are installed on this system")) : resolve(plan)));
     },
     // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
     // refusal, the same exact-once identity check over the requested keys, then synthetic
@@ -1489,6 +1496,101 @@ test("a weed field out of range disables Cut and says why", async ({ page }) => 
   await page.getByLabel("Weed clearance").fill("4");
   await expect(page.getByRole("alert").filter({ hasText: "Clearance must be less than the margin" })).toBeVisible();
   await expect(start).toBeDisabled();
+});
+
+// What a replan for a weed edit does to the rows: the operator's arrangement (which passes are cut,
+// in what order, with what settings) stays, since the weed changes none of the passes.
+test("a weed edit keeps the passes as the operator arranged them, and their travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  const rows = page.getByTestId("cut-pass-row");
+  await expect(rows).toHaveCount(2);
+  await rows.nth(1).getByRole("button", { name: "Up" }).click(); // green first
+  await rows.nth(1).getByRole("checkbox").uncheck(); // and red not cut
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+
+  await page.getByLabel("Weed border").check();
+  await expect(rows.nth(0).locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(rows.nth(1).getByRole("checkbox")).not.toBeChecked();
+  // Travel for the list as arranged: only green is cut, so one move, to its border. The plan's
+  // own travel (both passes, in planned order) would read 3.
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+// Reordering asks the backend for travel again, and that request must carry the weed the plan was
+// made with: without it the replanned travel drops the moves to each border.
+test("reordering passes keeps the weed in the replanned travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await page.getByTestId("cut-pass-row").nth(1).getByRole("button", { name: "Up" }).click();
+  await expect(page.getByTestId("cut-pass-row").first().locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+});
+
+test("Cut waits while a weed replan is out, so a border nobody has previewed cannot be cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  const start = page.getByRole("button", { name: "Start Cut" });
+  await expect(start).toBeEnabled();
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Weed border").check();
+  await expect(start).toBeDisabled();
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(start).toBeEnabled();
+});
+
+test("a refused weed replan puts the controls back to the plan still installed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Weed border").check();
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Weed lines").selectOption("Both");
+  // The controls say what the installed plan holds, so Cut is offered for what the preview shows.
+  await expect(page.getByLabel("Weed lines")).toHaveValue("None");
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// A refusal arriving after the operator has typed on must not put back over what they typed.
+test("a refused weed replan does not overwrite what was typed after it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName(/2 weed paths/);
+  await page.evaluate(() => {
+    const w = window as unknown as { __armHold: () => void; __refuseHeldPlans: () => void };
+    w.__armHold();
+    w.__refuseHeldPlans();
+  });
+  await page.getByLabel("Weed margin").fill("5"); // replan out, held
+  await page.getByLabel("Weed margin").fill(""); // mid-edit: reads as nothing, plans nothing
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(page.getByLabel("Weed margin")).toHaveValue("");
+});
+
+test("changing the grouping keeps the weed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Group passes by").selectOption("Single");
+  // One pass over both rects, so one border around both.
+  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
 });
 
 test("reopening the cut dialog keeps the weed controls as they were left", async ({ page }) => {

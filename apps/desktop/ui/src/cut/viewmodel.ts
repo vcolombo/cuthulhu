@@ -459,3 +459,17 @@ export function polylineBounds(polylines: [number, number][][]): Bounds[] {
     return { x, y, w: xs.reduce((a, b) => Math.max(a, b)) - x, h: ys.reduce((a, b) => Math.max(a, b)) - y };
   });
 }
+
+/** The rows of a plan made for a weed edit, with the operator's arrangement carried over from the
+ *  rows it replaces: their order and each pass's settings, matched by key. The weed changes no
+ *  pass, so a replan for it that reset every row to cut-everything-in-planned-order would undo
+ *  edits the operator never touched, silently. New rows keep their planned place after the rest;
+ *  everything else (shape count, ids, starts, weed) comes from the new plan. */
+export function carryRows<T extends PassVm>(prev: PassVm[], next: T[]): T[] {
+  const at = new Map(prev.map((r, i) => [r.key, i]));
+  const kept = next.filter((r) => at.has(r.key)).sort((a, b) => at.get(a.key)! - at.get(b.key)!).map((r) => {
+    const p = prev[at.get(r.key)!];
+    return { ...r, enabled: p.enabled, presetId: p.presetId, speed: p.speed, force: p.force, repeatCount: p.repeatCount };
+  });
+  return [...kept, ...next.filter((r) => !at.has(r.key))];
+}

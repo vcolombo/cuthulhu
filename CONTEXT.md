@@ -91,6 +91,20 @@ bounds, and non-degenerate; Settings inside the machine's range; a Document mean
 machine that is plugged in; an output that fits in memory.
 _Avoid_: validation, checks, linting
 
+**Weed border**:
+A rectangle cut around a DocumentPass's shapes, a margin outside their bounds, so that pass's
+sheet comes off the roll in one piece. Each DocumentPass gets its own, because each is its own
+sheet of material, and it is cut last in that pass.
+_Avoid_: weed box, frame, bounding box (that is what it is drawn from, not what it is)
+
+**Weed lines**:
+Straight cuts across the waste inside a Weed border, kept a clearance away from the design and
+never through it, so the waste lifts off in strips. Cut after the pass's shapes and before its
+border. The border and lines together are a pass's weed; **WeedOptions** says what to generate
+and travels with the plan, the travel and the cut, like the Grouping. Generated, never stored in
+the Document.
+_Avoid_: hatch, fill lines, weeding grid
+
 **Stale plan**:
 A cut requested against a Document that has since changed. Refused rather than cut, because the
 operator approved geometry that no longer exists.

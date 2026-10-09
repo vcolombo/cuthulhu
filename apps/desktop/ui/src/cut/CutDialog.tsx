@@ -27,6 +27,7 @@ import {
   presetIdForKey,
   presetPicker,
   rowPresetLookup,
+  carryRows,
   readWeedDraft,
   weedDraftFrom,
   type AimedPresets,
@@ -263,10 +264,24 @@ export function CutDialog({
   const travelSeq = useRef(0);
   /** Serial number of the newest Replan, so two in flight cannot install out of order. */
   const planSeq = useRef(0);
+  /** The plan as last rendered, for a reply that lands after the rows were rearranged since its
+   *  request went out: what it carries over must be the arrangement on screen now. */
+  const planRef = useRef(plan);
+  planRef.current = plan;
+  /** Counts weed edits, so a refused replan puts the controls back only if nothing was typed since
+   *  it went out: typing that plans nothing (a cleared field) does not move `planSeq`. */
+  const weedEdits = useRef(0);
 
   // A draft that does not read plans with the weed already installed, so Replan still works.
-  const replan = (mode: ipc.Grouping = grouping, weedOptions: ipc.WeedOptions | null = weedRead.ok ? weedRead.options : plan?.weed ?? null) => {
+  // `keepRows` carries the operator's arrangement into the new rows (`carryRows`): a weed edit
+  // changes no pass. Every other replan starts the rows afresh, as it always has.
+  const replan = (
+    mode: ipc.Grouping = grouping,
+    weedOptions: ipc.WeedOptions | null = weedRead.ok ? weedRead.options : plan?.weed ?? null,
+    keepRows = false,
+  ) => {
     const seq = ++planSeq.current;
+    const editAt = weedEdits.current;
     setReplanning(true);
     // Nothing is cleared or orphaned on the way out. The previous plan stays installed until this
     // reply lands, and if the reply is a failure it stays installed for good — so both the travel
@@ -287,28 +302,35 @@ export function CutDialog({
         // stale_plan rejection would re-raise the banner this plan just cleared (Greptile drove
         // exactly that interleaving on PR #142).
         travelSeq.current++;
-        setPlan({
+        const fresh: PassRow[] = response.passes.map((p) => ({
+          key: p.key,
+          shapeCount: p.shape_count,
+          nodeIds: p.node_ids,
+          starts: p.starts,
+          weed: p.weed,
+          enabled: true,
+          // A preset-keyed pass starts with the preset it is keyed on, or it would be cut
+          // with defaults — the one thing grouping by material exists to avoid.
+          presetId: presetIdForKey(p.key),
+          speed: null,
+          force: null,
+          repeatCount: null,
+        }));
+        const prev = planRef.current;
+        const rows = keepRows && prev !== null && prev.grouping === mode ? carryRows(prev.rows, fresh) : fresh;
+        const installed: InstalledPlan = {
           grouping: mode,
           weed: weedOptions,
           revision: response.doc_revision,
           skippedNotCut: response.skipped_not_cut,
-          rows: response.passes.map((p) => ({
-            key: p.key,
-            shapeCount: p.shape_count,
-            nodeIds: p.node_ids,
-            starts: p.starts,
-            weed: p.weed,
-            enabled: true,
-            // A preset-keyed pass starts with the preset it is keyed on, or it would be cut
-            // with defaults — the one thing grouping by material exists to avoid.
-            presetId: presetIdForKey(p.key),
-            speed: null,
-            force: null,
-            repeatCount: null,
-          })),
+          rows,
           travel: response.travel,
-        });
+        };
+        setPlan(installed);
         setStalePlan(false);
+        // The reply's travel is for every pass in planned order; carried rows that differ need
+        // travel for the list as arranged, against the plan just installed.
+        if (rows.some((r, i) => r.key !== fresh[i].key || !r.enabled)) refreshTravel(rows, installed);
       })
       .catch((e) => {
         if (seq !== planSeq.current) return; // superseded: its failure is no longer news
@@ -318,7 +340,9 @@ export function CutDialog({
         // the machine does the split the old plan still holds.
         setGrouping(plan?.grouping ?? "Color");
         // The weed controls go back to the installed plan's too, for the same reason.
-        if (plan !== null) onWeedChange(plan.weed ? weedDraftFrom(plan.weed, true) : { ...weedDraft, border: false });
+        if (plan !== null && weedEdits.current === editAt) {
+          onWeedChange(plan.weed ? weedDraftFrom(plan.weed, true) : { ...weedDraft, border: false });
+        }
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => {
@@ -336,9 +360,10 @@ export function CutDialog({
   // weed, because an earlier replan may still be in flight and `planSeq` lets only the newest
   // install. A draft that does not read plans nothing, and Cut waits (`weedSettled`).
   const changeWeed = (next: WeedDraft) => {
+    weedEdits.current++;
     onWeedChange(next);
     const read = readWeedDraft(next, ranges?.weed ?? null);
-    if (read.ok) replan(grouping, read.options);
+    if (read.ok) replan(grouping, read.options, true);
   };
 
   // Not disabled while a replan is in flight, unlike the row controls: every keystroke replans,
@@ -350,7 +375,8 @@ export function CutDialog({
       <label style={{ display: "flex", alignItems: "center", gap: 4 }}>
         {label}
         <input
-          aria-label={`Weed ${field}`}
+          // Contains the visible text, so a voice user saying "Margin" reaches the field.
+          aria-label={`Weed ${label.toLowerCase()}`}
           type="number"
           step="0.1"
           value={weedDraft[field]}
@@ -790,12 +816,13 @@ export function CutDialog({
   // orders their replies: an older response landing last would redraw travel for a list
   // the rows no longer show. Only the latest request's reply (or failure) may touch
   // state, and `replan` bumps the sequence too, so a fresh plan orphans them all.
-  const refreshTravel = (next: PassRow[]) => {
+  // `base` is the installed plan unless a replan passes the one it is installing this moment.
+  const refreshTravel = (next: PassRow[], base: InstalledPlan | null = plan) => {
     // No plan means no travel on screen to go stale (the initial plan itself failed).
-    if (plan === null) return;
+    if (base === null) return;
     const seq = ++travelSeq.current;
     ipc
-      .travelForOrder(plan.revision, plan.grouping, plan.weed, toTravelPasses(next))
+      .travelForOrder(base.revision, base.grouping, base.weed, toTravelPasses(next))
       .then((t) => {
         // Onto whatever plan is installed when the reply lands, not the one captured when it was
         // asked for: the sequence guard has already established they are the same plan.
@@ -1080,6 +1107,9 @@ export function CutDialog({
               type="checkbox"
               aria-label="Weed border"
               checked={weedDraft.border}
+              // Until the defaults arrive there is nothing to fill the fields with, and a border
+              // ticked then would start from an empty margin.
+              disabled={weed === null && ranges === null}
               onChange={(e) => changeWeed({ ...weedDraft, border: e.target.checked })}
             />
             Border

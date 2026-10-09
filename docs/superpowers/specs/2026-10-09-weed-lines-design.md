@@ -55,12 +55,18 @@ From `main` at `2057e75`:
        That blocks a superset of the points truly within the clearance, so a line never passes
        closer than that. Vertical lines are the same with the axes swapped.
     2. **Inside a shape.** Each piece left over is tested at its midpoint against every closed
-       outline of the pass, one shape at a time, by the even-odd rule. A piece inside a shape's
-       filled area is dropped, since cutting it would slice the decal. A piece inside a hole
-       (the counter of an O) is outside by even-odd and stays: that waste has to come out too.
+       outline of the pass, one shape at a time, by the non-zero winding rule, which is how the
+       app fills (`geometry::boolean`, SVG's default). A piece inside a shape's filled area is
+       dropped, since cutting it would slice the decal; that includes a pentagram's centre and
+       the overlap of two subpaths. A piece inside a hole (the counter of an O, which winds the
+       other way) stays: that waste has to come out too. (Revised in gate 1 from even-odd, which
+       cut lines through those filled areas.) A hole drawn as a separate node is a disc of its
+       own, cut as its own piece, so the waste between them is not weeded.
 
     Pieces shorter than `MIN_WEED_PIECE_MM` (2 mm) are dropped. A nick that short weeds nothing
-    and costs a blade lift.
+    and costs a blade lift. A pass that would need more than `MAX_WEED_LINES` (10 000) lines on
+    one axis is refused before any is built: lines are generated before preflight, under the
+    document lock, and a stray scale would otherwise build millions (added in gate 1).
     (`// ponytail:` straight lines at a fixed spacing. Ceiling: no diagonal lines, and no lines
     that bend around shapes. Upgrade: #222's line-fill engine.)
 - **Cut order within a pass:** the pass's shapes first, then the lines, then the border last.
@@ -119,9 +125,12 @@ From `main` at `2057e75`:
 
   Lines without a border are not offered: their ends would stop in the open sheet. Fields show
   their range from `settings_ranges`. An out-of-range value marks the field and disables Cut, as
-  the settings fields already do.
+  the settings fields already do. A weed edit replans but keeps the operator's pass order and
+  settings, since it changes no pass (added in gate 1).
 - **CLI:** `cuthulhu cut --weed-margin MM [--weed-lines h|v|both] [--weed-spacing MM]
-  [--weed-clearance MM]`. Without `--weed-margin`, there is no weeding. It is the same
+  [--weed-clearance MM]`. Without `--weed-margin`, there is no weeding. A flag that would do
+  nothing is refused rather than ignored: line flags without `--weed-margin`, and spacing or
+  clearance without `--weed-lines`. It is the same
   `plan_passes_for` call, so `--dry-run` reports the weed geometry too.
 
 ## Defaults

@@ -234,7 +234,7 @@ pub fn plan_passes_for(doc: &Document, grouping: Grouping, weed: Option<&WeedOpt
     opts.validate().map_err(PlanError::Weed)?;
     let mut planned = plan_passes_with(doc, grouping)?;
     for pass in &mut planned.passes {
-        pass.weed = weed_geometry(&pass.shapes, opts);
+        pass.weed = weed_geometry(&pass.shapes, opts).map_err(PlanError::Weed)?;
     }
     Ok(planned)
 }
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(planned.passes.len(), 2);
         for pass in &planned.passes {
             assert!(!pass.weed.is_empty(), "{:?} has no weed", pass.key);
-            assert_eq!(pass.weed, weed_geometry(&pass.shapes, &opts));
+            assert_eq!(pass.weed, weed_geometry(&pass.shapes, &opts).unwrap());
         }
         // The red border stops short of the blue rect at x = 60.
         let red_right = planned.passes[0].weed.last().unwrap().iter().map(|p| p.x).fold(f64::MIN, f64::max);

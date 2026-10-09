@@ -111,6 +111,7 @@ import {
   fieldDisabled,
   toCutRequest,
   polylineBounds,
+  carryRows,
   readWeedDraft,
   weedDraftFrom,
   type WeedDraft,
@@ -877,5 +878,26 @@ describe("polylineBounds", () => {
       { x: -3, y: 0, w: 3, h: 0 },
     ]);
     expect(polylineBounds([[]])).toEqual([]);
+  });
+});
+
+describe("carryRows", () => {
+  const row = (key: string, over: Partial<PassVm> = {}): PassVm => ({
+    key, shapeCount: 1, enabled: true, presetId: null, speed: null, force: null, repeatCount: null, ...over,
+  });
+
+  it("keeps the operator's order and settings for every pass the new plan still has", () => {
+    const before = [row("color:00ff00ff", { speed: 9 }), row("color:ff0000ff", { enabled: false, presetId: "vinyl" })];
+    const fresh = [row("color:ff0000ff", { shapeCount: 3 }), row("color:00ff00ff")];
+    expect(carryRows(before, fresh)).toEqual([
+      row("color:00ff00ff", { speed: 9 }),
+      row("color:ff0000ff", { shapeCount: 3, enabled: false, presetId: "vinyl" }),
+    ]);
+  });
+
+  it("puts a pass the old rows did not have last, as planned, and drops one that is gone", () => {
+    const before = [row("color:00ff00ff", { force: 4 }), row("no-color")];
+    const fresh = [row("color:ff0000ff"), row("color:00ff00ff")];
+    expect(carryRows(before, fresh)).toEqual([row("color:00ff00ff", { force: 4 }), row("color:ff0000ff")]);
   });
 });

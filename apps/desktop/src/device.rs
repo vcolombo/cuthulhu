@@ -1782,6 +1782,10 @@ mod tests {
             assert_eq!(pass.weed.len(), 1, "{}: the border alone", pass.key);
             assert_eq!(pass.weed[0].len(), 5, "a closed rectangle");
         }
+        // Each pass's own 10 mm rect, grown by the 3 mm margin: red at x = 0, blue at x = 100.
+        let border = |key: PassKey| response.passes.iter().find(|p| p.key == key).unwrap().weed[0].clone();
+        assert_eq!(border(colour(RED)), vec![[-3.0, -3.0], [13.0, -3.0], [13.0, 13.0], [-3.0, 13.0], [-3.0, -3.0]]);
+        assert_eq!(border(colour(BLUE))[2], [113.0, 13.0]);
         let plain = plan_cut_response(&app.editor.doc, Grouping::Color, None).unwrap();
         assert!(plain.passes.iter().all(|p| p.weed.is_empty()));
     }

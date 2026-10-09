@@ -175,7 +175,7 @@ pub fn preset_settings_out_of_range(s: &crate::presets::PresetSettings) -> Optio
 /// 1. All enabled passes have no shapes → NothingToCut (weed alone is not a job)
 /// 2. Any NaN/inf coordinate → NonFiniteGeometry
 /// 3. Polyline < 2 points → DegeneratePolyline
-///    (2 and 3 for a pass's weed → WeedGeometry, checked after every shape)
+///    (2 and 3 for a pass's weed → WeedGeometry, checked after both for every shape)
 /// 4. Geometry outside 0..width_mm × 0..height_mm → OutOfBounds, or WeedOutOfBounds for weed
 ///    (unless allow_out_of_bounds)
 /// 5. repeat_count outside 1..=10 or speed outside 1..=30 / force outside 1..=33 when set
@@ -210,15 +210,6 @@ pub fn preflight(
             }
         }
     }
-    // After the shapes, so a bad shape is named by its id rather than through the weed built
-    // around it. Rules 2 and 3 share one variant: weed is generated, never drawn, so either
-    // means the same thing to the operator.
-    for pass in passes.iter().filter(|p| p.enabled) {
-        let bad = |q: &geometry::Polyline| q.len() < 2 || q.iter().any(|p| !p.x.is_finite() || !p.y.is_finite());
-        if pass.pass.weed.iter().any(bad) {
-            return Err(PreflightError::WeedGeometry(pass.pass.key.clone()));
-        }
-    }
 
     // Rule 3: Polyline < 2 points → DegeneratePolyline (checked after NaN/inf)
     for pass in passes.iter().filter(|p| p.enabled) {
@@ -228,6 +219,16 @@ pub fn preflight(
                     return Err(PreflightError::DegeneratePolyline(shape.node_id));
                 }
             }
+        }
+    }
+
+    // After rules 2 and 3 for every shape, so a bad shape is named by its id rather than through
+    // the weed built around it. Rules 2 and 3 share one variant: weed is generated, never drawn,
+    // so either means the same thing to the operator.
+    for pass in passes.iter().filter(|p| p.enabled) {
+        let bad = |q: &geometry::Polyline| q.len() < 2 || q.iter().any(|p| !p.x.is_finite() || !p.y.is_finite());
+        if pass.pass.weed.iter().any(bad) {
+            return Err(PreflightError::WeedGeometry(pass.pass.key.clone()));
         }
     }
 
@@ -375,6 +376,32 @@ mod tests {
             assert_eq!(err, PreflightError::WeedGeometry(key.clone()));
             assert_eq!(err.code(), "weed_geometry");
         }
+    }
+
+    /// Weed is checked after every shape rule it shares, so a bad shape is named by its id.
+    #[test]
+    fn a_degenerate_shape_is_named_before_bad_weed() {
+        let pass = with_weed(
+            make_pass(PassKey::Color(Some(1)), vec![make_shape(7, vec![vec![pt(10.0, 10.0)]])]),
+            vec![vec![pt(f64::NAN, 50.0), pt(50.0, 50.0)]],
+        );
+        let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
+        assert_eq!(
+            preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, true),
+            Err(PreflightError::DegeneratePolyline(NodeId(7))),
+        );
+    }
+
+    /// A pass nobody cuts is not checked, its weed included.
+    #[test]
+    fn weed_on_a_disabled_pass_is_not_checked() {
+        let cut = make_pass(PassKey::Color(Some(1)), vec![inside_shape()]);
+        let skipped = with_weed(make_pass(PassKey::Color(Some(2)), vec![inside_shape()]), vec![vec![pt(-50.0, 50.0), pt(f64::NAN, 50.0)]]);
+        let configured = vec![
+            make_configured_pass(&cut, Settings::default(), true),
+            make_configured_pass(&skipped, Settings::default(), false),
+        ];
+        assert_eq!(preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false), Ok(()));
     }
 
     /// A border around nothing is not a job.

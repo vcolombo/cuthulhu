@@ -4,6 +4,7 @@ pub mod passes;
 pub mod plan;
 pub mod preflight;
 pub mod presets;
+pub mod weed;
 pub use passes::*;
 pub use pass_key::*;
 pub use plan::{plan_cut, CutError, CutPlan, PassSelection, PlanOptions, PlannedPass};

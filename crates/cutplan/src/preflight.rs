@@ -3,6 +3,7 @@ use driver_core::{MachineProfile, MachineCaps, Settings};
 use document::NodeId;
 use geometry::Point;
 use serde::Serialize;
+use crate::pass_key::PassKey;
 use crate::passes::DocumentPass;
 
 pub struct ConfiguredPass<'a> {
@@ -17,6 +18,9 @@ pub enum PreflightError {
     NonFiniteGeometry(NodeId),
     DegeneratePolyline(NodeId),
     OutOfBounds { node: NodeId, bounds: (f64, f64, f64, f64) },
+    /// A pass's weed geometry, which belongs to no node, named by its pass instead.
+    WeedGeometry(PassKey),
+    WeedOutOfBounds { pass: PassKey, bounds: (f64, f64, f64, f64) },
     SettingsOutOfRange(&'static str),
     MachineMismatch { document: String, device: String },
     OutputTooLarge(usize),
@@ -39,6 +43,13 @@ impl std::fmt::Display for PreflightError {
             // bounds is (0, 0, width_mm, height_mm) — the machine's area, not the shape's.
             PreflightError::OutOfBounds { node, bounds } =>
                 write!(f, "shape #{} lies outside the {} x {} mm cutting area", node.0, bounds.2, bounds.3),
+            // Built from finite shapes it cannot happen; checked anyway, since it is cut.
+            PreflightError::WeedGeometry(pass) =>
+                write!(f, "the weed lines for pass {pass} have a coordinate that is not a finite number or a path with fewer than two points"),
+            // The lines sit inside the border, so whatever crossed the edge, the border did. The
+            // margin is what the operator can change to fix it, so the sentence says so.
+            PreflightError::WeedOutOfBounds { pass, bounds } =>
+                write!(f, "the weed border for pass {pass} lies outside the {} x {} mm cutting area; shrink the weed margin or move the design", bounds.2, bounds.3),
             // Already a whole clause naming the setting and its range, so a prefix would read twice.
             PreflightError::SettingsOutOfRange(message) => write!(f, "{message}"),
             PreflightError::MachineMismatch { document, device } =>
@@ -64,7 +75,9 @@ impl PreflightError {
             PreflightError::NothingToCut => "nothing_to_cut",
             PreflightError::NonFiniteGeometry(_) => "non_finite_geometry",
             PreflightError::DegeneratePolyline(_) => "degenerate_polyline",
-            PreflightError::OutOfBounds { .. } => "out_of_bounds",
+            // One code for both: a caller branching on "outside the area" means either.
+            PreflightError::OutOfBounds { .. } | PreflightError::WeedOutOfBounds { .. } => "out_of_bounds",
+            PreflightError::WeedGeometry(_) => "weed_geometry",
             PreflightError::SettingsOutOfRange(_) => "settings_out_of_range",
             PreflightError::MachineMismatch { .. } => "machine_mismatch",
             PreflightError::OutputTooLarge(_) => "output_too_large",
@@ -159,10 +172,12 @@ pub fn preset_settings_out_of_range(s: &crate::presets::PresetSettings) -> Optio
 }
 
 /// Validate a cut job before encoding. Rules checked in order (first violation wins):
-/// 1. All enabled passes empty → NothingToCut
+/// 1. All enabled passes have no shapes → NothingToCut (weed alone is not a job)
 /// 2. Any NaN/inf coordinate → NonFiniteGeometry
 /// 3. Polyline < 2 points → DegeneratePolyline
-/// 4. Geometry outside 0..width_mm × 0..height_mm → OutOfBounds (unless allow_out_of_bounds)
+///    (2 and 3 for a pass's weed → WeedGeometry, checked after every shape)
+/// 4. Geometry outside 0..width_mm × 0..height_mm → OutOfBounds, or WeedOutOfBounds for weed
+///    (unless allow_out_of_bounds)
 /// 5. repeat_count outside 1..=10 or speed outside 1..=30 / force outside 1..=33 when set
 ///    (Cameo bounds from docs/protocol/silhouette-cameo5.md §Settings ranges) → SettingsOutOfRange
 /// 6. doc_machine_id set and ≠ profile.id → MachineMismatch
@@ -195,6 +210,15 @@ pub fn preflight(
             }
         }
     }
+    // After the shapes, so a bad shape is named by its id rather than through the weed built
+    // around it. Rules 2 and 3 share one variant: weed is generated, never drawn, so either
+    // means the same thing to the operator.
+    for pass in passes.iter().filter(|p| p.enabled) {
+        let bad = |q: &geometry::Polyline| q.len() < 2 || q.iter().any(|p| !p.x.is_finite() || !p.y.is_finite());
+        if pass.pass.weed.iter().any(bad) {
+            return Err(PreflightError::WeedGeometry(pass.pass.key.clone()));
+        }
+    }
 
     // Rule 3: Polyline < 2 points → DegeneratePolyline (checked after NaN/inf)
     for pass in passes.iter().filter(|p| p.enabled) {
@@ -223,6 +247,14 @@ pub fn preflight(
                 }
             }
         }
+        for pass in passes.iter().filter(|p| p.enabled) {
+            if pass.pass.weed.iter().flatten().any(|point| point_out_of_bounds(point, profile)) {
+                return Err(PreflightError::WeedOutOfBounds {
+                    pass: pass.pass.key.clone(),
+                    bounds: (0.0, 0.0, profile.width_mm, profile.height_mm),
+                });
+            }
+        }
     }
 
     // Rule 5: repeat_count outside 1..=10 or speed/force out of bounds → SettingsOutOfRange
@@ -248,10 +280,8 @@ pub fn preflight(
     let mut estimated_size = 0usize;
     for pass in passes.iter().filter(|p| p.enabled) {
         let mut pass_points = 0usize;
-        for shape in &pass.pass.shapes {
-            for polyline in &shape.polylines {
-                pass_points = pass_points.saturating_add(polyline.len());
-            }
+        for polyline in pass.pass.shapes.iter().flat_map(|s| s.polylines.iter()).chain(pass.pass.weed.iter()) {
+            pass_points = pass_points.saturating_add(polyline.len());
         }
         let pass_bytes = pass_points
             .saturating_mul(BYTES_PER_POINT)
@@ -277,7 +307,7 @@ mod tests {
     }
 
     fn make_pass(key: PassKey, shapes: Vec<PlannedShape>) -> DocumentPass {
-        DocumentPass { key, shapes }
+        DocumentPass { key, shapes, weed: vec![] }
     }
 
     fn make_shape(node_id: u64, polylines: Vec<Vec<Point>>) -> PlannedShape {
@@ -314,6 +344,63 @@ mod tests {
             supports_force: true,
             needs_operator_pass_confirm: false,
         }
+    }
+
+    fn with_weed(mut pass: DocumentPass, weed: Vec<Vec<Point>>) -> DocumentPass {
+        pass.weed = weed;
+        pass
+    }
+
+    fn inside_shape() -> PlannedShape { make_shape(1, vec![vec![pt(40.0, 40.0), pt(60.0, 60.0)]]) }
+
+    #[test]
+    fn a_weed_border_past_the_area_is_refused_by_its_pass_unless_allowed() {
+        let key = PassKey::Color(Some(0xFF0000FF));
+        let pass = with_weed(make_pass(key.clone(), vec![inside_shape()]), vec![vec![pt(-1.0, 50.0), pt(50.0, 50.0)]]);
+        let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
+        let err = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false).unwrap_err();
+        assert_eq!(err, PreflightError::WeedOutOfBounds { pass: key, bounds: (0.0, 0.0, 100.0, 100.0) });
+        assert_eq!(err.code(), "out_of_bounds");
+        assert_eq!(err.to_string(), "the weed border for pass color:ff0000ff lies outside the 100 x 100 mm cutting area; shrink the weed margin or move the design");
+        assert_eq!(preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, true), Ok(()));
+    }
+
+    #[test]
+    fn weed_geometry_that_is_not_finite_or_degenerate_is_refused_by_its_pass() {
+        let key = PassKey::Color(Some(0xFF0000FF));
+        for weed in [vec![vec![pt(f64::NAN, 50.0), pt(50.0, 50.0)]], vec![vec![pt(50.0, 50.0)]]] {
+            let pass = with_weed(make_pass(key.clone(), vec![inside_shape()]), weed);
+            let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
+            let err = preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, true).unwrap_err();
+            assert_eq!(err, PreflightError::WeedGeometry(key.clone()));
+            assert_eq!(err.code(), "weed_geometry");
+        }
+    }
+
+    /// A border around nothing is not a job.
+    #[test]
+    fn weed_alone_is_still_nothing_to_cut() {
+        let pass = with_weed(make_pass(PassKey::Color(Some(1)), vec![]), vec![vec![pt(10.0, 10.0), pt(20.0, 10.0)]]);
+        let configured = vec![make_configured_pass(&pass, Settings::default(), true)];
+        assert_eq!(preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false), Err(PreflightError::NothingToCut));
+    }
+
+    #[test]
+    fn output_size_counts_weed_points() {
+        // Exactly at the limit in shape points (8 repeats keeps the vector small), then pushed
+        // over it by the weed alone.
+        let settings = Settings { repeat_count: 8, ..Settings::default() };
+        let limit_points = MAX_ENCODED_BYTES / BYTES_PER_POINT / 8;
+        let shape = make_shape(1, vec![vec![pt(50.0, 50.0); limit_points]]);
+        let pass = make_pass(PassKey::Color(Some(1)), vec![shape.clone()]);
+        let configured = vec![make_configured_pass(&pass, settings.clone(), true)];
+        assert_eq!(preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false), Ok(()));
+        let weeded = with_weed(make_pass(PassKey::Color(Some(1)), vec![shape]), vec![vec![pt(50.0, 50.0), pt(51.0, 50.0)]]);
+        let configured = vec![make_configured_pass(&weeded, settings, true)];
+        assert!(matches!(
+            preflight(&configured, &profile_100x100(), &caps_no_speed_force(), None, false),
+            Err(PreflightError::OutputTooLarge(_))
+        ));
     }
 
     #[test]

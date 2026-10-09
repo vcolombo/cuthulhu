@@ -8,6 +8,7 @@ use geometry::{Affine, Point, Polyline};
 use serde::{Deserialize, Serialize};
 
 use crate::pass_key::PassKey;
+use crate::weed::{weed_geometry, WeedError, WeedOptions};
 
 /// A single shape's flattened, world-transformed outline, ready to cut.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -19,8 +20,17 @@ pub struct PlannedShape { pub node_id: NodeId, pub polylines: Vec<Polyline> }
 ///
 /// Named for the Document rather than for a colour because a colour is now one of three
 /// things a pass can be keyed on — the type was `ColorPass` while it was the only one.
+///
+/// `weed` is the pass's weed lines then its border (`weed::weed_geometry`), cut after its shapes.
+/// Kept apart from `shapes` because a `PlannedShape` is a document node, and the dialog counts
+/// shapes and anchors its order badges on them.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-pub struct DocumentPass { pub key: PassKey, pub shapes: Vec<PlannedShape> }
+pub struct DocumentPass {
+    pub key: PassKey,
+    pub shapes: Vec<PlannedShape>,
+    #[serde(default)]
+    pub weed: Vec<Polyline>,
+}
 
 /// Every `DocumentPass` a document contains, in first-seen order — an inventory of
 /// what *could* be cut. Nothing here is selected, configured or checked; that is
@@ -40,7 +50,7 @@ pub struct DocumentPasses {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum PlanError { BadShape(NodeId, String), MissingNode(NodeId), CycleDetected }
+pub enum PlanError { BadShape(NodeId, String), MissingNode(NodeId), CycleDetected, Weed(WeedError) }
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -53,6 +63,7 @@ impl std::fmt::Display for PlanError {
                 write!(f, "shape #{} is referenced by the document but missing from it", node.0),
             PlanError::CycleDetected =>
                 write!(f, "the document's shapes contain each other in a loop"),
+            PlanError::Weed(e) => write!(f, "{e}"),
         }
     }
 }
@@ -182,6 +193,7 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
                                         // settings lookup is not `plan_cut`'s job.
                                         key: PassKey::Preset(material.map(String::from)),
                                         shapes: vec![shape],
+                                        weed: vec![],
                                     }),
                                 }
                             }
@@ -195,7 +207,7 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
                                 };
                                 match passes.iter_mut().find(|p| p.key == key) {
                                     Some(pass) => pass.shapes.push(shape),
-                                    None => passes.push(DocumentPass { key, shapes: vec![shape] }),
+                                    None => passes.push(DocumentPass { key, shapes: vec![shape], weed: vec![] }),
                                 }
                             }
                         }
@@ -213,6 +225,20 @@ pub fn plan_passes_with(doc: &Document, grouping: Grouping) -> Result<DocumentPa
     })
 }
 
+/// `plan_passes_with`, plus each pass's weed geometry when `weed` is set. Every caller that plans
+/// a cut goes through here, so the preview, the travel and the cut are built from the same weed.
+/// Options out of range are refused, not clamped.
+pub fn plan_passes_for(doc: &Document, grouping: Grouping, weed: Option<&WeedOptions>)
+    -> Result<DocumentPasses, PlanError> {
+    let Some(opts) = weed else { return plan_passes_with(doc, grouping) };
+    opts.validate().map_err(PlanError::Weed)?;
+    let mut planned = plan_passes_with(doc, grouping)?;
+    for pass in &mut planned.passes {
+        pass.weed = weed_geometry(&pass.shapes, opts);
+    }
+    Ok(planned)
+}
+
 /// Travel (non-cutting) moves needed to visit every shape across `configured` passes,
 /// in the given order: end of one shape's last polyline -> start of the next shape's
 /// first polyline. `configured` lets the caller reorder/subset passes (e.g. by machine
@@ -221,9 +247,12 @@ pub fn travel_moves(configured: &[&DocumentPass]) -> Vec<(Point, Point)> {
     let mut moves = vec![];
     let mut prev_end: Option<Point> = None;
     for pass in configured {
-        for shape in &pass.shapes {
-            let start = shape.polylines.first().and_then(|p| p.first()).copied();
-            let end = shape.polylines.last().and_then(|p| p.last()).copied();
+        // Each weed polyline is its own stop, after the shapes: the order `plan_cut` cuts them in.
+        let stops = pass.shapes.iter().map(|s| s.polylines.as_slice())
+            .chain(pass.weed.iter().map(std::slice::from_ref));
+        for polylines in stops {
+            let start = polylines.first().and_then(|p| p.first()).copied();
+            let end = polylines.last().and_then(|p| p.last()).copied();
             if let (Some(prev), Some(start)) = (prev_end, start) {
                 moves.push((prev, start));
             }
@@ -267,6 +296,10 @@ mod tests {
             (
                 PlanError::CycleDetected,
                 "the document's shapes contain each other in a loop",
+            ),
+            (
+                PlanError::Weed(WeedError("the weed margin must be 0.5–50 mm".into())),
+                "the weed margin must be 0.5–50 mm",
             ),
         ];
         for (error, sentence) in cases {
@@ -538,10 +571,12 @@ mod tests {
                 shape(1, vec![vec![pt(0.0, 0.0), pt(1.0, 0.0)]]),
                 shape(2, vec![vec![pt(2.0, 0.0), pt(3.0, 0.0)]]),
             ],
+            weed: vec![],
         };
         let pass_b = DocumentPass {
             key: PassKey::Color(Some(2)),
             shapes: vec![shape(3, vec![vec![pt(10.0, 0.0), pt(11.0, 0.0)]])],
+            weed: vec![],
         };
         // reversed order: pass_b before pass_a
         let moves = travel_moves(&[&pass_b, &pass_a]);
@@ -549,6 +584,68 @@ mod tests {
             (pt(11.0, 0.0), pt(0.0, 0.0)), // end of pass_b's only shape -> start of pass_a's first shape
             (pt(1.0, 0.0), pt(2.0, 0.0)),  // end of pass_a's first shape -> start of pass_a's second shape
         ]);
+    }
+
+    /// The blade goes to the weed after the pass's shapes, one stop per polyline, and the next
+    /// pass starts from where the border ended.
+    #[test]
+    fn travel_visits_a_pass_weed_after_its_shapes() {
+        let pass_a = DocumentPass {
+            key: PassKey::Color(Some(1)),
+            shapes: vec![shape(1, vec![vec![pt(0.0, 0.0), pt(1.0, 0.0)]])],
+            weed: vec![vec![pt(5.0, 0.0), pt(6.0, 0.0)], vec![pt(7.0, 0.0), pt(8.0, 0.0)]],
+        };
+        let pass_b = DocumentPass {
+            key: PassKey::Color(Some(2)),
+            shapes: vec![shape(2, vec![vec![pt(20.0, 0.0), pt(21.0, 0.0)]])],
+            weed: vec![],
+        };
+        assert_eq!(travel_moves(&[&pass_a, &pass_b]), vec![
+            (pt(1.0, 0.0), pt(5.0, 0.0)),
+            (pt(6.0, 0.0), pt(7.0, 0.0)),
+            (pt(8.0, 0.0), pt(20.0, 0.0)),
+        ]);
+    }
+
+    fn two_colour_rects() -> Document {
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+        for (stroke, x) in [(0xFF0000FFu32, 10.0), (0x0000FFFF, 60.0)] {
+            let id = ed.doc.ids.next();
+            let mut node = with_stroke(Node::shape(id, ShapeKind::Rect { w: 20.0, h: 10.0 }), Some(stroke));
+            node.transform = geometry::Affine::translate(x, 10.0);
+            ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+        }
+        ed.doc
+    }
+
+    #[test]
+    fn planning_without_weed_options_is_plan_passes_with() {
+        let doc = two_colour_rects();
+        assert_eq!(plan_passes_for(&doc, Grouping::Color, None).unwrap(), plan_passes_with(&doc, Grouping::Color).unwrap());
+    }
+
+    /// Each pass is its own sheet, so each gets the weed of its own shapes, not of the job.
+    #[test]
+    fn each_pass_gets_the_weed_of_its_own_shapes() {
+        let doc = two_colour_rects();
+        let opts = WeedOptions { margin_mm: 3.0, lines: crate::weed::WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.5 };
+        let planned = plan_passes_for(&doc, Grouping::Color, Some(&opts)).unwrap();
+        assert_eq!(planned.passes.len(), 2);
+        for pass in &planned.passes {
+            assert!(!pass.weed.is_empty(), "{:?} has no weed", pass.key);
+            assert_eq!(pass.weed, weed_geometry(&pass.shapes, &opts));
+        }
+        // The red border stops short of the blue rect at x = 60.
+        let red_right = planned.passes[0].weed.last().unwrap().iter().map(|p| p.x).fold(f64::MIN, f64::max);
+        assert!((red_right - 33.0).abs() < 1e-9, "red border right edge {red_right}");
+    }
+
+    #[test]
+    fn weed_options_out_of_range_refuse_the_plan() {
+        let opts = WeedOptions { margin_mm: 0.1, lines: crate::weed::WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.5 };
+        let err = plan_passes_for(&two_colour_rects(), Grouping::Color, Some(&opts)).unwrap_err();
+        assert_eq!(err.to_string(), "the weed margin must be 0.5–50 mm");
     }
 
     /// The point of the whole change: geometry with no stroke is cut when it says it is,

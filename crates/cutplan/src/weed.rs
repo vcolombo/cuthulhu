@@ -76,9 +76,11 @@ pub const MAX_WEED_PIECES: usize = 100_000;
 
 /// What a pass's lines may still spend. Running out refuses the pass rather than truncating it: a
 /// pass with some of its lines missing would weed worse than the operator previewed, and say nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Budget { tests: f64, pieces: usize }
 
 impl Budget {
+    const FULL: Budget = Budget { tests: MAX_WEED_WORK, pieces: MAX_WEED_PIECES };
     /// At least one test per call, so even work over no segments (a pass of single points) counts.
     fn spend(&mut self, tests: usize) -> Option<()> {
         self.tests -= tests.max(1) as f64;
@@ -131,15 +133,34 @@ impl WeedOptions {
 /// The weed geometry for one pass: lines first, then the border, which is cut last so the sheet
 /// stays held while the blade still has detail to cut. Nothing for a pass with no points, or
 /// with bounds that are not finite: preflight then refuses the shape by its id. Refused when the
-/// pass is so large or detailed that its lines would pass `MAX_WEED_LINES` or `MAX_WEED_WORK`.
-/// `opts` is assumed valid (`WeedOptions::validate`).
+/// pass is so large or detailed that its lines would pass `MAX_WEED_LINES`, `MAX_WEED_WORK` or
+/// `MAX_WEED_PIECES`. `opts` is assumed valid (`WeedOptions::validate`).
 pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<Polyline>, WeedError> {
+    let mut budget = Budget::FULL;
+    weed_geometry_within(shapes, opts, &mut budget)
+}
+
+/// The early refusal: whether a pass's lines can fit at all, before anything is built. `n <= cap`
+/// is false for NaN, and the spacing must be positive, so a value nobody validated can neither
+/// slip through nor send `steps` down an endless decreasing sequence.
+fn lines_fit(rows: f64, columns: f64, segments: usize, spacing_mm: f64) -> bool {
+    let within = |n: f64, cap: f64| n <= cap;
+    spacing_mm > 0.0
+        && within(rows, MAX_WEED_LINES) && within(columns, MAX_WEED_LINES)
+        && within((rows + columns) * segments as f64, MAX_WEED_WORK)
+}
+
+/// `weed_geometry` against `budget`, which is left holding what was not spent. Apart so tests can
+/// measure a pass's cost and set the limit exactly at it.
+fn weed_geometry_within(shapes: &[PlannedShape], opts: &WeedOptions, budget: &mut Budget)
+    -> Result<Vec<Polyline>, WeedError> {
     // ponytail: the border is the bounding box grown by the margin, not a contour. Ceiling: an
     // L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
     // from #159's path offset.
-    // ponytail: straight lines at a fixed spacing, each scanned against every segment, and each piece
-    // tested inside against every closed outline, so the cost is lines × segments × pieces and the
-    // dialog pays it per keystroke (`MAX_WEED_WORK` bounds it, refusing the densest designs).
+    // ponytail: straight lines at a fixed spacing, each scanned against every segment and sorted,
+    // and each piece tested inside against every closed outline, so the cost is about
+    // lines × (segments log segments + pieces × closed segments), paid per keystroke in the dialog
+    // (`MAX_WEED_WORK` bounds it, refusing the densest designs).
     // Ceiling: no diagonal lines, no lines that bend around shapes, and a dense comb is refused
     // rather than weeded. Upgrade: #222's line-fill engine, or a sorted sweep of each line's signed
     // crossings, which reads every piece's winding in O(crossings log crossings).
@@ -156,26 +177,18 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<
     if horizontal || vertical {
         let across = |extent: f64, on: bool| if on { extent / opts.spacing_mm } else { 0.0 };
         let (rows, columns) = (across(bottom - top, horizontal), across(right - left, vertical));
-        // An early refusal, before anything is built, for a pass that cannot fit the budget even on
-        // its scans alone. `n <= cap` is false for NaN, and the spacing must be positive, so a value
-        // nobody validated cannot slip through or loop `steps` forever.
-        let within = |n: f64, cap: f64| n <= cap;
-        if !(opts.spacing_mm > 0.0
-            && within(rows, MAX_WEED_LINES) && within(columns, MAX_WEED_LINES)
-            && within((rows + columns) * segments as f64, MAX_WEED_WORK))
-        {
+        if !lines_fit(rows, columns, segments, opts.spacing_mm) {
             return Err(too_much());
         }
     }
     let closed = shapes.iter().flat_map(|s| &s.polylines)
         .filter(|p| is_closed(p)).map(|p| p.len() - 1).sum::<usize>();
-    let mut budget = Budget { tests: MAX_WEED_WORK, pieces: MAX_WEED_PIECES };
     let mut out = vec![];
     if horizontal {
         let outlines: Vec<Vec<&Polyline>> = shapes.iter().map(|s| s.polylines.iter().collect()).collect();
         let fills = filled(&outlines);
         for y in steps(top, bottom, opts.spacing_mm) {
-            let line = pieces(&outlines, &fills, y, left, right, opts.clearance_mm, (segments, closed), &mut budget);
+            let line = pieces(&outlines, &fills, y, left, right, opts.clearance_mm, (segments, closed), budget);
             for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x: a, y }, Point { x: b, y }]);
             }
@@ -189,7 +202,7 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<
         let outlines: Vec<Vec<&Polyline>> = swapped.iter().map(|s| s.iter().collect()).collect();
         let fills = filled(&outlines);
         for x in steps(left, right, opts.spacing_mm) {
-            let line = pieces(&outlines, &fills, x, top, bottom, opts.clearance_mm, (segments, closed), &mut budget);
+            let line = pieces(&outlines, &fills, x, top, bottom, opts.clearance_mm, (segments, closed), budget);
             for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x, y: a }, Point { x, y: b }]);
             }
@@ -239,6 +252,8 @@ fn pieces(
             blocked.push(r);
         }
     }
+    // The sort is the scan's other cost, about b log b comparisons.
+    budget.spend(blocked.len() * blocked.len().max(1).ilog2() as usize)?;
     blocked.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut free = vec![];
     let mut at = lo;
@@ -505,13 +520,55 @@ mod tests {
         }
     }
 
+    /// The early check on its own: a negative spacing gives negative line counts, which every cap
+    /// admits, so only the spacing test refuses it before `steps` runs away.
+    #[test]
+    fn the_early_check_refuses_a_spacing_that_is_not_positive() {
+        assert!(lines_fit(2.0, 2.0, 4, 5.0));
+        assert!(!lines_fit(-2.0, -2.0, 4, -5.0));
+        assert!(!lines_fit(f64::INFINITY, 0.0, 4, 0.0));
+        assert!(!lines_fit(f64::NAN, 0.0, 4, f64::NAN));
+    }
+
+    /// What a pass costs: the budget spent generating it, from a full one.
+    fn cost(shapes: &[PlannedShape], o: &WeedOptions) -> Budget {
+        let mut b = Budget::FULL;
+        weed_geometry_within(shapes, o, &mut b).unwrap();
+        Budget { tests: Budget::FULL.tests - b.tests, pieces: Budget::FULL.pieces - b.pieces }
+    }
+
+    /// A grid of closed squares, so lines in both directions find pieces and pay for inside tests.
+    fn grid(n: usize) -> Vec<PlannedShape> {
+        (0..n * n).map(|i| shape(vec![rect(6.0 * (i % n) as f64, 6.0 * (i / n) as f64, 1.0, 1.0)])).collect()
+    }
+
+    /// Horizontal and vertical lines draw on one budget, and a pass that fits it exactly is kept.
+    #[test]
+    fn both_directions_share_one_budget_and_a_pass_that_fits_it_exactly_is_kept() {
+        let shapes = grid(12);
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let (h, v) = (cost(&shapes, &WeedOptions { lines: WeedLines::Horizontal, ..o }), cost(&shapes, &WeedOptions { lines: WeedLines::Vertical, ..o }));
+        let both = cost(&shapes, &o);
+        assert_eq!(both, Budget { tests: h.tests + v.tests, pieces: h.pieces + v.pieces });
+        assert!(both.pieces > 0 && both.tests > 0.0);
+
+        let run = |b: Budget| weed_geometry_within(&shapes, &o, &mut b.clone());
+        assert!(run(both).is_ok(), "exactly enough");
+        assert!(run(Budget { tests: both.tests - 1.0, ..both }).is_err(), "one test short");
+        assert!(run(Budget { pieces: both.pieces - 1, ..both }).is_err(), "one piece short");
+        // Either direction alone fits a budget the two together overrun.
+        let larger = Budget { tests: h.tests.max(v.tests), pieces: h.pieces.max(v.pieces) };
+        assert!(run(larger).is_err());
+    }
+
     /// The early estimate counts only each line's scan; a comb gives every line a piece per gap, and
     /// each piece an inside test against every outline. The budget charges that as it is spent.
     #[test]
     fn a_comb_that_passes_the_estimate_is_refused_by_the_work_it_actually_costs() {
-        // 2000 closed 1 × 100 mm teeth 6 mm apart: about 21 lines, each with 2000 pieces, each
-        // tested against 8000 segments, so about 340 million tests while the estimate says 170 000.
-        let teeth: Vec<PlannedShape> = (0..2000).map(|i| shape(vec![rect(6.0 * i as f64, 0.0, 1.0, 100.0)])).collect();
+        // 2000 closed 0.5 × 100 mm teeth 6 mm apart (gaps of 2.5 mm once the clearance is off):
+        // about 21 lines, each with 2000 pieces, each tested against 8000 segments, so about 340
+        // million tests while the estimate says 170 000.
+        let teeth: Vec<PlannedShape> = (0..2000).map(|i| shape(vec![rect(6.0 * i as f64, 0.0, 0.5, 100.0)])).collect();
         let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
         let err = weed_geometry(&teeth, &o).unwrap_err().to_string();
         assert!(err.contains("8000 segments") && err.contains("too large or detailed"), "{err}");

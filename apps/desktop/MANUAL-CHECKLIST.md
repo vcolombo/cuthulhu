@@ -163,3 +163,7 @@ real network can confirm the swap end to end.
       with its lines and then its border, and the strips weed.
 - [ ] Tune the defaults (margin 3, spacing 25, clearance 1.5 mm) on real vinyl and HTV; record the
       values that weed cleanly here.
+- [ ] Lines: Both at 25 mm on the densest real job at hand (a full sheet of small lettering, a
+      trace): it is planned without "too large or detailed", and typing in a weed field does not
+      lag. The work budget (`cutplan::weed::MAX_WEED_WORK`) leaves about 5x a 300-letter sheet by
+      estimate, unmeasured; raise it, or take the sorted-crossing upgrade, if a real job hits it.

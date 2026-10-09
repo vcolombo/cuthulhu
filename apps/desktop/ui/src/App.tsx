@@ -20,6 +20,7 @@ import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } f
 import type { Preset } from "./cut/viewmodel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
+import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
 import { TextDialog } from "./text/TextDialog";
 
@@ -136,6 +137,11 @@ export function App() {
   }, []);
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
+  // The cut dialog's weed controls, kept here so reopening the dialog keeps them. Per session, not
+  // in the project: a weed tweak saved in the document would be an undoable edit that also makes
+  // the open plan stale. (`ponytail:` an operator who always borders sets it once per launch;
+  // upgrade by remembering it in the app's config beside presets.json.)
+  const [cutWeed, setCutWeed] = useState<WeedDraft | null>(null);
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
   const [status, setStatus] = useState<ipc.CutStatus>(ipc.DISCONNECTED_STATUS);
@@ -675,6 +681,8 @@ export function App() {
           onConvertMachine={(machineId) => edit(() => ipc.setMachine({ machineId }))}
           onError={setError}
           onClose={() => setCutOpen(false)}
+          weed={cutWeed}
+          onWeedChange={setCutWeed}
         />
       ) : null}
       {tracePath !== null ? (

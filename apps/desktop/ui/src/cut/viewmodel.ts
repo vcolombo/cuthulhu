@@ -2,7 +2,7 @@
 // One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
 // callers keep their import path without a second structurally-identical type drifting.
 import type { Bounds } from "../render/hittest";
-import type { Grouping, PassKey } from "../ipc";
+import type { Grouping, PassKey, WeedLines, WeedOptions, WeedRanges } from "../ipc";
 export type { Bounds };
 
 // View model types (UI representation)
@@ -36,6 +36,7 @@ export type CutRequest = {
   device_instance_id: string;
   doc_revision: string;
   grouping: Grouping;
+  weed: WeedOptions | null;
   passes: ConfiguredPassDto[];
 };
 
@@ -380,18 +381,21 @@ export function fieldDisabled(
  * Maps camelCase PassVm to snake_case ConfiguredPassDto fields.
  *
  * The grouping travels with the rows because it is what named them: rows keyed under one mode
- * sent under another would match passes holding different shapes.
+ * sent under another would match passes holding different shapes. The weed options travel for
+ * the same reason: they made the weed geometry the preview showed.
  */
 export function toCutRequest(
   deviceInstanceId: string,
   docRevision: string,
   grouping: Grouping,
+  weed: WeedOptions | null,
   passes: PassVm[]
 ): CutRequest {
   return {
     device_instance_id: deviceInstanceId,
     doc_revision: docRevision,
     grouping,
+    weed,
     passes: passes.map((p) => ({
       key: p.key,
       enabled: p.enabled,
@@ -401,4 +405,71 @@ export function toCutRequest(
       repeat_count: p.repeatCount,
     })),
   };
+}
+
+/** The weed controls as typed. Strings, because a field mid-edit ("1.") is not a number yet, and
+ *  the draft outlives the dialog (App keeps it for the session) so it must hold what was typed. */
+export type WeedDraft = { border: boolean; margin: string; lines: WeedLines; spacing: string; clearance: string };
+export type WeedField = "margin" | "spacing" | "clearance";
+/** Options to plan with (null: no weeding), or why the draft cannot be sent. Kept apart from
+ *  "no weeding" on purpose: a draft that fails to read must disable Cut, not cut without a border. */
+export type WeedRead =
+  | { ok: true; options: WeedOptions | null }
+  | { ok: false; errors: Partial<Record<WeedField, string>> };
+
+export function weedDraftFrom(o: WeedOptions, border: boolean): WeedDraft {
+  return { border, margin: String(o.margin_mm), lines: o.lines, spacing: String(o.spacing_mm), clearance: String(o.clearance_mm) };
+}
+
+const WEED_LABEL: Record<WeedField, string> = { margin: "Margin", spacing: "Spacing", clearance: "Clearance" };
+
+/** The draft as options, checked against `ranges` from `settings_ranges` rather than bounds of
+ *  its own. Before the ranges arrive it checks only that the fields are numbers, and `cutplan`
+ *  still refuses anything out of range. Spacing and clearance are checked only when lines are on,
+ *  as `WeedOptions::validate` does; unused, they are sent as 0 so the JSON stays finite. */
+export function readWeedDraft(d: WeedDraft, ranges: WeedRanges | null): WeedRead {
+  if (!d.border) return { ok: true, options: null };
+  const errors: Partial<Record<WeedField, string>> = {};
+  const read = (field: WeedField, text: string, range: { min: number; max: number } | null) => {
+    const v = text.trim() === "" ? NaN : Number(text);
+    if (!Number.isFinite(v)) errors[field] = `${WEED_LABEL[field]} must be a number of mm`;
+    else if (range && (v < range.min || v > range.max)) errors[field] = `${WEED_LABEL[field]} must be ${range.min}–${range.max} mm`;
+    return v;
+  };
+  const margin = read("margin", d.margin, ranges?.margin_mm ?? null);
+  const lined = d.lines !== "None";
+  const unused = (text: string) => (Number.isFinite(Number(text)) && text.trim() !== "" ? Number(text) : 0);
+  const spacing = lined ? read("spacing", d.spacing, ranges?.spacing_mm ?? null) : unused(d.spacing);
+  const clearance = lined ? read("clearance", d.clearance, ranges?.clearance_mm ?? null) : unused(d.clearance);
+  if (lined && errors.margin === undefined && errors.clearance === undefined && clearance >= margin) {
+    errors.clearance = "Clearance must be less than the margin";
+  }
+  if (Object.keys(errors).length > 0) return { ok: false, errors };
+  return { ok: true, options: { margin_mm: margin, lines: d.lines, spacing_mm: spacing, clearance_mm: clearance } };
+}
+
+/** Each polyline's box, so the preview's fit takes in weed geometry, which sits outside every
+ *  shape's bounds by the margin. An empty polyline has no box. */
+export function polylineBounds(polylines: [number, number][][]): Bounds[] {
+  return polylines.filter((l) => l.length > 0).map((l) => {
+    const xs = l.map((p) => p[0]);
+    const ys = l.map((p) => p[1]);
+    const x = xs.reduce((a, b) => Math.min(a, b));
+    const y = ys.reduce((a, b) => Math.min(a, b));
+    return { x, y, w: xs.reduce((a, b) => Math.max(a, b)) - x, h: ys.reduce((a, b) => Math.max(a, b)) - y };
+  });
+}
+
+/** The rows of a plan made for a weed edit, with the operator's arrangement carried over from the
+ *  rows it replaces: their order and each pass's settings, matched by key. The weed changes no
+ *  pass, so a replan for it that reset every row to cut-everything-in-planned-order would undo
+ *  edits the operator never touched, silently. New rows keep their planned place after the rest;
+ *  everything else (shape count, ids, starts, weed) comes from the new plan. */
+export function carryRows<T extends PassVm>(prev: PassVm[], next: T[]): T[] {
+  const at = new Map(prev.map((r, i) => [r.key, i]));
+  const kept = next.filter((r) => at.has(r.key)).sort((a, b) => at.get(a.key)! - at.get(b.key)!).map((r) => {
+    const p = prev[at.get(r.key)!];
+    return { ...r, enabled: p.enabled, presetId: p.presetId, speed: p.speed, force: p.force, repeatCount: p.repeatCount };
+  });
+  return [...kept, ...next.filter((r) => !at.has(r.key))];
 }

@@ -110,6 +110,11 @@ import {
   effectiveSettings,
   fieldDisabled,
   toCutRequest,
+  polylineBounds,
+  carryRows,
+  readWeedDraft,
+  weedDraftFrom,
+  type WeedDraft,
   parsePassKey,
   passRowLabel,
   presetIdForKey,
@@ -119,7 +124,7 @@ import {
   type Caps,
   type Preset,
 } from "./viewmodel";
-import type { DeviceInfo, Grouping } from "../ipc";
+import type { DeviceInfo, Grouping, WeedOptions, WeedRanges } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
   instance_id: "usb:mock",
@@ -454,7 +459,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", "Color", passes);
+    const result = toCutRequest("device123", "42", "Color", null, passes);
 
     expect(result.device_instance_id).toBe("device123");
     expect(result.doc_revision).toBe("42");
@@ -483,7 +488,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", "Color", passes);
+    const result = toCutRequest("device123", "42", "Color", null, passes);
 
     expect(result.passes[0]).toEqual({
       key: "no-color",
@@ -517,7 +522,7 @@ describe("toCutRequest", () => {
       },
     ];
 
-    const result = toCutRequest("device123", "42", "Color", passes);
+    const result = toCutRequest("device123", "42", "Color", null, passes);
 
     expect(result.passes).toHaveLength(2);
     expect(result.passes[0].preset_id).toBe("preset1");
@@ -711,7 +716,7 @@ describe("installed plan", () => {
           speed: null, force: null, repeatCount: null },
       ],
     };
-    const request = toCutRequest("dev-1", plan.revision, plan.grouping, plan.rows);
+    const request = toCutRequest("dev-1", plan.revision, plan.grouping, null, plan.rows);
     expect(request.grouping).toBe("Fill");
     expect(request.passes.map((p) => p.key)).toEqual(["color:00ff00ff"]);
   });
@@ -723,7 +728,7 @@ describe("installed plan", () => {
       key, shapeCount: 1, enabled: true, presetId: presetIdForKey(key),
       speed: null, force: null, repeatCount: null,
     }));
-    const request = toCutRequest("dev-1", "7", "Preset", rows);
+    const request = toCutRequest("dev-1", "7", "Preset", null, rows);
     expect(request.passes.map((p) => p.preset_id)).toEqual(["cameo5-htv", null]);
   });
 });
@@ -791,5 +796,108 @@ describe("rowPresetLookup", () => {
   // long as the dialog is open on that cutter.
   it("holds no aim's list as unread", () => {
     expect(rowPresetLookup(null)).toEqual({ presets: [], loaded: false });
+  });
+});
+
+const WEED_RANGES: WeedRanges = {
+  margin_mm: { min: 0.5, max: 50 },
+  spacing_mm: { min: 5, max: 500 },
+  clearance_mm: { min: 0.2, max: 20 },
+};
+const WEED_DEFAULTS: WeedOptions = { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 };
+
+describe("readWeedDraft", () => {
+  const draft = (over: Partial<WeedDraft> = {}): WeedDraft => ({ ...weedDraftFrom(WEED_DEFAULTS, true), ...over });
+
+  it("is no weeding, and valid, while Border is off, whatever the fields say", () => {
+    expect(readWeedDraft(draft({ border: false, margin: "nonsense" }), WEED_RANGES)).toEqual({ ok: true, options: null });
+  });
+
+  it("reads a border-only draft as options, sending finite placeholders for the unused line fields", () => {
+    expect(readWeedDraft(draft({ margin: " 4.5 ", spacing: "", clearance: "x" }), WEED_RANGES)).toEqual({
+      ok: true,
+      options: { margin_mm: 4.5, lines: "None", spacing_mm: 0, clearance_mm: 0 },
+    });
+  });
+
+  it("reads lines with their spacing and clearance", () => {
+    expect(readWeedDraft(draft({ lines: "Both", spacing: "30", clearance: "2" }), WEED_RANGES)).toEqual({
+      ok: true,
+      options: { margin_mm: 3, lines: "Both", spacing_mm: 30, clearance_mm: 2 },
+    });
+  });
+
+  it("names each field that is not a number or is out of the ranges it was given", () => {
+    expect(readWeedDraft(draft({ margin: "" }), WEED_RANGES)).toEqual({ ok: false, errors: { margin: "Margin must be a number of mm" } });
+    expect(readWeedDraft(draft({ margin: "1e400" }), WEED_RANGES)).toEqual({ ok: false, errors: { margin: "Margin must be a number of mm" } });
+    expect(readWeedDraft(draft({ margin: "0.4" }), WEED_RANGES)).toEqual({ ok: false, errors: { margin: "Margin must be 0.5–50 mm" } });
+    expect(readWeedDraft(draft({ lines: "Horizontal", spacing: "501", clearance: "0.1" }), WEED_RANGES)).toEqual({
+      ok: false,
+      errors: { spacing: "Spacing must be 5–500 mm", clearance: "Clearance must be 0.2–20 mm" },
+    });
+  });
+
+  it("admits the range edges themselves", () => {
+    expect(readWeedDraft(draft({ margin: "50", lines: "Vertical", spacing: "5", clearance: "20" }), WEED_RANGES).ok).toBe(true);
+    expect(readWeedDraft(draft({ margin: "0.5" }), WEED_RANGES).ok).toBe(true);
+  });
+
+  it("refuses a clearance as wide as the margin, since a line runs to the border", () => {
+    expect(readWeedDraft(draft({ lines: "Both", clearance: "3" }), WEED_RANGES)).toEqual({
+      ok: false,
+      errors: { clearance: "Clearance must be less than the margin" },
+    });
+  });
+
+  it("checks only that the fields are numbers before the ranges have arrived", () => {
+    expect(readWeedDraft(draft({ margin: "99" }), null)).toEqual({
+      ok: true,
+      options: { margin_mm: 99, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
+    });
+    expect(readWeedDraft(draft({ margin: "abc" }), null).ok).toBe(false);
+  });
+
+  it("round-trips options through a draft", () => {
+    const o: WeedOptions = { margin_mm: 4, lines: "Horizontal", spacing_mm: 12.5, clearance_mm: 1 };
+    expect(readWeedDraft(weedDraftFrom(o, true), WEED_RANGES)).toEqual({ ok: true, options: o });
+  });
+});
+
+describe("toCutRequest weed", () => {
+  it("carries the weed options the plan was made with", () => {
+    const weed: WeedOptions = { margin_mm: 4, lines: "Both", spacing_mm: 20, clearance_mm: 1 };
+    expect(toCutRequest("dev", "1", "Color", weed, []).weed).toEqual(weed);
+    expect(toCutRequest("dev", "1", "Color", null, []).weed).toBeNull();
+  });
+});
+
+describe("polylineBounds", () => {
+  it("boxes each polyline so the preview fit includes a border wider than the shapes", () => {
+    expect(polylineBounds([[[1, 2], [5, 2], [5, 8]], [[-3, 0], [0, 0]]])).toEqual([
+      { x: 1, y: 2, w: 4, h: 6 },
+      { x: -3, y: 0, w: 3, h: 0 },
+    ]);
+    expect(polylineBounds([[]])).toEqual([]);
+  });
+});
+
+describe("carryRows", () => {
+  const row = (key: string, over: Partial<PassVm> = {}): PassVm => ({
+    key, shapeCount: 1, enabled: true, presetId: null, speed: null, force: null, repeatCount: null, ...over,
+  });
+
+  it("keeps the operator's order and settings for every pass the new plan still has", () => {
+    const before = [row("color:00ff00ff", { speed: 9 }), row("color:ff0000ff", { enabled: false, presetId: "vinyl" })];
+    const fresh = [row("color:ff0000ff", { shapeCount: 3 }), row("color:00ff00ff")];
+    expect(carryRows(before, fresh)).toEqual([
+      row("color:00ff00ff", { speed: 9 }),
+      row("color:ff0000ff", { shapeCount: 3, enabled: false, presetId: "vinyl" }),
+    ]);
+  });
+
+  it("puts a pass the old rows did not have last, as planned, and drops one that is gone", () => {
+    const before = [row("color:00ff00ff", { force: 4 }), row("no-color")];
+    const fresh = [row("color:ff0000ff"), row("color:00ff00ff")];
+    expect(carryRows(before, fresh)).toEqual([row("color:00ff00ff", { force: 4 }), row("color:ff0000ff")]);
   });
 });

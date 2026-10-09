@@ -28,7 +28,7 @@
   "new_doc": [],
   "pair_host": ["address", "fingerprint", "name", "token"],
   "pick_image": [],
-  "plan_cut": ["grouping"],
+  "plan_cut": ["grouping", "weed"],
   "probe_host": ["address"],
   "reconnect_device": [],
   "redo": [],
@@ -44,6 +44,6 @@
   "test_host": ["address", "fingerprint", "token"],
   "trace_controls": [],
   "trace_image": ["controls", "path"],
-  "travel_for_order": ["docRevision", "grouping", "passes"],
+  "travel_for_order": ["docRevision", "grouping", "passes", "weed"],
   "undo": []
 }

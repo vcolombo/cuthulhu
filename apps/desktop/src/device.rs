@@ -8,7 +8,8 @@ use cutplan::presets::{
     default_presets_path, load_presets, resolve_settings, save_user_presets, MaterialPreset,
     SettingsOverride,
 };
-use cutplan::{plan_cut, plan_passes_with, DocumentPass, CutError, Grouping, PassKey, PassSelection, PlanOptions};
+use cutplan::{plan_cut, plan_passes_for, DocumentPass, CutError, Grouping, PassKey, PassSelection, PlanOptions};
+use cutplan::weed::WeedOptions;
 use driver_core::manager::{CutPass, DeviceEvent, DeviceManager};
 use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, HostId, MachineCaps};
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,9 @@ pub struct CutRequest {
     /// the travel and the cut are three round trips, and a mode kept in `AppState` could be
     /// changed between them while the stale-plan check only guards the document.
     pub grouping: Grouping,
+    /// The weed options the dialog planned with, sent for the same reason as `grouping`: rows
+    /// previewed with one border and cut with another would send geometry nobody saw.
+    pub weed: Option<WeedOptions>,
     pub passes: Vec<ConfiguredPassDto>,
 }
 
@@ -1044,7 +1048,7 @@ impl DeviceManagerHandle {
 
         // Planned here, at cut time, against the live document — `expect_revision`
         // is what refuses the cut if that is no longer the document the UI planned.
-        let planned = plan_passes_with(&app.editor.doc, request.grouping)
+        let planned = plan_passes_for(&app.editor.doc, request.grouping, request.weed.as_ref())
             .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
         let plan = plan_cut(&planned, &profile, &caps, &opts).map_err(map_cut_error)?;
         Ok((connected, plan.cut_passes()))
@@ -1346,16 +1350,19 @@ pub struct PlanCutPassSummary {
     /// from `travel`, which has no move to the first shape and none for a single-shape
     /// plan. `None` is a shape whose outline flattened to nothing.
     pub starts: Vec<Option<[f64; 2]>>,
+    /// The pass's weed lines then its border, in world mm, for the preview to draw. Empty
+    /// without weed options.
+    pub weed: Vec<Vec<[f64; 2]>>,
 }
 
-/// Summarizes `plan_passes_with` output for the UI — not the raw `DocumentPasses`
+/// Summarizes `plan_passes_for` output for the UI — not the raw `DocumentPasses`
 /// (which carries full flattened polylines the cut dialog doesn't need).
 ///
 /// Takes the grouping rather than defaulting it: unlike `cutplan::plan_passes`, this has no
 /// caller that means "whatever the default is" — the dialog always has a mode selected.
-pub fn plan_cut_response(doc: &document::Document, grouping: Grouping)
+pub fn plan_cut_response(doc: &document::Document, grouping: Grouping, weed: Option<&WeedOptions>)
     -> Result<PlanCutResponse, IpcError> {
-    let planned = plan_passes_with(doc, grouping)
+    let planned = plan_passes_for(doc, grouping, weed)
         .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
     let refs: Vec<&DocumentPass> = planned.passes.iter().collect();
     let travel = cutplan::travel_moves(&refs);
@@ -1367,6 +1374,7 @@ pub fn plan_cut_response(doc: &document::Document, grouping: Grouping)
             starts: p.shapes.iter().map(|s| {
                 s.polylines.first().and_then(|p| p.first()).map(|pt| [pt.x, pt.y])
             }).collect(),
+            weed: p.weed.iter().map(|l| l.iter().map(|pt| [pt.x, pt.y]).collect()).collect(),
         }).collect(),
         skipped_not_cut: planned.skipped_not_cut,
         doc_revision: planned.doc_revision.to_string(),
@@ -1393,6 +1401,7 @@ pub fn travel_for_order(
     doc: &document::Document,
     doc_revision: &str,
     grouping: Grouping,
+    weed: Option<&WeedOptions>,
     configured: &[TravelPassDto],
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Same rule as `prepare_cut`: a revision string that isn't a u64 was never
@@ -1400,7 +1409,7 @@ pub fn travel_for_order(
     let Ok(expected) = doc_revision.parse::<u64>() else {
         return Err(IpcError::new("stale_plan", "travel request carries an unrecognized plan revision"));
     };
-    let planned = plan_passes_with(doc, grouping)
+    let planned = plan_passes_for(doc, grouping, weed)
         .map_err(|e| IpcError::new("plan_error", e.to_string()))?;
     if planned.doc_revision != expected {
         return Err(map_cut_error(CutError::StalePlan { expected, actual: planned.doc_revision }));
@@ -1534,7 +1543,7 @@ pub fn delete_preset(path: &Path, machine_id: &str, id: &str) -> Result<(), IpcE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutplan::DocumentPasses;
+    use cutplan::{plan_passes_with, DocumentPasses};
     use driver_core::{Driver, Job, MachineCaps, MachineProfile, Phase, Transport, TransportError, TransportKind};
 
     struct TestDriver { profile: MachineProfile, caps: MachineCaps }
@@ -1599,6 +1608,7 @@ mod tests {
             // The mode the passes were planned under. `plan_for` uses colour grouping, so
             // this must too, or every request here would be refused as an unknown key.
             grouping: Grouping::Color,
+            weed: None,
             passes: plan.passes.iter().map(|p| ConfiguredPassDto {
                 key: p.key.clone(), enabled: true, preset_id: None,
                 speed: None, force: None, repeat_count: None,
@@ -1636,7 +1646,7 @@ mod tests {
         let dev = test_device_setup();
         let revision = cutplan::doc_revision(&app.editor.doc);
         let request = CutRequest { device_instance_id: test_instance().instance_id,
-            doc_revision: revision.to_string(), grouping: Grouping::Color, passes: vec![] };
+            doc_revision: revision.to_string(), grouping: Grouping::Color, weed: None, passes: vec![] };
         let err = dev.cut_from_request(&app, request).unwrap_err();
         assert_eq!(err.code, "nothing_to_cut");
     }
@@ -1682,12 +1692,12 @@ mod tests {
         let (app, revision) = two_color_doc();
 
         // The plan's own first-seen order reproduces exactly what plan_cut_response sent.
-        let planned = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(BLUE))]).unwrap();
-        assert_eq!(planned, plan_cut_response(&app.editor.doc, Grouping::Color).unwrap().travel);
+        let planned = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED)), on(colour(BLUE))]).unwrap();
+        assert_eq!(planned, plan_cut_response(&app.editor.doc, Grouping::Color, None).unwrap().travel);
         assert_eq!(planned.len(), 1);
         assert!(planned[0][2] >= 100.0, "red first: travel lands on the blue rect at x=100, got {planned:?}");
 
-        let reversed = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(BLUE)), on(colour(RED))]).unwrap();
+        let reversed = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(BLUE)), on(colour(RED))]).unwrap();
         assert_eq!(reversed.len(), 1);
         assert!(reversed[0][0] >= 100.0 && reversed[0][2] <= 10.0,
             "blue first: travel leaves x=100 for the red rect at the origin, got {reversed:?}");
@@ -1698,11 +1708,11 @@ mod tests {
     #[test]
     fn travel_for_order_skips_a_disabled_pass() {
         let (app, revision) = two_color_doc();
-        let travel = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), off(colour(BLUE))]).unwrap();
+        let travel = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED)), off(colour(BLUE))]).unwrap();
         assert!(travel.is_empty(), "nothing to travel to with only one pass cut, got {travel:?}");
 
         // And with everything off there is no motion at all.
-        let none = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[off(colour(RED)), off(colour(BLUE))]).unwrap();
+        let none = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[off(colour(RED)), off(colour(BLUE))]).unwrap();
         assert!(none.is_empty(), "no pass is cut, so the head does not move: {none:?}");
     }
 
@@ -1710,7 +1720,7 @@ mod tests {
     fn travel_for_order_with_a_stale_revision_is_refused() {
         let (mut app, revision) = two_color_doc();
         app.add_rect(5.0, 5.0);
-        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(BLUE))]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED)), on(colour(BLUE))]).unwrap_err();
         assert_eq!(err.code, "stale_plan");
     }
 
@@ -1718,7 +1728,7 @@ mod tests {
     fn travel_for_order_with_an_unknown_key_is_refused() {
         let (app, revision) = two_color_doc();
         let unknown = TravelPassDto { key: colour(0xDEADBEEF), enabled: true };
-        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), unknown]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED)), unknown]).unwrap_err();
         assert_eq!(err.code, "unknown_pass");
     }
 
@@ -1727,21 +1737,21 @@ mod tests {
     #[test]
     fn travel_for_order_missing_a_planned_pass_is_refused() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED))]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED))]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 
     #[test]
     fn travel_for_order_naming_a_pass_twice_is_a_mismatch_not_an_unknown_pass() {
         let (app, revision) = two_color_doc();
-        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, &[on(colour(RED)), on(colour(RED))]).unwrap_err();
+        let err = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &[on(colour(RED)), on(colour(RED))]).unwrap_err();
         assert_eq!(err.code, "plan_mismatch");
     }
 
     #[test]
     fn plan_cut_response_carries_each_shapes_first_world_point() {
         let (app, _) = two_color_doc();
-        let response = plan_cut_response(&app.editor.doc, Grouping::Color).unwrap();
+        let response = plan_cut_response(&app.editor.doc, Grouping::Color, None).unwrap();
         for pass in &response.passes {
             assert_eq!(pass.starts.len(), pass.node_ids.len(), "starts is parallel to node_ids");
         }
@@ -1750,6 +1760,85 @@ mod tests {
         let blue = response.passes.iter().find(|p| p.key == colour(BLUE)).unwrap();
         let start = blue.starts[0].unwrap();
         assert!(start[0] >= 100.0, "world-space start, got {start:?}");
+    }
+
+    fn border_only() -> WeedOptions {
+        WeedOptions { margin_mm: 3.0, lines: cutplan::weed::WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.5 }
+    }
+
+    /// Moves a shape to (x, y), so a weed border around it stays on the test machine's mat.
+    fn place(app: &mut AppState, id: document::NodeId, x: f64, y: f64) {
+        let before = app.editor.doc.get(id).unwrap().clone();
+        let mut after = before.clone();
+        after.transform = geometry::Affine::translate(x, y);
+        app.editor.doc.apply(document::Delta(vec![document::NodeOp::Update { id, before, after }]));
+    }
+
+    #[test]
+    fn a_weeded_plan_carries_each_pass_border_for_the_preview() {
+        let (app, _) = two_color_doc();
+        let response = plan_cut_response(&app.editor.doc, Grouping::Color, Some(&border_only())).unwrap();
+        for pass in &response.passes {
+            assert_eq!(pass.weed.len(), 1, "{}: the border alone", pass.key);
+            assert_eq!(pass.weed[0].len(), 5, "a closed rectangle");
+        }
+        // Each pass's own 10 mm rect, grown by the 3 mm margin: red at x = 0, blue at x = 100.
+        let border = |key: PassKey| response.passes.iter().find(|p| p.key == key).unwrap().weed[0].clone();
+        assert_eq!(border(colour(RED)), vec![[-3.0, -3.0], [13.0, -3.0], [13.0, 13.0], [-3.0, 13.0], [-3.0, -3.0]]);
+        assert_eq!(border(colour(BLUE))[2], [113.0, 13.0]);
+        let plain = plan_cut_response(&app.editor.doc, Grouping::Color, None).unwrap();
+        assert!(plain.passes.iter().all(|p| p.weed.is_empty()));
+    }
+
+    #[test]
+    fn weeded_travel_goes_to_each_border_after_its_pass_shapes() {
+        let (app, revision) = two_color_doc();
+        let order = [on(colour(RED)), on(colour(BLUE))];
+        let plain = travel_for_order(&app.editor.doc, &revision, Grouping::Color, None, &order).unwrap();
+        let weeded = travel_for_order(&app.editor.doc, &revision, Grouping::Color, Some(&border_only()), &order).unwrap();
+        assert_eq!(weeded.len(), plain.len() + 2, "one more stop per pass: its border");
+        // The preview's first travel and the replanned one agree.
+        assert_eq!(weeded, plan_cut_response(&app.editor.doc, Grouping::Color, Some(&border_only())).unwrap().travel);
+    }
+
+    /// The reason the options travel with the request: the cut is built from what it was sent.
+    #[test]
+    fn a_cut_cuts_the_weed_it_was_sent() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        let id = app.add_rect(10.0, 10.0);
+        place(&mut app, id, 50.0, 50.0);
+        let (_, plain) = dev.prepare_cut(&app, request_from(plan_for(&app))).unwrap();
+        let mut request = request_from(plan_for(&app));
+        request.weed = Some(border_only());
+        let (_, weeded) = dev.prepare_cut(&app, request).unwrap();
+
+        assert_eq!(weeded[0].job.polylines.len(), plain[0].job.polylines.len() + 1);
+        let border = weeded[0].job.polylines.last().unwrap();
+        let xs = border.iter().map(|p| p.x);
+        assert_eq!(xs.clone().fold(f64::MAX, f64::min), 47.0);
+        assert_eq!(xs.fold(f64::MIN, f64::max), 63.0);
+    }
+
+    #[test]
+    fn a_weed_border_off_the_mat_is_refused_as_out_of_bounds() {
+        let mut app = AppState::new();
+        let dev = test_device_setup();
+        app.add_rect(10.0, 10.0); // at the origin, so a 3 mm border reaches -3
+        let mut request = request_from(plan_for(&app));
+        request.weed = Some(border_only());
+        let err = dev.prepare_cut(&app, request).err().expect("refused");
+        assert_eq!(err.code, "out_of_bounds");
+        assert!(err.message.contains("weed border"), "{}", err.message);
+    }
+
+    #[test]
+    fn weed_options_out_of_range_are_refused_with_their_sentence() {
+        let (app, _) = two_color_doc();
+        let bad = WeedOptions { margin_mm: 99.0, ..border_only() };
+        let err = plan_cut_response(&app.editor.doc, Grouping::Color, Some(&bad)).err().expect("refused");
+        assert_eq!(err.code, "plan_error");
+        assert_eq!(err.message, "the weed margin must be 0.5–50 mm");
     }
 
     /// The grouping the dialog asked for is the grouping that gets cut. Without it the
@@ -1763,12 +1852,13 @@ mod tests {
         // so the request's grouping is observable in what matches.
         let id = app.add_rect(10.0, 10.0);
         paint(&mut app, id, Some(RED), Some(GREEN));
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Fill,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 key: colour(RED), enabled: true, preset_id: None,
                 speed: None, force: None, repeat_count: None }],
@@ -1783,11 +1873,11 @@ mod tests {
         let mut app = AppState::new();
         let id = app.add_rect(10.0, 10.0);
         paint(&mut app, id, Some(RED), Some(GREEN));
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Fill, None).unwrap().doc_revision;
 
-        assert!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
+        assert!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill, None,
             &[on(colour(GREEN))]).is_ok());
-        assert_eq!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill,
+        assert_eq!(travel_for_order(&app.editor.doc, &revision, Grouping::Fill, None,
             &[on(colour(RED))]).unwrap_err().code, "unknown_pass");
     }
 
@@ -1796,7 +1886,7 @@ mod tests {
     fn a_plan_response_names_its_passes_by_key() {
         let mut app = AppState::new();
         app.add_rect(10.0, 10.0);
-        let response = plan_cut_response(&app.editor.doc, Grouping::Single).unwrap();
+        let response = plan_cut_response(&app.editor.doc, Grouping::Single, None).unwrap();
         assert_eq!(response.passes[0].key, PassKey::All);
     }
 
@@ -1810,12 +1900,13 @@ mod tests {
         let id = app.add_rect(10.0, 10.0);
         app.set_material_preset(vec![id], document::PresetAssignment::Preset("cameo5-htv".into()))
             .expect("assignable");
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Preset,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 key: PassKey::Preset(Some("cameo5-htv".into())),
                 enabled: true,
@@ -1847,12 +1938,13 @@ mod tests {
         let id = app.add_rect(10.0, 10.0);
         app.set_material_preset(vec![id], document::PresetAssignment::Preset("cameo5-htv".into()))
             .expect("assignable");
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Preset,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 key: PassKey::Preset(Some("cameo5-htv".into())),
                 enabled: true,
@@ -1884,12 +1976,13 @@ mod tests {
         let id = app.add_rect(10.0, 10.0);
         app.set_material_preset(vec![id], document::PresetAssignment::Preset("deleted-by-hand".into()))
             .expect("assignable");
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Preset,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 key: PassKey::Preset(Some("deleted-by-hand".into())),
                 enabled: true,
@@ -1910,12 +2003,13 @@ mod tests {
         let mut app = AppState::new();
         let dev = test_device_setup();
         app.add_rect(10.0, 10.0);
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Preset,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 // What the dialog sends for a `preset:` row now that both grammars parse it.
                 key: PassKey::Preset(Some(String::new())),
@@ -1944,12 +2038,13 @@ mod tests {
         let id = app.add_rect(10.0, 10.0);
         app.set_material_preset(vec![id], document::PresetAssignment::Preset("puma-htv".into()))
             .expect("assignable");
-        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset).unwrap().doc_revision;
+        let revision = plan_cut_response(&app.editor.doc, Grouping::Preset, None).unwrap().doc_revision;
 
         let request = CutRequest {
             device_instance_id: test_instance().instance_id,
             doc_revision: revision,
             grouping: Grouping::Preset,
+            weed: None,
             passes: vec![ConfiguredPassDto {
                 key: PassKey::Preset(Some("puma-htv".into())),
                 enabled: true,

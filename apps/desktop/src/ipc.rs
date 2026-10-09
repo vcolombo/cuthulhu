@@ -8,6 +8,7 @@ use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHand
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 use cutplan::Grouping;
+use cutplan::weed::WeedOptions;
 
 pub type AppStateHandle = Mutex<AppState>;
 
@@ -155,8 +156,8 @@ pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Op
 }
 
 #[tauri::command]
-pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping) -> Result<PlanCutResponse, IpcError> {
-    plan_cut_response(&state.lock().unwrap().editor.doc, grouping)
+pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping, weed: Option<WeedOptions>) -> Result<PlanCutResponse, IpcError> {
+    plan_cut_response(&state.lock().unwrap().editor.doc, grouping, weed.as_ref())
 }
 
 #[tauri::command]
@@ -164,10 +165,11 @@ pub fn travel_for_order(
     state: tauri::State<AppStateHandle>,
     doc_revision: String,
     grouping: Grouping,
+    weed: Option<WeedOptions>,
     passes: Vec<TravelPassDto>,
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Fully qualified because the command and the function it forwards to share a name.
-    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, &passes)
+    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, weed.as_ref(), &passes)
 }
 
 // async: prepare_cut briefly locks the document (plan + preflight), then the
@@ -209,11 +211,29 @@ pub fn machine_caps(dev: tauri::State<DeviceManagerHandle>, machine_id: String) 
     dev.caps_for(&machine_id)
 }
 
-/// The preset editor is told the bounds rather than restating them: a second copy in TypeScript
-/// offers the operator a speed `cutplan` then refuses (the arrangement `trace_controls` uses).
+/// Both sets of bounds in one answer, flattened so the settings keep the shape the preset editor
+/// already reads, with the weed bounds and starting values beside them. Keys in camelCase like
+/// `SettingsRanges`'s own; the weed values inside keep `WeedOptions`'s snake_case, the shape the
+/// dialog sends back in its requests.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Ranges {
+    #[serde(flatten)]
+    settings: cutplan::preflight::SettingsRanges,
+    weed: cutplan::weed::WeedRanges,
+    weed_defaults: cutplan::weed::WeedOptions,
+}
+
+/// The preset editor and the cut dialog are told the bounds rather than restating them: a second
+/// copy in TypeScript offers the operator a value `cutplan` then refuses (the arrangement
+/// `trace_controls` uses).
 #[tauri::command]
-pub fn settings_ranges() -> Result<cutplan::preflight::SettingsRanges, IpcError> {
-    Ok(cutplan::preflight::SETTINGS_RANGES)
+pub fn settings_ranges() -> Result<Ranges, IpcError> {
+    Ok(Ranges {
+        settings: cutplan::preflight::SETTINGS_RANGES,
+        weed: cutplan::weed::WEED_RANGES,
+        weed_defaults: cutplan::weed::WEED_DEFAULTS,
+    })
 }
 
 #[tauri::command]
@@ -416,5 +436,24 @@ mod tests {
             serde_json::from_str(r#"[{"ids":[1,2],"m":[1,0,0,1,5,0]}]"#).unwrap();
         assert_eq!(moves[0].ids, vec![NodeId(1), NodeId(2)]);
         assert_eq!(moves[0].m, Affine([1.0, 0.0, 0.0, 1.0, 5.0, 0.0]));
+    }
+
+    /// The shape `ipc.ts`'s `SettingsRanges` reads. The e2e fake hardcodes its own copy, so a
+    /// rename here would leave the real dialog reading undefined while every e2e test passed.
+    #[test]
+    fn settings_ranges_answer_in_the_shape_the_dialog_reads() {
+        let json = serde_json::to_value(settings_ranges().unwrap()).unwrap();
+        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["force", "repeatCount", "speed", "weed", "weedDefaults"]);
+        // All of it, since the e2e fake hardcodes the same numbers and would drift silently.
+        assert_eq!(json["weed"], serde_json::json!({
+            "margin_mm": { "min": 0.5, "max": 50.0 },
+            "spacing_mm": { "min": 5.0, "max": 500.0 },
+            "clearance_mm": { "min": 0.2, "max": 20.0 },
+        }));
+        assert_eq!(json["weedDefaults"], serde_json::json!({
+            "margin_mm": 3.0, "lines": "None", "spacing_mm": 25.0, "clearance_mm": 1.5,
+        }));
     }
 }

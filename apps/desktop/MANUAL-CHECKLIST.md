@@ -148,3 +148,24 @@ real network can confirm the swap end to end.
       border cuts where it was.
 - [ ] One ⌘Z (Ctrl+Z) after an align puts every moved piece back at once.
 - [ ] The eight icons read as what they do at the panel's size, in the dark theme (light is deferred).
+
+## Weed lines (spec 2026-10-09, unverified)
+
+- [ ] A word cut on the Cameo 5 with Border on (3 mm): the border is cut last, after every letter,
+      and the sheet lifts off the roll in one piece.
+- [ ] The same word with Lines: Both, spacing 25 mm, clearance 1.5 mm: no line nicks a letter, and
+      the waste weeds off strip by strip, including from inside the counters (O, A, e).
+- [ ] A two-colour design grouped by colour: each colour's sheet gets a border sized to its own
+      shapes, cut in that colour's pass.
+- [ ] A design within 3 mm of the mat edge with Border on: the cut is refused, and the message says
+      to shrink the weed margin or move the design.
+- [ ] `cuthulhu cut --group-by color --weed-margin 3 --weed-lines h` on the Puma IV: each pass ends
+      with its lines and then its border, and the strips weed.
+- [ ] Tune the defaults (margin 3, spacing 25, clearance 1.5 mm) on real vinyl and HTV; record the
+      values that weed cleanly here.
+- [ ] Lines: Both at 25 mm on the densest real job at hand (a full sheet of small lettering, a
+      trace): it is planned without "too large or detailed", and typing in a weed field does not
+      lag. The work budget (`cutplan::weed::MAX_WEED_WORK`, 50M tests) measured about 2.9M for a
+      synthetic trace of 1000 closed 100-sided blobs over 300 mm at the defaults (test
+      `a_dense_trace_at_the_default_spacing_is_weeded_not_refused`); raise it, or take the
+      sorted-crossing upgrade, if a real job hits it.

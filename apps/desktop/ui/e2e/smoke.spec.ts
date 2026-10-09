@@ -16,6 +16,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
   type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
+  type WeedOptions = { margin_mm: number; lines: "None" | "Horizontal" | "Vertical" | "Both"; spacing_mm: number; clearance_mm: number };
   type Doc = {
     nodes: Record<number, Node>;
     root: number;
@@ -424,6 +425,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     device_instance_id: string;
     doc_revision: string;
     grouping: Grouping;
+    weed?: WeedOptions | null;
     passes: {
       key: string;
       enabled: boolean;
@@ -475,7 +477,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
   // Armed by the test rather than by a call count — StrictMode plans twice on mount, so
   // "hold from the second call" holds the dialog's own opening plan and it never gets rows.
   let holding = false;
+  // Set by a test that needs a held plan to fail when released rather than install: a replan that
+  // is out while the operator keeps typing, and then refused.
+  let refuseHeldPlans = false;
   const heldPlans: (() => void)[] = [];
+  // The weed controls start from the defaults `settings_ranges` carries, so a test needs the window
+  // before they arrive, and the case where they never do.
+  let holdingRanges = false;
+  let rangesFail = false;
+  const heldRanges: (() => void)[] = [];
   const heldTravel: (() => void)[] = [];
   const release = (queue: (() => void)[]) => {
     queue.splice(0).forEach((f) => f());
@@ -517,6 +527,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     __releaseCommits: () => { holdingCommits = false; return release(heldCommits); },
     __armHold: () => { holding = true; },
     __releasePlans: () => release(heldPlans),
+    __refuseHeldPlans: () => { refuseHeldPlans = true; },
+    __holdRanges: () => { holdingRanges = true; },
+    __releaseRanges: () => release(heldRanges),
+    __failRanges: () => { rangesFail = true; },
     __releaseTravel: () => release(heldTravel),
   });
 
@@ -589,14 +603,74 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     return { code, message };
   }
 
-  function planFromDoc(grouping: Grouping = "Color") {
+  // Mirrors cutplan::weed. WEED_RANGES and WeedOptions::validate, refusing with the same sentences.
+  const WEED_RANGES = { margin_mm: { min: 0.5, max: 50 }, spacing_mm: { min: 5, max: 500 }, clearance_mm: { min: 0.2, max: 20 } };
+  function validateWeed(w: WeedOptions) {
+    const check = (name: string, v: number, r: { min: number; max: number }) => {
+      if (!(v >= r.min && v <= r.max)) throw ipcError("plan_error", `the weed ${name} must be ${r.min}–${r.max} mm`);
+    };
+    check("margin", w.margin_mm, WEED_RANGES.margin_mm);
+    if (w.lines === "None") return;
+    check("line spacing", w.spacing_mm, WEED_RANGES.spacing_mm);
+    check("line clearance", w.clearance_mm, WEED_RANGES.clearance_mm);
+    if (w.clearance_mm >= w.margin_mm) {
+      throw ipcError("plan_error", `the weed line clearance (${w.clearance_mm} mm) must be less than the margin (${w.margin_mm} mm)`);
+    }
+  }
+
+  // Mirrors cutplan::weed::weed_geometry for what the fixtures hold: axis-aligned rects. For a
+  // closed axis-aligned rect, the band clipping plus the winding test reduce exactly to blocking
+  // the rect's box grown by the clearance, so this is the real output, not an approximation of it.
+  type Box = { x: number; y: number; w: number; h: number };
+  function weedFor(boxes: Box[], w: WeedOptions): [number, number][][] {
+    if (boxes.length === 0) return [];
+    const left = Math.min(...boxes.map((b) => b.x)) - w.margin_mm;
+    const top = Math.min(...boxes.map((b) => b.y)) - w.margin_mm;
+    const right = Math.max(...boxes.map((b) => b.x + b.w)) + w.margin_mm;
+    const bottom = Math.max(...boxes.map((b) => b.y + b.h)) + w.margin_mm;
+    const c = w.clearance_mm;
+    const out: [number, number][][] = [];
+    // `at` is the line's position on one axis; each box blocks [lo, hi] on the other if it comes
+    // within the clearance of the line.
+    const pieces = (at: number, from: number, to: number, spans: { near: [number, number]; block: [number, number] }[]) => {
+      const blocked = spans.filter((s) => at >= s.near[0] - c && at <= s.near[1] + c)
+        .map((s) => [s.block[0] - c, s.block[1] + c]).sort((p, q) => p[0] - q[0]);
+      const free: [number, number][] = [];
+      let pos = from;
+      for (const [a, b] of blocked) {
+        if (a > pos) free.push([pos, Math.min(a, to)]);
+        pos = Math.max(pos, b);
+        if (pos >= to) break;
+      }
+      if (pos < to) free.push([pos, to]);
+      return free.filter(([a, b]) => b - a >= 2);
+    };
+    const steps = (from: number, to: number) => {
+      const v: number[] = [];
+      for (let k = 1; from + k * w.spacing_mm < to - 1e-9; k++) v.push(from + k * w.spacing_mm);
+      return v;
+    };
+    if (w.lines === "Horizontal" || w.lines === "Both") {
+      const spans = boxes.map((b) => ({ near: [b.y, b.y + b.h] as [number, number], block: [b.x, b.x + b.w] as [number, number] }));
+      for (const y of steps(top, bottom)) for (const [a, b] of pieces(y, left, right, spans)) out.push([[a, y], [b, y]]);
+    }
+    if (w.lines === "Vertical" || w.lines === "Both") {
+      const spans = boxes.map((b) => ({ near: [b.x, b.x + b.w] as [number, number], block: [b.y, b.y + b.h] as [number, number] }));
+      for (const x of steps(left, right)) for (const [a, b] of pieces(x, top, bottom, spans)) out.push([[x, a], [x, b]]);
+    }
+    out.push([[left, top], [right, top], [right, bottom], [left, bottom], [left, top]]);
+    return out;
+  }
+
+  function planFromDoc(grouping: Grouping = "Color", weed: WeedOptions | null = null) {
+    if (weed) validateWeed(weed);
     // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
     // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
     // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
     // absent), the resolved material, or `all` for one pass. Absence is its own token
     // (`no-color`, `no-preset`) because a preset id may be any string, so a preset called
     // `none` must not write what no preset at all writes.
-    const byKey = new Map<string, { key: string; node_ids: number[] }>();
+    const byKey = new Map<string, { key: string; node_ids: number[]; boxes: Box[] }>();
     let skipped = 0;
     const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
     const colorKey = (n: Node) => {
@@ -605,9 +679,26 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
       return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
     };
-    const walk = (id: number, inherited: string | null) => {
+    const mul = (p: number[], q: number[]) => [
+      q[0] * p[0] + q[2] * p[1], q[1] * p[0] + q[3] * p[1],
+      q[0] * p[2] + q[2] * p[3], q[1] * p[2] + q[3] * p[3],
+      q[0] * p[4] + q[2] * p[5] + q[4], q[1] * p[4] + q[3] * p[5] + q[5],
+    ];
+    // A Rect's world box, for the weed. Other kinds carry no geometry here, so they add none.
+    const worldBox = (n: Node, world: number[]): Box | null => {
+      const r = (n.kind as { Shape?: { Rect?: { x?: number; y?: number; w: number; h: number } } }).Shape?.Rect;
+      if (!r) return null;
+      const [x0, y0] = [r.x ?? 0, r.y ?? 0];
+      const pts = [[x0, y0], [x0 + r.w, y0], [x0, y0 + r.h], [x0 + r.w, y0 + r.h]]
+        .map(([x, y]) => [world[0] * x + world[2] * y + world[4], world[1] * x + world[3] * y + world[5]]);
+      const xs = pts.map((p) => p[0]);
+      const ys = pts.map((p) => p[1]);
+      return { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
+    };
+    const walk = (id: number, inherited: string | null, parentWorld: number[] = [1, 0, 0, 1, 0, 0]) => {
       const n = doc.nodes[id];
       if (!n) return;
+      const world = mul(n.transform, parentWorld);
       const a = n.material_preset;
       const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
       const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
@@ -619,12 +710,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
             grouping === "Single" ? "all"
             : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
             : colorKey(n);
+          const box = worldBox(n, world);
           const existing = byKey.get(key);
-          if (existing) existing.node_ids.push(id);
-          else byKey.set(key, { key, node_ids: [id] });
+          if (existing) {
+            existing.node_ids.push(id);
+            if (box) existing.boxes.push(box);
+          } else byKey.set(key, { key, node_ids: [id], boxes: box ? [box] : [] });
         }
       }
-      for (const c of n.children) walk(c, material);
+      for (const c of n.children) walk(c, material, world);
     };
     walk(doc.root, null);
     // starts is all-null on purpose: the fake carries no geometry to flatten, and null
@@ -635,6 +729,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       shape_count: p.node_ids.length,
       node_ids: p.node_ids,
       starts: p.node_ids.map(() => null),
+      weed: weed ? weedFor(p.boxes, weed) : [],
     }));
     // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
     // snapshot_json: a doc edited back to a previous state is not stale. A counter
@@ -644,8 +739,16 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     // passes to be cut - because the real `plan_cut` returns the travel for the order it just
     // planned, and a fake that plans passes but never any travel between them cannot show a
     // preview going empty. Every pass a fresh plan produces is enabled.
-    const travel = passes.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+    const travel = syntheticTravel(passes);
     return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel };
+  }
+
+  // One synthetic segment per adjacent pair of passes cut, plus one per weed polyline, which the
+  // real `travel_moves` visits after each pass's shapes. The fake has no blade path to put them on.
+  function syntheticTravel(cut: { weed: [number, number][][] }[]) {
+    const between = cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+    const toWeed = cut.flatMap((p) => p.weed.map(() => [0, 0, 0, 0] as [number, number, number, number]));
+    return [...between, ...toWeed];
   }
 
   // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
@@ -787,9 +890,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       // Answered from the document as it is *now*, like the real command, then parked if
       // the test has armed the hold: which of a replan and an older reorder settles first
       // is the whole subject of the race test, and a timing race cannot state it.
-      const plan = planFromDoc(a.grouping as Grouping);
+      const plan = planFromDoc(a.grouping as Grouping, (a.weed as WeedOptions | null | undefined) ?? null);
       if (!holding) return plan;
-      return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
+      return new Promise((resolve, reject) => heldPlans.push(() =>
+        refuseHeldPlans ? reject(ipcError("plan_error", "shape #2: no fonts are installed on this system")) : resolve(plan)));
     },
     // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
     // refusal, the same exact-once identity check over the requested keys, then synthetic
@@ -809,7 +913,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       const settle = () => {
         // Decided at settle time, like the real command — a request issued before a replan is
         // stale even if it settles after one.
-        const plan = planFromDoc(grouping);
+        const plan = planFromDoc(grouping, (a.weed as WeedOptions | null | undefined) ?? null);
         if (plan.doc_revision !== a.docRevision) {
           throw ipcError("stale_plan", "document changed since the cut was planned; replan");
         }
@@ -829,8 +933,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
         if (remaining.length > 0) {
           throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
         }
-        const cut = passes.filter((p) => p.enabled);
-        return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
+        const cut = passes.filter((p) => p.enabled).map((p) => plan.passes.find((q) => q.key === p.key)!);
+        return syntheticTravel(cut);
       };
       if (!holding) return settle();
       return new Promise((resolve, reject) => heldTravel.push(() => {
@@ -857,7 +961,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
             `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
         }
       }
-      const plan = planFromDoc(request.grouping);
+      const plan = planFromDoc(request.grouping, request.weed ?? null);
       if (plan.doc_revision !== request.doc_revision) {
         throw ipcError("stale_plan", "document changed since the cut was planned; replan");
       }
@@ -991,11 +1095,18 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
     // to answer something; the casing and the numbers are pinned on the Rust side.
-    settings_ranges: () => ({
-      speed: { min: 1, max: 30 },
-      force: { min: 1, max: 33 },
-      repeatCount: { min: 1, max: 10 },
-    }),
+    settings_ranges: () => {
+      const ranges = {
+        speed: { min: 1, max: 30 },
+        force: { min: 1, max: 33 },
+        repeatCount: { min: 1, max: 10 },
+        weed: WEED_RANGES,
+        weedDefaults: { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
+      };
+      if (rangesFail) throw ipcError("io", "settings ranges could not be read");
+      if (holdingRanges) return new Promise((resolve) => heldRanges.push(() => resolve(ranges)));
+      return ranges;
+    },
     // Every refusal `desktop::device::save_preset` makes, because the editor is what must never
     // send one: an entry under a builtin's pair shadows a shipped material with no way back, an
     // id-less entry is dropped on load (a save the operator never gets back), and a setting out of
@@ -1347,6 +1458,189 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+test("a weed border and lines replan into the preview, and the cut carries the options", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  // Lines wait for a border: without one their ends would stop in the open sheet.
+  await expect(page.getByLabel("Weed lines")).toBeDisabled();
+  await expect(page.getByLabel("Weed margin")).toBeDisabled();
+
+  await page.getByLabel("Weed border").check();
+  // One border per pass, each its own sheet, and the blade travels to each after its shapes.
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await expect(page.getByLabel("Weed lines")).toBeEnabled();
+  await expect(page.getByLabel("Weed spacing")).toBeDisabled();
+
+  await page.getByLabel("Weed lines").selectOption("Horizontal");
+  await page.getByLabel("Weed spacing").fill("5");
+  // Each 10 mm rect's border runs -3..13 on y; lines at y = 2 and 7 cross the rect and are cut off
+  // within the clearance, leaving stubs under 2 mm, so only y = 12 survives: one line per pass.
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 5 travel moves, 4 weed paths");
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  const request = await callFake(page, "__test_last_cut_request") as { weed: unknown };
+  expect(request.weed).toEqual({ margin_mm: 3, lines: "Horizontal", spacing_mm: 5, clearance_mm: 1.5 });
+});
+
+test("a weed field out of range disables Cut and says why", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Weed border").check();
+  const start = page.getByRole("button", { name: "Start Cut" });
+  await expect(start).toBeEnabled();
+
+  await page.getByLabel("Weed margin").fill("60");
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.5–50 mm" })).toBeVisible();
+  await expect(start).toBeDisabled();
+  // Not cut without its border: the last plan still holds the old margin, so Cut waits.
+  await page.getByLabel("Weed margin").fill("4");
+  await expect(start).toBeEnabled();
+
+  await page.getByLabel("Weed lines").selectOption("Both");
+  await page.getByLabel("Weed clearance").fill("4");
+  await expect(page.getByRole("alert").filter({ hasText: "Clearance must be less than the margin" })).toBeVisible();
+  await expect(start).toBeDisabled();
+});
+
+// What a replan for a weed edit does to the rows: the operator's arrangement (which passes are cut,
+// in what order, with what settings) stays, since the weed changes none of the passes.
+test("a weed edit keeps the passes as the operator arranged them, and their travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  const rows = page.getByTestId("cut-pass-row");
+  await expect(rows).toHaveCount(2);
+  await rows.nth(1).getByRole("button", { name: "Up" }).click(); // green first
+  await rows.nth(1).getByRole("checkbox").uncheck(); // and red not cut
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+
+  await page.getByLabel("Weed border").check();
+  await expect(rows.nth(0).locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(rows.nth(1).getByRole("checkbox")).not.toBeChecked();
+  // Travel for the list as arranged: only green is cut, so one move, to its border. The plan's
+  // own travel (both passes, in planned order) would read 3.
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+// Reordering asks the backend for travel again, and that request must carry the weed the plan was
+// made with: without it the replanned travel drops the moves to each border.
+test("reordering passes keeps the weed in the replanned travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await page.getByTestId("cut-pass-row").nth(1).getByRole("button", { name: "Up" }).click();
+  await expect(page.getByTestId("cut-pass-row").first().locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+});
+
+test("Cut waits while a weed replan is out, so a border nobody has previewed cannot be cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  const start = page.getByRole("button", { name: "Start Cut" });
+  await expect(start).toBeEnabled();
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await page.getByLabel("Weed border").check();
+  await expect(start).toBeDisabled();
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(start).toBeEnabled();
+});
+
+test("a refused weed replan puts the controls back to the plan still installed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByLabel("Weed border").check();
+  const preview = page.getByRole("img", { name: /Cut preview/ });
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Weed lines").selectOption("Both");
+  // The controls say what the installed plan holds, so Cut is offered for what the preview shows.
+  await expect(page.getByLabel("Weed lines")).toHaveValue("None");
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+});
+
+// A refusal arriving after the operator has typed on must not put back over what they typed.
+test("a refused weed replan does not overwrite what was typed after it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName(/2 weed paths/);
+  await page.evaluate(() => {
+    const w = window as unknown as { __armHold: () => void; __refuseHeldPlans: () => void };
+    w.__armHold();
+    w.__refuseHeldPlans();
+  });
+  await page.getByLabel("Weed margin").fill("5"); // replan out, held
+  await page.getByLabel("Weed margin").fill(""); // mid-edit: reads as nothing, plans nothing
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(page.getByLabel("Weed margin")).toHaveValue("");
+});
+
+test("changing the grouping keeps the weed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Group passes by").selectOption("Single");
+  // One pass over both rects, so one border around both.
+  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+test("Border waits for the weed defaults, and says why while it waits or when they fail", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.evaluate(() => (window as unknown as { __holdRanges: () => void }).__holdRanges());
+  await page.getByRole("button", { name: "Cut" }).click();
+  const border = page.getByLabel("Weed border");
+  // Ticked now it would start from an empty margin.
+  await expect(border).toBeDisabled();
+  await expect(border).toHaveAttribute("title", "Waiting for the weed defaults");
+  await page.evaluate(() => (window as unknown as { __releaseRanges: () => Promise<void> }).__releaseRanges());
+  await expect(border).not.toHaveAttribute("title");
+  await border.check();
+  await expect(page.getByLabel("Weed margin")).toHaveValue("3");
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.reload();
+  await page.evaluate(() => (window as unknown as { __failRanges: () => void }).__failRanges());
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByLabel("Weed border")).toBeDisabled();
+  await expect(page.getByLabel("Weed border")).toHaveAttribute("title", /Weeding is unavailable: settings ranges could not be read/);
+});
+
+test("reopening the cut dialog keeps the weed controls as they were left", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Weed margin").fill("4");
+  await page.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("button", { name: "Cut" }).click();
+  await expect(page.getByLabel("Weed border")).toBeChecked();
+  await expect(page.getByLabel("Weed margin")).toHaveValue("4");
+  // And the first plan of the reopened dialog is made with them.
+  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
 });
 
 // Greptile's P1 on this PR, with its own Playwright repro: a replan that fails leaves the previous

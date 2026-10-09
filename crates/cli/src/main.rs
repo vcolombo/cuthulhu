@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use cli::cut;
 use cli::pipeline::{
     check_interactive, check_pass_flag_scope, driver_for, dry_run_pass_bytes, plan_cut_from_svg,
-    resolve_device_info,
+    resolve_device_info, weed_options,
 };
 use driver_registry::{machine_ids, HardwareBackendFactory};
 use driver_core::{DeviceBackendFactory, Driver, Settings};
@@ -30,6 +30,27 @@ impl From<GroupBy> for cutplan::Grouping {
             GroupBy::Stroke => cutplan::Grouping::Stroke,
             GroupBy::Fill => cutplan::Grouping::Fill,
             GroupBy::Preset => cutplan::Grouping::Preset,
+        }
+    }
+}
+
+/// The `--weed-lines` spellings, kept apart from `cutplan::weed::WeedLines` for the same reason
+/// as `GroupBy`. No `none`: leaving the flag off says that.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+enum WeedLinesArg {
+    #[value(alias = "h")]
+    Horizontal,
+    #[value(alias = "v")]
+    Vertical,
+    Both,
+}
+
+impl From<WeedLinesArg> for cutplan::weed::WeedLines {
+    fn from(l: WeedLinesArg) -> cutplan::weed::WeedLines {
+        match l {
+            WeedLinesArg::Horizontal => cutplan::weed::WeedLines::Horizontal,
+            WeedLinesArg::Vertical => cutplan::weed::WeedLines::Vertical,
+            WeedLinesArg::Both => cutplan::weed::WeedLines::Both,
         }
     }
 }
@@ -73,6 +94,18 @@ enum Command {
         /// Send geometry that falls outside the machine's cutting area
         #[arg(long)]
         allow_out_of_bounds: bool,
+        /// Cut a weed border this many mm outside each pass's shapes, after them
+        #[arg(long, value_name = "MM")]
+        weed_margin: Option<f64>,
+        /// Also cut weed lines inside the border (needs --weed-margin)
+        #[arg(long, value_enum)]
+        weed_lines: Option<WeedLinesArg>,
+        /// Distance between weed lines, in mm (needs --weed-lines)
+        #[arg(long, value_name = "MM")]
+        weed_spacing: Option<f64>,
+        /// The closest a weed line comes to the design, in mm (needs --weed-lines)
+        #[arg(long, value_name = "MM")]
+        weed_clearance: Option<f64>,
     },
     /// List known devices
     ListDevices,
@@ -130,14 +163,18 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Cut { file, device, dry_run, speed, force, port, baud, group_by, skip_pass, order, allow_out_of_bounds } => {
+        Command::Cut {
+            file, device, dry_run, speed, force, port, baud, group_by, skip_pass, order, allow_out_of_bounds,
+            weed_margin, weed_lines, weed_spacing, weed_clearance,
+        } => {
             let driver = driver_for(&device)?;
             let grouping: cutplan::Grouping = group_by.into();
             check_pass_flag_scope(&skip_pass, &order, grouping)?;
+            let weed = weed_options(weed_margin, weed_lines.map(Into::into), weed_spacing, weed_clearance)?;
             let svg = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
             let settings = Settings { speed, force, repeat_count: 1 };
             cut_planned(&svg, driver.as_ref(), &device, &settings, grouping, &skip_pass, &order,
-                        dry_run, port, baud, allow_out_of_bounds)
+                        dry_run, port, baud, allow_out_of_bounds, weed)
         }
         Command::ListDevices => {
             for id in machine_ids() {
@@ -174,10 +211,11 @@ fn cut_planned(
     port: Option<String>,
     baud: u32,
     allow_out_of_bounds: bool,
+    weed: Option<cutplan::weed::WeedOptions>,
 ) -> Result<(), String> {
     // Preflight runs here, before the dry-run branch, so a dry run and a real
     // cut always agree on whether the job is acceptable at all.
-    let plan = plan_cut_from_svg(svg, driver, settings, grouping, skip_pass, order, allow_out_of_bounds)?;
+    let plan = plan_cut_from_svg(svg, driver, settings, grouping, skip_pass, order, allow_out_of_bounds, weed.as_ref())?;
     let passes = &plan.passes;
 
     if dry_run {
@@ -224,6 +262,22 @@ mod tests {
 
     /// A mode neither entry point knows must die in the parser, where clap names the flag and the
     /// legal values, rather than surviving as a `String` for `run` to reject later.
+    fn parse_cut(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec!["cuthulhu", "cut", "in.svg", "--device", "cameo5"];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn weed_flags_parse_with_short_line_spellings() {
+        let cli = parse_cut(&["--weed-margin", "4", "--weed-lines", "h", "--weed-spacing", "30"]).expect("parses");
+        let Command::Cut { weed_margin, weed_lines, weed_spacing, weed_clearance, .. } = cli.command else {
+            panic!("parsed a different subcommand")
+        };
+        assert_eq!((weed_margin, weed_lines, weed_spacing, weed_clearance), (Some(4.0), Some(WeedLinesArg::Horizontal), Some(30.0), None));
+        assert!(parse_cut(&["--weed-lines", "diagonal"]).is_err());
+    }
+
     #[test]
     fn mode_flag_rejects_unknown_values_at_parse_time() {
         assert!(parse_trace(&["--mode", "neither"]).is_err());

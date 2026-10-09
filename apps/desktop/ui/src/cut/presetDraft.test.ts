@@ -23,6 +23,8 @@ const RANGES: SettingsRanges = {
   speed: { min: 1, max: 30 },
   force: { min: 1, max: 33 },
   repeatCount: { min: 1, max: 10 },
+  weed: { margin_mm: { min: 0.5, max: 50 }, spacing_mm: { min: 5, max: 500 }, clearance_mm: { min: 0.2, max: 20 } },
+  weedDefaults: { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
 };
 
 const CAMEO: Caps = { supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false };

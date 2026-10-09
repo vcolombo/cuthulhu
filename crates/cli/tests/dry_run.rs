@@ -32,7 +32,7 @@ fn multi_pass_dry_run_parks_between_passes_like_the_device_manager() {
     </svg>"##;
     // Planned through the one entry point every mode uses since #148, preflight included.
     let puma = driver_for("puma").expect("registry id");
-    let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false).unwrap();
+    let plan = plan_cut_from_svg(svg, puma.as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false, None).unwrap();
     let passes = &plan.passes;
     assert_eq!(passes.len(), 2);
 

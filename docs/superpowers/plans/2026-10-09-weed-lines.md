@@ -22,7 +22,7 @@
 ### Task 1: `cutplan::weed`, the geometry
 
 - [ ] Types: `WeedLines { None, Horizontal, Vertical, Both }` and `WeedOptions { margin_mm, lines, spacing_mm, clearance_mm }`, with serde shapes the UI can send as JSON. Add `WEED_RANGES` (margin 0.5–50, spacing 5–500, clearance 0.2–20, all in mm), plus `WeedOptions::validate() -> Result<(), WeedError>`, which also refuses clearance ≥ margin. `WeedError` is a sentence naming the field.
-- [ ] `pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Vec<Polyline>` returns the lines first and the border last. If there is no geometry, or the bounds are not finite, it returns nothing; preflight then names the shape.
+- [ ] `pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<Polyline>, WeedError>` returns the lines first and the border last. If there is no geometry, or the bounds are not finite, it returns nothing; preflight then names the shape. It refuses a pass whose lines would exceed the line, work or piece caps (`MAX_WEED_LINES`, `MAX_WEED_WORK`, `MAX_WEED_PIECES`; added in gate 1).
 - [ ] Tests:
   - the border is the bounds plus the margin;
   - lines are spaced from the border edge;

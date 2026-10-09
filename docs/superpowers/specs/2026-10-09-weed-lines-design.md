@@ -64,10 +64,12 @@ From `main` at `2057e75`:
        own, cut as its own piece, so the waste between them is not weeded.
 
     Pieces shorter than `MIN_WEED_PIECE_MM` (2 mm) are dropped. A nick that short weeds nothing
-    and costs a blade lift. A pass that would need more than `MAX_WEED_LINES` (10 000) lines on
-    one axis, or whose lines would cost more than `MAX_WEED_WORK` (50 million) segment tests, is
-    refused before any is built, with its size in the sentence: lines are generated before preflight, under the
-    document lock, and a stray scale would otherwise build millions (added in gate 1).
+    and costs a blade lift. Lines are generated before preflight, under the document lock, so
+    their cost is bounded (added in gate 1): a pass needing more than `MAX_WEED_LINES` (10 000)
+    lines on one axis is refused before any is built, and the work actually done (each line's
+    scan, each piece's inside test) and the pieces kept draw on a budget (`MAX_WEED_WORK`, 50
+    million segment tests; `MAX_WEED_PIECES`, 100 000). Running out refuses the pass, with its
+    size in the sentence, rather than cutting some of its lines.
     (`// ponytail:` straight lines at a fixed spacing. Ceiling: no diagonal lines, and no lines
     that bend around shapes. Upgrade: #222's line-fill engine.)
 - **Cut order within a pass:** the pass's shapes first, then the lines, then the border last.

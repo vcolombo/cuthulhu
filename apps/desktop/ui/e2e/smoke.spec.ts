@@ -1616,6 +1616,7 @@ test("Border waits for the weed defaults, and says why while it waits or when th
   await expect(border).toBeDisabled();
   await expect(border).toHaveAttribute("title", "Waiting for the weed defaults");
   await page.evaluate(() => (window as unknown as { __releaseRanges: () => Promise<void> }).__releaseRanges());
+  await expect(border).not.toHaveAttribute("title");
   await border.check();
   await expect(page.getByLabel("Weed margin")).toHaveValue("3");
 

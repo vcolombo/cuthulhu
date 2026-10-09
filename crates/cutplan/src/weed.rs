@@ -63,10 +63,32 @@ pub const MIN_WEED_PIECE_MM: f64 = 2.0;
 /// minimum spacing is a 50 m roll, past any cutter here.
 pub const MAX_WEED_LINES: f64 = 10_000.0;
 
-/// The most segment tests one pass's lines may cost (each line is scanned against every segment).
-/// The line cap alone left a dense trace on a wide pass at billions of tests, on every keystroke
-/// in the dialog. Fifty million is a fraction of a second.
+/// The most segment tests one pass's lines may cost: the scan of each line against every segment,
+/// and the inside test of each piece left over against every closed outline. Charged as the work
+/// is done (`Budget`), so it bounds the time whatever the shapes look like; the line cap alone left
+/// a dense trace on a wide pass at billions of tests, on every keystroke in the dialog. Fifty
+/// million is a fraction of a second.
 pub const MAX_WEED_WORK: f64 = 50_000_000.0;
+
+/// The most weed line pieces one pass may produce, so the output's memory is bounded too: a comb
+/// of thin shapes yields a piece per gap per line.
+pub const MAX_WEED_PIECES: usize = 100_000;
+
+/// What a pass's lines may still spend. Running out refuses the pass rather than truncating it: a
+/// pass with some of its lines missing would weed worse than the operator previewed, and say nothing.
+struct Budget { tests: f64, pieces: usize }
+
+impl Budget {
+    /// At least one test per call, so even work over no segments (a pass of single points) counts.
+    fn spend(&mut self, tests: usize) -> Option<()> {
+        self.tests -= tests.max(1) as f64;
+        (self.tests >= 0.0).then_some(())
+    }
+    fn keep_piece(&mut self) -> Option<()> {
+        self.pieces = self.pieces.checked_sub(1)?;
+        Some(())
+    }
+}
 
 /// Weed options refused, as a sentence naming the field. Never clamped: a margin quietly cut to
 /// 50 mm is a border the operator did not ask for.
@@ -115,34 +137,46 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<
     // ponytail: the border is the bounding box grown by the margin, not a contour. Ceiling: an
     // L-shaped or diagonal design leaves a lot of waste inside its box. Upgrade: a contour border
     // from #159's path offset.
-    // ponytail: straight lines at a fixed spacing, each scanned against every segment, so the cost
-    // is lines × segments and the dialog pays it per keystroke (`MAX_WEED_WORK` bounds it). Ceiling:
-    // no diagonal lines, no lines that bend around shapes. Upgrade: #222's line-fill engine.
+    // ponytail: straight lines at a fixed spacing, each scanned against every segment, and each piece
+    // tested inside against every closed outline, so the cost is lines × segments × pieces and the
+    // dialog pays it per keystroke (`MAX_WEED_WORK` bounds it, refusing the densest designs).
+    // Ceiling: no diagonal lines, no lines that bend around shapes, and a dense comb is refused
+    // rather than weeded. Upgrade: #222's line-fill engine, or a sorted sweep of each line's signed
+    // crossings, which reads every piece's winding in O(crossings log crossings).
     let Some((x0, y0, x1, y1)) = bounds(shapes) else { return Ok(vec![]) };
     let m = opts.margin_mm;
     let (left, top, right, bottom) = (x0 - m, y0 - m, x1 + m, y1 + m);
     let horizontal = matches!(opts.lines, WeedLines::Horizontal | WeedLines::Both);
     let vertical = matches!(opts.lines, WeedLines::Vertical | WeedLines::Both);
+    let segments = shapes.iter().flat_map(|s| &s.polylines).map(|p| p.len().saturating_sub(1)).sum::<usize>();
+    let too_much = || WeedError(format!(
+        "this pass ({:.0} × {:.0} mm, {segments} segments) is too large or detailed for weed lines {} mm apart; raise the spacing or leave the lines off",
+        right - left, bottom - top, opts.spacing_mm,
+    ));
     if horizontal || vertical {
         let across = |extent: f64, on: bool| if on { extent / opts.spacing_mm } else { 0.0 };
         let (rows, columns) = (across(bottom - top, horizontal), across(right - left, vertical));
-        let segments = shapes.iter().flat_map(|s| &s.polylines).map(|p| p.len().saturating_sub(1)).sum::<usize>();
-        // `!(n <= cap)` rather than `n > cap`, so a NaN from a spacing nobody validated is refused too.
+        // An early refusal, before anything is built, for a pass that cannot fit the budget even on
+        // its scans alone. `n <= cap` is false for NaN, and the spacing must be positive, so a value
+        // nobody validated cannot slip through or loop `steps` forever.
         let within = |n: f64, cap: f64| n <= cap;
-        if !(within(rows, MAX_WEED_LINES) && within(columns, MAX_WEED_LINES)
+        if !(opts.spacing_mm > 0.0
+            && within(rows, MAX_WEED_LINES) && within(columns, MAX_WEED_LINES)
             && within((rows + columns) * segments as f64, MAX_WEED_WORK))
         {
-            return Err(WeedError(format!(
-                "this pass ({:.0} × {:.0} mm, {segments} segments) is too large or detailed for weed lines {} mm apart; raise the spacing or leave the lines off",
-                right - left, bottom - top, opts.spacing_mm,
-            )));
+            return Err(too_much());
         }
     }
+    let closed = shapes.iter().flat_map(|s| &s.polylines)
+        .filter(|p| is_closed(p)).map(|p| p.len() - 1).sum::<usize>();
+    let mut budget = Budget { tests: MAX_WEED_WORK, pieces: MAX_WEED_PIECES };
     let mut out = vec![];
     if horizontal {
         let outlines: Vec<Vec<&Polyline>> = shapes.iter().map(|s| s.polylines.iter().collect()).collect();
+        let fills = filled(&outlines);
         for y in steps(top, bottom, opts.spacing_mm) {
-            for (a, b) in pieces(&outlines, y, left, right, opts.clearance_mm) {
+            let line = pieces(&outlines, &fills, y, left, right, opts.clearance_mm, (segments, closed), &mut budget);
+            for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x: a, y }, Point { x: b, y }]);
             }
         }
@@ -153,8 +187,10 @@ pub fn weed_geometry(shapes: &[PlannedShape], opts: &WeedOptions) -> Result<Vec<
             .map(|s| s.polylines.iter().map(|p| p.iter().map(|q| Point { x: q.y, y: q.x }).collect()).collect())
             .collect();
         let outlines: Vec<Vec<&Polyline>> = swapped.iter().map(|s| s.iter().collect()).collect();
+        let fills = filled(&outlines);
         for x in steps(left, right, opts.spacing_mm) {
-            for (a, b) in pieces(&outlines, x, top, bottom, opts.clearance_mm) {
+            let line = pieces(&outlines, &fills, x, top, bottom, opts.clearance_mm, (segments, closed), &mut budget);
+            for (a, b) in line.ok_or_else(too_much)? {
                 out.push(vec![Point { x, y: a }, Point { x, y: b }]);
             }
         }
@@ -190,8 +226,13 @@ fn steps(from: f64, to: f64, spacing: f64) -> impl Iterator<Item = f64> {
 }
 
 /// The parts of the horizontal line `y` between `lo` and `hi` that keep `clearance` from every
-/// outline and lie outside every shape's filled area.
-fn pieces(shapes: &[Vec<&Polyline>], y: f64, lo: f64, hi: f64, clearance: f64) -> Vec<(f64, f64)> {
+/// outline and lie outside every shape's filled area, or None once `budget` runs out. `counts` is
+/// the pass's (segments, closed-outline segments): what the scan and each inside test cost.
+fn pieces(
+    shapes: &[Vec<&Polyline>], fills: &[Vec<&Polyline>], y: f64, lo: f64, hi: f64, clearance: f64,
+    (segments, closed): (usize, usize), budget: &mut Budget,
+) -> Option<Vec<(f64, f64)>> {
+    budget.spend(segments)?;
     let mut blocked: Vec<(f64, f64)> = vec![];
     for seg in shapes.iter().flatten().flat_map(|p| p.windows(2)) {
         if let Some(r) = band_span(seg[0], seg[1], y, clearance) {
@@ -217,13 +258,16 @@ fn pieces(shapes: &[Vec<&Polyline>], y: f64, lo: f64, hi: f64, clearance: f64) -
     // inside or wholly outside each shape, and its midpoint says which. Each shape is asked on its
     // own, since each is cut as its own piece: a hole drawn as a separate node is a disc of its own,
     // not a hole in the shape around it, so the waste between them is not weeded.
-    free.into_iter()
-        .filter(|&(a, b)| b - a >= MIN_WEED_PIECE_MM)
-        .filter(|&(a, b)| {
-            let mid = Point { x: (a + b) / 2.0, y };
-            !shapes.iter().any(|outline| winding(outline, mid) != 0)
-        })
-        .collect()
+    let mut kept = vec![];
+    for (a, b) in free.into_iter().filter(|&(a, b)| b - a >= MIN_WEED_PIECE_MM) {
+        budget.spend(closed)?;
+        let mid = Point { x: (a + b) / 2.0, y };
+        if !fills.iter().any(|outline| winding(outline, mid) != 0) {
+            budget.keep_piece()?;
+            kept.push((a, b));
+        }
+    }
+    Some(kept)
 }
 
 /// The x-range on line `y` that segment `a`–`b` blocks: its part inside the band
@@ -246,14 +290,26 @@ fn band_span(a: Point, b: Point, y: f64, c: f64) -> Option<(f64, f64)> {
     Some((xa.min(xb) - c, xa.max(xb) + c))
 }
 
-/// The winding number of a shape's closed polylines around `p`; non-zero is inside its filled
+/// Whether a polyline is closed: flattening pushes a subpath's exact start point on `Close`.
+fn is_closed(p: &Polyline) -> bool { p.len() > 2 && p.first() == p.last() }
+
+/// Each shape's closed polylines, and only shapes that have one: an open path has no inside, so the
+/// inside test (`winding`) never needs to visit it, and its cost is then what `Budget` charges.
+fn filled<'a>(shapes: &[Vec<&'a Polyline>]) -> Vec<Vec<&'a Polyline>> {
+    shapes.iter()
+        .map(|s| s.iter().copied().filter(|p| is_closed(p)).collect::<Vec<_>>())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// The winding number of a shape's closed polylines (`filled`) around `p`; non-zero is inside its filled
 /// area. Non-zero, not even-odd, because that is how the app fills (`geometry::boolean`, and
 /// SVG's default): a pentagram's centre is filled, and a line there would cut through the decal.
 /// A glyph's counter winds the other way, so the waste inside an O is still weeded. An open path
 /// has no inside.
 fn winding(outline: &[&Polyline], p: Point) -> i32 {
     let mut w = 0;
-    for poly in outline.iter().filter(|q| q.len() > 2 && q.first() == q.last()) {
+    for poly in outline {
         for seg in poly.windows(2) {
             let (a, b) = (seg[0], seg[1]);
             let side = (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y);
@@ -442,9 +498,36 @@ mod tests {
     }
 
     #[test]
-    fn a_spacing_that_is_not_a_number_is_refused_not_looped_on() {
-        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm: f64::NAN, clearance_mm: 1.5 };
-        assert!(weed_geometry(&[shape(vec![rect(0.0, 0.0, 10.0, 10.0)])], &o).is_err());
+    fn a_spacing_that_is_not_a_positive_number_is_refused_not_looped_on() {
+        for spacing_mm in [f64::NAN, -5.0, 0.0] {
+            let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Both, spacing_mm, clearance_mm: 1.5 };
+            assert!(weed_geometry(&[shape(vec![rect(0.0, 0.0, 10.0, 10.0)])], &o).is_err(), "{spacing_mm}");
+        }
+    }
+
+    /// The early estimate counts only each line's scan; a comb gives every line a piece per gap, and
+    /// each piece an inside test against every outline. The budget charges that as it is spent.
+    #[test]
+    fn a_comb_that_passes_the_estimate_is_refused_by_the_work_it_actually_costs() {
+        // 2000 closed 1 × 100 mm teeth 6 mm apart: about 21 lines, each with 2000 pieces, each
+        // tested against 8000 segments, so about 340 million tests while the estimate says 170 000.
+        let teeth: Vec<PlannedShape> = (0..2000).map(|i| shape(vec![rect(6.0 * i as f64, 0.0, 1.0, 100.0)])).collect();
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
+        let err = weed_geometry(&teeth, &o).unwrap_err().to_string();
+        assert!(err.contains("8000 segments") && err.contains("too large or detailed"), "{err}");
+    }
+
+    /// The output is bounded too: open sticks cost one test per piece, but there can be too many.
+    #[test]
+    fn a_pass_that_would_make_too_many_pieces_is_refused() {
+        // 2000 open 300 mm sticks 6 mm apart, about 61 lines: about 122 000 pieces.
+        let sticks: Vec<PlannedShape> = (0..2000)
+            .map(|i| shape(vec![vec![Point { x: 6.0 * i as f64, y: 0.0 }, Point { x: 6.0 * i as f64, y: 300.0 }]]))
+            .collect();
+        let o = WeedOptions { margin_mm: 3.0, lines: WeedLines::Horizontal, spacing_mm: 5.0, clearance_mm: 1.5 };
+        assert!(weed_geometry(&sticks, &o).unwrap_err().to_string().contains("too large or detailed"));
+        // Half the sticks fit.
+        assert!(weed_geometry(&sticks[..1000], &o).is_ok());
     }
 
     #[test]

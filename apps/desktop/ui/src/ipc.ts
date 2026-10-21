@@ -408,3 +408,14 @@ export async function loadImagePreview(args: { path: string }): Promise<string> 
 export async function pickImagePath(): Promise<string | null> {
   return invoke("pick_image", {});
 }
+
+export type Appearance = "light" | "dark" | "system";
+export type Preferences = { appearance: Appearance };
+
+export async function getPreferences(): Promise<Preferences> {
+  return invoke("get_preferences", {});
+}
+
+export async function setPreferences(appearance: Appearance): Promise<Preferences> {
+  return invoke("set_preferences", { appearance });
+}

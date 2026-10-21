@@ -11,7 +11,7 @@ import ipcInventory from "../../ipc-inventory.json" with { type: "json" };
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -1239,6 +1239,31 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     // The picker now lives in Rust so the backend, not the caller, decides what is readable.
     pick_image: () => "/tmp/fake.png",
+    // Persisted in sessionStorage so a reload keeps it: addInitScript rebuilds this closure,
+    // and localStorage is the boot cache of the resolved theme, not the preference.
+    get_preferences: () => {
+      const read = () => {
+        const raw = sessionStorage.getItem("cuthulhu.preferences");
+        if (!raw) return { appearance: "system" };
+        const parsed = JSON.parse(raw) as { appearance?: string };
+        return { appearance: parsed.appearance ?? "system" };
+      };
+      if (opts?.holdPreferences) {
+        return new Promise((resolve) => {
+          (window as unknown as { __releasePreferences?: () => void }).__releasePreferences = () => resolve(read());
+        });
+      }
+      return read();
+    },
+    set_preferences: (a) => {
+      const appearance = a.appearance;
+      if (appearance !== "light" && appearance !== "dark" && appearance !== "system") {
+        throw new Error("appearance is not light, dark, or system");
+      }
+      const prefs = { appearance };
+      sessionStorage.setItem("cuthulhu.preferences", JSON.stringify(prefs));
+      return prefs;
+    },
   } as Record<string, (args: Record<string, unknown>) => unknown>);
 
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
@@ -4772,4 +4797,67 @@ test("a second Open or Reload while one is still loading is refused, and edits s
   // Once the first load's snapshot renders, editing works.
   await page.getByTestId("layer-row").first().click();
   await expect(page.getByRole("button", { name: "Align horizontal centres" })).toBeEnabled();
+});
+
+test("appearance is remembered across a reload", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const appearance = page.getByRole("button", { name: "Appearance" });
+  await expect(appearance).toBeEnabled();
+  await appearance.click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("cuthulhu.theme"))).toBe("dark");
+
+  await page.reload();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await expect(page.getByRole("menuitemradio", { name: "Dark" })).toHaveAttribute("aria-checked", "true");
+
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.reload();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await expect(page.getByRole("menuitemradio", { name: "Light" })).toHaveAttribute("aria-checked", "true");
+});
+
+test("system appearance follows the operating system and an explicit one does not", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Appearance" })).toBeEnabled();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).toHaveClass(/dark/);
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+});
+
+test("the boot script paints the cached theme before preferences answer", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => localStorage.setItem("cuthulhu.theme", "dark"));
+  await page.addInitScript(installMockTauri, { holdPreferences: true });
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect.poll(() =>
+    page.evaluate(() => typeof (window as unknown as { __releasePreferences?: unknown }).__releasePreferences === "function"),
+  ).toBe(true);
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.evaluate(() => (window as unknown as { __releasePreferences: () => void }).__releasePreferences());
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await expect(page.getByRole("button", { name: "Appearance" })).toBeEnabled();
 });

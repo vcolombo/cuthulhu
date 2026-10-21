@@ -13,7 +13,11 @@
       {
         "title": "cuthulhu",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "minWidth": 1180,
+        "minHeight": 760,
+        "visible": false,
+        "backgroundColor": [248, 251, 251, 255]
       }
     ],
     "security": {

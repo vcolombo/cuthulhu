@@ -410,6 +410,23 @@ fn trace_error(e: trace::TraceError) -> IpcError {
     IpcError::new(e.code(), e.to_string())
 }
 
+/// Appearance only. Units and weed defaults belong in this file later; a save merges onto
+/// what is already there, so naming just appearance does not drop them (#243).
+#[tauri::command]
+pub fn get_preferences() -> Result<crate::preferences::Preferences, IpcError> {
+    crate::preferences::load(&preferences_path()?).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn set_preferences(appearance: crate::preferences::Appearance) -> Result<crate::preferences::Preferences, IpcError> {
+    crate::preferences::set_appearance(&preferences_path()?, appearance).map_err(Into::into)
+}
+
+fn preferences_path() -> Result<PathBuf, IpcError> {
+    crate::preferences::default_preferences_path()
+        .ok_or_else(|| IpcError::new("no_config_dir", "this system has no configuration directory"))
+}
+
 /// Returns the source thumbnail as a re-encoded PNG data URL — never the file's original bytes,
 /// so a path that is not a decodable image yields an error rather than its contents.
 #[tauri::command(async)]

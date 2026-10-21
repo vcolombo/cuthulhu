@@ -47,7 +47,7 @@ export function LayersPanel({ doc, selected, onSelect }: Props) {
   const root = doc?.nodes[doc.root];
   return (
     <div style={{ overflowY: "auto", borderBottom: "1px solid var(--border)" }}>
-      <div style={{ padding: "4px 8px", fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Layers</div>
+      <div style={{ padding: "4px 8px", fontSize: 11, color: "var(--muted-foreground)", textTransform: "uppercase" }}>Layers</div>
       {/* The document root is an implicit container (Document::new() always creates it) —
           only its children are user-visible layers, so it doesn't get its own row. */}
       {doc && root

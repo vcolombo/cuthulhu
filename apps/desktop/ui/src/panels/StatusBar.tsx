@@ -18,7 +18,7 @@ type Props = {
 function dotColor(phase: Phase): string {
   if (phase === "Idle" || phase === "Disconnected") return "var(--ready)";
   if (phase === "Failed") return "var(--cut)";
-  return "var(--accent)";
+  return "var(--accent-ink)";
 }
 
 export function StatusBar({ machine, artboard, error, status, zoomPercent, cursor }: Props) {
@@ -30,7 +30,7 @@ export function StatusBar({ machine, artboard, error, status, zoomPercent, curso
         gap: 10,
         padding: "4px 10px",
         fontSize: 11,
-        color: "var(--muted)",
+        color: "var(--muted-foreground)",
         background: "var(--panel)",
         borderTop: "1px solid var(--border)",
       }}

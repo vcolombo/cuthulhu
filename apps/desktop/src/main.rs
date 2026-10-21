@@ -8,10 +8,37 @@ use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
 use desktop::device::DeviceManagerHandle;
+use desktop::preferences::ResolvedTheme;
 use driver_registry::HardwareBackendFactory;
 use desktop::hosts;
 use desktop::ipc;
 use desktop::state::AppState;
+
+fn resolved_theme(theme: tauri::Theme) -> ResolvedTheme {
+    match theme {
+        tauri::Theme::Dark => ResolvedTheme::Dark,
+        tauri::Theme::Light => ResolvedTheme::Light,
+        // `Theme` is non-exhaustive. An unknown variant is the same case as a query that
+        // failed: stay on the light background the window was created with.
+        _ => ResolvedTheme::Light,
+    }
+}
+
+fn tauri_theme(theme: ResolvedTheme) -> tauri::Theme {
+    match theme {
+        ResolvedTheme::Dark => tauri::Theme::Dark,
+        ResolvedTheme::Light => tauri::Theme::Light,
+    }
+}
+
+fn chrome_color(theme: ResolvedTheme) -> tauri::webview::Color {
+    // The same hex as `--background`. Light is also `tauri.conf.json`'s `backgroundColor`,
+    // so a theme that could not be read does not change the colour the window was born with.
+    match theme {
+        ResolvedTheme::Light => tauri::webview::Color(0xF8, 0xFB, 0xFB, 0xFF),
+        ResolvedTheme::Dark => tauri::webview::Color(0x0B, 0x1A, 0x1D, 0xFF),
+    }
+}
 
 /// Cancels + shuts down the device manager and exits the process. Used by the
 /// UI after the user confirms they want to quit with a cut in progress.
@@ -91,8 +118,32 @@ fn main() {
             ipc::list_fonts,
             ipc::load_image_preview,
             ipc::pick_image,
+            ipc::get_preferences,
+            ipc::set_preferences,
             force_quit,
         ])
+        .setup(|app| {
+            // The window is created hidden. Theme and the colour behind the webview are set
+            // before anything can show it; the page calls `show` only after it has painted
+            // the same theme. A preferences file this build will not read is left as it is
+            // and the window follows the system, which is also what a missing file means.
+            if let Some(window) = app.get_webview_window("main") {
+                let prefs = desktop::preferences::load_or_warn(
+                    desktop::preferences::default_preferences_path().as_deref(),
+                    |e| eprintln!("cuthulhu: preferences could not be loaded: {e}"),
+                );
+                let system = window.theme().ok().map(resolved_theme);
+                let chrome = desktop::preferences::launch_chrome(prefs.appearance, system);
+                let theme = chrome.theme.map(tauri_theme);
+                if let Err(e) = window.set_theme(theme) {
+                    eprintln!("cuthulhu: window theme was not applied: {e}");
+                }
+                if let Err(e) = window.set_background_color(Some(chrome_color(chrome.background))) {
+                    eprintln!("cuthulhu: window background was not applied: {e}");
+                }
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();

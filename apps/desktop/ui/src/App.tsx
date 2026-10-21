@@ -23,6 +23,7 @@ import { CutDialog } from "./cut/CutDialog";
 import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
 import { TextDialog } from "./text/TextDialog";
+import { useTheme } from "./useTheme";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -122,6 +123,7 @@ function unitsOf(s: Scene, ids: number[], expand: (ids: number[]) => number[]): 
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Canvas2DRenderer | null>(null);
+  const theme = useTheme();
 
   const [doc, setDoc] = useState<DocSnapshot | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
@@ -135,12 +137,18 @@ export function App() {
     if (typeof next === "string") errorAt.current = performance.now();
     setErrorState(next);
   }, []);
+  // A preferences failure is the same status-bar error as a document one. It is not cleared
+  // when the fault goes away: a later edit owns that, and wiping it would hide a message
+  // that arrived in between.
+  useEffect(() => {
+    if (theme.fault) setError(theme.fault);
+  }, [theme.fault, setError]);
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);
   // The cut dialog's weed controls, kept here so reopening the dialog keeps them. Per session, not
   // in the project: a weed tweak saved in the document would be an undoable edit that also makes
   // the open plan stale. (`ponytail:` an operator who always borders sets it once per launch;
-  // upgrade by remembering it in the app's config beside presets.json.)
+  // upgrade by remembering it in preferences.json, which already holds appearance.)
   const [cutWeed, setCutWeed] = useState<WeedDraft | null>(null);
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
@@ -397,7 +405,10 @@ export function App() {
     // gesture. `scene` and `selected` are listed because they are what it draws; `size` because a
     // resize clears the backing store and nothing else would repaint it.
     repaint();
-  }, [scene, selected, doc, interaction.view, interaction.size, repaint]);
+    // `theme.resolved` is what the canvas reads out of the CSS variables. A theme
+    // change does not touch the scene, so without it the selection stays in the
+    // previous theme's colour until the next gesture.
+  }, [scene, selected, doc, interaction.view, interaction.size, repaint, theme.resolved]);
 
   // Clears selection only once the delete actually lands, so a failed delete leaves the
   // (still valid) selection in place, and a successful one can't leave stale ids around to
@@ -612,6 +623,9 @@ export function App() {
           onImportFile={onImportFile}
           onCut={() => setCutOpen(true)}
           onTrace={onTrace}
+          appearance={theme.appearance}
+          appearanceReady={theme.ready}
+          onAppearance={theme.setAppearance}
         />
       </div>
       <ToolRail

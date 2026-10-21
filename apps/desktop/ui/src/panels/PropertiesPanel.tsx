@@ -54,7 +54,7 @@ export function PropertiesPanel({ bounds, cutLineType, materialPreset, effective
                                   onChangeCutLineType, onChangeMaterialPreset }: Props) {
   return (
     <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" }}>
-      <div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Properties</div>
+      <div style={{ fontSize: 11, color: "var(--muted-foreground)", textTransform: "uppercase" }}>Properties</div>
       {bounds ? (
         <>
           <NumberField label="X" value={bounds.x} disabled={editsLocked !== null} onChange={onChangeX} />
@@ -109,13 +109,13 @@ export function PropertiesPanel({ bounds, cutLineType, materialPreset, effective
               <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>
             ))}
           </select>
-          <span style={{ color: "var(--muted)" }}>
+          <span style={{ color: "var(--muted-foreground)" }}>
             {materialLabel(materialPreset, effectiveMaterial, presets)}
           </span>
         </label>
       ) : null}
       {bounds === null && cutLineType === null && materialPreset === undefined ? (
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>No selection</div>
+        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>No selection</div>
       ) : null}
     </div>
   );

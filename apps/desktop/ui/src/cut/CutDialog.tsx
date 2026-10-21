@@ -119,10 +119,10 @@ const dialogStyle: CSSProperties = {
 // before any of this: quiet is what "nobody has asked yet" should look like.
 const TONE_COLOR: Record<ReturnType<typeof deviceBadge>["tone"], string> = {
   idle: "var(--ready)",
-  busy: "var(--accent)",
+  busy: "var(--accent-ink)",
   attention: "var(--cut)",
-  unknown: "var(--muted)",
-  gone: "var(--muted)",
+  unknown: "var(--muted-foreground)",
+  gone: "var(--muted-foreground)",
 };
 
 const btn: CSSProperties = {
@@ -867,11 +867,11 @@ export function CutDialog({
         </div>
 
         <div>
-          <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 4 }}>Device</div>
+          <div style={{ fontSize: 12, color: "var(--muted-foreground)", marginBottom: 4 }}>Device</div>
           {/* Only when there is nothing at all. A paired host with no cutters attached is a
               different fact, and it has its own section saying so. */}
           {devices.length === 0 && hosts.length === 0 ? (
-            <div style={{ fontSize: 12, color: "var(--muted)" }}>
+            <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
               No devices found — connect a cutter and reopen this dialog.
             </div>
           ) : null}
@@ -887,8 +887,8 @@ export function CutDialog({
               {section.hostId === null && hosts.length === 0 && !section.stale ? null : (
                 <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
                   <strong>{section.title}</strong>
-                  {section.address ? <span style={{ color: "var(--muted)" }}>{section.address}</span> : null}
-                  {section.stale ? <span style={{ color: "var(--muted)" }}>last known</span> : null}
+                  {section.address ? <span style={{ color: "var(--muted-foreground)" }}>{section.address}</span> : null}
+                  {section.stale ? <span style={{ color: "var(--muted-foreground)" }}>last known</span> : null}
                   <div style={{ flex: 1 }} />
                   {hosts.some((h) => h.id === section.hostId) ? (
                     <button
@@ -1024,7 +1024,7 @@ export function CutDialog({
             onDelete={deletePresetDraft}
           />
         ) : (
-          <div style={{ fontSize: 12, color: "var(--muted)" }}>Reading this cutter's presets…</div>
+          <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>Reading this cutter's presets…</div>
         )}
 
         {/* The decision is the operator's, and nothing moves until they make it: Save writes and
@@ -1219,7 +1219,7 @@ export function CutDialog({
                   onChange={(e) => updateRow(i, { repeatCount: e.target.value === "" ? null : Number(e.target.value) })}
                   style={{ width: 50 }}
                 />
-                {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted)" }}>set on the Puma's panel</span> : null}
+                {speedDisabled || forceDisabled ? <span style={{ color: "var(--muted-foreground)" }}>set on the Puma's panel</span> : null}
                 <button style={btn} onClick={() => movePass(i, -1)} disabled={replanning || i === 0}>
                   Up
                 </button>
@@ -1231,7 +1231,7 @@ export function CutDialog({
           })}
         </div>
 
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
           Not cut: {plan?.skippedNotCut ?? 0} shape{(plan?.skippedNotCut ?? 0) === 1 ? "" : "s"} marked No Cut
         </div>
 
@@ -1248,7 +1248,7 @@ export function CutDialog({
           {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
           {/* How the last job ended comes from the backend, so the dialog remembers
               nothing: no latch, no reading `actions.cancel` as a liveness bit. */}
-          {status.ended === "Cancelled" ? <span style={{ color: "var(--muted)" }}>Cancelled</span> : null}
+          {status.ended === "Cancelled" ? <span style={{ color: "var(--muted-foreground)" }}>Cancelled</span> : null}
           {status.ended === "Completed" ? <span>Job complete</span> : null}
           {status.phase === "Failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
 

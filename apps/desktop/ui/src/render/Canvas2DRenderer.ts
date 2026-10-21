@@ -4,11 +4,13 @@ import type { Affine6, Bounds, Scene, ShapeGeom } from "./hittest";
 import { apply, compose, IDENTITY, transformBounds } from "./affine";
 import { boxCorners, handleWorld, SCALE_HANDLES } from "../interaction/selectionBox";
 
-const FALLBACK_ACCENT = "#22D3EE";
-const FALLBACK_BORDER = "#2E2E34";
-const FALLBACK_PANEL = "#1F1F23";
-const FALLBACK_TEXT = "#E7E7EA";
-const FALLBACK_GUIDE = "#F472B6";
+const FALLBACK_SELECTION = "#012F36";
+const FALLBACK_HANDLE = "#012F36";
+const FALLBACK_HANDLE_FILL = "#FFFFFF";
+const FALLBACK_BORDER = "#CFDADA";
+const FALLBACK_PANEL = "#F1F6F6";
+const FALLBACK_TEXT = "#012F36";
+const FALLBACK_GUIDE = "#B73A80";
 
 // CSS px, whatever the zoom.
 const STROKE_PX = 1;
@@ -78,7 +80,13 @@ export class Canvas2DRenderer implements Renderer {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const style = getComputedStyle(document.documentElement);
-    const accent = style.getPropertyValue("--accent").trim() || FALLBACK_ACCENT;
+    // Selection is neutral. `--accent` is a selected-row fill in the chrome, and reading
+    // it here would put that teal on the canvas.
+    const selection = style.getPropertyValue("--selection").trim() || FALLBACK_SELECTION;
+    const handleStroke = style.getPropertyValue("--selection-handle").trim() || FALLBACK_HANDLE;
+    // The token table says handles are filled white. `--primary-foreground` is that white
+    // in both themes; there is no separate handle-fill token.
+    const handleFill = style.getPropertyValue("--primary-foreground").trim() || FALLBACK_HANDLE_FILL;
     const border = style.getPropertyValue("--border").trim() || FALLBACK_BORDER;
     const panel = style.getPropertyValue("--panel").trim() || FALLBACK_PANEL;
     const guide = style.getPropertyValue("--guide").trim() || FALLBACK_GUIDE;
@@ -96,7 +104,7 @@ export class Canvas2DRenderer implements Renderer {
 
     for (const node of this.scene.nodes) {
       const selected = this.selected.has(node.id);
-      ctx.strokeStyle = selected ? accent : text;
+      ctx.strokeStyle = selected ? selection : text;
       ctx.lineWidth = selected ? SELECTED_STROKE_PX : STROKE_PX;
       if (node.shape && node.world) {
         // Geometry is carried to screen space before stroking, so the line is in CSS px whatever
@@ -111,11 +119,11 @@ export class Canvas2DRenderer implements Renderer {
       }
     }
 
-    this.drawOverlay(accent, panel, guide);
+    this.drawOverlay(selection, handleStroke, handleFill, guide);
     this.dirty.clear();
   }
 
-  private drawOverlay(accent: string, panel: string, guide: string): void {
+  private drawOverlay(selection: string, handleStroke: string, handleFill: string, guide: string): void {
     const { ctx, view } = this;
     const { box, marquee, guides } = this.overlay;
     // Guides first, so the box and handles they line up stay on top of them.
@@ -136,10 +144,11 @@ export class Canvas2DRenderer implements Renderer {
       ctx.beginPath();
       corners.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
       ctx.closePath();
-      ctx.strokeStyle = accent;
+      ctx.strokeStyle = selection;
       ctx.lineWidth = STROKE_PX;
       ctx.stroke();
-      ctx.fillStyle = panel;
+      ctx.fillStyle = handleFill;
+      ctx.strokeStyle = handleStroke;
       const half = HANDLE_PX / 2;
       for (const h of SCALE_HANDLES) {
         const p = apply(view, handleWorld(box, h));
@@ -151,12 +160,12 @@ export class Canvas2DRenderer implements Renderer {
       const m = transformBounds(view, marquee);
       ctx.save();
       ctx.globalAlpha = MARQUEE_ALPHA;
-      ctx.fillStyle = accent;
+      ctx.fillStyle = selection;
       ctx.fillRect(m.x, m.y, m.w, m.h);
       ctx.restore();
       ctx.save();
       ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = accent;
+      ctx.strokeStyle = selection;
       ctx.lineWidth = STROKE_PX;
       ctx.strokeRect(m.x, m.y, m.w, m.h);
       ctx.restore();

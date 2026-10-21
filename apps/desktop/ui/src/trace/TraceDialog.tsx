@@ -44,7 +44,7 @@ const previewPane: CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   fontSize: 12,
-  color: "var(--muted)",
+  color: "var(--muted-foreground)",
   overflow: "hidden",
 };
 
@@ -132,7 +132,7 @@ export function TraceDialog({ path, onInsert, onClose }: {
         </div>
 
         {preview.kind === "ready" ? (
-          <div style={{ fontSize: 12, color: "var(--muted)" }}>
+          <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
             {preview.pathCount} {preview.pathCount === 1 ? "path" : "paths"}
             {preview.downscaled ? ` — large image reduced to ${specs?.maxDim} px for tracing` : ""}
           </div>

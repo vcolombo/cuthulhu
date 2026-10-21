@@ -128,7 +128,8 @@ export function TopBar(props: Props) {
           </DropdownMenuLabel>
           <DropdownMenuItem onSelect={props.onTrace}>
             <FileImage />
-            Image… opens Trace
+            Image
+            <span className="ml-auto text-2xs text-muted-foreground">Opens Trace</span>
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

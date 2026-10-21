@@ -429,6 +429,8 @@ fn trace_error(e: trace::TraceError) -> IpcError {
 
 /// Appearance and length units. Weed defaults still belong in this file later; a save merges
 /// onto what is already there, so naming one field does not drop the other (#243).
+/// `units` is null when the file has never recorded one. The UI resolves the region once
+/// and saves it; this command does not, so a read still does not create the file.
 #[tauri::command]
 pub fn get_preferences() -> Result<crate::preferences::Preferences, IpcError> {
     crate::preferences::load(&preferences_path()?).map_err(Into::into)

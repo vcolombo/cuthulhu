@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { Check, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import type { Appearance } from "../theme";
 
 type Props = {
@@ -14,47 +15,9 @@ const OPTIONS: { value: Appearance; label: string }[] = [
   { value: "system", label: "System" },
 ];
 
-/** Sun over a moon, the control the menu hangs off. Decorative: the button's name is Appearance. */
-function SunMoonIcon() {
-  return (
-    <svg width={16} height={16} viewBox="0 0 16 16" aria-hidden fill="none" stroke="currentColor" strokeWidth={1.25}>
-      <circle cx={7} cy={7} r={2.25} />
-      <path d="M7 2.2v1.3M7 10.5v1.3M2.2 7h1.3M10.5 7h1.3M3.6 3.6l.9.9M9.5 9.5l.9.9M3.6 10.4l.9-.9M9.5 4.5l.9-.9" />
-      <path d="M10.2 10.2a3.2 3.2 0 1 1-3.4-4.6 2.6 2.6 0 0 0 3.4 4.6z" fill="currentColor" stroke="none" />
-    </svg>
-  );
-}
-
 function OptionIcon({ value }: { value: Appearance }) {
-  if (value === "light") {
-    return (
-      <svg width={14} height={14} viewBox="0 0 16 16" aria-hidden fill="none" stroke="currentColor" strokeWidth={1.25}>
-        <circle cx={8} cy={8} r={2.4} />
-        <path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1" />
-      </svg>
-    );
-  }
-  if (value === "dark") {
-    return (
-      <svg width={14} height={14} viewBox="0 0 16 16" aria-hidden fill="currentColor">
-        <path d="M9.2 2.1a5.2 5.2 0 1 0 4.7 7.6A4.4 4.4 0 0 1 9.2 2.1z" />
-      </svg>
-    );
-  }
-  return (
-    <svg width={14} height={14} viewBox="0 0 16 16" aria-hidden fill="none" stroke="currentColor" strokeWidth={1.25}>
-      <rect x={2} y={3} width={12} height={8} rx={1} />
-      <path d="M6 13.5h4M8 11v2.5" />
-    </svg>
-  );
-}
-
-function CheckIcon() {
-  return (
-    <svg width={12} height={12} viewBox="0 0 12 12" aria-hidden fill="none" stroke="currentColor" strokeWidth={1.5}>
-      <path d="M2 6.2 4.6 9 10 3" />
-    </svg>
-  );
+  const Icon = value === "light" ? Sun : value === "dark" ? Moon : Monitor;
+  return <Icon className="size-3.5" aria-hidden />;
 }
 
 export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
@@ -120,9 +83,9 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
         aria-controls={open ? menuId : undefined}
         disabled={!ready}
         onClick={() => setOpen((value) => !value)}
-        className="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-foreground hover:bg-accent disabled:cursor-default disabled:opacity-[0.35]"
+        className="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-foreground hover:bg-accent disabled:cursor-default"
       >
-        <SunMoonIcon />
+        <SunMoon className="size-4" aria-hidden />
       </button>
       {open ? (
         <div
@@ -147,7 +110,7 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
               >
                 <OptionIcon value={option.value} />
                 <span style={{ flex: 1 }}>{option.label}</span>
-                {checked ? <CheckIcon /> : <span aria-hidden style={{ width: 12 }} />}
+                {checked ? <Check className="size-3" aria-hidden /> : <span aria-hidden style={{ width: 12 }} />}
               </button>
             );
           })}

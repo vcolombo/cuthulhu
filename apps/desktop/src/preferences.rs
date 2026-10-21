@@ -31,7 +31,10 @@ impl Default for Appearance {
 }
 
 /// Lengths on screen. Storage and IPC stay in millimetres; this only chooses how they are shown.
-/// Millimetres is the absence of a choice, which is what every document is stored in.
+///
+/// Absence is not millimetres. A missing key means the operator has not chosen, and the UI
+/// resolves the computer's region once and saves `in` or `mm`. A present key, including
+/// millimetres, is that saved choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Units {
     #[serde(rename = "in")]
@@ -40,25 +43,21 @@ pub enum Units {
     Mm,
 }
 
-impl Default for Units {
-    fn default() -> Self {
-        Self::Mm
-    }
-}
-
 /// The preferences this build reads. Further fields live in the file as raw JSON so a save of
 /// one field does not drop them; they are not modelled until a caller has somewhere to put them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     pub appearance: Appearance,
-    pub units: Units,
+    /// `None` when the file has no `units` key. Serialises as null so the UI can tell
+    /// "never saved" from a saved millimetre.
+    pub units: Option<Units>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             appearance: Appearance::System,
-            units: Units::Mm,
+            units: None,
         }
     }
 }
@@ -274,12 +273,10 @@ fn preferences_of(value: &Value) -> Result<Preferences, PreferencesError> {
         })?,
     };
     let units = match value.get("units") {
-        None => Units::Mm,
-        Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
-            PreferencesError::Corrupt(
-                "the preferences file's units are not in or mm".into(),
-            )
-        })?,
+        None | Some(Value::Null) => None,
+        Some(v) => Some(serde_json::from_value(v.clone()).map_err(|_| {
+            PreferencesError::Corrupt("the preferences file's units are not in or mm".into())
+        })?),
     };
     Ok(Preferences { appearance, units })
 }
@@ -348,11 +345,11 @@ mod tests {
         let path = path(&dir);
         std::fs::write(&path, r#"{"version":1,"units":"in","weed":true}"#).unwrap();
         assert_eq!(load(&path).unwrap().appearance, Appearance::System);
-        assert_eq!(load(&path).unwrap().units, Units::In);
+        assert_eq!(load(&path).unwrap().units, Some(Units::In));
 
         let saved = set_appearance(&path, Appearance::Dark).unwrap();
         assert_eq!(saved.appearance, Appearance::Dark);
-        assert_eq!(saved.units, Units::In);
+        assert_eq!(saved.units, Some(Units::In));
         assert_eq!(load(&path).unwrap().appearance, Appearance::Dark);
 
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -376,12 +373,14 @@ mod tests {
         let path = path(&dir);
         set_appearance(&path, Appearance::Dark).unwrap();
         let saved = update(&path, None, Some(Units::In)).unwrap();
-        assert_eq!(saved.units, Units::In);
+        assert_eq!(saved.units, Some(Units::In));
         assert_eq!(saved.appearance, Appearance::Dark);
-        assert_eq!(load(&path).unwrap().units, Units::In);
-        // A missing units key is millimetres, the unit documents are stored in.
+        assert_eq!(load(&path).unwrap().units, Some(Units::In));
+        // A missing units key is not a choice. The UI resolves the region and saves one.
         std::fs::write(&path, r#"{"version":1,"appearance":"light"}"#).unwrap();
-        assert_eq!(load(&path).unwrap().units, Units::Mm);
+        assert_eq!(load(&path).unwrap().units, None);
+        std::fs::write(&path, r#"{"version":1,"appearance":"light","units":null}"#).unwrap();
+        assert_eq!(load(&path).unwrap().units, None);
         // Nothing named is a read, and it must not create a file where there was none.
         let fresh = dir.path().join("fresh.json");
         assert_eq!(update(&fresh, None, None).unwrap(), Preferences::default());

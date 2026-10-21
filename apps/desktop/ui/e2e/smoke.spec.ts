@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
+import { renderedContrastFromPixels } from "./renderedContrast";
 // Generated from the desktop's own generate_handler! registry by
 // apps/desktop/tests/ipc_inventory.rs. Nothing else here calls a real #[tauri::command], so this
 // is what the fake below checks command and argument names against (#85).
@@ -23,7 +24,7 @@ async function fileAction(page: Page, name: string) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -1259,9 +1260,12 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     get_preferences: () => {
       const read = () => {
         const raw = sessionStorage.getItem("cuthulhu.preferences");
-        if (!raw) return { appearance: "system", units: "mm" };
+        // A saved millimetre, not the locale default. The suite's cursor readout is millimetres.
+        // `unsetUnits` is the first-run file: null until something saves a unit.
+        if (!raw) return { appearance: "system", units: opts?.unsetUnits ? null : "mm" };
         const parsed = JSON.parse(raw) as { appearance?: string; units?: string };
-        const units = parsed.units === "in" || parsed.units === "mm" ? parsed.units : "mm";
+        const saved = parsed.units === "in" || parsed.units === "mm" ? parsed.units : null;
+        const units = saved ?? (opts?.unsetUnits ? null : "mm");
         return { appearance: parsed.appearance ?? "system", units };
       };
       if (opts?.holdPreferences) {
@@ -5086,4 +5090,141 @@ test("the boot script paints the cached theme before preferences answer", async 
   await page.evaluate(() => (window as unknown as { __releasePreferences: () => void }).__releasePreferences());
   await expect(page.locator("html")).not.toHaveClass(/dark/);
   await expect(page.getByRole("button", { name: "Appearance" })).toBeEnabled();
+});
+
+async function paintContrast(page: Page, locator: Locator) {
+  const bytes = (await locator.screenshot()) as unknown as Uint8Array;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const rgba = await page.evaluate(async (png) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${png}`;
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no canvas");
+    ctx.drawImage(img, 0, 0);
+    return Array.from(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+  }, btoa(binary));
+  return renderedContrastFromPixels(rgba);
+}
+
+test("top-bar labels stay readable in both themes, including after a light-to-dark switch", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const importButton = page.getByRole("button", { name: "Import", exact: true });
+  const fileButton = page.getByRole("button", { name: "File", exact: true });
+  const undo = page.getByRole("button", { name: "Undo", exact: true });
+  const redo = page.getByRole("button", { name: "Redo", exact: true });
+  const properties = page.getByRole("tab", { name: "Properties", exact: true });
+  const devices = page.getByRole("tab", { name: "Devices", exact: true });
+  await expect(importButton).toBeEnabled();
+  await expect(undo).toBeDisabled();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  const measure = async () => ({
+    import: await paintContrast(page, importButton),
+    file: await paintContrast(page, fileButton),
+    undo: await paintContrast(page, undo),
+    redo: await paintContrast(page, redo),
+    properties: await paintContrast(page, properties),
+    devices: await paintContrast(page, devices),
+  });
+
+  const light = await measure();
+  expect(await importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(1, 47, 54)");
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  // `transition-colors` holds the light foreground for a frame after the class
+  // flips. The settled button color is the dark token.
+  await expect.poll(() => importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(230, 240, 240)");
+  await expect.poll(() => properties.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(157, 184, 185)");
+  const dark = await measure();
+
+  for (const [theme, sample] of [
+    ["light", light],
+    ["dark", dark],
+  ] as const) {
+    // Printed so a failure names the pixels, and so the PR can quote the ratios.
+    console.log(theme, {
+      import: sample.import.ratio.toFixed(2),
+      file: sample.file.ratio.toFixed(2),
+      undo: sample.undo.ratio.toFixed(2),
+      redo: sample.redo.ratio.toFixed(2),
+      properties: sample.properties.ratio.toFixed(2),
+      devices: sample.devices.ratio.toFixed(2),
+      importInk: sample.import.ink.join(","),
+      undoInk: sample.undo.ink.join(","),
+      propertiesInk: sample.properties.ink.join(","),
+      importPeak: sample.import.peak.toFixed(2),
+      undoPeak: sample.undo.peak.toFixed(2),
+    });
+    expect(sample.import.ratio, `${theme} Import`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.file.ratio, `${theme} File`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.undo.ratio, `${theme} Undo`).toBeGreaterThanOrEqual(3);
+    expect(sample.redo.ratio, `${theme} Redo`).toBeGreaterThanOrEqual(3);
+    expect(sample.properties.ratio, `${theme} Properties`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.devices.ratio, `${theme} Devices`).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+test("the File menu ring follows the keyboard, not a pointer click", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const file = page.getByRole("button", { name: "File", exact: true });
+  await page.getByRole("button", { name: "Import", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(file).toBeFocused();
+  await expect.poll(() => file.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+
+  await file.click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: "Save", exact: true })).toBeVisible();
+  // Radix hides the rest of the page from the accessibility tree while the menu is open.
+  const trigger = page.locator('header button[aria-label="File"]');
+  expect(await trigger.evaluate((el) => getComputedStyle(el).boxShadow)).toBe("none");
+  expect(await menu.evaluate((el) => getComputedStyle(el).boxShadow)).toBe("none");
+});
+
+test("Import names Image, with Opens Trace beside it", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Import", exact: true }).click();
+  const item = page.getByRole("menuitem", { name: "Image" });
+  await expect(item).toBeVisible();
+  await expect(item).toContainText("Opens Trace");
+  await expect(item).not.toContainText("Image…");
+});
+
+test("the Appearance glyph is a 16px icon", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const box = await page.getByRole("button", { name: "Appearance" }).locator("svg").boundingBox();
+  expect(box?.width).toBeGreaterThanOrEqual(15);
+  expect(box?.width).toBeLessThanOrEqual(17);
+  expect(box?.height).toBeGreaterThanOrEqual(15);
+  expect(box?.height).toBeLessThanOrEqual(17);
+});
+
+test("a machine with no saved unit takes inches from en-US once and then keeps them", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "language", {
+      configurable: true,
+      get: () => sessionStorage.getItem("cuthulhu.testLocale") || "en-US",
+    });
+  });
+  await page.addInitScript(installMockTauri, { unsetUnits: true });
+  await page.goto("/");
+  const inches = page.getByRole("button", { name: "in", exact: true });
+  const millimetres = page.getByRole("button", { name: "mm", exact: true });
+  await expect(inches).toHaveAttribute("aria-pressed", "true");
+
+  await page.evaluate(() => sessionStorage.setItem("cuthulhu.testLocale", "fr-FR"));
+  await page.reload();
+  await expect(inches).toHaveAttribute("aria-pressed", "true");
+  await expect(millimetres).toHaveAttribute("aria-pressed", "false");
 });

@@ -418,7 +418,8 @@ export async function pickImagePath(): Promise<string | null> {
 
 export type Appearance = "light" | "dark" | "system";
 export type LengthUnit = "in" | "mm";
-export type Preferences = { appearance: Appearance; units: LengthUnit };
+/** `units` is null until a choice has been saved. The UI resolves the region once and writes it. */
+export type Preferences = { appearance: Appearance; units: LengthUnit | null };
 
 export async function getPreferences(): Promise<Preferences> {
   return invoke("get_preferences", {});

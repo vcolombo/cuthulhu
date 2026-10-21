@@ -17,7 +17,7 @@ type Props = {
 };
 
 const btn =
-  "flex w-14 flex-col items-center gap-0.5 rounded-md border border-transparent px-0.5 py-1.5 text-[11px] leading-tight tracking-tight text-muted-foreground hover:bg-subtle hover:text-foreground disabled:pointer-events-none disabled:opacity-[0.35]";
+  "flex w-14 flex-col items-center gap-0.5 rounded-md border border-transparent px-0.5 py-1.5 text-[11px] leading-tight tracking-tight text-muted-foreground hover:bg-subtle hover:text-foreground disabled:pointer-events-none";
 
 const BOOLS: { op: BoolOp; label: string; tip: string; kbd: string; Icon: typeof Square }[] = [
   { op: "Union", label: "Union", tip: "Weld / Union", kbd: "⌘U", Icon: SquaresUnite },

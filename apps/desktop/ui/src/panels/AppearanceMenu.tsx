@@ -119,17 +119,8 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         disabled={!ready}
-        title="Appearance"
         onClick={() => setOpen((value) => !value)}
-        style={{
-          background: "var(--panel)",
-          color: "var(--text)",
-          border: "1px solid var(--border)",
-          padding: "4px 8px",
-          cursor: ready ? "pointer" : "default",
-          display: "inline-flex",
-          alignItems: "center",
-        }}
+        className="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-foreground hover:bg-accent disabled:cursor-default disabled:opacity-[0.35]"
       >
         <SunMoonIcon />
       </button>
@@ -139,23 +130,9 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
           role="menu"
           aria-label="Appearance"
           onKeyDown={onMenuKey}
-          style={{
-            position: "absolute",
-            top: "100%",
-            right: 0,
-            marginTop: 4,
-            zIndex: 30,
-            minWidth: 148,
-            padding: 4,
-            display: "flex",
-            flexDirection: "column",
-            gap: 2,
-            background: "var(--card)",
-            color: "var(--text)",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--radius)",
-          }}
+          className="absolute right-0 z-50 mt-1 flex min-w-[11rem] flex-col gap-0.5 rounded-md border border-border bg-popover p-1 text-foreground shadow-md"
         >
+          <div className="px-2 py-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">Appearance</div>
           {OPTIONS.map((option) => {
             const checked = appearance === option.value;
             return (
@@ -165,20 +142,8 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
                 role="menuitemradio"
                 aria-checked={checked}
                 autoFocus={checked}
-                className="appearance-option"
+                className="appearance-option flex w-full cursor-pointer items-center gap-2 rounded-sm border-0 bg-transparent px-2 py-1.5 text-left text-sm text-foreground"
                 onClick={() => choose(option.value)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  width: "100%",
-                  textAlign: "left",
-                  color: "var(--text)",
-                  border: 0,
-                  borderRadius: 4,
-                  padding: "4px 8px",
-                  cursor: "pointer",
-                }}
               >
                 <OptionIcon value={option.value} />
                 <span style={{ flex: 1 }}>{option.label}</span>

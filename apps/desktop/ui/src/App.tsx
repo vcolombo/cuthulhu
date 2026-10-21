@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { Cpu, Layers, SlidersHorizontal } from "lucide-react";
 import * as ipc from "./ipc";
+import { Toaster } from "./components/ui/sonner";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
+import { TooltipProvider } from "./components/ui/tooltip";
+import { useActiveCutter } from "./hooks/useActiveCutter";
+import { useDevices } from "./hooks/useDevices";
+import { useDocument } from "./hooks/useDocument";
+import { useJob } from "./hooks/useJob";
+import { useUnits } from "./hooks/useUnits";
+import { DevicesTab } from "./panels/DevicesTab";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { unionBounds, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
+import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { IDENTITY, compose, transformBounds } from "./render/affine";
 import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
@@ -17,7 +27,6 @@ import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
-import type { Preset } from "./cut/viewmodel";
 import { StatusBar } from "./panels/StatusBar";
 import { CutDialog } from "./cut/CutDialog";
 import type { WeedDraft } from "./cut/viewmodel";
@@ -120,30 +129,41 @@ function unitsOf(s: Scene, ids: number[], expand: (ids: number[]) => number[]): 
   return found.sort((a, b) => a.first - b.first).map((f) => f.unit);
 }
 
+function countShapes(doc: DocSnapshot | null): number {
+  if (!doc) return 0;
+  return Object.values(doc.nodes).filter((node) => typeof node.kind === "object" && "Shape" in node.kind).length;
+}
+
+function selectionBounds(scene: Scene, selected: number[]): Bounds | null {
+  const boxes = scene.nodes.filter((node) => selected.includes(node.id)).map((node) => node.bounds);
+  if (boxes.length === 0) return null;
+  const x = Math.min(...boxes.map((box) => box.x));
+  const y = Math.min(...boxes.map((box) => box.y));
+  const right = Math.max(...boxes.map((box) => box.x + box.w));
+  const bottom = Math.max(...boxes.map((box) => box.y + box.h));
+  return { x, y, w: right - x, h: bottom - y };
+}
+
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Canvas2DRenderer | null>(null);
   const theme = useTheme();
+  // The canvas hook does not exist yet on the first line. Edits read it when they start, which is
+  // after this render has stored the real lock.
+  const editsLockNow = useRef<() => EditsLock>(() => "loading");
+  const docState = useDocument(editsLockNow);
+  const {
+    doc, selected, setSelected, machines, presets, setError, errorAt, lastPath, setLastPath,
+    docRev, history, refresh, run, edit, lockReason, waitForEdits, noteLoaded, root,
+  } = docState;
 
-  const [doc, setDoc] = useState<DocSnapshot | null>(null);
-  const [selected, setSelected] = useState<number[]>([]);
-  const [machines, setMachines] = useState<MachineProfile[]>([]);
-  const [tool, setTool] = useState("select");
-  const [error, setErrorState] = useState<string | null>(null);
-  // When the message on screen was raised, on the clock the canvas stamps its requests with: a
-  // commit clears only a message older than the request it carries (Copilot on #301).
-  const errorAt = useRef(0);
-  const setError = useCallback((next: SetStateAction<string | null>) => {
-    if (typeof next === "string") errorAt.current = performance.now();
-    setErrorState(next);
-  }, []);
-  // A preferences failure is the same status-bar error as a document one. It is not cleared
-  // when the fault goes away: a later edit owns that, and wiping it would hide a message
-  // that arrived in between.
+  // A preferences failure is the same toast as a document one. It is not cleared when the fault
+  // goes away: a later edit owns that, and wiping it would hide a message that arrived in between.
   useEffect(() => {
     if (theme.fault) setError(theme.fault.message);
   }, [theme.fault, setError]);
-  const [lastPath, setLastPath] = useState<string | null>(null);
+
+  const [tool, setTool] = useState("select");
   const [cutOpen, setCutOpen] = useState(false);
   // The cut dialog's weed controls, kept here so reopening the dialog keeps them. Per session, not
   // in the project: a weed tweak saved in the document would be an undoable edit that also makes
@@ -152,123 +172,21 @@ export function App() {
   const [cutWeed, setCutWeed] = useState<WeedDraft | null>(null);
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
-  const [status, setStatus] = useState<ipc.CutStatus>(ipc.DISCONNECTED_STATUS);
-  /** The machine's material presets, for the properties panel's control. Loaded here rather
-   *  than in the panel because the document names the machine, and read for the *document's*
-   *  machine rather than the connected one: a preset assigned to a Node is saved in the
-   *  project, so the choice must not depend on which cutter happens to be plugged in. The cut
-   *  dialog keeps its own list for the connected machine, which is what its settings apply to. */
-  const [presets, setPresets] = useState<Preset[]>([]);
+  const [rightTab, setRightTab] = useState("layers");
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
-
-  // Every successful snapshot gets the next revision, set in the same render as the document it
-  // came with. A pending canvas preview retires by revision, not on any new document, because
-  // queued commits can render an earlier one's snapshot while a later one is still on the wire.
-  const revCounter = useRef(0);
-  const [docRev, setDocRev] = useState(0);
-  // Bumped when a load replaces the document. A snapshot asked for before that answers with the
-  // document that left; rendered after the load, it showed that one under the next revision, which
-  // also lifted the edit lock over the loaded document (Copilot on #301). So it is dropped, and
-  // null says nothing rendered.
-  const docGen = useRef(0);
-  // Snapshots in the order they were asked for, and the latest that rendered. One answering after a
-  // newer one rendered is older than what is on screen: shown under the next revision, it put the
-  // canvas back to before an edit the newer one already showed (CodeRabbit on #301). It answers
-  // with the revision on screen instead, which was read later and so holds everything it would
-  // have: as null, a transform's preview stayed up over that newer scene (Copilot on #301).
-  const snapshotsAsked = useRef(0);
-  const snapshotShown = useRef(0);
-  // Whether the last read of this document failed. After a load, edits stay locked until its
-  // snapshot renders; when that read fails nothing else will render one, so the lock says to Reload
-  // rather than that the document is still loading (silent-failure-hunter on #301).
-  const [readFailed, setReadFailed] = useState(false);
-  const refresh = useCallback(async (): Promise<number | null> => {
-    const gen = docGen.current;
-    const asked = ++snapshotsAsked.current;
-    let json: string;
-    try {
-      json = (await ipc.snapshot()) as string;
-    } catch (e) {
-      if (gen === docGen.current) setReadFailed(true);
-      throw e;
-    }
-    if (gen !== docGen.current) return null;
-    if (asked < snapshotShown.current) return revCounter.current;
-    snapshotShown.current = asked;
-    const parsed = JSON.parse(json) as DocSnapshot;
-    const rev = ++revCounter.current;
-    setDoc(parsed);
-    setDocRev(rev);
-    setReadFailed(false);
-    return rev;
-  }, []);
-
-  // ponytail: every command re-fetches the full snapshot instead of applying its returned
-  // Delta locally with reconcile() — correct and simple while scenes stay tiny. Canvas gestures
-  // (useCanvasInteraction) use applyOptimistic for live feedback, then also just re-fetch once
-  // their commit lands; reconcile() stays unused until per-frame delta application is worth it.
-  const run = useCallback(
-    async (fn: () => Promise<unknown>) => {
-      try {
-        setError(null);
-        await fn();
-        await refresh();
-        return true;
-      } catch (e) {
-        // No silent failures: every caught error is surfaced in the status bar. Device/cut
-        // commands reject with a structured IpcError, not a string — ipcErrorMessage handles
-        // both that and the plain-string rejections from the older doc-editing commands.
-        setError(ipc.ipcErrorMessage(e));
-        return false;
-      }
-    },
-    [refresh],
-  );
-
-  // Returns the request so a caller that polls can wait for it: a tick that fires while the last
-  // one is still in flight has to be skipped, and it cannot skip what it cannot see finish.
-  const refreshDeviceState = useCallback(() => {
-    return ipc
-      .getDeviceState()
-      .then(setStatus)
-      .catch((e) => setError(ipc.ipcErrorMessage(e)));
-  }, []);
-
-  useEffect(() => {
-    refresh().catch((e) => setError(ipc.ipcErrorMessage(e)));
-    ipc
-      .listMachines()
-      .then((m) => setMachines(m as MachineProfile[]))
-      .catch((e) => setError(ipc.ipcErrorMessage(e)));
-  }, [refresh]);
-
-  // Re-read when the document's machine changes, because presets are machine-scoped: a project
-  // converted from a Cameo to a Puma must not keep offering Cameo materials. No machine set
-  // means no list — there is nothing for a preset id to be scoped to yet.
-  const docMachineId = doc?.machine?.id ?? null;
-  useEffect(() => {
-    if (docMachineId === null) {
-      setPresets([]);
-      return;
-    }
-    ipc
-      .listPresets(docMachineId)
-      .then((p) => setPresets(p as Preset[]))
-      .catch((e) => setError(ipc.ipcErrorMessage(e)));
-  }, [docMachineId]);
-
-  // Mount-once device-event listener. Every event carries the status that held when it
-  // was sent, so keeping the latest is the whole job — no event-kind interpreting, no
-  // job-id filtering (one worker sends them in order over one channel), no poll.
-  useEffect(() => {
-    const unlisten = listen<ipc.DeviceEvent>("device-event", (e) => {
-      setStatus(e.payload.status);
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
+  const { status, refreshDeviceState } = useJob(setError);
+  const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
+  const { unit, setUnit } = useUnits(setError);
+  const designFor = useCallback((machineId: string) => edit(() => ipc.setMachine({ machineId })), [edit]);
+  const cutter = useActiveCutter({
+    profileId: doc?.machine?.id ?? null,
+    shapeCount: countShapes(doc),
+    machines,
+    designFor,
+    refreshDeviceState,
+    onError: setError,
+  });
 
   // Backend refuses to close the window mid-cut (main.rs's on_window_event calls
   // prevent_close and emits this instead) — ask the user, then force_quit if they
@@ -333,66 +251,15 @@ export function App() {
     },
     sceneRev: docRev,
   });
-
-  // Every other command that changes the document, refused while Open or Reload replaces it and
-  // until the loaded one renders: each names ids or the root of the document on screen, which the
-  // loaded one reuses, so a Delete pressed during a Reload removed what it gave those ids
-  // (CodeRabbit on #301). Refused with a word, like the panel's locked controls.
-  // The lock is read when an edit starts, and some then wait before they send (an import reads its
-  // file first): a load waits for every edit started before it, or one could name the old root in
-  // the new document (CodeRabbit on #301). `run` never rejects, so neither does the wait.
-  const editsStarted = useRef(new Set<Promise<boolean>>());
-  const { editsLockNow } = interaction;
-  const lockReason = (lock: EditsLock) =>
-    lock === null ? null
-    : lock === "unread" && readFailed ? "the loaded document could not be read. Reload to try again"
-    : "waiting for the document to load";
-  // A refusal after the loaded document's read failed also reads it again: the lock lifts once a
-  // snapshot renders, so the next try can go through without a Reload.
-  const refuseEdit = useCallback(
-    (lock: "loading" | "unread") => {
-      if (lock === "loading" || !readFailed) {
-        setError("Not applied: the document is still loading");
-        return;
-      }
-      const refused = "Not applied: the loaded document could not be read. Reading it again";
-      setError(refused);
-      refresh().then(
-        (rev) => {
-          // Null: a newer load replaced the document meanwhile, and its own read speaks for it.
-          if (rev === null) return;
-          setError((shown) => (shown === refused ? "Not applied, but the loaded document is on screen now: try again" : shown));
-        },
-        (e) => {
-          const failed = `Not applied: the loaded document could not be read: ${ipc.ipcErrorMessage(e)}. Reload to try again`;
-          setError((shown) => (shown === refused ? failed : shown));
-        },
-      );
-    },
-    [readFailed, refresh, setError],
-  );
-  const edit = useCallback(
-    (fn: () => Promise<unknown>) => {
-      const lock = editsLockNow();
-      if (lock !== null) {
-        refuseEdit(lock);
-        return Promise.resolve(false);
-      }
-      const started = run(fn);
-      editsStarted.current.add(started);
-      void started.finally(() => editsStarted.current.delete(started));
-      return started;
-    },
-    [run, refuseEdit, editsLockNow],
-  );
+  // Stored for the next edit. The document hook reads it when an edit starts, which is after this.
+  editsLockNow.current = interaction.editsLockNow;
 
   // Inside `replaceDocument`, which has locked edits by then, so nothing joins the set while it waits.
   const loadDocument = (path: string) =>
     interaction.replaceDocument(async () => {
-      await Promise.all(editsStarted.current);
+      await waitForEdits();
       await ipc.loadProject({ path });
-      docGen.current++;
-      setReadFailed(false);
+      noteLoaded();
     });
 
   const { repaint } = interaction;
@@ -419,24 +286,6 @@ export function App() {
     });
   }, [edit, selected]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA");
-      if ((e.key === "Delete" || e.key === "Backspace") && !typing) {
-        if (selected.length === 0) return;
-        e.preventDefault();
-        deleteSelected();
-      } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !typing) {
-        e.preventDefault();
-        edit(() => (e.shiftKey ? ipc.redo() : ipc.undo()));
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [selected, edit, deleteSelected]);
-
-  const root = doc?.root ?? 0;
   // Bounds of a single selection in a given scene. The fields read the effective scene, which holds
   // an unread or in-flight commit's preview, so they show (and compute from) where the shape is now.
   const boundsIn = (s: Scene) =>
@@ -573,60 +422,143 @@ export function App() {
     setTracePath(null);
   };
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      const typing = t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable || t.closest("[role='dialog'], [role='menu']") !== null);
+      if (typing) return;
+      const key = e.key.toLowerCase();
+      const mod = e.metaKey || e.ctrlKey;
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (selected.length === 0) return;
+        e.preventDefault();
+        deleteSelected();
+        return;
+      }
+      if (mod && key === "z") {
+        e.preventDefault();
+        if (e.shiftKey) {
+          if (history.can_redo) edit(() => ipc.redo());
+        } else if (history.can_undo) {
+          edit(() => ipc.undo());
+        }
+        return;
+      }
+      if (mod && key === "u") {
+        e.preventDefault();
+        if (selected.length >= 2) onBooleanOp("Union");
+        return;
+      }
+      if (mod && e.altKey && key === "s") {
+        e.preventDefault();
+        if (selected.length >= 2) onBooleanOp("Subtract");
+        return;
+      }
+      if (mod && e.altKey && key === "i") {
+        e.preventDefault();
+        if (selected.length >= 2) onBooleanOp("Intersect");
+        return;
+      }
+      if (mod && e.altKey && key === "e") {
+        e.preventDefault();
+        if (selected.length >= 2) onBooleanOp("Exclude");
+        return;
+      }
+      if (mod) return;
+      if (e.shiftKey && key === "t") {
+        e.preventDefault();
+        onTrace();
+        return;
+      }
+      if (key === "v") setTool("select");
+      else if (key === "r") edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }));
+      else if (key === "e") edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }));
+      else if (key === "t") setTextOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
+
+  const cutting = status.phase === "Sending" || status.phase === "AwaitingColorSwap" || status.phase === "AwaitingConfirmation";
+  const selectionSize = selectionBounds(interaction.effectiveScene, selected);
+
+  const reportPick = (info: ipc.DeviceInfo) => {
+    void cutter.pick(info).catch((e) => setError(ipc.ipcErrorMessage(e)));
+  };
+
   return (
+    <TooltipProvider>
+    {/* Inline height and grid tracks, not `h-full`/`flex-1`: a percentage height that does not
+        resolve collapses the middle row to 0, the canvas reports a 1px bitmap, and fit never runs. */}
     <div
+      className="bg-background text-foreground"
       style={{
         display: "grid",
-        gridTemplateRows: "auto 1fr auto",
-        gridTemplateColumns: "auto 1fr 280px",
+        // A fixed rail. An `auto` first column absorbs the min-content of the bars that span
+        // every column, and the canvas then shrinks until a handle's hit radius covers the
+        // middle of a small shape.
+        gridTemplateRows: "auto minmax(0, 1fr) auto",
+        gridTemplateColumns: "64px minmax(0, 1fr) 320px",
         height: "100%",
+        minHeight: 0,
       }}
     >
-      <div style={{ gridColumn: "1 / -1" }}>
-        <TopBar
-          machines={machines}
-          currentMachineId={doc?.machine?.id ?? null}
-          onSelectMachine={(id) => edit(() => ipc.setMachine({ machineId: id }))}
-          onSave={() =>
-            run(async () => {
-              const p = await ipc.pickSavePath();
-              if (p) {
-                await ipc.saveProject({ path: p });
-                setLastPath(p);
-              }
-            })
-          }
-          onOpen={() =>
-            run(async () => {
-              const p = await ipc.pickOpenPath();
-              if (p) {
-                // Held for the whole load, not cleared before it: the backend has replaced the
-                // document by the time loadProject resolves, and a commit settling in between would
-                // drain into it (CodeRabbit on #301), as would an edit made while it loads.
-                await loadDocument(p);
-                setLastPath(p);
-                setSelected([]); // loaded doc may not contain the old ids
-                interaction.requestFit();
-              }
-            })
-          }
-          onReload={() =>
-            run(async () => {
-              await loadDocument(lastPath!);
-              setSelected([]);
+      <div style={{ gridColumn: "1 / -1", minWidth: 0 }}>
+      <TopBar
+        canUndo={history.can_undo}
+        canRedo={history.can_redo}
+        onUndo={() => edit(() => ipc.undo())}
+        onRedo={() => edit(() => ipc.redo())}
+        onImportFile={onImportFile}
+        onTrace={onTrace}
+        onSave={() =>
+          run(async () => {
+            const p = await ipc.pickSavePath();
+            if (p) {
+              await ipc.saveProject({ path: p });
+              setLastPath(p);
+            }
+          })
+        }
+        onOpen={() =>
+          run(async () => {
+            const p = await ipc.pickOpenPath();
+            if (p) {
+              // Held for the whole load, not cleared before it: the backend has replaced the
+              // document by the time loadProject resolves, and a commit settling in between would
+              // drain into it (CodeRabbit on #301), as would an edit made while it loads.
+              await loadDocument(p);
+              setLastPath(p);
+              setSelected([]); // loaded doc may not contain the old ids
               interaction.requestFit();
-            })
-          }
-          canReload={lastPath !== null}
-          onUndo={() => edit(() => ipc.undo())}
-          onRedo={() => edit(() => ipc.redo())}
-          onImportFile={onImportFile}
-          onCut={() => setCutOpen(true)}
-          onTrace={onTrace}
-          appearance={theme.appearance}
-          appearanceReady={theme.ready}
-          onAppearance={theme.setAppearance}
-        />
+            }
+          })
+        }
+        onReload={() =>
+          run(async () => {
+            await loadDocument(lastPath!);
+            setSelected([]);
+            interaction.requestFit();
+          })
+        }
+        canReload={lastPath !== null}
+        unit={unit}
+        onUnit={setUnit}
+        appearance={theme.appearance}
+        appearanceReady={theme.ready}
+        onAppearance={theme.setAppearance}
+        device={cutter.device}
+        profileId={doc?.machine?.id ?? null}
+        machines={machines}
+        devices={devices}
+        hosts={hosts}
+        phase={status.phase}
+        onPick={reportPick}
+        onRefreshDevices={() => {
+          void refreshDevices();
+        }}
+        onSend={() => setCutOpen(true)}
+      />
       </div>
       <ToolRail
         tool={tool}
@@ -635,6 +567,7 @@ export function App() {
         onAddRect={() => edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }))}
         onAddEllipse={() => edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }))}
         onAddText={() => setTextOpen(true)}
+        onTrace={onTrace}
         onBoolean={onBooleanOp}
         onDelete={deleteSelected}
       />
@@ -650,41 +583,67 @@ export function App() {
           {...interaction.handlers}
         />
       </div>
-      <div style={{ display: "grid", gridTemplateRows: "1fr 1fr", borderLeft: "1px solid var(--border)", minHeight: 0 }}>
-        <LayersPanel
-          doc={doc}
-          selected={selected}
-          onSelect={(id, shiftKey) => setSelected((prev) => (shiftKey ? toggleId(prev, id) : [id]))}
-        />
-        <PropertiesPanel
-          bounds={selectedBounds}
-          onChangeX={(v) => commitAxis("x", v)}
-          onChangeY={(v) => commitAxis("y", v)}
-          onChangeW={(v) => commitScale("w", v)}
-          onChangeH={(v) => commitScale("h", v)}
-          unitCount={unitCount}
-          distributeBlocked={distributeBlocked}
-          editsLocked={lockReason(interaction.editsLock)}
-          onAlign={align}
-          onDistribute={distribute}
-          cutLineType={cutLineType}
-          onChangeCutLineType={setCutLineType}
-          materialPreset={materialPreset}
-          effectiveMaterial={effectiveMaterial}
-          presets={presets}
-          onChangeMaterialPreset={setMaterialPreset}
-        />
+      <aside className="flex min-h-0 flex-col border-l border-border bg-panel">
+        <Tabs value={rightTab} onValueChange={setRightTab} className="flex min-h-0 flex-1 flex-col gap-0">
+          <TabsList className="m-2 grid h-8 grid-cols-3 bg-background p-0.5">
+            <TabsTrigger value="layers" className="h-7 gap-1.5 text-xs"><Layers className="size-3.5" aria-hidden />Layers</TabsTrigger>
+            <TabsTrigger value="properties" className="h-7 gap-1.5 text-xs"><SlidersHorizontal className="size-3.5" aria-hidden />Properties</TabsTrigger>
+            <TabsTrigger value="devices" className="h-7 gap-1.5 text-xs">
+              <Cpu className="size-3.5" aria-hidden />
+              Devices
+              {cutting ? <span className="size-1.5 rounded-full bg-success" aria-hidden /> : null}
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="layers" className="mt-0 min-h-0 flex-1 overflow-auto">
+            <LayersPanel
+              doc={doc}
+              selected={selected}
+              onSelect={(id, shiftKey) => setSelected((prev) => (shiftKey ? toggleId(prev, id) : [id]))}
+            />
+          </TabsContent>
+          <TabsContent value="properties" className="mt-0 min-h-0 flex-1 overflow-auto">
+            <PropertiesPanel
+              bounds={selectedBounds}
+              onChangeX={(v) => commitAxis("x", v)}
+              onChangeY={(v) => commitAxis("y", v)}
+              onChangeW={(v) => commitScale("w", v)}
+              onChangeH={(v) => commitScale("h", v)}
+              unitCount={unitCount}
+              distributeBlocked={distributeBlocked}
+              editsLocked={lockReason(interaction.editsLock)}
+              onAlign={align}
+              onDistribute={distribute}
+              cutLineType={cutLineType}
+              onChangeCutLineType={setCutLineType}
+              materialPreset={materialPreset}
+              effectiveMaterial={effectiveMaterial}
+              presets={presets}
+              onChangeMaterialPreset={setMaterialPreset}
+              machines={machines}
+              machineId={doc?.machine?.id ?? null}
+              onDesignFor={designFor}
+            />
+          </TabsContent>
+          <TabsContent value="devices" className="mt-0 min-h-0 flex-1 overflow-auto">
+            <DevicesTab devices={devices} hosts={hosts} listError={deviceListError} active={cutter.device} machines={machines} onPick={reportPick} />
+          </TabsContent>
+        </Tabs>
+      </aside>
+      <div style={{ gridColumn: "1 / -1", minWidth: 0 }}>
+      <StatusBar
+        device={cutter.device}
+        profile={doc?.machine ?? null}
+        machines={machines}
+        hosts={hosts}
+        artboard={doc?.artboard ?? null}
+        status={status}
+        zoomPercent={doc ? zoomPercent(interaction.view) : null}
+        cursor={interaction.cursor}
+        selection={selectionSize}
+        unit={unit}
+      />
       </div>
-      <div style={{ gridColumn: "1 / -1" }}>
-        <StatusBar
-          machine={doc?.machine ?? null}
-          artboard={doc?.artboard ?? null}
-          error={error}
-          status={status}
-          zoomPercent={doc ? zoomPercent(interaction.view) : null}
-          cursor={interaction.cursor}
-        />
-      </div>
+    </div>
       {cutOpen && doc ? (
         <CutDialog
           scene={scene}
@@ -692,7 +651,11 @@ export function App() {
           docMachineId={doc.machine?.id ?? null}
           status={status}
           refreshDeviceState={refreshDeviceState}
-          onConvertMachine={(machineId) => edit(() => ipc.setMachine({ machineId }))}
+          connected={cutter.device}
+          onConnect={cutter.pick}
+          onDisconnect={cutter.disconnect}
+          onReconnect={cutter.reconnect}
+          onConvertMachine={designFor}
           onError={setError}
           onClose={() => setCutOpen(false)}
           weed={cutWeed}
@@ -713,6 +676,7 @@ export function App() {
           onClose={() => setTextOpen(false)}
         />
       ) : null}
-    </div>
+    <Toaster position="bottom-center" theme={theme.resolved} offset={{ bottom: "40px" }} />
+    </TooltipProvider>
   );
 }

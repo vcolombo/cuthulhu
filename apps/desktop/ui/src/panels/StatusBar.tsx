@@ -1,59 +1,108 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import { Crosshair, Maximize2, ZoomIn } from "lucide-react";
 import type { MachineProfile } from "../App";
-import type { CutStatus, Phase } from "../ipc";
+import type { LengthUnit } from "../length";
+import { formatLength } from "../length";
+import type { CutStatus, DeviceInfo, PairedHostView, Phase } from "../ipc";
 
 type Props = {
-  machine: MachineProfile | null;
+  device: DeviceInfo | null;
+  profile: MachineProfile | null;
+  machines: MachineProfile[];
+  hosts: PairedHostView[];
   artboard: { w: number; h: number } | null;
-  error: string | null;
   status: CutStatus;
   /** Null until a document is loaded: there is no artboard to be zoomed relative to. */
   zoomPercent: number | null;
-  /** Pointer position in document mm, or null when the pointer is off the canvas. */
+  /** Pointer position in document millimetres, or null when the pointer is off the canvas. */
   cursor: { x: number; y: number } | null;
+  /** Selection bounds in document millimetres, or null when nothing is selected. */
+  selection: { w: number; h: number } | null;
+  unit: LengthUnit;
 };
 
-// Idle/Disconnected read as "nothing wrong" (green), a failed device is red, and every
-// other phase (connecting, actively cutting, cancelling…) is "busy" (accent).
-function dotColor(phase: Phase): string {
+function phaseDot(phase: Phase): string {
   if (phase === "Idle" || phase === "Disconnected") return "var(--ready)";
   if (phase === "Failed") return "var(--cut)";
   return "var(--accent-ink)";
 }
 
-export function StatusBar({ machine, artboard, error, status, zoomPercent, cursor }: Props) {
+function bed(mm: number, unit: LengthUnit): string {
+  if (unit === "mm" && Number.isInteger(mm)) return String(mm);
+  return formatLength(mm, unit);
+}
+
+/** The cursor string the wheel-pan test reads. Millimetres keep two spaces before `y`. */
+function cursorText(cursor: { x: number; y: number }, unit: LengthUnit): string {
+  if (unit === "mm") return `x ${cursor.x.toFixed(1)}  y ${cursor.y.toFixed(1)} mm`;
+  return `x ${formatLength(cursor.x, "in")}  y ${formatLength(cursor.y, "in")} in`;
+}
+
+export function StatusBar({ device, profile, machines, hosts, artboard, status, zoomPercent, cursor, selection, unit }: Props) {
+  const connectedName = device ? (machines.find((machine) => machine.id === device.machine_id)?.name ?? device.machine_id) : null;
+  const where = device
+    ? device.host === null
+      ? "USB · this computer"
+      : (hosts.find((host) => host.id === device.host)?.name ?? device.host)
+    : null;
+  const machineText = device && connectedName
+    ? `${connectedName} · ${where}`
+    : profile
+      ? `Designing for ${profile.name}`
+      : "No cutter";
+  const busy = status.phase === "Sending" || status.phase === "AwaitingColorSwap" || status.phase === "AwaitingConfirmation";
+  const progress = status.sent && status.sent.total > 0 ? Math.round((status.sent.sent / status.sent.total) * 100) : null;
+
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "4px 10px",
-        fontSize: 11,
-        color: "var(--muted-foreground)",
-        background: "var(--panel)",
-        borderTop: "1px solid var(--border)",
-      }}
-    >
-      <span style={{ width: 8, height: 8, borderRadius: "50%", background: dotColor(status.phase), display: "inline-block" }} />
-      <span>{machine ? machine.name : "No machine selected"}</span>
+    <footer className="flex h-8 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t border-border bg-panel px-3 text-xs text-muted-foreground">
+      <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: phaseDot(status.phase) }} aria-hidden />
+      <span className="truncate text-foreground">{machineText}</span>
       {artboard ? (
         <span>
-          {artboard.w} x {artboard.h} mm
+          {bed(artboard.w, unit)} × {bed(artboard.h, unit)} {unit}
         </span>
       ) : null}
-      <div style={{ flex: 1 }} />
-      {cursor ? (
-        <span data-testid="status-cursor" style={{ fontVariantNumeric: "tabular-nums" }}>
-          x {cursor.x.toFixed(1)}  y {cursor.y.toFixed(1)} mm
-        </span>
-      ) : null}
+      <span className="flex items-center gap-1.5">
+        <Crosshair className="size-3.5" aria-hidden />
+        {cursor ? (
+          <span data-testid="status-cursor" className="tabular">
+            {cursorText(cursor, unit)}
+          </span>
+        ) : (
+          <span>—</span>
+        )}
+      </span>
+      <span className="flex items-center gap-1.5">
+        <Maximize2 className="size-3.5" aria-hidden />
+        {selection ? (
+          <span>
+            {formatLength(selection.w, unit)} × {formatLength(selection.h, unit)} {unit}
+          </span>
+        ) : (
+          <span>No selection</span>
+        )}
+      </span>
       {zoomPercent !== null ? (
-        <span data-testid="status-zoom" style={{ fontVariantNumeric: "tabular-nums" }}>
-          {zoomPercent}%
+        <span className="flex items-center gap-1.5">
+          <ZoomIn className="size-3.5" aria-hidden />
+          <span data-testid="status-zoom" className="tabular">
+            {zoomPercent}%
+          </span>
         </span>
       ) : null}
-      {error ? <span style={{ color: "var(--cut)" }}>{error}</span> : null}
-    </div>
+      <div className="flex-1" />
+      {busy ? (
+        <span className="flex items-center gap-2 text-foreground">
+          <span>
+            {status.pass ? `pass ${status.pass.index + 1}/${status.pass.total}` : status.phase}
+          </span>
+          {progress !== null ? (
+            <span className="h-1 w-16 overflow-hidden rounded-full bg-subtle">
+              <span className="block h-full bg-success" style={{ width: `${progress}%` }} />
+            </span>
+          ) : null}
+        </span>
+      ) : null}
+    </footer>
   );
 }

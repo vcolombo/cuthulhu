@@ -30,17 +30,35 @@ impl Default for Appearance {
     }
 }
 
+/// Lengths on screen. Storage and IPC stay in millimetres; this only chooses how they are shown.
+/// Millimetres is the absence of a choice, which is what every document is stored in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Units {
+    #[serde(rename = "in")]
+    In,
+    #[serde(rename = "mm")]
+    Mm,
+}
+
+impl Default for Units {
+    fn default() -> Self {
+        Self::Mm
+    }
+}
+
 /// The preferences this build reads. Further fields live in the file as raw JSON so a save of
-/// appearance does not drop them; they are not modelled until a caller has somewhere to put them.
+/// one field does not drop them; they are not modelled until a caller has somewhere to put them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preferences {
     pub appearance: Appearance,
+    pub units: Units,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             appearance: Appearance::System,
+            units: Units::Mm,
         }
     }
 }
@@ -150,25 +168,48 @@ pub fn set_appearance(
     path: &Path,
     appearance: Appearance,
 ) -> Result<Preferences, PreferencesError> {
+    update(path, Some(appearance), None)
+}
+
+/// Record whichever of appearance and units the caller named. `None` leaves that key as it
+/// stands, including a key this build stores and one it does not.
+///
+/// Both `None` reads and does not write. A missing file is created only when something is set.
+pub fn update(
+    path: &Path,
+    appearance: Option<Appearance>,
+    units: Option<Units>,
+) -> Result<Preferences, PreferencesError> {
+    if appearance.is_none() && units.is_none() {
+        return load(path);
+    }
     let mut value = match read_value(path)? {
         Some(value) => value,
         None => serde_json::json!({ "version": PREFERENCES_VERSION }),
     };
     // Probe before mutating, so a refusal returns the file untouched. `preferences_of` is that
-    // probe: an unknown version and a damaged appearance both land here, and a missing
-    // appearance is the default rather than damage.
+    // probe: an unknown version and a damaged field both land here, and a missing field is the
+    // default rather than damage.
     let _ = preferences_of(&value)?;
     let object = value.as_object_mut().ok_or_else(|| {
         PreferencesError::Corrupt("the preferences file is not a JSON object".into())
     })?;
     object.insert("version".into(), Value::from(PREFERENCES_VERSION));
-    object.insert(
-        "appearance".into(),
-        serde_json::to_value(appearance)
-            .map_err(|e| PreferencesError::Unwritable(e.to_string()))?,
-    );
+    if let Some(appearance) = appearance {
+        object.insert(
+            "appearance".into(),
+            serde_json::to_value(appearance)
+                .map_err(|e| PreferencesError::Unwritable(e.to_string()))?,
+        );
+    }
+    if let Some(units) = units {
+        object.insert(
+            "units".into(),
+            serde_json::to_value(units).map_err(|e| PreferencesError::Unwritable(e.to_string()))?,
+        );
+    }
     write_value(path, &value)?;
-    Ok(Preferences { appearance })
+    preferences_of(&value)
 }
 
 /// What startup uses. A missing directory, or a file this build will not read, must not keep
@@ -232,7 +273,15 @@ fn preferences_of(value: &Value) -> Result<Preferences, PreferencesError> {
             )
         })?,
     };
-    Ok(Preferences { appearance })
+    let units = match value.get("units") {
+        None => Units::Mm,
+        Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+            PreferencesError::Corrupt(
+                "the preferences file's units are not in or mm".into(),
+            )
+        })?,
+    };
+    Ok(Preferences { appearance, units })
 }
 
 /// `file/preferences.json` when `file` is a regular file. `read` calls that NotFound on
@@ -297,18 +346,21 @@ mod tests {
     fn appearance_round_trips_and_keeps_a_field_this_build_does_not_model() {
         let dir = dir();
         let path = path(&dir);
-        std::fs::write(&path, r#"{"version":1,"units":"mm"}"#).unwrap();
+        std::fs::write(&path, r#"{"version":1,"units":"in","weed":true}"#).unwrap();
         assert_eq!(load(&path).unwrap().appearance, Appearance::System);
+        assert_eq!(load(&path).unwrap().units, Units::In);
 
         let saved = set_appearance(&path, Appearance::Dark).unwrap();
         assert_eq!(saved.appearance, Appearance::Dark);
+        assert_eq!(saved.units, Units::In);
         assert_eq!(load(&path).unwrap().appearance, Appearance::Dark);
 
         let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            value["units"], "mm",
+            value["weed"], true,
             "a later field has to survive an appearance save"
         );
+        assert_eq!(value["units"], "in", "saving appearance must not drop units");
         assert_eq!(value["version"], 1);
         assert_eq!(value["appearance"], "dark");
 
@@ -316,6 +368,38 @@ mod tests {
         assert_eq!(load(&path).unwrap().appearance, Appearance::Light);
         set_appearance(&path, Appearance::System).unwrap();
         assert_eq!(load(&path).unwrap().appearance, Appearance::System);
+    }
+
+    #[test]
+    fn units_round_trip_and_do_not_drop_appearance() {
+        let dir = dir();
+        let path = path(&dir);
+        set_appearance(&path, Appearance::Dark).unwrap();
+        let saved = update(&path, None, Some(Units::In)).unwrap();
+        assert_eq!(saved.units, Units::In);
+        assert_eq!(saved.appearance, Appearance::Dark);
+        assert_eq!(load(&path).unwrap().units, Units::In);
+        // A missing units key is millimetres, the unit documents are stored in.
+        std::fs::write(&path, r#"{"version":1,"appearance":"light"}"#).unwrap();
+        assert_eq!(load(&path).unwrap().units, Units::Mm);
+        // Nothing named is a read, and it must not create a file where there was none.
+        let fresh = dir.path().join("fresh.json");
+        assert_eq!(update(&fresh, None, None).unwrap(), Preferences::default());
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn units_this_build_does_not_know_are_corrupt_and_are_not_overwritten() {
+        let dir = dir();
+        let path = path(&dir);
+        let original = r#"{"version":1,"units":"cm"}"#;
+        std::fs::write(&path, original).unwrap();
+        let err = update(&path, None, Some(Units::In)).unwrap_err();
+        assert!(
+            matches!(err, PreferencesError::Corrupt(ref m) if m.contains("not in or mm")),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]

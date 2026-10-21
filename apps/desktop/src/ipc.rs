@@ -77,6 +77,23 @@ pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>
     state.lock().unwrap().set_material_preset(ids, value).map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+pub struct HistoryDto {
+    pub can_undo: bool,
+    pub can_redo: bool,
+}
+
+/// Separate from the document snapshot: that JSON is the project shape, and these two flags
+/// are the editor's stacks (#308).
+#[tauri::command]
+pub fn history(state: tauri::State<AppStateHandle>) -> Result<HistoryDto, String> {
+    let state = state.lock().unwrap();
+    Ok(HistoryDto {
+        can_undo: state.can_undo(),
+        can_redo: state.can_redo(),
+    })
+}
+
 #[tauri::command]
 pub fn undo(state: tauri::State<AppStateHandle>) -> Result<Option<Delta>, String> {
     Ok(state.lock().unwrap().undo())
@@ -410,16 +427,19 @@ fn trace_error(e: trace::TraceError) -> IpcError {
     IpcError::new(e.code(), e.to_string())
 }
 
-/// Appearance only. Units and weed defaults belong in this file later; a save merges onto
-/// what is already there, so naming just appearance does not drop them (#243).
+/// Appearance and length units. Weed defaults still belong in this file later; a save merges
+/// onto what is already there, so naming one field does not drop the other (#243).
 #[tauri::command]
 pub fn get_preferences() -> Result<crate::preferences::Preferences, IpcError> {
     crate::preferences::load(&preferences_path()?).map_err(Into::into)
 }
 
 #[tauri::command]
-pub fn set_preferences(appearance: crate::preferences::Appearance) -> Result<crate::preferences::Preferences, IpcError> {
-    crate::preferences::set_appearance(&preferences_path()?, appearance).map_err(Into::into)
+pub fn set_preferences(
+    appearance: Option<crate::preferences::Appearance>,
+    units: Option<crate::preferences::Units>,
+) -> Result<crate::preferences::Preferences, IpcError> {
+    crate::preferences::update(&preferences_path()?, appearance, units).map_err(Into::into)
 }
 
 fn preferences_path() -> Result<PathBuf, IpcError> {

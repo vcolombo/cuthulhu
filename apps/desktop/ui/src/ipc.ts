@@ -51,6 +51,13 @@ export async function setMaterialPreset(args: Args) {
   return invoke("set_material_preset", args);
 }
 
+export type HistoryFlags = { can_undo: boolean; can_redo: boolean };
+
+/** The editor's undo stacks. Kept off the document snapshot: that JSON is the project shape (#308). */
+export async function history(): Promise<HistoryFlags> {
+  return invoke("history", {});
+}
+
 export async function undo() {
   return invoke("undo", {});
 }
@@ -410,12 +417,14 @@ export async function pickImagePath(): Promise<string | null> {
 }
 
 export type Appearance = "light" | "dark" | "system";
-export type Preferences = { appearance: Appearance };
+export type LengthUnit = "in" | "mm";
+export type Preferences = { appearance: Appearance; units: LengthUnit };
 
 export async function getPreferences(): Promise<Preferences> {
   return invoke("get_preferences", {});
 }
 
-export async function setPreferences(appearance: Appearance): Promise<Preferences> {
-  return invoke("set_preferences", { appearance });
+/** Either field may be omitted. A save merges onto the file, so naming one does not drop the other. */
+export async function setPreferences(appearance?: Appearance, units?: LengthUnit): Promise<Preferences> {
+  return invoke("set_preferences", { appearance, units });
 }

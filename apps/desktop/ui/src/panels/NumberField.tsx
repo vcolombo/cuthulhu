@@ -51,7 +51,7 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
   };
 
   return (
-    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted)" }}>
+    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted-foreground)" }}>
       <span
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}

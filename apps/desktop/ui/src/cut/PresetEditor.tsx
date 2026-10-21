@@ -99,11 +99,11 @@ export function PresetEditor({
             {mode === "builtin" ? "Save as Copy" : "Duplicate"}
           </button>
         ) : null}
-        {mode === "builtin" ? <span style={{ color: "var(--muted)" }}>built-in — read-only</span> : null}
+        {mode === "builtin" ? <span style={{ color: "var(--muted-foreground)" }}>built-in — read-only</span> : null}
       </div>
 
       {draft === null ? (
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
           Choose a preset to edit, or add one of your own.
         </div>
       ) : (
@@ -165,7 +165,7 @@ export function PresetEditor({
               pass row's: the preset is stored for that machine and outlives this session, and a
               disabled field is one an operator cannot correct a value out of. What the machine
               ignores is said here instead. */}
-          <div data-testid="preset-preview" style={{ fontSize: 12, color: "var(--muted)" }}>
+          <div data-testid="preset-preview" style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
             {presetPreview(draft, caps)}
           </div>
 

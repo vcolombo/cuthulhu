@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useRef, type CSSProperties } from "react";
 import type { MachineProfile } from "../App";
+import type { Appearance } from "../theme";
+import { AppearanceMenu } from "./AppearanceMenu";
 
 type Props = {
   machines: MachineProfile[];
@@ -15,6 +17,9 @@ type Props = {
   onImportFile: (file: File) => void;
   onCut: () => void;
   onTrace: () => void;
+  appearance: Appearance;
+  appearanceReady: boolean;
+  onAppearance: (next: Appearance) => void;
 };
 
 const btn: CSSProperties = {
@@ -38,6 +43,9 @@ export function TopBar({
   onImportFile,
   onCut,
   onTrace,
+  appearance,
+  appearanceReady,
+  onAppearance,
 }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   return (
@@ -103,6 +111,7 @@ export function TopBar({
       <button aria-label="Cut" style={btn} onClick={onCut}>
         Cut
       </button>
+      <AppearanceMenu appearance={appearance} ready={appearanceReady} onAppearance={onAppearance} />
     </div>
   );
 }

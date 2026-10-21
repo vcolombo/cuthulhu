@@ -60,6 +60,15 @@ impl From<cutplan::presets::PresetError> for IpcError {
     }
 }
 
+/// A preferences-file refusal as the UI's own currency. The code and the sentence are
+/// `preferences`'s, so a version this build cannot read and a damaged file stay distinct
+/// (#243) instead of arriving as one `Debug` string.
+impl From<crate::preferences::PreferencesError> for IpcError {
+    fn from(e: crate::preferences::PreferencesError) -> Self {
+        IpcError::new(e.code(), e.to_string())
+    }
+}
+
 /// A client failure as a code the UI can branch on, keeping the three that need three different
 /// things from the operator apart.
 ///

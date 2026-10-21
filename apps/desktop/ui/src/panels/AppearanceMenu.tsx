@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import type { Appearance } from "../theme";
 
 type Props = {
@@ -60,15 +60,23 @@ function CheckIcon() {
 export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const menuId = useId();
+
+  const closeToTrigger = useCallback(() => {
+    setOpen(false);
+    // The focused item unmounts with the menu, and focus would land on body.
+    triggerRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     const onPointer = (event: PointerEvent) => {
+      // The pointer target keeps focus. Only a keyboard close returns it here.
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") closeToTrigger();
     };
     document.addEventListener("pointerdown", onPointer);
     document.addEventListener("keydown", onKey);
@@ -76,11 +84,11 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
       document.removeEventListener("pointerdown", onPointer);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [open, closeToTrigger]);
 
   const choose = (next: Appearance) => {
     onAppearance(next);
-    setOpen(false);
+    closeToTrigger();
   };
 
   const onMenuKey = (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -104,6 +112,7 @@ export function AppearanceMenu({ appearance, ready, onAppearance }: Props) {
   return (
     <div ref={rootRef} style={{ position: "relative" }}>
       <button
+        ref={triggerRef}
         type="button"
         aria-label="Appearance"
         aria-haspopup="menu"

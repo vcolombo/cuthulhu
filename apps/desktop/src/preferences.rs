@@ -191,6 +191,12 @@ fn read_value(path: &Path) -> Result<Option<Value>, PreferencesError> {
     // as false, and the operator's choice would come back as "never set".
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
+        // Windows reports a file standing in the path as NotFound. That is not a
+        // preferences file that was never saved: creating the parent would try to
+        // replace the file. Unix fails this read with ENOTDIR, which is the other arm.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && an_ancestor_is_a_file(path) => {
+            return Err(PreferencesError::Unreadable(e.to_string()));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(PreferencesError::Unreadable(e.to_string())),
     };
@@ -227,6 +233,26 @@ fn preferences_of(value: &Value) -> Result<Preferences, PreferencesError> {
         })?,
     };
     Ok(Preferences { appearance })
+}
+
+/// `file/preferences.json` when `file` is a regular file. `read` calls that NotFound on
+/// Windows and ENOTDIR on Unix, so the NotFound arm is the only one that has to ask.
+fn an_ancestor_is_a_file(path: &Path) -> bool {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        match std::fs::metadata(dir) {
+            Ok(meta) => return meta.is_file(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => cursor = dir.parent(),
+            // `file/missing` when `file` is a file. Unix says NotADirectory; Windows
+            // says NotFound and the walk reaches the file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => return true,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn write_value(path: &Path, value: &Value) -> Result<(), PreferencesError> {
@@ -387,9 +413,9 @@ mod tests {
         let dir = dir();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, "x").unwrap();
-        // `file/preferences.json` is not a missing file: the kernel says the parent is not a
-        // directory, which is a read failure. Treating it as "never saved" would try to create
-        // a directory where a file stands.
+        // `file/preferences.json` is not a missing file. Unix says the parent is not a
+        // directory; Windows says the path was not found. Either way it is a read failure.
+        // Treating it as "never saved" would try to create a directory where a file stands.
         let path = blocker.join("preferences.json");
         let err = set_appearance(&path, Appearance::Dark).unwrap_err();
         assert!(matches!(err, PreferencesError::Unreadable(_)), "{err:?}");
@@ -399,6 +425,10 @@ mod tests {
             PreferencesError::Unwritable("disk full".into()).code(),
             "preferences_unwritable",
         );
+        // The Windows NotFound arm. Unix never reaches it: the read is already ENOTDIR.
+        assert!(an_ancestor_is_a_file(&path));
+        assert!(an_ancestor_is_a_file(&blocker.join("deeper").join("preferences.json")));
+        assert!(!an_ancestor_is_a_file(&dir.path().join("preferences.json")));
     }
 
     #[test]

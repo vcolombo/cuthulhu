@@ -141,7 +141,7 @@ export function App() {
   // when the fault goes away: a later edit owns that, and wiping it would hide a message
   // that arrived in between.
   useEffect(() => {
-    if (theme.fault) setError(theme.fault);
+    if (theme.fault) setError(theme.fault.message);
   }, [theme.fault, setError]);
   const [lastPath, setLastPath] = useState<string | null>(null);
   const [cutOpen, setCutOpen] = useState(false);

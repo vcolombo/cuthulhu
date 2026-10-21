@@ -60,13 +60,24 @@ export async function syncNativeTheme(appearance: Appearance): Promise<void> {
 
 /** After the frame that painted `applyTheme`. One animation frame runs before that
  *  paint, so the show is the frame after it — a single callback would reveal the
- *  webview still on the previous theme. */
+ *  webview still on the previous theme. A hidden webview may never be handed a
+ *  frame, and then those callbacks never run; the timer is that case. */
 export function showWindow(): void {
   if (!tauriWindowAvailable()) return;
+  let shown = false;
+  const show = () => {
+    if (shown) return;
+    shown = true;
+    window.clearTimeout(fallback);
+    getCurrentWindow()
+      .show()
+      .catch((error: unknown) => {
+        console.error("cuthulhu: the window could not be shown", error);
+      });
+  };
+  const fallback = window.setTimeout(show, 150);
   requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      void getCurrentWindow().show();
-    });
+    requestAnimationFrame(show);
   });
 }
 

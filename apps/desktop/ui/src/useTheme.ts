@@ -18,7 +18,9 @@ export type ThemeControls = {
   /** False until the first `get_preferences` attempt has settled, so a click cannot
    *  race the value that attempt is about to apply. */
   ready: boolean;
-  fault: string | null;
+  /** A fresh object on every failure. A repeated string would not re-run the status
+   *  effect after an edit had cleared the same message. */
+  fault: { message: string } | null;
   setAppearance: (next: Appearance) => void;
 };
 
@@ -31,7 +33,7 @@ export function useTheme(): ThemeControls {
   const [appearance, setAppearanceState] = useState<Appearance>("system");
   const [resolved, setResolved] = useState<ResolvedTheme>(bootResolved);
   const [ready, setReady] = useState(false);
-  const [fault, setFault] = useState<string | null>(null);
+  const [fault, setFault] = useState<{ message: string } | null>(null);
   const appearanceRef = useRef(appearance);
   appearanceRef.current = appearance;
 
@@ -51,7 +53,7 @@ export function useTheme(): ThemeControls {
       } catch (e) {
         // Still show the window. A hidden window and a silent failure are the same
         // from the operator's side, and the boot script has already painted something.
-        if (!cancelled) setFault(ipcErrorMessage(e));
+        if (!cancelled) setFault({ message: ipcErrorMessage(e) });
       }
       if (cancelled) return;
       setAppearanceState(next);
@@ -86,10 +88,13 @@ export function useTheme(): ThemeControls {
           setFault(null);
           setAppearanceState(saved.appearance);
           appearanceRef.current = saved.appearance;
-          publish(saved.appearance, await osTheme());
+          // Native theme first. Windows forces the webview's prefers-color-scheme
+          // along with an explicit Dark, and reading it before setTheme(null)
+          // would publish that Dark as System and store it in the boot cache.
           await syncNativeTheme(saved.appearance);
+          publish(saved.appearance, await osTheme());
         } catch (e) {
-          setFault(ipcErrorMessage(e));
+          setFault({ message: ipcErrorMessage(e) });
         }
       })();
     },

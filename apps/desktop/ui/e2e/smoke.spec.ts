@@ -4805,7 +4805,13 @@ test("appearance is remembered across a reload", async ({ page }) => {
   const appearance = page.getByRole("button", { name: "Appearance" });
   await expect(appearance).toBeEnabled();
   await appearance.click();
+  await page.keyboard.press("Escape");
+  await expect(appearance).toBeFocused();
+  await expect(page.getByRole("menu", { name: "Appearance" })).toHaveCount(0);
+
+  await appearance.click();
   await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(appearance).toBeFocused();
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect.poll(() => page.evaluate(() => localStorage.getItem("cuthulhu.theme"))).toBe("dark");
 

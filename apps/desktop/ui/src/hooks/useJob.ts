@@ -66,6 +66,9 @@ export function useJob(onError: (message: string) => void) {
   snapshotRef.current = snapshot;
   const offlineRef = useRef(false);
   const hostIdRef = useRef<string | null>(null);
+  /** Bumped on every aim change. Comparing the host id misses null → host → null,
+   *  and a stale swap applied then has nobody polling to correct it. */
+  const aimGenRef = useRef(0);
   const knownHostRef = useRef<ipc.PairedHostView | null>(null);
   const cancelQueuedRef = useRef(false);
   const onErrorRef = useRef(onError);
@@ -145,12 +148,9 @@ export function useJob(onError: (message: string) => void) {
         cancelQueuedRef.current = false;
         offlineRef.current = false;
         setOfflineHost(null);
-        // This read belongs to the aim it started under. A later attach is a
-        // different cutter, and applying it would put the paused job back over
-        // the Disconnected the detach just stored. Nothing polls to correct that.
-        const aim = hostIdRef.current;
+        const aimGen = aimGenRef.current;
         return ipc.getDeviceState().then((next) => {
-          if (acceptGenRef.current !== gen || hostIdRef.current !== aim) return;
+          if (acceptGenRef.current !== gen || aimGenRef.current !== aimGen) return;
           ingest(next);
         }).catch((e) => {
           onErrorRef.current(ipc.ipcErrorMessage(e));
@@ -197,6 +197,7 @@ export function useJob(onError: (message: string) => void) {
 
   const attach = useCallback((device: ipc.DeviceInfo | null) => {
     const next = device?.host ?? null;
+    if (hostIdRef.current !== next) aimGenRef.current += 1;
     hostIdRef.current = next;
     setHostId((prev) => (prev === next ? prev : next));
   }, []);
@@ -210,7 +211,11 @@ export function useJob(onError: (message: string) => void) {
     offlineRef.current = false;
     setOfflineHost(null);
     cancelQueuedRef.current = false;
-    void ipc.getDeviceState().then(ingest).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
+    const aimGen = aimGenRef.current;
+    void ipc.getDeviceState().then((next) => {
+      if (aimGenRef.current !== aimGen) return;
+      ingest(next);
+    }).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
   }, [hostId, ingest]);
 
   useEffect(() => {

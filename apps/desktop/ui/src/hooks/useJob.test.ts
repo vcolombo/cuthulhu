@@ -265,7 +265,7 @@ describe("useJob", () => {
     expect(api.current?.offlineHost).toBeNull();
   });
 
-  it("does not apply a detach refetch once the aim has moved again", async () => {
+  it("does not apply a detach refetch after the aim leaves and comes back to none", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();
     await act(async () => { api.current?.attach(REMOTE); });
@@ -287,6 +287,7 @@ describe("useJob", () => {
       stateReads[0](SWAP);
     });
     await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.attach(null); });
     await act(async () => {
       stateReads[2](SWAP);
       await pending;

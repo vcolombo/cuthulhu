@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // @vitest-environment happy-dom
-import { act, createElement, type ReactNode } from "react";
+import { act, createElement, Suspense, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PlanCutResponse } from "../../ipc";
@@ -28,13 +28,17 @@ function Host({
   weed,
   onWeedChange,
   onError,
+  gate,
 }: {
   api: { current: PlanApi | null };
   weed: WeedDraft | null;
   onWeedChange: (draft: WeedDraft) => void;
   onError: (msg: string) => void;
+  /** Throws to abandon the render after the hook has run, the way a child suspense does. */
+  gate?: () => void;
 }) {
   api.current = useCutPlan({ weed, onWeedChange, ranges: null, onError });
+  gate?.();
   return null;
 }
 
@@ -57,13 +61,18 @@ describe("useCutPlan", () => {
   // happy-dom does not set the flag React's act() looks for, so every update warns.
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-  function render(): ReactNode {
-    return createElement(Host, {
-      api,
-      weed: null,
-      onWeedChange: (draft) => weedChanges.push(draft),
-      onError: (msg) => errors.push(msg),
-    });
+  function render(gate?: () => void): ReactNode {
+    return createElement(
+      Suspense,
+      { fallback: null },
+      createElement(Host, {
+        api,
+        weed: null,
+        onWeedChange: (draft) => weedChanges.push(draft),
+        onError: (msg) => errors.push(msg),
+        gate,
+      }),
+    );
   }
 
   beforeEach(() => {
@@ -205,5 +214,178 @@ describe("useCutPlan", () => {
     expect(api.current?.plan?.revision).toBe("single");
     expect(api.current?.grouping).toBe("Single");
     expect(errors[errors.length - 1]).toBe("late");
+  });
+
+  async function install(revision: string, key: string) {
+    let resolveFirst: (value: PlanCutResponse) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveFirst = resolve;
+      }),
+    );
+    await act(async () => {
+      root.render(render());
+    });
+    await act(async () => {
+      resolveFirst(planResponse(revision, key));
+    });
+  }
+
+  it("does not let a travel reply for the previous rows raise stale_plan after a newer plan installs", async () => {
+    await install("kept", "color:ff0000ff");
+    let rejectTravel: (reason: unknown) => void = () => {};
+    ipc.travelForOrder.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => {
+        rejectTravel = reject;
+      }),
+    );
+    await act(async () => {
+      api.current?.setPassEnabled(0, false);
+    });
+    expect(api.current?.plan?.rows[0].enabled).toBe(false);
+
+    let resolveNext: (value: PlanCutResponse) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveNext = resolve;
+      }),
+    );
+    await act(async () => {
+      api.current?.replan("Single");
+    });
+    await act(async () => {
+      resolveNext(planResponse("next", "all"));
+    });
+    expect(api.current?.plan?.revision).toBe("next");
+    expect(api.current?.stalePlan).toBe(false);
+
+    // The disable went out against the old revision. Landing after the new plan, its stale_plan
+    // refusal is about rows that are gone; raising the banner would send the operator to replan
+    // a plan that just installed.
+    await act(async () => {
+      rejectTravel({ code: "stale_plan", message: "document changed since the cut was planned; replan" });
+    });
+    expect(api.current?.stalePlan).toBe(false);
+    expect(api.current?.plan?.revision).toBe("next");
+    expect(api.current?.plan?.travel).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  it("raises the stale-plan banner for the travel reply that still matches the rows on screen", async () => {
+    await install("kept", "color:ff0000ff");
+    let rejectTravel: (reason: unknown) => void = () => {};
+    ipc.travelForOrder.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => {
+        rejectTravel = reject;
+      }),
+    );
+    await act(async () => {
+      api.current?.setPassEnabled(0, false);
+    });
+    await act(async () => {
+      rejectTravel({ code: "stale_plan", message: "document changed since the cut was planned; replan" });
+    });
+    expect(api.current?.stalePlan).toBe(true);
+    expect(api.current?.plan?.revision).toBe("kept");
+    expect(api.current?.plan?.rows[0].enabled).toBe(false);
+    expect(errors).toEqual([]);
+  });
+
+  it("reports a travel failure that is not a stale plan, and leaves the banner down", async () => {
+    await install("kept", "color:ff0000ff");
+    let rejectTravel: (reason: unknown) => void = () => {};
+    ipc.travelForOrder.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => {
+        rejectTravel = reject;
+      }),
+    );
+    await act(async () => {
+      api.current?.setPassEnabled(0, false);
+    });
+    await act(async () => {
+      rejectTravel({ code: "plan_error", message: "shape #2: no fonts are installed on this system" });
+    });
+    expect(api.current?.stalePlan).toBe(false);
+    expect(errors).toEqual(["shape #2: no fonts are installed on this system"]);
+    expect(api.current?.plan?.rows[0].enabled).toBe(false);
+  });
+
+  it("keeps a travel reply that still matches the rows when the replan that followed it fails", async () => {
+    await install("kept", "color:ff0000ff");
+    let resolveTravel: (value: [number, number, number, number][]) => void = () => {};
+    ipc.travelForOrder.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveTravel = resolve;
+      }),
+    );
+    await act(async () => {
+      api.current?.setPassEnabled(0, false);
+    });
+
+    let rejectNext: (reason: unknown) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => {
+        rejectNext = reject;
+      }),
+    );
+    await act(async () => {
+      api.current?.setGrouping("Single");
+      api.current?.replan("Single");
+    });
+    await act(async () => {
+      rejectNext({ code: "plan_error", message: "shape #2: no fonts are installed on this system" });
+    });
+    expect(api.current?.plan?.revision).toBe("kept");
+    expect(api.current?.grouping).toBe("Color");
+
+    // The failure left the disabled row in place, so the travel asked for that row is still the
+    // one on screen. Dropping it on the way out of the replan left one enabled pass with the
+    // travel of a list that still had it enabled.
+    const segment: [number, number, number, number] = [0, 0, 10, 0];
+    await act(async () => {
+      resolveTravel([segment]);
+    });
+    expect(api.current?.plan?.rows[0].enabled).toBe(false);
+    expect(api.current?.plan?.travel).toEqual([segment]);
+  });
+
+  it("does not let a discarded render publish a grouping the operator has not seen", async () => {
+    await install("color", "color:ff0000ff");
+    const held = api.current?.replan;
+    let release: () => void = () => {};
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let armed = false;
+
+    await act(async () => {
+      armed = true;
+      root.render(render(() => {
+        if (armed) throw blocked;
+      }));
+      api.current?.setGrouping("Single");
+    });
+
+    ipc.planCut.mockClear();
+    let resolveLate: (value: PlanCutResponse) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveLate = resolve;
+      }),
+    );
+    await act(async () => {
+      held?.();
+    });
+    // Connect calls the replan it captured, with no mode argument, after its await. A render
+    // React then throws away must not have published Single into that call: the picker on screen
+    // is still Color, and Single is a grouping nobody committed.
+    expect(ipc.planCut).toHaveBeenCalledTimes(1);
+    expect(ipc.planCut).toHaveBeenCalledWith("Color", null);
+
+    armed = false;
+    release();
+    await act(async () => {
+      resolveLate(planResponse("color", "color:ff0000ff"));
+    });
   });
 });

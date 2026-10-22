@@ -126,8 +126,21 @@ describe("collectPassIssues", () => {
     expect(collectPassIssues([row({ speed: 10, force: 10 })], lookup(), CAMEO, RANGES)).toEqual([]);
   });
 
-  it("skips a pass that will not be cut, and skips everything until ranges arrive", () => {
+  it("skips a pass that will not be cut", () => {
     expect(collectPassIssues([row({ enabled: false })], lookup(), CAMEO, RANGES)).toEqual([]);
-    expect(collectPassIssues([row()], lookup(), CAMEO, null)).toEqual([]);
+    expect(collectPassIssues([row({ enabled: false })], lookup(), CAMEO, null)).toEqual([]);
+  });
+
+  it("refuses a blank speed and force before the cutter's limits arrive", () => {
+    expect(collectPassIssues([row()], lookup(), CAMEO, null)).toEqual([
+      { index: 0, field: "speed", message: "Waiting for the cutter's limits" },
+      { index: 0, field: "force", message: "Waiting for the cutter's limits" },
+    ]);
+    // A number is not compared until the limits exist. Inventing "Use 1–30" would refuse one
+    // the cutter might accept.
+    expect(collectPassIssues([row({ speed: 99, force: 10 })], lookup(), CAMEO, null)).toEqual([]);
+    // An unread preset's nulls are the file's, with or without the limits.
+    expect(collectPassIssues([row({ presetId: "vinyl" })], lookup([], false), CAMEO, null)).toEqual([]);
+    expect(collectPassIssues([row()], lookup(), PUMA, null)).toEqual([]);
   });
 });

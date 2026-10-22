@@ -174,24 +174,36 @@ body {
 }
 
 /* Tailwind's preflight sets `appearance: button` and `color: inherit` inside
-   `@layer base`. Unlayered, so this wins, and the same rule matches in light
-   and dark: the ink is the token, which already changes with the theme. A
-   selector that only starts matching when `.dark` is added is what a theme
-   flip has to wait on, and a full-page shot of that frame was still the
-   previous ink. Checkboxes and radios keep their native appearance. A button
-   that names its own colour is restated below, or a primary label would
-   become body text. */
+   `@layer base`. Unlayered, so this wins. Checkboxes and radios keep their
+   native appearance. */
 button,
 input:where([type="button"], [type="reset"], [type="submit"]) {
   appearance: none;
+}
+/* Ghost and text buttons only. The same selector matches in both themes, so a
+   flip is not waiting on `.dark`. Filled, secondary, and pressed controls are
+   excluded: painting every button with the body ink put light text on a fill
+   that was still the light pill. */
+button:not(
+  .bg-primary,
+  .bg-secondary,
+  .text-primary,
+  .text-primary-foreground,
+  .text-muted-foreground,
+  .text-destructive,
+  .text-accent-ink,
+  .text-warning,
+  .text-success,
+  [aria-pressed="true"],
+  [data-state="active"]
+),
+input:where([type="button"], [type="reset"], [type="submit"]) {
   color: var(--foreground);
 }
-/* Inactive tabs stay on the muted token (the restatement below). The active
-   tab names accent ink in both themes; the dark rule further down puts the
-   darker teal on the white pill, which is the pairing that stays above 4.5:1. */
-button[role="tab"][data-state="active"] {
-  color: var(--accent-ink);
+button.bg-secondary {
+  color: var(--foreground);
 }
+button.bg-primary,
 button.text-primary-foreground {
   color: var(--primary-foreground);
 }
@@ -210,6 +222,14 @@ button.text-warning {
 button.text-success {
   color: var(--success);
 }
+/* Pressed tab and toggle: white pill, primary ink, in both themes. #106c72 on
+   white is 6.16:1, and neither side changes when the theme does, so the flip
+   frame cannot catch the previous pairing. The tool rail names accent ink. */
+button[aria-pressed="true"]:not(.text-accent-ink),
+button[role="tab"][data-state="active"] {
+  background: var(--primary-foreground);
+  color: var(--primary);
+}
 
 /* One opacity for every disabled control that used to repeat `opacity: 0.35`.
    Scoped to buttons and menu items so a disabled field does not fade with them. */
@@ -217,15 +237,6 @@ button:disabled,
 [role="menuitem"][data-disabled],
 [role="menuitemradio"][data-disabled] {
   opacity: var(--disabled-opacity);
-}
-
-/* Dark active tab. `--card` plus `--accent-ink` is teal on a dark pill; the light
-   pairing is a white pill and the dark teal, which is what the light theme already
-   shows and what stays above 4.5:1. Unlayered so it wins over the utility and over
-   a hover or focus that would put the teal back on the dark fill. */
-.dark [role="tab"][data-state="active"] {
-  background: var(--primary-foreground);
-  color: var(--primary);
 }
 
 /* Opening a menu with the pointer focuses the trigger and the popover, and

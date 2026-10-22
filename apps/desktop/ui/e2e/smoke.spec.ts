@@ -6474,26 +6474,41 @@ test("Option+S subtracts when the produced character is not s", async ({ page })
   await expect.poll(() => page.evaluate(() => (window as unknown as { __booleanOp?: string }).__booleanOp)).toBe("Subtract");
 });
 
+type InkBox = { name: string; box: { x: number; y: number; width: number; height: number } };
+
 /** Boxes first, then one full-page shot. A later clip is a different paint: the
  *  screenshot walk captures the frame the theme click returns on. */
 async function contrastsOnPageShot(
   page: Page,
-  items: { name: string; locator: Locator }[],
+  items: { name: string; locator: Locator; inset?: number }[],
 ) {
-  const regions: { name: string; box: { x: number; y: number; width: number; height: number } }[] = [];
+  const regions: InkBox[] = [];
   for (const item of items) {
     const box = await item.locator.boundingBox();
     if (!box) throw new Error(`no box for ${item.name}`);
-    regions.push({ name: item.name, box });
+    regions.push({ name: item.name, box: insetBox(box, item.inset ?? 0) });
   }
   const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  return contrastsInPng(page, regions, bytes);
+}
+
+/** The control's own fill, not the bar it sits on. A white pill's box includes
+ *  the dark zoom bar at the edge, and that edge outranks the label. */
+function insetBox(box: InkBox["box"], inset: number): InkBox["box"] {
+  if (inset <= 0) return box;
+  return {
+    x: box.x + inset,
+    y: box.y + inset,
+    width: Math.max(1, box.width - inset * 2),
+    height: Math.max(1, box.height - inset * 2),
+  };
+}
+
+async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   const crops = await page.evaluate(
-    async (payload: {
-      png: string;
-      regions: { name: string; box: { x: number; y: number; width: number; height: number } }[];
-    }) => {
+    async (payload: { png: string; regions: InkBox[] }) => {
       const img = new Image();
       img.src = `data:image/png;base64,${payload.png}`;
       await img.decode();
@@ -6557,8 +6572,12 @@ test("a cold dark boot paints job controls on the full-page shot", async ({ page
   });
   await openSwap(page);
   await expect(page.locator("html")).toHaveClass(/dark/);
-  const samples = await contrastsOnPageShot(page, jobInkLocators(page));
-  assertDarkJobInk(samples);
+  const samples = await contrastsOnPageShot(page, [
+    ...jobInkLocators(page),
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ]);
+  assertDarkJobInk(samples.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(samples.filter((sample) => sample.name === "Rulers"));
 });
 
 test("a light-to-dark switch paints job controls on the screenshot the walk takes", async ({ page }) => {
@@ -6567,55 +6586,121 @@ test("a light-to-dark switch paints job controls on the screenshot the walk take
   await page.addInitScript(installMockTauri, { seedRedGold: true });
   await openSwap(page);
   await expect(page.locator("html")).not.toHaveClass(/dark/);
-  const items = jobInkLocators(page);
-  const regions: { name: string; min: number; locator: Locator }[] = [];
-  for (const item of items) regions.push(item);
-  // Boxes before the click. Anything awaited after the click lets the old
-  // transition finish, which is the measurement the full-page shot does not get.
-  const boxed: { name: string; min: number; box: { x: number; y: number; width: number; height: number } }[] = [];
-  for (const item of regions) {
+  const items = [
+    ...jobInkLocators(page),
+    { name: "Rulers", min: 4.5, locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ];
+  const hit = await flipDarkShot(page, items);
+  assertDarkJobInk(hit.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(hit.filter((sample) => sample.name === "Rulers"));
+});
+
+test("pressed, secondary and send-sheet buttons clear 4.5:1 on the full-page shot", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+
+  await page.emulateMedia({ colorScheme: "light" });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const light = await filledSurfaces(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  // Boxes before the click. Anything awaited after it lets a transition finish,
+  // which is the frame the full-page shot does not get. The sheet covers the
+  // top bar, so the menu is opened from the element rather than the pointer.
+  const confirmHit = await flipDarkShot(page, [
+    { name: "Cancel", locator: light.cancel, inset: 4 },
+    { name: "Rulers", locator: light.rulers, inset: 4 },
+  ]);
+  assertFilledInk(confirmHit);
+});
+
+test("the send sheet secondary clears 4.5:1 on the theme-flip frame", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const host = await openSendHost(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  assertFilledInk(await flipDarkShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }], "class"));
+});
+
+async function openSendHost(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const host = page.getByRole("dialog", { name: "Send to cutter" }).getByRole("button", { name: "Add a Cut Host…", exact: true });
+  await expect(host).toBeVisible();
+  return host;
+}
+
+async function filledSurfaces(page: Page) {
+  const host = await openSendHost(page);
+  const hostInk = await contrastsOnPageShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }]);
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  const cancel = page.getByRole("region", { name: "Job" }).getByRole("button", { name: "Cancel", exact: true });
+  const rulers = page.getByRole("button", { name: "Rulers", exact: true });
+  await expect(cancel).toBeVisible();
+  const confirmInk = await contrastsOnPageShot(page, [
+    { name: "Cancel", locator: cancel, inset: 4 },
+    { name: "Rulers", locator: rulers, inset: 4 },
+  ]);
+  return { hostInk, confirmInk, cancel, rulers, all: [...hostInk, ...confirmInk] };
+}
+
+async function filledInkShot(page: Page) {
+  const surfaces = await filledSurfaces(page);
+  return surfaces.all;
+}
+
+async function flipDarkShot(
+  page: Page,
+  items: { name: string; locator: Locator; min?: number; inset?: number }[],
+  how: "menu" | "class" = "menu",
+) {
+  const boxed: { name: string; min?: number; box: InkBox["box"] }[] = [];
+  for (const item of items) {
     const box = await item.locator.boundingBox();
     if (!box) throw new Error(`no box for ${item.name}`);
-    boxed.push({ name: item.name, min: item.min, box });
+    boxed.push({ name: item.name, min: item.min, box: insetBox(box, item.inset ?? 0) });
   }
-  await page.getByRole("button", { name: "Appearance" }).click();
-  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  if (how === "class") {
+    // The sheet is modal, so the top bar is hidden from the tree and the
+    // Appearance click cannot land. The menu's paint is this class change.
+    await page.evaluate(() => {
+      document.documentElement.classList.add("dark");
+      document.documentElement.style.colorScheme = "dark";
+    });
+  } else {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  }
   const bytes = (await page.screenshot()) as unknown as Uint8Array;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  const crops = await page.evaluate(
-    async (payload: {
-      png: string;
-      regions: { name: string; box: { x: number; y: number; width: number; height: number } }[];
-    }) => {
-      const img = new Image();
-      img.src = `data:image/png;base64,${payload.png}`;
-      await img.decode();
-      const canvas = document.createElement("canvas");
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("no canvas");
-      ctx.drawImage(img, 0, 0);
-      const scale = img.naturalWidth / window.innerWidth;
-      return payload.regions.map((region) => {
-        const data = ctx.getImageData(
-          Math.round(region.box.x * scale),
-          Math.round(region.box.y * scale),
-          Math.max(1, Math.round(region.box.width * scale)),
-          Math.max(1, Math.round(region.box.height * scale)),
-        ).data;
-        return { name: region.name, rgba: Array.from(data) };
-      });
-    },
-    { png: btoa(binary), regions: boxed },
-  );
-  assertDarkJobInk(crops.map((crop, i) => ({
-    name: crop.name,
-    min: boxed[i].min,
-    hit: renderedContrastFromPixels(crop.rgba),
-  })));
-});
+  const crops = await contrastsInPng(page, boxed, bytes);
+  return crops.map((crop, i) => ({ name: crop.name, min: boxed[i].min, hit: crop.hit }));
+}
 
 function assertDarkJobInk(samples: { name: string; min?: number; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
   for (const sample of samples) {
@@ -6623,5 +6708,12 @@ function assertDarkJobInk(samples: { name: string; min?: number; hit: ReturnType
     console.log("job ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
     expect(sample.hit.background[0], `${sample.name} background`).toBeLessThan(80);
     expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(min);
+  }
+}
+
+function assertFilledInk(samples: { name: string; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    console.log("filled ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(4.5);
   }
 }

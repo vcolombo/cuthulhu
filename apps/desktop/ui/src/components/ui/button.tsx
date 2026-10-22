@@ -4,17 +4,16 @@ import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "../../lib/cn";
 
+// No fill transition. A theme change would otherwise hold the previous fill
+// while the ink has already switched, and the frame a screenshot takes is
+// light text on that still-light pill.
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-sm font-medium cursor-pointer transition-[background-color,border-color] disabled:pointer-events-none disabled:cursor-not-allowed [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-sm font-medium cursor-pointer disabled:pointer-events-none disabled:cursor-not-allowed [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
   {
     variants: {
       variant: {
         default: "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90",
         secondary: "bg-secondary text-foreground shadow-sm hover:bg-secondary/80",
-        // The ink is the foreground token in both themes. Colour is not in the
-        // transition: a theme change would otherwise hold the previous ink for
-        // the length of transition-colors, and a screenshot of that frame is
-        // dark text on the new dark bar.
         ghost: "text-foreground hover:bg-accent hover:text-foreground",
       },
       size: {

@@ -179,7 +179,7 @@ export function TopBar(props: Props) {
             onClick={() => props.onUnit(unit)}
             className={cn(
               "h-6 cursor-pointer rounded-sm px-2.5 text-xs",
-              props.unit === unit ? "bg-subtle text-foreground" : "text-muted-foreground hover:text-foreground",
+              props.unit === unit ? "bg-primary-foreground text-primary" : "text-muted-foreground hover:text-foreground",
             )}
           >
             {unit}

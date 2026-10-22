@@ -9,9 +9,10 @@ import {
   jobIsActive,
   jobSurface,
   loadPrompt,
-  lostBanner,
   lostLabel,
+  passLive,
   passPercent,
+  reconnectingLine,
   percentLabel,
   placeOf,
   waitingLine,
@@ -33,9 +34,19 @@ function status(patch: Partial<CutStatus> & Pick<CutStatus, "phase">): CutStatus
 const snapshot: JobSnapshot = {
   grouping: "Color",
   passes: [
-    { key: "color:ff0000ff", shapeCount: 2 },
-    { key: "color:00ff00ff", shapeCount: 1 },
-    { key: "color:d39900ff", shapeCount: 3 },
+    { key: "color:ff0000ff", shapeCount: 2, enabled: true },
+    { key: "color:00ff00ff", shapeCount: 1, enabled: true },
+    { key: "color:d39900ff", shapeCount: 3, enabled: true },
+  ],
+};
+
+/** Green is switched off between red and gold. The worker's index 1 is gold, the second pass it was given. */
+const disabledMiddle: JobSnapshot = {
+  grouping: "Color",
+  passes: [
+    { key: "color:ff0000ff", shapeCount: 1, enabled: true },
+    { key: "color:00ff00ff", shapeCount: 1, enabled: false },
+    { key: "color:d39900ff", shapeCount: 1, enabled: true },
   ],
 };
 
@@ -92,19 +103,40 @@ describe("pass copy", () => {
     });
     expect(currentPass(snapshot, status({ phase: "AwaitingColorSwap", pass: { index: 2, total: 3 } }))?.name).toBe("Gold vinyl");
     expect(currentPass(snapshot, status({ phase: "Sending", pass: { index: 9, total: 3 } }))).toBeNull();
-    expect(loadPrompt("Gold vinyl")).toBe("Load Gold vinyl, then press Resume");
+    expect(loadPrompt("Gold vinyl")).toBe("Load gold vinyl, then press Resume");
     expect(loadPrompt("#00ff00")).toBe("Load #00ff00, then press Resume");
     expect(waitingLine("Silhouette Cameo 5 Alpha", { index: 1, total: 2 }, 1)).toBe(
       "Silhouette Cameo 5 Alpha is waiting · pass 2 of 2 · 1 shape",
     );
     expect(waitingLine("Cameo", null, null)).toBe("Cameo is waiting");
   });
+
+  it("skips a disabled middle pass instead of naming it", () => {
+    expect(currentPass(disabledMiddle, status({ phase: "Sending", pass: { index: 0, total: 2 } }))?.name).toBe("Red vinyl");
+    expect(currentPass(disabledMiddle, status({ phase: "AwaitingColorSwap", pass: { index: 1, total: 2 } }))).toMatchObject({
+      name: "Gold vinyl",
+      key: "color:d39900ff",
+      shapeCount: 1,
+    });
+    expect(currentPass(disabledMiddle, status({ phase: "Sending", pass: { index: 2, total: 2 } }))).toBeNull();
+  });
+
+  it("animates only while a pass is still sending", () => {
+    expect(passLive("Sending", 40, false)).toBe(true);
+    expect(passLive("Sending", 100, false)).toBe(false);
+    expect(passLive("Sending", 40, true)).toBe(false);
+    expect(passLive("AwaitingConfirmation", 40, false)).toBe(false);
+    expect(passLive("AwaitingColorSwap", 0, false)).toBe(false);
+  });
 });
 
 describe("offline and failure copy", () => {
   it("counts real seconds and keeps cancel available under a different label", () => {
     expect(lostLabel(5)).toBe("Connection lost · last update 5s ago");
-    expect(lostBanner("Bench Pi")).toBe("Lost connection to Bench Pi, the cut is continuing on the host.");
+    expect(reconnectingLine("Bench Pi", "bench.local:7878")).toBe(
+      "Reconnecting to Bench Pi (bench.local:7878). The cut keeps going on the host.",
+    );
+    expect(reconnectingLine("Bench Pi", "")).toBe("Reconnecting to Bench Pi. The cut keeps going on the host.");
     expect(cancelLabel("panel", false)).toBe("Cancel");
     expect(cancelLabel("swap", false)).toBe("Cancel job");
     expect(cancelLabel("swap", true)).toBe("Cancel (when reconnected)");

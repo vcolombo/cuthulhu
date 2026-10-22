@@ -56,7 +56,9 @@ export function useCutDispatch({
         if (started.duplicate || plan === null) return;
         onAccepted?.({
           grouping: plan.grouping,
-          passes: plan.rows.filter((row) => row.enabled).map((row) => ({ key: row.key, shapeCount: row.shapeCount })),
+          // Disabled rows stay. The worker never sees them, and dropping them here would make
+          // its enabled-pass index point at the wrong vinyl.
+          passes: plan.rows.map((row) => ({ key: row.key, shapeCount: row.shapeCount, enabled: row.enabled })),
         });
       })
       .catch((e) => {

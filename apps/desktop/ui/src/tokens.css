@@ -94,8 +94,8 @@
   --warning: #9a5b00;
   --destructive: #c92324;
   --destructive-foreground: #ffffff;
-  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 clears about
-     3.4:1 on the light panel and 5.1:1 on the dark one, and still reads as off. */
+  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 is about 3.4:1
+     on the light panel. Dark uses its own value: the same 0.55 is 5.1:1 there. */
   --disabled-opacity: 0.55;
   /* #f472b6 is 1.79:1 on the light mat. This is that magenta at OKLCH L 0.55
      (same chroma and hue), 3.60:1 on #d4d4d4. */
@@ -145,6 +145,8 @@
   --destructive: #ff6b63;
   --destructive-foreground: #ffffff;
   --guide: #f472b6;
+  /* 0.42 of the dark foreground on the dark panel is about 3.6:1. 0.55 reads as body text. */
+  --disabled-opacity: 0.42;
 }
 
 html,
@@ -182,16 +184,45 @@ input:where([type="button"], [type="reset"], [type="submit"]) {
   appearance: none;
 }
 
-/* `color: inherit` on a button does not recompute when the theme class flips
-   `color-scheme`, so the used color stays the light foreground (`#012f36`)
-   even though `--foreground` on that button is already the dark one. A
-   variable on the control itself does recompute. `@layer base` so a utility
-   such as `text-primary-foreground` or `text-muted-foreground` still wins. */
-@layer base {
-  button,
-  input:where([type="button"], [type="reset"], [type="submit"]) {
-    color: var(--foreground);
-  }
+/* Chromium does not repaint a button's used `color` when `color-scheme` flips,
+   even when that color is a variable that already holds the new theme. The
+   light foreground (`#012f36`) stays painted on the dark panel, which is how
+   Collapse, Undo and the inactive tabs disappeared. A rule that starts or
+   stops matching on the flip replaces the used value. A button that names its
+   own color is restated underneath, or a primary label would become body text.
+   The active tab keeps the unlayered rule further down: it is more specific
+   than `.dark button`, and the muted restatement excludes `data-state=active`. */
+:root:not(.dark) button:not([data-state="active"]),
+:root:not(.dark) input:where([type="button"], [type="reset"], [type="submit"]) {
+  color: var(--foreground);
+}
+.dark button:not([data-state="active"]),
+.dark input:where([type="button"], [type="reset"], [type="submit"]) {
+  color: var(--foreground);
+}
+:root:not(.dark) button.text-primary-foreground,
+.dark button.text-primary-foreground {
+  color: var(--primary-foreground);
+}
+:root:not(.dark) button.text-muted-foreground:not([data-state="active"]),
+.dark button.text-muted-foreground:not([data-state="active"]) {
+  color: var(--muted-foreground);
+}
+:root:not(.dark) button.text-destructive,
+.dark button.text-destructive {
+  color: var(--destructive);
+}
+:root:not(.dark) button.text-accent-ink,
+.dark button.text-accent-ink {
+  color: var(--accent-ink);
+}
+:root:not(.dark) button.text-warning,
+.dark button.text-warning {
+  color: var(--warning);
+}
+:root:not(.dark) button.text-success,
+.dark button.text-success {
+  color: var(--success);
 }
 
 /* One opacity for every disabled control that used to repeat `opacity: 0.35`.

@@ -30,8 +30,8 @@ import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
 import { JobPanel } from "./cut/job/JobPanel";
-import { jobSurface, placeOf } from "./cut/job/model";
-import { SwapBar, SwapChip } from "./cut/job/SwapBar";
+import { jobIsActive, jobSurface, placeOf } from "./cut/job/model";
+import { JobStatusChip, SwapBar, SwapChip } from "./cut/job/SwapBar";
 import { SendSheet } from "./cut/send/SendSheet";
 import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
@@ -183,6 +183,7 @@ export function App() {
   const [tool, setTool] = useState("select");
   const [cutOpen, setCutOpen] = useState(false);
   const [swapCollapsed, setSwapCollapsed] = useState(false);
+  const [expandJob, setExpandJob] = useState(0);
   // The cut dialog's weed controls, kept here so reopening the dialog keeps them. Per session, not
   // in the project: a weed tweak saved in the document would be an undoable edit that also makes
   // the open plan stale. (`ponytail:` an operator who always borders sets it once per launch;
@@ -549,6 +550,18 @@ export function App() {
   // Leaving the swap drops the chip. Set during render so the bar and the chip never both show.
   if (surface !== "swap" && swapCollapsed) setSwapCollapsed(false);
   const place = placeOf(cutter.device, machines, hosts);
+  const jobRunning = job.tracking && jobIsActive(status.phase);
+  const viewJob = () => {
+    if (surface === "swap") setSwapCollapsed(false);
+    setExpandJob((n) => n + 1);
+  };
+  useEffect(() => {
+    if (expandJob === 0) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById("job-surface")?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [expandJob]);
 
   const reportPick = (info: ipc.DeviceInfo) => {
     void cutter.pick(info).catch((e) => setError(ipc.ipcErrorMessage(e)));
@@ -732,6 +745,7 @@ export function App() {
             onConfirm={job.confirmPassDone}
             onStartAgain={() => setCutOpen(true)}
             onDismiss={job.dismiss}
+            expandToken={expandJob}
           />
         ) : null}
       </aside>
@@ -774,7 +788,15 @@ export function App() {
             snapshot={job.snapshot}
             theme={theme.resolved}
             offline={job.offlineHost !== null}
-            onExpand={() => setSwapCollapsed(false)}
+            onExpand={viewJob}
+          />
+        ) : jobRunning ? (
+          <JobStatusChip
+            status={status}
+            snapshot={job.snapshot}
+            theme={theme.resolved}
+            offline={job.offlineHost !== null}
+            onActivate={viewJob}
           />
         ) : null}
       />

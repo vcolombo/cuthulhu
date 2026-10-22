@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useState, type ReactElement, type ReactNode } from "react";
+import { Play } from "lucide-react";
 import { Tip } from "../../components/Tip";
 import { Button } from "../../components/ui/button";
 import type { CutStatus } from "../../ipc";
@@ -42,7 +43,12 @@ export function JobButtons({
   return (
     <>
       {actions.cancel ? (
-        <Button variant="secondary" size="sm" onClick={() => setConfirming(true)}>
+        <Button
+          variant={place === "swap" ? "ghost" : "secondary"}
+          size="sm"
+          className={place === "swap" ? "text-foreground" : undefined}
+          onClick={() => setConfirming(true)}
+        >
           {cancelLabel(place, offline)}
         </Button>
       ) : null}
@@ -61,7 +67,14 @@ export function JobButtons({
       ) : null}
       {actions.resume ? (
         <Held offline={offline}>
-          <Button variant="default" size="sm" disabled={offline} onClick={onResume}>
+          <Button
+            variant="default"
+            size={place === "swap" ? "default" : "sm"}
+            className={place === "swap" ? "h-11 px-5 text-base font-semibold" : undefined}
+            disabled={offline}
+            onClick={onResume}
+          >
+            {place === "swap" ? <Play aria-hidden /> : null}
             Resume
           </Button>
         </Held>

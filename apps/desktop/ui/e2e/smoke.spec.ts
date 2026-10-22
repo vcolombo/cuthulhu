@@ -136,7 +136,7 @@ async function showPresetEditor(page: Page) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -240,6 +240,26 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
       material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, goldId);
+  }
+
+  // Red, then a green that tests switch off, then gold. The swap must name gold.
+  if (opts?.seedThreeVinyl) {
+    const add = (x: number, stroke: number) => {
+      const id = nextId++;
+      doc.nodes[id] = {
+        id,
+        kind: { Shape: { Rect: { x, y: 0, w: 10, h: 10 } } },
+        transform: [1, 0, 0, 1, 0, 0],
+        style: { stroke, fill: null },
+        children: [],
+        cut_line_type: "Cut",
+        material_preset: { state: "inherit" },
+      };
+      doc.nodes[doc.root].children.push(id);
+    };
+    add(0, 0xff0000ff);
+    add(20, 0x00ff00ff);
+    add(40, 0xd39900ff);
   }
 
   // Seven vinyl colours on a Cameo 12×12. Gold is before red so the red fill covers the gold fill
@@ -994,19 +1014,21 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
   // jobId — a mock-fidelity gap, not a production bug. The setTimeout also makes
   // Transmitting observable to Playwright's polling assertions instead of being
   // superseded within the same synchronous burst.
-  function runPass(passIndex: number, enabledIndices: number[]) {
+  // `enabledPos` is the index among enabled passes, which is what driver-core reports
+  // (`PassPosition` into the submitted vec). The plan-row index would name a disabled
+  // colour when one sits in front of the pass the machine is actually on.
+  function runPass(enabledPos: number, enabledCount: number) {
     const total = 100;
     const sending = (sent: number) =>
-      statusOf("Sending", { cancel: true }, { pass: { index: passIndex, total: enabledIndices.length }, sent: { sent, total } });
+      statusOf("Sending", { cancel: true }, { pass: { index: enabledPos, total: enabledCount }, sent: { sent, total } });
     status = sending(0);
     emit("StateChanged");
     const advance = () => {
       status = sending(total);
-      emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
-      emit({ PassComplete: passIndex });
+      emit({ Progress: { pass_index: enabledPos, submitted_bytes: total, total_bytes: total } });
+      emit({ PassComplete: enabledPos });
 
-      const pos = enabledIndices.indexOf(passIndex);
-      const isLast = pos === enabledIndices.length - 1;
+      const isLast = enabledPos === enabledCount - 1;
       if (isLast) {
         // finish_pass emits JobComplete *before* the state becomes Idle, so this event's
         // status still reads Sending. A frontend that treats the JobComplete kind as
@@ -1021,11 +1043,10 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
         // would never stamp.
         jobId = null;
       } else {
-        const next = enabledIndices[pos + 1];
         status = statusOf(
           "AwaitingColorSwap",
           { cancel: true, resume: true },
-          { pass: { index: next, total: enabledIndices.length } },
+          { pass: { index: enabledPos + 1, total: enabledCount } },
         );
         emit("StateChanged");
       }
@@ -1218,7 +1239,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
         // one — the mid-flight status it faulted from never reaches a render.
         failNextCut = false;
         const id = jobId;
-        status = statusOf("Sending", { cancel: true }, { pass: { index: enabledIndices[0], total: enabledIndices.length }, sent: { sent: 0, total: 100 } });
+        status = statusOf("Sending", { cancel: true }, { pass: { index: 0, total: enabledIndices.length }, sent: { sent: 0, total: 100 } });
         emit("StateChanged");
         emit({ Failed: "Timeout" });
         status = statusOf("Failed", {}, { error: "Timeout" });
@@ -1226,7 +1247,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
         jobId = null;
         return { job_id: id, duplicate: false };
       }
-      runPass(enabledIndices[0], enabledIndices);
+      runPass(0, enabledIndices.length);
       // `duplicate` is the Cut Host's own answer — it is the only party that knows whether it had
       // already accepted this dispatch id. This fake stands in for a local cutter, which has no
       // dedupe to be caught by, so it is always false here.
@@ -1276,8 +1297,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
         }, 50);
         return null;
       }
-      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
-      runPass(nextIndex, enabledIndices);
+      const enabledCount = planPasses.filter((p) => p.enabled).length;
+      runPass(nextIndex, enabledCount);
       return null;
     },
     // Test hook (no production counterpart): arms a one-shot failure for the next
@@ -1725,6 +1746,9 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   const swap = page.getByRole("region", { name: "Colour swap" });
   await expect(swap).toBeVisible();
   await expect(swap.getByText("Load #00ff00, then press Resume")).toBeVisible();
+  // §5.2 keeps Send as the one primary. The status-bar chip is still there while the bar is open.
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Send to cutter" })).not.toContainText("then press Resume");
@@ -1734,6 +1758,27 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("a disabled middle pass names the next vinyl the machine will cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedThreeVinyl: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Enabled" }).nth(1).uncheck();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText("#00ff00")).toHaveCount(0);
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
 });
 
 // The operator-facing half of #148: the picker, the replan it triggers, and a row named for
@@ -3955,7 +4000,7 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
 
 test("an unreachable host freezes the pass, then shows the real status", async ({ page }) => {
   test.setTimeout(60_000);
-  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.addInitScript(installMockTauri, { seedRedGold: true, seedRemoteIdle: true });
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
@@ -3964,6 +4009,7 @@ test("an unreachable host freezes the pass, then shows the real status", async (
   await startCut(page);
 
   const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Red vinyl")).toBeVisible();
   await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
   await callFakeWith(page, "__test_set_progress", { sent: 40 });
   await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
@@ -4047,6 +4093,8 @@ test("the job panel, swap bar, confirm, cancel and failure states", async ({ pag
   const job = page.getByRole("region", { name: "Job" });
   await expect(job.getByText("Pass 1 of 2")).toBeVisible();
   await expect(job.getByText("Red vinyl")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
   await callFakeWith(page, "__test_set_progress", { sent: 40 });
   await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
   await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
@@ -4054,15 +4102,16 @@ test("the job panel, swap bar, confirm, cancel and failure states", async ({ pag
 
   await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
   const swap = page.getByRole("region", { name: "Colour swap" });
-  await expect(swap.getByText("Load Gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
   await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
   await shot(page, "swap-waiting");
 
   await swap.getByRole("button", { name: "Collapse", exact: true }).click();
   await expect(swap).toHaveCount(0);
   const chip = page.getByTestId("swap-chip");
   await expect(chip).toBeVisible();
-  await expect(chip).toHaveAttribute("aria-label", "Show colour swap: Load Gold vinyl, then press Resume");
+  await expect(chip).toHaveAttribute("aria-label", "Show colour swap: Load gold vinyl, then press Resume");
   await shot(page, "swap-chip");
   await chip.click();
   await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
@@ -4074,6 +4123,8 @@ test("the job panel, swap bar, confirm, cancel and failure states", async ({ pag
   });
   await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByText("Gold vinyl")).toBeVisible();
   await shot(page, "confirm-pass");
 
   await job.getByRole("button", { name: "Cancel", exact: true }).click();

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import type { CutStatus, PairedHostView } from "../../ipc";
@@ -9,6 +9,7 @@ import { OfflineBanner } from "./OfflineBanner";
 import {
   currentPass,
   failureCopy,
+  passLive,
   passPercent,
   percentLabel,
   type JobSnapshot,
@@ -29,19 +30,24 @@ type Props = {
   onConfirm: () => void;
   onStartAgain: () => void;
   onDismiss: () => void;
+  /** Bumped by the status-bar job chip. A minimised panel opens again, because that is what the click asked for. */
+  expandToken: number;
 };
 
 /** Docked in the right column. Pause, Retry pass (#306) and "about N min" (#309) are not
  *  rendered: the backend has neither a pause command nor a rate estimate yet. */
 export function JobPanel(props: Props) {
   const [minimised, setMinimised] = useState(false);
-  const { status, place, offlineHost } = props;
+  const { status, place, offlineHost, expandToken } = props;
+  useEffect(() => {
+    setMinimised(false);
+  }, [expandToken]);
   const pass = currentPass(props.snapshot, status);
   const pct = passPercent(status.sent);
   const passLine = status.pass ? `Pass ${status.pass.index + 1} of ${status.pass.total}` : null;
 
   return (
-    <section aria-label="Job" className="shrink-0 border-t border-border bg-card px-3 py-3 text-sm">
+    <section id="job-surface" tabIndex={-1} aria-label="Job" className="shrink-0 border-t border-border bg-card px-3 py-3 text-sm outline-none">
       <header className="flex items-start gap-2">
         <div className="min-w-0 flex-1">
           <div className="truncate font-medium text-foreground">{place.cutter}</div>
@@ -152,7 +158,7 @@ function JobBody({
             className="h-2 overflow-hidden rounded-full bg-subtle"
           >
             <div
-              className={offline ? "h-full bg-primary" : "progress-live h-full bg-primary"}
+              className={passLive(status.phase, pct, offline) ? "progress-live h-full bg-primary" : "h-full bg-primary"}
               style={{ width: `${pct}%` }}
             />
           </div>

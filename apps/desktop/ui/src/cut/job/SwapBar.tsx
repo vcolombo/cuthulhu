@@ -3,7 +3,7 @@ import { Button } from "../../components/ui/button";
 import type { CutStatus, PairedHostView } from "../../ipc";
 import type { VinylTheme } from "../../render/vinyl";
 import { JobButtons } from "./JobButtons";
-import { currentPass, loadPrompt, waitingLine, type JobSnapshot } from "./model";
+import { currentPass, loadPrompt, passPercent, waitingLine, type JobSnapshot } from "./model";
 import { OfflineBanner } from "./OfflineBanner";
 import { VinylSwatch } from "./VinylSwatch";
 
@@ -26,7 +26,7 @@ export function SwapBar(props: Props) {
   const pass = currentPass(props.snapshot, props.status);
   const name = pass?.name ?? "the next vinyl";
   return (
-    <section aria-label="Colour swap" className="flex flex-wrap items-center gap-4 border-t border-border bg-card px-4 py-3">
+    <section id="job-surface" tabIndex={-1} aria-label="Colour swap" className="flex flex-wrap items-center gap-4 border-t border-border bg-card px-4 py-3 outline-none">
       <VinylSwatch color={pass?.swatch ?? null} theme={props.theme} className="size-14 rounded-lg" />
       <div className="min-w-0 flex-1">
         <p role="status" className="text-base font-medium text-foreground">{loadPrompt(name)}</p>
@@ -48,7 +48,7 @@ export function SwapBar(props: Props) {
           onResume={props.onResume}
           onConfirm={props.onConfirm}
           extra={
-            <Button variant="ghost" size="sm" onClick={props.onCollapse}>
+            <Button variant="ghost" size="sm" className="text-foreground" onClick={props.onCollapse}>
               Collapse
             </Button>
           }
@@ -85,6 +85,39 @@ export function SwapChip({
     >
       <VinylSwatch color={pass?.swatch ?? null} theme={theme} className="size-3 rounded-sm" />
       <span className="truncate">{offline ? "Connection lost" : prompt}</span>
+    </button>
+  );
+}
+
+/** The status-bar chip while the panel or the open swap bar is already on screen. */
+export function JobStatusChip({
+  status,
+  snapshot,
+  theme,
+  offline,
+  onActivate,
+}: {
+  status: CutStatus;
+  snapshot: JobSnapshot | null;
+  theme: VinylTheme;
+  offline: boolean;
+  onActivate: () => void;
+}) {
+  const pass = currentPass(snapshot, status);
+  const pct = passPercent(status.sent);
+  const passLine = status.pass ? `Pass ${status.pass.index + 1} of ${status.pass.total}` : "Job";
+  const name = offline ? "Connection lost" : (pass?.name ?? "Job");
+  return (
+    <button
+      type="button"
+      data-testid="job-chip"
+      aria-label={`View job: ${passLine}, ${name}`}
+      onClick={onActivate}
+      className="inline-flex max-w-72 items-center gap-2 rounded-sm border border-border bg-card px-2 text-foreground"
+    >
+      <VinylSwatch color={pass?.swatch ?? null} theme={theme} className="size-3 rounded-sm" />
+      <span className="truncate">{offline ? "Connection lost" : passLine}</span>
+      {pct !== null && !offline ? <span className="tabular">{pct}%</span> : null}
     </button>
   );
 }

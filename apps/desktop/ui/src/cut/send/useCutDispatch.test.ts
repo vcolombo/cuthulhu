@@ -109,11 +109,17 @@ describe("useCutDispatch", () => {
     expect(accepted).toEqual([]);
   });
 
-  it("remembers only the enabled passes of a cut that started", async () => {
+  it("remembers every planned pass, including one that is switched off", async () => {
     ipc.cut.mockResolvedValue({ duplicate: false });
     await act(async () => { root.render(render()); });
     await act(async () => { api.current?.startCut(); });
-    expect(accepted).toEqual([{ grouping: "Color", passes: [{ key: "color:ff0000ff", shapeCount: 2 }] }]);
+    expect(accepted).toEqual([{
+      grouping: "Color",
+      passes: [
+        { key: "color:ff0000ff", shapeCount: 2, enabled: true },
+        { key: "color:00ff00ff", shapeCount: 1, enabled: false },
+      ],
+    }]);
   });
 
   it("keeps the sheet's passes when the host had already accepted the cut", async () => {

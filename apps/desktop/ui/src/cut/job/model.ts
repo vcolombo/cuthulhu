@@ -3,11 +3,13 @@ import type { CutStatus, DeviceError, Grouping, PassKey, Phase } from "../../ipc
 import { vinylName } from "../../render/vinyl";
 import { parsePassKey, passRowLabel, type PresetLookup } from "../viewmodel";
 
-/** The passes that were actually sent, in cut order. Disabled rows are absent: the worker's
- *  pass index counts enabled passes only, and a disabled colour would name the wrong vinyl. */
+/** Every pass row from the accepted cut, in plan order, including rows that were switched off.
+ *  The worker's pass index counts only the passes it was given (`PassPosition` into that vec,
+ *  `driver-core` `status.rs`). A disabled row left in the middle would name the wrong vinyl if
+ *  the index were used on this list directly, so `currentPass` skips those rows. */
 export type JobSnapshot = {
   grouping: Grouping;
-  passes: { key: PassKey; shapeCount: number }[];
+  passes: { key: PassKey; shapeCount: number; enabled: boolean }[];
 };
 
 export type JobSurface =
@@ -55,8 +57,14 @@ export function percentLabel(pct: number): string {
   return `${pct}% of this pass`;
 }
 
+/** A name standing in a sentence. A hex has no case to change; "Gold vinyl" becomes "gold vinyl". */
+export function vinylInSentence(name: string): string {
+  if (name.startsWith("#")) return name;
+  return name.length === 0 ? name : name.charAt(0).toLowerCase() + name.slice(1);
+}
+
 export function loadPrompt(name: string): string {
-  return `Load ${name}, then press Resume`;
+  return `Load ${vinylInSentence(name)}, then press Resume`;
 }
 
 export function waitingLine(
@@ -74,8 +82,15 @@ export function lostLabel(seconds: number): string {
   return `Connection lost · last update ${seconds}s ago`;
 }
 
-export function lostBanner(name: string): string {
-  return `Lost connection to ${name}, the cut is continuing on the host.`;
+/** The address stays whole. A truncated host is the one an operator cannot redial. */
+export function reconnectingLine(name: string, address: string): string {
+  const where = address === "" ? name : `${name} (${address})`;
+  return `Reconnecting to ${where}. The cut keeps going on the host.`;
+}
+
+/** Stripes mean the blade is still taking bytes. A full pass, a confirm, and a frozen host are still. */
+export function passLive(phase: Phase, pct: number | null, offline: boolean): boolean {
+  return !offline && phase === "Sending" && pct !== null && pct < 100;
 }
 
 /** Offline cancel stays available, and says it will not land until the host answers. */
@@ -117,7 +132,8 @@ export function placeOf(
   return { cutter, where };
 }
 
-/** The enabled pass the worker is on, named the same way a Send-sheet row is. */
+/** The enabled pass the worker is on. `status.pass.index` counts submitted passes, so a row
+ *  that was not sent is skipped rather than loaded. */
 export function currentPass(snapshot: JobSnapshot | null, status: CutStatus): {
   key: PassKey;
   shapeCount: number;
@@ -125,7 +141,7 @@ export function currentPass(snapshot: JobSnapshot | null, status: CutStatus): {
   name: string;
 } | null {
   if (snapshot === null || status.pass === null) return null;
-  const pass = snapshot.passes[status.pass.index];
+  const pass = snapshot.passes.filter((row) => row.enabled)[status.pass.index];
   if (pass === undefined) return null;
   const parsed = parsePassKey(pass.key);
   if (parsed.kind === "color" && parsed.color !== null) {

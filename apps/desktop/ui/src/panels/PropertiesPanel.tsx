@@ -32,6 +32,8 @@ type Props = {
   machines?: MachineProfile[];
   machineId?: string | null;
   onDesignFor?: (machineId: string) => void;
+  /** A selected shape whose vinyl alpha is under 0.1. It still cuts. */
+  faintVinyl?: boolean;
 };
 
 /** What the material row reads for each state. Exported for its own test: it is the consumer
@@ -56,7 +58,7 @@ export function materialLabel(
 
 export function PropertiesPanel({ bounds, cutLineType, materialPreset, effectiveMaterial, presets,
                                   onChangeX, onChangeY, onChangeW, onChangeH, unitCount, editsLocked, distributeBlocked, onAlign, onDistribute,
-                                  onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor }: Props) {
+                                  onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor, faintVinyl }: Props) {
   return (
     <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" }}>
       {onDesignFor ? (
@@ -108,6 +110,9 @@ export function PropertiesPanel({ bounds, cutLineType, materialPreset, effective
           />
           Cut
         </label>
+      ) : null}
+      {faintVinyl ? (
+        <p className="text-2xs text-muted-foreground">Nearly invisible in the file. It still cuts.</p>
       ) : null}
       {materialPreset !== undefined ? (
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>

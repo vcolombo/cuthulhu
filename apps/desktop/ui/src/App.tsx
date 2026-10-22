@@ -20,11 +20,12 @@ import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
-import { viewMatrix, zoomPercent } from "./interaction/viewport";
+import { viewMatrix, zoomPercent, type Inset } from "./interaction/viewport";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
+import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/CanvasChrome";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
@@ -33,6 +34,8 @@ import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
 import { TextDialog } from "./text/TextDialog";
 import { useTheme } from "./useTheme";
+import { colorModeVinyl, selectionHasFaintVinyl } from "./render/vinyl";
+import { matBounds, matKindsFor, offeredKind, clampRollLength, ROLL_DEFAULT_MM, type MatKind } from "./render/mat";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -54,10 +57,13 @@ type NodeOpJson =
   | { Remove: { parent: number; id: number } }
   | { Update: { id: number; before: unknown; after: unknown } };
 
+export type StyleJson = { stroke: number | null; fill: number | null };
+
 export type DocNode = {
   id: number;
   kind: NodeKindJson;
   transform: Affine6;
+  style: StyleJson;
   cut_line_type: CutLineTypeJson;
   material_preset: ipc.PresetAssignmentJson;
   children: number[];
@@ -103,7 +109,15 @@ function buildScene(doc: DocSnapshot): Scene {
       // `bounds` is its axis-aligned world box (all four corners, so committed scale and
       // rotation both show up), for the marquee and the properties panel.
       const local = shapeBounds(n.kind.Shape);
-      nodes.push({ id: n.id, bounds: transformBounds(world, local), local, shape: shapeGeom(n.kind.Shape), world });
+      nodes.push({
+        id: n.id,
+        bounds: transformBounds(world, local),
+        local,
+        shape: shapeGeom(n.kind.Shape),
+        world,
+        vinyl: colorModeVinyl(n.style),
+        cut: n.cut_line_type !== "NoCut",
+      });
     } else {
       for (const child of n.children) walk(child, world);
     }
@@ -173,8 +187,32 @@ export function App() {
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState("layers");
+  // The mat is view state. Saving it in the project is #199; a reload starts back on 12×12.
+  const [matKind, setMatKind] = useState<MatKind>("12x12");
+  const [rollLengthMm, setRollLengthMm] = useState(ROLL_DEFAULT_MM);
+  // Rulers match the approved canvas. The control turns them off; the fit inset follows.
+  const [rulers, setRulers] = useState(true);
 
   const scene = useMemo(() => (doc ? buildScene(doc) : { nodes: [] }), [doc]);
+  const mat = useMemo(() => {
+    if (!doc) return null;
+    const width = doc.machine?.width_mm ?? doc.artboard.w;
+    return matBounds(offeredKind(matKind, doc.machine?.id ?? null), width, rollLengthMm);
+  }, [doc, matKind, rollLengthMm]);
+  const contentBounds = useMemo(
+    () => (scene.nodes.length > 0 ? unionBounds(scene.nodes.map((n) => n.bounds)) : null),
+    [scene],
+  );
+  const inset = useMemo<Inset>(
+    () => ({
+      left: rulers ? RULER_PX : 0,
+      top: rulers ? RULER_PX : 0,
+      right: 0,
+      // The bar sits on the canvas, so the mat is fitted to the area above it.
+      bottom: ZOOM_BAR_CLEAR_PX,
+    }),
+    [rulers],
+  );
   const { status, refreshDeviceState } = useJob(setError);
   const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
   const { unit, setUnit } = useUnits(setError);
@@ -220,6 +258,9 @@ export function App() {
     setSelected,
     expand,
     artboard: doc?.artboard ?? null,
+    mat,
+    contentBounds,
+    inset,
     // Not `run`: it reports one `false` for two failures that need opposite repairs. A refused
     // transform must put the shape back; one that landed but could not be re-read must keep it,
     // because the backend already holds the new geometry (silent-failure-hunter on #298).
@@ -253,6 +294,8 @@ export function App() {
   });
   // Stored for the next edit. The document hook reads it when an edit starts, which is after this.
   editsLockNow.current = interaction.editsLockNow;
+  const fitContentNow = useRef(interaction.requestFitContent);
+  fitContentNow.current = interaction.requestFitContent;
 
   // Inside `replaceDocument`, which has locked edits by then, so nothing joins the set while it waits.
   const loadDocument = (path: string) =>
@@ -266,7 +309,8 @@ export function App() {
   useEffect(() => {
     const r = rendererRef.current;
     if (!r) return;
-    r.setArtboard(doc?.artboard ?? null);
+    r.setMat(mat);
+    r.setGridUnit(unit);
     r.setView(viewMatrix(interaction.view));
     // The hook draws the scene, so a redraw here cannot paint the committed scene over a live
     // gesture. `scene` and `selected` are listed because they are what it draws; `size` because a
@@ -275,7 +319,7 @@ export function App() {
     // `theme.resolved` is what the canvas reads out of the CSS variables. A theme
     // change does not touch the scene, so without it the selection stays in the
     // previous theme's colour until the next gesture.
-  }, [scene, selected, doc, interaction.view, interaction.size, repaint, theme.resolved]);
+  }, [scene, selected, doc, mat, unit, interaction.view, interaction.size, repaint, theme.resolved]);
 
   // Clears selection only once the delete actually lands, so a failed delete leaves the
   // (still valid) selection in place, and a successful one can't leave stale ids around to
@@ -400,10 +444,12 @@ export function App() {
   );
 
   const onImportFile = (file: File) => {
-    edit(async () => {
+    void edit(async () => {
       const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
       const [, skipped] = (await ipc.importSvg({ bytes, parent: root })) as [unknown, string[]];
       if (skipped.length > 0) setError(`Imported with ${skipped.length} element(s) skipped: ${skipped.join(", ")}`);
+    }).then((ok) => {
+      if (ok) fitContentNow.current();
     });
   };
 
@@ -414,10 +460,12 @@ export function App() {
     });
 
   const onTraceInsert = (svg: string) => {
-    edit(async () => {
+    void edit(async () => {
       const bytes = Array.from(new TextEncoder().encode(svg));
       const [, skipped] = (await ipc.importSvg({ bytes, parent: root })) as [unknown, string[]];
       if (skipped.length > 0) setError(`Inserted with ${skipped.length} element(s) skipped: ${skipped.join(", ")}`);
+    }).then((ok) => {
+      if (ok) fitContentNow.current();
     });
     setTracePath(null);
   };
@@ -472,9 +520,15 @@ export function App() {
         return;
       }
       if (key === "v") setTool("select");
-      else if (key === "r") edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }));
-      else if (key === "e") edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }));
-      else if (key === "t") setTextOpen(true);
+      else if (key === "r") {
+        void edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } })).then((ok) => {
+          if (ok) fitContentNow.current();
+        });
+      } else if (key === "e") {
+        void edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } })).then((ok) => {
+          if (ok) fitContentNow.current();
+        });
+      } else if (key === "t") setTextOpen(true);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -565,8 +619,16 @@ export function App() {
         tool={tool}
         selectionCount={selected.length}
         onSelectTool={setTool}
-        onAddRect={() => edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } }))}
-        onAddEllipse={() => edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } }))}
+        onAddRect={() => {
+          void edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } })).then((ok) => {
+            if (ok) interaction.requestFitContent();
+          });
+        }}
+        onAddEllipse={() => {
+          void edit(() => ipc.addPrimitive({ parent: root, kind: { Ellipse: { rx: 10, ry: 10 } } })).then((ok) => {
+            if (ok) interaction.requestFitContent();
+          });
+        }}
         onAddText={() => setTextOpen(true)}
         onTrace={onTrace}
         onBoolean={onBooleanOp}
@@ -583,6 +645,18 @@ export function App() {
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block", background: "var(--workspace)", touchAction: "none" }}
           {...interaction.handlers}
         />
+        {rulers ? <Rulers view={interaction.view} size={interaction.size} unit={unit} /> : null}
+        {doc ? (
+          <ZoomControls
+            zoomPercent={zoomPercent(interaction.view)}
+            rulers={rulers}
+            onZoomOut={interaction.zoomOut}
+            onZoomIn={interaction.zoomIn}
+            onFitMat={interaction.requestFit}
+            onFitContent={interaction.requestFitContent}
+            onToggleRulers={() => setRulers((on) => !on)}
+          />
+        ) : null}
       </div>
       <aside className="flex min-h-0 flex-col border-l border-border bg-panel">
         <Tabs value={rightTab} onValueChange={setRightTab} className="flex min-h-0 flex-1 flex-col gap-0">
@@ -623,6 +697,7 @@ export function App() {
               machines={machines}
               machineId={doc?.machine?.id ?? null}
               onDesignFor={designFor}
+              faintVinyl={doc ? selectionHasFaintVinyl(doc.nodes, selected) : false}
             />
           </TabsContent>
           <TabsContent value="devices" className="mt-0 min-h-0 flex-1 overflow-auto">
@@ -636,7 +711,13 @@ export function App() {
         profile={doc?.machine ?? null}
         machines={machines}
         hosts={hosts}
-        artboard={doc?.artboard ?? null}
+        mat={doc && mat ? {
+          kind: offeredKind(matKind, doc.machine?.id ?? null),
+          kinds: matKindsFor(doc.machine?.id ?? null),
+          rollLengthMm,
+          onKind: setMatKind,
+          onRollLength: (mm) => setRollLengthMm(clampRollLength(mm)),
+        } : null}
         status={status}
         zoomPercent={doc ? zoomPercent(interaction.view) : null}
         cursor={interaction.cursor}
@@ -661,6 +742,7 @@ export function App() {
           onClose={() => setCutOpen(false)}
           weed={cutWeed}
           onWeedChange={setCutWeed}
+          theme={theme.resolved}
         />
       ) : null}
       {tracePath !== null ? (
@@ -672,7 +754,9 @@ export function App() {
             setTextOpen(false);
             // ponytail: content and size are fixed until #33 grows this dialog into real
             // text editing; the family is the only choice the backend can act on today.
-            edit(() => ipc.addText({ parent: root, family, sizeMm: 10, text: "Text" }));
+            edit(() => ipc.addText({ parent: root, family, sizeMm: 10, text: "Text" })).then((ok) => {
+              if (ok) interaction.requestFitContent();
+            });
           }}
           onClose={() => setTextOpen(false)}
         />

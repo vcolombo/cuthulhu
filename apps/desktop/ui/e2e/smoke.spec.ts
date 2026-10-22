@@ -24,7 +24,7 @@ async function fileAction(page: Page, name: string) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -103,6 +103,32 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, greenId);
+  }
+
+  // Seven vinyl colours on a Cameo 12×12. Gold is before red so the red fill covers the gold fill
+  // and the outline pass has to put the gold edge back. Centres are in the test that reads pixels.
+  if (opts?.seedVinylBoard) {
+    doc.machine = machines[0];
+    const pack = (hex: string): number => ((Number.parseInt(hex.slice(1), 16) << 8) | 0xff) >>> 0;
+    const ellipse = (rx: number, tx: number, ty: number, hex: string): Node => {
+      const id = nextId++;
+      return { id, kind: { Shape: { Ellipse: { rx, ry: rx } } }, transform: [1, 0, 0, 1, tx, ty], style: { stroke: pack(hex), fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
+    };
+    const rect = (x: number, y: number, hex: string): Node => {
+      const id = nextId++;
+      return { id, kind: { Shape: { Rect: { w: 30.48, h: 30.48 } } }, transform: [1, 0, 0, 1, x, y], style: { stroke: pack(hex), fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
+    };
+    const shapes = [
+      ellipse(22.86, 27.94, 27.94, "#d39900"),
+      ellipse(50.8, 0, 0, "#d02c2a"),
+      rect(115, 10, "#1c1c1c"),
+      rect(160, 10, "#ffffff"),
+      rect(205, 10, "#113663"),
+      rect(115, 55, "#7b3fa0"),
+      rect(160, 55, "#f5e6a3"),
+    ];
+    for (const shape of shapes) doc.nodes[shape.id] = shape;
+    doc.nodes[doc.root].children.push(...shapes.map((shape) => shape.id));
   }
 
   // After the rects: a Group of two 10 mm rects at (50, 20) and (70, 40), so its bounds are
@@ -3430,15 +3456,31 @@ async function toPage(page: Page, v: CanvasView, mm: { x: number; y: number }) {
   return { x: box.x + mm.x * v.scale + v.tx, y: box.y + mm.y * v.scale + v.ty };
 }
 
+/** The Cameo bed these wheel deltas were written against. Fit used to show that bed (~0.2 px/mm)
+ *  with a 24 px margin and no rulers; it now shows the mat, and the same notch count walks the
+ *  shapes off the canvas. 24 is that old margin, not the mat fit's padding. */
+const CAMEO_BED_MM = { w: 330, h: 3000 };
+const BED_FIT_MARGIN_PX = 24;
+
 /** Ctrl-wheel at (the whole pixel nearest) a document point; returns the view once the zoom has
  *  landed. Whole pixels because Chromium reports a wheel's position as integers: a fractional
- *  target puts the pinned point up to a pixel away, and a 20× zoom turns that into twenty. */
+ *  target puts the pinned point up to a pixel away, and a 20× zoom turns that into twenty.
+ *  The delta is applied to the old bed-fit scale, not the current mat fit, so a drag of
+ *  `n * v.scale` still means n millimetres on the canvas. */
 async function zoomInAt(page: Page, mm: { x: number; y: number }, deltaY: number): Promise<CanvasView> {
   const before = await fittedView(page);
+  const box = await page.getByTestId("design-canvas").boundingBox();
+  if (!box) throw new Error("design canvas has no layout box");
+  const availW = Math.max(box.width - 2 * BED_FIT_MARGIN_PX, 1);
+  const availH = Math.max(box.height - 2 * BED_FIT_MARGIN_PX, 1);
+  const bedFit = Math.min(availW / CAMEO_BED_MM.w, availH / CAMEO_BED_MM.h);
+  const target = bedFit * Math.exp(-deltaY * 0.01);
+  // Already at least as close as this delta used to get (the mat fit is past a shallow zoom).
+  if (target <= before.scale * 1.01) return before;
   const at = await toPage(page, before, mm);
   await page.mouse.move(Math.round(at.x), Math.round(at.y));
   await page.keyboard.down("Control");
-  await page.mouse.wheel(0, deltaY);
+  await page.mouse.wheel(0, Math.round(-Math.log(target / before.scale) / 0.01));
   await page.keyboard.up("Control");
   await expect.poll(async () => (await readView(page)).scale).toBeGreaterThan(before.scale);
   return readView(page);
@@ -3635,8 +3677,17 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await showTab(page, "Properties");
   await page.getByLabel("Design for").selectOption("puma");
   const box = (await page.getByTestId("design-canvas").boundingBox())!;
-  // The Puma's 600 × 5000 mm bed, height-bound in this window like the Cameo's.
-  await expect.poll(async () => (await readView(page)).scale).toBeCloseTo((box.height - 48) / 5000, 3);
+  // Puma is roll-only. The default roll is the machine width by 36 in. Rulers take 24 px off the
+  // left and top, the zoom bar takes 54 px off the bottom, and the mat fit pads 32 px, so the
+  // scale is not the 600 × 5000 mm bed.
+  const margin = 32;
+  const ruler = 24;
+  const zoomBar = 54;
+  const rollW = 600;
+  const rollH = 36 * 25.4;
+  const availW = box.width - 2 * margin - ruler;
+  const availH = box.height - 2 * margin - ruler - zoomBar;
+  await expect.poll(async () => (await readView(page)).scale).toBeCloseTo(Math.min(availW / rollW, availH / rollH), 3);
 });
 
 test("keyboard zoom works after a toolbar click and leaves a focused field alone", async ({ page }) => {
@@ -3680,11 +3731,14 @@ test("Shift-click inside the selection toggles a shape out without dragging the 
 test("Space-drag pans after a toolbar click without pressing the button, and so does a middle drag", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  const v0 = await fittedView(page);
+  const beforeAdd = await fittedView(page);
   await page.getByRole("button", { name: "Rectangle" }).click(); // adds one; focus stays on it
   await showTab(page, "Layers");
   const rows = page.getByTestId("layer-row");
   await expect(rows).toHaveCount(3);
+  // Adding a shape fits the artwork, so the pan is measured from that view, not the mat fit.
+  await expect.poll(async () => Math.abs((await readView(page)).scale - beforeAdd.scale)).toBeGreaterThan(0.05);
+  const v0 = await readView(page);
   const box = (await page.getByTestId("design-canvas").boundingBox())!;
   const start = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
 
@@ -3703,6 +3757,105 @@ test("Space-drag pans after a toolbar click without pressing the button, and so 
   await page.mouse.up({ button: "middle" });
   await expect.poll(async () => (await readView(page)).tx).toBeCloseTo(v0.tx + 30, 0);
 });
+
+test("vinyl colours stay distinct on the mat in both themes, including a gold outline inside red", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(installMockTauri, { seedVinylBoard: true });
+  await page.goto("/");
+  await fittedView(page);
+  await expect(page.getByRole("button", { name: "Fit mat" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Fit content" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom in" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out" })).toBeVisible();
+
+  const readBoard = () =>
+    page.evaluate(() => {
+      const canvas = document.querySelector("[data-testid='design-canvas']") as HTMLCanvasElement | null;
+      if (!canvas) return null;
+      const [scale, tx, ty] = (canvas.getAttribute("data-view") ?? "").split(" ").map(Number);
+      const dpr = canvas.width / canvas.clientWidth;
+      const ctx = canvas.getContext("2d");
+      if (!ctx || !(scale > 0)) return null;
+      const at = (x: number, y: number) => {
+        const sx = Math.round((x * scale + tx) * dpr);
+        const sy = Math.round((y * scale + ty) * dpr);
+        const px = ctx.getImageData(sx, sy, 1, 1).data;
+        return [px[0], px[1], px[2]];
+      };
+      const along: { x: number; rgb: number[] }[] = [];
+      for (let x = 50.8; x <= 100; x += 0.2) along.push({ x, rgb: at(x, 50.8) });
+      return {
+        along,
+        mat: at(250, 250),
+        fills: {
+          black: at(130.24, 25.24),
+          white: at(175.24, 25.24),
+          navy: at(220.24, 25.24),
+          purple: at(130.24, 70.24),
+          pale: at(175.24, 70.24),
+        },
+      };
+    });
+
+  const farFrom = (a: number[], b: number[]) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+  for (const theme of ["Light", "Dark"] as const) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: theme }).click();
+    await expect.poll(async () => documentDark(page)).toBe(theme === "Dark");
+    // The mat pixel is the redraw, not just the class: the canvas keeps the previous frame until draw().
+    await expect.poll(async () => (await readBoard())?.mat[0] ?? -1).toBeLessThan(theme === "Dark" ? 120 : 255);
+    await expect.poll(async () => (await readBoard())?.mat[0] ?? -1).toBeGreaterThan(theme === "Dark" ? 20 : 160);
+
+    const board = await readBoard();
+    expect(board, theme).not.toBeNull();
+    if (!board) continue;
+    const gold = board.along.find((s) => s.x > 70 && s.x < 78 && isGoldPixel(s.rgb));
+    const red = board.along.find((s) => s.x > 82 && isRedPixel(s.rgb));
+    expect(gold, `${theme} gold outline ${JSON.stringify(board.along.filter((s) => s.x > 68 && s.x < 80))}`).toBeTruthy();
+    expect(red, `${theme} red fill`).toBeTruthy();
+    for (const [name, rgb] of Object.entries(board.fills)) {
+      expect(farFrom(rgb, board.mat), `${theme} ${name} ${rgb.join(",")}`).toBeGreaterThan(15);
+    }
+    const seen = Object.values(board.fills);
+    for (let i = 0; i < seen.length; i++) {
+      for (let j = i + 1; j < seen.length; j++) {
+        expect(farFrom(seen[i], seen[j]), theme).toBeGreaterThan(12);
+      }
+    }
+    await page.screenshot({ path: `/opt/cursor/artifacts/editor-${theme.toLowerCase()}.png` }).catch(() => undefined);
+    if (theme === "Dark") {
+      await page.getByRole("tablist").screenshot({ path: "/opt/cursor/artifacts/tabs-dark.png" }).catch(() => undefined);
+    }
+  }
+
+  const box = (await page.getByTestId("design-canvas").boundingBox())!;
+  const v = await readView(page);
+  const mat = 12 * 25.4;
+  const matBottom = box.y + v.ty + mat * v.scale;
+  const matLeft = box.x + v.tx;
+  const matRight = matLeft + mat * v.scale;
+  const bar = (await page.getByTestId("zoom-controls").boundingBox())!;
+  expect(matLeft - box.x).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(box.y + v.ty - box.y).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(matBottom).toBeLessThanOrEqual(bar.y + 1);
+  expect(matRight).toBeLessThanOrEqual(box.x + box.width - 32 + 1);
+  const rulers = page.getByRole("button", { name: "Rulers" });
+  await expect(rulers).toHaveAttribute("aria-pressed", "true");
+});
+
+async function documentDark(page: Page): Promise<boolean> {
+  return page.evaluate(() => document.documentElement.classList.contains("dark"));
+}
+
+function isGoldPixel(rgb: number[]): boolean {
+  const [r, g, b] = rgb;
+  return r > 80 && g > 40 && b < 90 && r > b + 40 && g > b + 25;
+}
+
+function isRedPixel(rgb: number[]): boolean {
+  const [r, g, b] = rgb;
+  return r > 150 && r > g + 40 && r > b + 40 && g < 160;
+}
 
 test("dragging just outside a corner rotates about the centre; Alt scales about it", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
@@ -5164,6 +5317,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
   const fileButton = page.getByRole("button", { name: "File", exact: true });
   const undo = page.getByRole("button", { name: "Undo", exact: true });
   const redo = page.getByRole("button", { name: "Redo", exact: true });
+  const layers = page.getByRole("tab", { name: "Layers", exact: true });
   const properties = page.getByRole("tab", { name: "Properties", exact: true });
   const devices = page.getByRole("tab", { name: "Devices", exact: true });
   await expect(importButton).toBeEnabled();
@@ -5175,6 +5329,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
     file: await paintContrast(page, fileButton),
     undo: await paintContrast(page, undo),
     redo: await paintContrast(page, redo),
+    layers: await paintContrast(page, layers),
     properties: await paintContrast(page, properties),
     devices: await paintContrast(page, devices),
   });
@@ -5188,6 +5343,13 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
   // flips. The settled button color is the dark token.
   await expect.poll(() => importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(230, 240, 240)");
   await expect.poll(() => properties.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(157, 184, 185)");
+  // Active tab: the light theme's dark teal on a white pill, in both themes.
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.hover();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.focus();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
   const dark = await measure();
 
   for (const [theme, sample] of [
@@ -5200,6 +5362,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
       file: sample.file.ratio.toFixed(2),
       undo: sample.undo.ratio.toFixed(2),
       redo: sample.redo.ratio.toFixed(2),
+      layers: sample.layers.ratio.toFixed(2),
       properties: sample.properties.ratio.toFixed(2),
       devices: sample.devices.ratio.toFixed(2),
       importInk: sample.import.ink.join(","),
@@ -5212,6 +5375,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
     expect(sample.file.ratio, `${theme} File`).toBeGreaterThanOrEqual(4.5);
     expect(sample.undo.ratio, `${theme} Undo`).toBeGreaterThanOrEqual(3);
     expect(sample.redo.ratio, `${theme} Redo`).toBeGreaterThanOrEqual(3);
+    expect(sample.layers.ratio, `${theme} Layers`).toBeGreaterThanOrEqual(4.5);
     expect(sample.properties.ratio, `${theme} Properties`).toBeGreaterThanOrEqual(4.5);
     expect(sample.devices.ratio, `${theme} Devices`).toBeGreaterThanOrEqual(4.5);
   }

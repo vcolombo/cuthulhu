@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { vinylDisplay } from "../render/vinyl";
+import type { ResolvedTheme } from "../theme";
 import * as ipc from "../ipc";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../hosts/deviceList";
 import { PairHostDialog } from "../hosts/PairHostDialog";
@@ -91,6 +93,9 @@ type Props = {
    *  they start from the backend's defaults. */
   weed: WeedDraft | null;
   onWeedChange: (draft: WeedDraft) => void;
+  /** App's resolved theme. A second `useTheme()` keeps its own state, so a keyboard
+   *  appearance change while this dialog is open would leave the swatches on the old theme. */
+  theme: ResolvedTheme;
 };
 
 const panelStyle: CSSProperties = {
@@ -159,6 +164,7 @@ export function CutDialog({
   onClose,
   weed,
   onWeedChange,
+  theme,
 }: Props) {
   const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
   const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
@@ -1186,6 +1192,7 @@ export function CutDialog({
             // A pass keyed on a preset has no swatch to be recognised by, so
             // the row says what it holds instead.
             const label = passRowLabel(row.key, presetLookup, plan?.grouping ?? grouping);
+            const swatch = label.swatch !== null ? vinylDisplay(label.swatch, theme).swatch : null;
             /** Every option the material picker offers, keyed as this row's `PassKey` grammar keys
              *  a pass: a bare-id picker has to spend the empty string as its "no preset" sentinel,
              *  and an id can be any string an operator typed, that one included. */
@@ -1196,13 +1203,13 @@ export function CutDialog({
                 data-testid="cut-pass-row"
                 style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, border: "1px solid var(--border)", padding: 6 }}
               >
-                {label.swatch !== null ? (
+                {swatch !== null ? (
                   <span
                     style={{
                       width: 12,
                       height: 12,
                       display: "inline-block",
-                      background: label.swatch,
+                      background: swatch,
                     }}
                   />
                 ) : null}
@@ -1268,7 +1275,7 @@ export function CutDialog({
           Not cut: {plan?.skippedNotCut ?? 0} shape{(plan?.skippedNotCut ?? 0) === 1 ? "" : "s"} marked No Cut
         </div>
 
-        <CutPreview scene={scene} artboard={artboard} passes={plan?.rows ?? []} travel={plan?.travel ?? []} />
+        <CutPreview scene={scene} artboard={artboard} passes={plan?.rows ?? []} travel={plan?.travel ?? []} theme={theme} />
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}

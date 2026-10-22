@@ -296,6 +296,35 @@ describe("useJob", () => {
     expect(api.current?.status.actions.resume).toBe(false);
   });
 
+  it("does not let the previous cutter's poll replace the one now aimed on the same host", async () => {
+    const other = { ...REMOTE, instance_id: "usb:pi:D" } as DeviceInfo;
+    const idle = status({ phase: "Idle", actions: { cut: true, cancel: false, resume: false, confirm: false } });
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+
+    let releaseState: (next: CutStatus) => void = () => {};
+    let releaseHosts: (hosts: PairedHostView[]) => void = () => {};
+    ipc.getDeviceState.mockImplementation(() => new Promise((resolve) => { releaseState = resolve; }));
+    ipc.listHosts.mockImplementation(() => new Promise((resolve) => { releaseHosts = resolve; }));
+    const stale = api.current!.refreshDeviceState();
+
+    ipc.getDeviceState.mockResolvedValue(idle);
+    ipc.listHosts.mockResolvedValue([HOST]);
+    await act(async () => { api.current?.attach(other); });
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status).toEqual(idle);
+
+    await act(async () => {
+      releaseHosts([HOST]);
+      releaseState(SWAP);
+      await stale;
+    });
+    expect(api.current?.status).toEqual(idle);
+  });
+
   it("does not cancel a cut that finished while the host was unreachable", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

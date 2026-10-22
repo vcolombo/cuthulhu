@@ -66,8 +66,9 @@ export function useJob(onError: (message: string) => void) {
   snapshotRef.current = snapshot;
   const offlineRef = useRef(false);
   const hostIdRef = useRef<string | null>(null);
-  /** Bumped on every aim change. Comparing the host id misses null → host → null,
-   *  and a stale swap applied then has nobody polling to correct it. */
+  const instanceRef = useRef<string | null>(null);
+  /** Bumped when the aimed cutter changes. Host id alone misses a return to no
+   *  cutter, and a same-host switch, and either one lets a stale poll land. */
   const aimGenRef = useRef(0);
   const knownHostRef = useRef<ipc.PairedHostView | null>(null);
   const cancelQueuedRef = useRef(false);
@@ -131,10 +132,11 @@ export function useJob(onError: (message: string) => void) {
   const refreshDeviceState = useCallback((): Promise<void> => {
     const id = hostIdRef.current;
     const gen = acceptGenRef.current;
+    const aimGen = aimGenRef.current;
     const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
     if (!watching || id === null) {
       return ipc.getDeviceState().then((next) => {
-        if (acceptGenRef.current !== gen) return;
+        if (acceptGenRef.current !== gen || aimGenRef.current !== aimGen) return;
         ingest(next);
       }).catch((e) => {
         onErrorRef.current(ipc.ipcErrorMessage(e));
@@ -156,6 +158,8 @@ export function useJob(onError: (message: string) => void) {
           onErrorRef.current(ipc.ipcErrorMessage(e));
         });
       }
+      // Same host, different cutter. This read was started for the previous one.
+      if (aimGenRef.current !== aimGen) return;
       const host = hostsResult.status === "fulfilled" ? hostsResult.value.find((item) => item.id === id) ?? null : null;
       if (host !== null) knownHostRef.current = host;
       const unreachable = hostsResult.status === "fulfilled" && (host === null || host.unreachable !== null);
@@ -197,7 +201,13 @@ export function useJob(onError: (message: string) => void) {
 
   const attach = useCallback((device: ipc.DeviceInfo | null) => {
     const next = device?.host ?? null;
-    if (hostIdRef.current !== next) aimGenRef.current += 1;
+    const instance = device?.instance_id ?? null;
+    if (hostIdRef.current !== next || instanceRef.current !== instance) {
+      aimGenRef.current += 1;
+      // The queued cancel named the cutter we just left.
+      cancelQueuedRef.current = false;
+    }
+    instanceRef.current = instance;
     hostIdRef.current = next;
     setHostId((prev) => (prev === next ? prev : next));
   }, []);

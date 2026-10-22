@@ -71,12 +71,15 @@ export function useJob(onError: (message: string) => void) {
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
   /** The ending `remember` replaced. A poll has no job id, so the same value coming
-   *  back is the previous cut, not this one finishing the same way. It stays until
-   *  the next accept: Sending does not prove the following poll has left that ending. */
+   *  back is the previous cut, not this one finishing the same way. The placeholder
+   *  Sending is local and does not clear it; a polled active phase does. */
   const staleStatusRef = useRef<ipc.CutStatus | null>(null);
   const lastTerminalRef = useRef<ipc.CutStatus | null>(null);
   const acceptedJobRef = useRef<number | null>(null);
   const seenJobRef = useRef<number | null>(null);
+  /** Bumped in `remember`. A read started before this accept can still resolve with
+   *  the previous cut's Sending, and that must not clear the latched ending. */
+  const acceptGenRef = useRef(0);
 
   const ingest = useCallback((next: ipc.CutStatus, eventJobId?: number) => {
     if (offlineRef.current) return;
@@ -101,6 +104,10 @@ export function useJob(onError: (message: string) => void) {
     // same phase is the detach, and keeping it out would leave Resume on screen.
     const detached = next.phase === "Disconnected" && hostIdRef.current === null;
     if (stale !== null && sameStatus(next, stale) && !namesThisCut && !detached) return;
+    // A remote accept reports job id 0 (`execute_cut`'s ponytail: `Accepted` carries
+    // none), so a poll cannot name this cut. Seeing it active is the proof the host
+    // has left the previous ending; a later identical Idle is then this cut finishing.
+    if (jobIsActive(next.phase) || namesThisCut) staleStatusRef.current = null;
     if (eventJobId !== undefined && eventJobId !== 0) seenJobRef.current = eventJobId;
     // This cut's own failure can arrive before accept returns. Recording it as the
     // previous ending is what would make `remember` paint Sending over Cut failed.
@@ -120,20 +127,28 @@ export function useJob(onError: (message: string) => void) {
 
   const refreshDeviceState = useCallback((): Promise<void> => {
     const id = hostIdRef.current;
+    const gen = acceptGenRef.current;
     const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
     if (!watching || id === null) {
-      return ipc.getDeviceState().then(ingest).catch((e) => {
+      return ipc.getDeviceState().then((next) => {
+        if (acceptGenRef.current !== gen) return;
+        ingest(next);
+      }).catch((e) => {
         onErrorRef.current(ipc.ipcErrorMessage(e));
       });
     }
     return Promise.allSettled([ipc.listHosts(), ipc.getDeviceState()]).then(([hostsResult, statusResult]) => {
+      if (acceptGenRef.current !== gen) return;
       // The aim moved while this read was in flight. Freezing here would keep the
       // swap bar after the cutter is gone; the detach effect may already have returned.
       if (hostIdRef.current !== id) {
         cancelQueuedRef.current = false;
         offlineRef.current = false;
         setOfflineHost(null);
-        return ipc.getDeviceState().then(ingest).catch((e) => {
+        return ipc.getDeviceState().then((next) => {
+          if (acceptGenRef.current !== gen) return;
+          ingest(next);
+        }).catch((e) => {
           onErrorRef.current(ipc.ipcErrorMessage(e));
         });
       }
@@ -230,6 +245,7 @@ export function useJob(onError: (message: string) => void) {
   }, [offlineHost]);
 
   const remember = useCallback((next: JobSnapshot) => {
+    acceptGenRef.current += 1;
     snapshotRef.current = next;
     setSnapshot(next);
     setDismissed(false);

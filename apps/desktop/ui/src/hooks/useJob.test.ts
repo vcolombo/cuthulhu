@@ -154,6 +154,69 @@ describe("useJob", () => {
     expect(api.current?.status).toEqual(COMPLETED);
   });
 
+  it("accepts a remote cut's identical ending once the host has shown it active", async () => {
+    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { emit(1, COMPLETED); });
+    await act(async () => { api.current?.remember(snapshot(0)); });
+    expect(api.current?.status.phase).toBe("Sending");
+
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.ended).toBeNull();
+
+    const sending = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      pass: { index: 0, total: 1 },
+      sent: { sent: 10, total: 100 },
+    });
+    ipc.getDeviceState.mockResolvedValue(sending);
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status).toEqual(sending);
+
+    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status).toEqual(COMPLETED);
+  });
+
+  it("does not let a poll that started before accept clear the previous ending", async () => {
+    let resolveRead: (next: CutStatus) => void = () => {};
+    let reads = 0;
+    ipc.getDeviceState.mockImplementation(() => {
+      reads += 1;
+      if (reads === 1) return new Promise((resolve) => { resolveRead = resolve; });
+      return new Promise(() => {});
+    });
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { emit(1, COMPLETED); });
+
+    let pending: Promise<void> | undefined;
+    await act(async () => { pending = api.current?.refreshDeviceState(); });
+    await act(async () => { api.current?.remember(snapshot(0)); });
+    expect(api.current?.status.pass).toBeNull();
+
+    const staleSending = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      pass: { index: 0, total: 1 },
+      sent: { sent: 10, total: 100 },
+    });
+    await act(async () => {
+      resolveRead(staleSending);
+      await pending;
+    });
+    expect(api.current?.status.pass).toBeNull();
+    expect(api.current?.status.ended).toBeNull();
+
+    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.ended).toBeNull();
+  });
+
   it("keeps a failure that arrived before the cut was accepted", async () => {
     const failed = status({ phase: "Failed", error: "Timeout" });
     ipc.getDeviceState.mockResolvedValue(SWAP);

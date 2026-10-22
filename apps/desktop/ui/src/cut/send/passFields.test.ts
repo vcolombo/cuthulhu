@@ -72,6 +72,17 @@ describe("collectPassIssues", () => {
     expect(collectPassIssues([named], lookup([], true), CAMEO, RANGES)).toEqual([]);
   });
 
+  it("still refuses a blank no-preset pass beside one whose preset is unread or gone", () => {
+    const named = row({ key: "preset:vinyl", presetId: "vinyl" });
+    const blank = row({ key: "no-preset", presetId: null });
+    const issues = [
+      { index: 1, field: "speed", message: "Use 1–30" },
+      { index: 1, field: "force", message: "Use 1–33" },
+    ];
+    expect(collectPassIssues([named, blank], lookup([], false), CAMEO, RANGES)).toEqual(issues);
+    expect(collectPassIssues([named, blank], lookup([], true), CAMEO, RANGES)).toEqual(issues);
+  });
+
   it("refuses a speed outside the ranges, including zero", () => {
     expect(collectPassIssues([row({ speed: 99, force: 10 })], lookup(), CAMEO, RANGES)).toEqual([
       { index: 0, field: "speed", message: "Use 1–30" },

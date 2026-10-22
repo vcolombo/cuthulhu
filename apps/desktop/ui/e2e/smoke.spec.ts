@@ -1712,6 +1712,12 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await fillSendLevels(page);
   await expect(next).toBeEnabled();
   await expectStartOffered(page);
+
+  // The cut that then goes out names the grouping on screen, not the colour passes it replaced.
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { grouping: string; passes: { key: string }[] };
+  expect(request.grouping).toBe("Single");
+  expect(request.passes.map((pass) => pass.key)).toEqual(["all"]);
 });
 
 test("a weed border and lines replan into the preview, and the cut carries the options", async ({ page }) => {
@@ -2718,8 +2724,14 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
   // And the repeat says nothing rather than one pass, which is a claim about the blade.
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  // Cutting stays available throughout: the backend resolves the material from the presets file,
-  // and refuses by name when it cannot, so nothing here is a gate.
+  // The unread preset is not a blank the form can fill. The other pass names no preset, and
+  // that blank still holds Next until it is set — filling it is what expectStartOffered does.
+  await expect(page.getByLabel("Speed for pass 1")).not.toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByLabel("Speed for pass 2")).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("Use 1–30").first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+  // Cutting stays available once that blank is filled: the backend resolves the material from
+  // the presets file, and refuses by name when it cannot.
   await expectStartOffered(page);
 
   // The name and its settings arrive together, under the aim that asked for them.
@@ -3018,6 +3030,16 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await startCut(page);
   await expect(page.getByText("Your design changed.")).toBeVisible();
 
+  // Stale blocks the next Start. It does not freeze the order: the grip stays usable and the
+  // move still lands, which is what a later Replan has to carry.
+  await goToSendStep(page, 2);
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeEnabled();
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  await reorderPass(page, 0, 1);
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeEnabled();
+
   await page.getByRole("button", { name: "Replan" }).click();
   // A replan starts the rows again, so the blanks a no-preset pass refuses have to be filled once more.
   await goToSendStep(page, 2);
@@ -3039,6 +3061,8 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
 
   await reorderPass(page, 0, 1);
   await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(page.getByRole("button", { name: "Up", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Down", exact: true })).toHaveCount(0);
 
   // The wire is the contract under test: the replan request names the swapped order.
   const requests = await page.evaluate(
@@ -3048,6 +3072,77 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
     { key: "color:00ff00ff", enabled: true },
     { key: "color:ff0000ff", enabled: true },
   ]]);
+});
+
+test("dragging a pass asks the backend for travel in the new order", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  await page.getByRole("button", { name: "Reorder pass 2" }).dragTo(page.getByTestId("cut-pass-row").first());
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
+  );
+  expect(requests).toEqual([[
+    { key: "color:00ff00ff", enabled: true },
+    { key: "color:ff0000ff", enabled: true },
+  ]]);
+});
+
+test("the mini mat names the pass under the pointer and dims the others", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const shapes = page.getByRole("img", { name: "Shapes in this pass" }).locator("rect[opacity]");
+  await expect(shapes).toHaveCount(2);
+  await expect(shapes.nth(0)).toHaveAttribute("opacity", "0.9");
+  await expect(shapes.nth(1)).toHaveAttribute("opacity", "0.18");
+  await page.getByTestId("cut-pass-row").nth(1).hover();
+  await expect(shapes.nth(0)).toHaveAttribute("opacity", "0.18");
+  await expect(shapes.nth(1)).toHaveAttribute("opacity", "0.9");
+});
+
+test("a machine the document was not set up for blocks the passes until it is converted", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  // The cutter is aimed either way. Dismissing the switch leaves the document on the Cameo.
+  page.once("dialog", (dialog) => dialog.dismiss());
+  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await goToSendStep(page, 2);
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(page.getByText("Document is set up for a different machine than the connected device.")).toBeVisible();
+  await expect(next).toBeDisabled();
+  await page.getByRole("button", { name: "Convert to puma" }).click();
+  await expect(page.getByText("Document is set up for a different machine than the connected device.")).toHaveCount(0);
+  // Converting replans, and the new row's speed and force start blank.
+  await fillSendLevels(page);
+  await expect(next).toBeEnabled();
+});
+
+test("an inch weed margin is a view of the millimetre draft", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
+  await page.getByLabel("Weed border").check();
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("0.12");
+  await margin.fill("1");
+  await fillSendLevels(page);
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };
+  expect(request.weed.margin_mm).toBe(25.4);
 });
 
 // The head does not travel to a pass that will not be cut, so switching one off is a travel
@@ -3402,6 +3497,7 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   // describe the product instead of a field it threw away. The unpolled row is `unknown`, not
   // `attention` — nothing is wrong with it, and red is how this UI says something is.
   await expect(page.getByTestId("device-badge").first()).toHaveAttribute("data-tone", "busy");
+  await expect(page.getByTestId("device-badge").first()).toHaveText("Cutting");
   await expect(page.getByTestId("device-badge").nth(1)).toHaveAttribute("data-tone", "unknown");
 });
 

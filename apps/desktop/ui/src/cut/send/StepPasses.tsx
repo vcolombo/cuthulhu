@@ -125,7 +125,6 @@ export function StepPasses({
 }) {
   // Open, so the weed controls are on the step the moment it is. Collapsing is a look, not a gate.
   const [weedOpen, setWeedOpen] = useState(true);
-  const [dragFrom, setDragFrom] = useState<number | null>(null);
   const [highlight, setHighlight] = useState<number | null>(null);
   const rows = planRows ?? [];
   const showSpeed = caps.supportsSpeed;
@@ -281,13 +280,17 @@ export function StepPasses({
                 onMouseEnter={() => setHighlight(i)}
                 onFocusCapture={() => setHighlight(i)}
                 onDragOver={(event) => {
-                  if (dragFrom === null || replanning) return;
+                  // The index lives on the drag, not in state: a drop can land before the
+                  // drag-start render commits, and a dragover that waits for that state
+                  // never accepts the drop.
+                  if (replanning || !event.dataTransfer.types.includes("text/plain")) return;
                   event.preventDefault();
                 }}
-                onDrop={() => {
-                  if (dragFrom === null) return;
-                  movePassTo(dragFrom, i);
-                  setDragFrom(null);
+                onDrop={(event) => {
+                  if (replanning) return;
+                  const from = Number(event.dataTransfer.getData("text/plain"));
+                  if (!Number.isInteger(from)) return;
+                  movePassTo(from, i);
                 }}
                 className={cn(
                   "grid items-start gap-3 rounded-lg border border-border bg-card px-2 py-2",
@@ -305,9 +308,7 @@ export function StepPasses({
                   onDragStart={(event) => {
                     event.dataTransfer.setData("text/plain", String(i));
                     event.dataTransfer.effectAllowed = "move";
-                    setDragFrom(i);
                   }}
-                  onDragEnd={() => setDragFrom(null)}
                   onKeyDown={(event) => {
                     if (!event.altKey || replanning) return;
                     if (event.key === "ArrowUp") {
@@ -476,14 +477,14 @@ function materialValue(rows: PassRow[]): string {
   return first === null ? "no-preset" : `preset:${first}`;
 }
 
-/** Inches are a view of the millimetre draft. Millimetres pass through, including a half-typed field. */
-function lengthFromDraft(stored: string): string {
+/** Inches are a view of the millimetre draft. A fragment that is not a number yet is left as typed. */
+export function lengthFromDraft(stored: string): string {
   if (stored.trim() === "") return "";
   const value = Number(stored);
   return Number.isFinite(value) ? formatLength(value, "in") : stored;
 }
 
-function lengthToDraft(typed: string): string {
+export function lengthToDraft(typed: string): string {
   if (typed.trim() === "") return "";
   const value = Number(typed);
   return Number.isFinite(value) ? String(unitToMm(value, "in")) : typed;

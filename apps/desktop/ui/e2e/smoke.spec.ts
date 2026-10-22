@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { renderedContrastFromPixels } from "./renderedContrast";
+import { modeRgb, pillApart, renderedContrastFromPixels, type Rgb } from "./renderedContrast";
 // Generated from the desktop's own generate_handler! registry by
 // apps/desktop/tests/ipc_inventory.rs. Nothing else here calls a real #[tauri::command], so this
 // is what the fake below checks command and argument names against (#85).
@@ -6603,10 +6603,10 @@ function insetBox(box: InkBox["box"], inset: number): InkBox["box"] {
   };
 }
 
-async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) {
+async function readPngRegions(page: Page, regions: InkBox[], bytes: Uint8Array) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  const crops = await page.evaluate(
+  return page.evaluate(
     async (payload: { png: string; regions: InkBox[] }) => {
       const img = new Image();
       img.src = `data:image/png;base64,${payload.png}`;
@@ -6619,17 +6619,23 @@ async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) 
       ctx.drawImage(img, 0, 0);
       const scale = img.naturalWidth / window.innerWidth;
       return payload.regions.map((region) => {
+        const width = Math.max(1, Math.round(region.box.width * scale));
+        const height = Math.max(1, Math.round(region.box.height * scale));
         const data = ctx.getImageData(
           Math.round(region.box.x * scale),
           Math.round(region.box.y * scale),
-          Math.max(1, Math.round(region.box.width * scale)),
-          Math.max(1, Math.round(region.box.height * scale)),
+          width,
+          height,
         ).data;
-        return { name: region.name, rgba: Array.from(data) };
+        return { name: region.name, rgba: Array.from(data), width, height };
       });
     },
     { png: btoa(binary), regions },
   );
+}
+
+async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) {
+  const crops = await readPngRegions(page, regions, bytes);
   return crops.map((crop) => ({ name: crop.name, hit: renderedContrastFromPixels(crop.rgba) }));
 }
 
@@ -6725,6 +6731,24 @@ test("pressed, secondary and send-sheet buttons clear 4.5:1 on the full-page sho
   assertFilledInk(confirmHit);
 });
 
+test("a pressed pill's fill differs from its container in both themes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await assertPressedApart(page, "light");
+
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await assertPressedApart(page, "dark");
+});
+
 test("the send sheet secondary clears 4.5:1 on the theme-flip frame", async ({ page }) => {
   test.setTimeout(60_000);
   await page.emulateMedia({ colorScheme: "light" });
@@ -6814,5 +6838,84 @@ function assertFilledInk(samples: { name: string; hit: ReturnType<typeof rendere
   for (const sample of samples) {
     console.log("filled ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
     expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(4.5);
+  }
+}
+
+/** The padding band above the pill, inside the control that holds it. Skipping
+ *  the parent's own 1px border keeps that edge out of the container sample. */
+function containerBand(parent: InkBox["box"], pill: InkBox["box"]): InkBox["box"] {
+  const y = parent.y + 1;
+  return {
+    x: parent.x + 2,
+    y,
+    width: Math.max(1, parent.width - 4),
+    height: Math.max(1, pill.y - y),
+  };
+}
+
+/** The top of the pill, wide enough that a rounded corner is not the sample.
+ *  Two rows cover a 1px border when the box origin rounds onto the row above. */
+function edgeBand(pill: InkBox["box"]): InkBox["box"] {
+  return {
+    x: pill.x + pill.width * 0.25,
+    y: pill.y,
+    width: Math.max(1, pill.width * 0.5),
+    height: 2,
+  };
+}
+
+function rowRgb(rgba: number[], width: number, y: number): Rgb {
+  const start = y * width * 4;
+  return modeRgb(rgba.slice(start, start + width * 4));
+}
+
+async function assertPressedApart(page: Page, theme: "light" | "dark") {
+  const pills = [
+    { name: "mm", locator: page.getByRole("button", { name: "mm", exact: true }) },
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }) },
+    { name: "Layers", locator: page.getByRole("tab", { name: "Layers", exact: true }) },
+  ];
+  const regions: InkBox[] = [];
+  for (const pill of pills) {
+    const box = await pill.locator.boundingBox();
+    const parent = await pill.locator.locator("xpath=..").boundingBox();
+    if (!box || !parent) throw new Error(`no box for ${pill.name}`);
+    regions.push({ name: `${pill.name} fill`, box: insetBox(box, 4) });
+    regions.push({ name: `${pill.name} container`, box: containerBand(parent, box) });
+    regions.push({ name: `${pill.name} edge`, box: edgeBand(box) });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  const crops = await readPngRegions(page, regions, bytes);
+  for (let i = 0; i < pills.length; i++) {
+    const name = pills[i].name;
+    const fillCrop = crops[i * 3];
+    const containerCrop = crops[i * 3 + 1];
+    const edgeCrop = crops[i * 3 + 2];
+    const text = renderedContrastFromPixels(fillCrop.rgba);
+    const fill = modeRgb(fillCrop.rgba);
+    const container = modeRgb(containerCrop.rgba);
+    const edges = Array.from({ length: edgeCrop.height }, (_, y) => rowRgb(edgeCrop.rgba, edgeCrop.width, y));
+    const sep = edges.map((edge) => pillApart(fill, container, edge)).find((hit) => hit.apart) ?? pillApart(fill, container, edges[0]);
+    console.log(
+      theme,
+      name,
+      "text",
+      text.ratio.toFixed(2),
+      text.ink.join(","),
+      "fill",
+      sep.fillRatio.toFixed(2),
+      fill.join(","),
+      "on",
+      container.join(","),
+      "edge",
+      sep.edgeRatio.toFixed(2),
+    );
+    expect(text.ratio, `${theme} ${name} text`).toBeGreaterThanOrEqual(4.5);
+    expect(sep.apart, `${theme} ${name} fill ${sep.fillRatio.toFixed(2)} edge ${sep.edgeRatio.toFixed(2)}`).toBe(true);
+    if (theme === "dark") {
+      expect(Math.min(...fill), `${theme} ${name} stays a white pill`).toBeGreaterThanOrEqual(250);
+    } else {
+      expect(Math.min(...fill), `${theme} ${name} is not a white pill`).toBeLessThan(250);
+    }
   }
 }

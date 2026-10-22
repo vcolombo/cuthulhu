@@ -123,7 +123,6 @@ export function ZoomControls({ zoomPercent, rulers, onZoomOut, onZoomIn, onFitMa
         size="sm"
         aria-pressed={rulers}
         onClick={onToggleRulers}
-        className={rulers ? "bg-primary-foreground text-primary" : undefined}
       >
         Rulers
       </Button>

@@ -101,6 +101,15 @@
      (same chroma and hue), 3.60:1 on #d4d4d4. */
   --guide: #b73a80;
   --radius: 6px;
+  /* Pressed pill on a light surface. A white pill is the panel, so the unit
+     toggle and Rulers had no fill cue. `--subtle` is the fill those controls
+     used before that pill. It is under 1.2:1 on the panel (#f1f6f6, 1.09:1)
+     and on the unit track (#f8fbfb, 1.14:1), so the 1px brand edge is what
+     separates it. #106c72 on #e3eeee is 5.20:1. Brand is non-text chrome
+     here: 3.47:1 on the panel, 3.64:1 on the track. */
+  --btn-pressed: var(--subtle);
+  --btn-pressed-edge: var(--brand);
+  --btn-pressed-edge-width: 1px;
 
   /* Names the screens already use. `--accent` is not aliased to `--accent-ink`:
      that would paint teal behind `--text` on a selected row. `--muted` is the
@@ -147,6 +156,11 @@
   --guide: #f472b6;
   /* 0.42 of the dark foreground on the dark panel is about 3.6:1. 0.55 reads as body text. */
   --disabled-opacity: 0.42;
+  /* White pill, no edge. #106c72 on white is 6.16:1, and white on the dark
+     panel (#10252a) is 15.9:1, so the fill itself is the cue. */
+  --btn-pressed: var(--primary-foreground);
+  --btn-pressed-edge: transparent;
+  --btn-pressed-edge-width: 0px;
 }
 
 html,
@@ -217,13 +231,19 @@ button[data-ink="success"] {
   --btn-ink: var(--success);
   --btn-ink-hover: var(--success);
 }
-/* Pressed tab and toggle: white pill, primary ink, in both themes. #106c72 on
-   white is 6.16:1, and neither side changes when the theme does, so the flip
-   frame cannot catch the previous pairing. The tool rail names accent ink. */
+/* One pressed rule. Ink stays on `--btn-ink` (`--primary`, #106c72 in both
+   themes). Fill and edge are tokens, so light is a bordered surface while
+   dark stays the white pill, without a second selector and without naming a
+   Tailwind class. The tool rail names accent ink and keeps its own fill. */
 button[aria-pressed="true"]:not([data-ink="accent"]),
 button[role="tab"][data-state="active"] {
-  background: var(--primary-foreground);
-  color: var(--primary);
+  --btn-ink: var(--primary);
+  --btn-ink-hover: var(--primary);
+  background: var(--btn-pressed);
+  color: var(--btn-ink, var(--foreground));
+  border-style: solid;
+  border-width: var(--btn-pressed-edge-width);
+  border-color: var(--btn-pressed-edge);
 }
 
 /* One opacity for every disabled control that used to repeat `opacity: 0.35`.

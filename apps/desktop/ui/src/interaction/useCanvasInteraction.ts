@@ -5,8 +5,8 @@ import { compose, IDENTITY, isIdentity, type Pt } from "../render/affine";
 import type { Canvas2DRenderer } from "../render/Canvas2DRenderer";
 import { applyMoves, applyOptimistic, gestureScene, type Matrix, type PendingPreview } from "./transform";
 import {
-  CSS_PX_PER_MM, IDENTITY_VIEW, ZOOM_STEP, fitView, minScaleFor, panBy, screenToWorld,
-  wheelFactor, zoomAt, type Size, type View,
+  CSS_PX_PER_MM, CONTENT_FIT_MARGIN_PX, FIT_MARGIN_PX, IDENTITY_VIEW, ZOOM_STEP, fitView, minScaleFor, panBy,
+  screenToWorld, wheelFactor, zoomAt, type Inset, type Size, type View,
 } from "./viewport";
 import { handleAt, selectionBox, type Box, type HandleKind } from "./selectionBox";
 import { gestureMatrix, type Modifiers } from "./gesture";
@@ -48,6 +48,13 @@ export type CanvasInteractionArgs = {
    *  actually moves. The box, highlight and preview use it; the commit sends the ids themselves. */
   expand: (ids: number[]) => number[];
   artboard: Bounds | null;
+  /** The mat the view fits and the zoom floor is taken from. Null until a document is open.
+   *  Not the artboard: that is the machine bed, and fitting it leaves a 12 in sheet as a sliver. */
+  mat: Bounds | null;
+  /** Artwork bounds for Fit content. Read from a ref inside the fit effect, so an edit does not refit. */
+  contentBounds: Bounds | null;
+  /** Rulers, when shown. A zero inset matches the older fit exactly. */
+  inset: Inset;
   /** Revision of the snapshot `scene` was built from; it rises with every successful refresh. */
   sceneRev: number;
   /** A refusal puts the preview back. An applied commit keeps it until its own snapshot has
@@ -88,6 +95,10 @@ export type CanvasInteraction = {
   size: Size;
   cursor: Pt | null;
   requestFit: () => void;
+  /** Fit the artwork with an 80 px margin. Import, add and trace call this; a plain edit does not. */
+  requestFitContent: () => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
   /** Draws the scene, selection and any live gesture. App calls it whenever the view, size, scene
    *  or selection changes, so those redraws cannot paint the committed scene over a gesture. */
   repaint: () => void;
@@ -136,7 +147,7 @@ function isTyping(t: EventTarget | null): boolean {
 }
 
 export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInteraction {
-  const { canvasRef, rendererRef, scene, selected, setSelected, expand, artboard, commit, sceneRev } = args;
+  const { canvasRef, rendererRef, scene, selected, setSelected, expand, artboard, mat, contentBounds, inset, commit, sceneRev } = args;
   const [view, setViewState] = useState<View>(IDENTITY_VIEW);
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   // ponytail: the readout re-renders App on every pointer move. Fine at today's App size; if a
@@ -144,7 +155,15 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
   // Held in screen px and converted on render: a pan or zoom moves the world under a still
   // pointer, and a world position stored at the last move would go stale (Copilot on #298).
   const [cursorScreen, setCursorScreen] = useState<Pt | null>(null);
-  const [fitEpoch, setFitEpoch] = useState(0);
+  const [fitReq, setFitReq] = useState<{ kind: "mat" | "content"; n: number }>({ kind: "mat", n: 0 });
+  // The fit effect must not depend on these objects: a new scene would refit content on every edit,
+  // and a new inset object would do the same for a render that did not toggle the rulers.
+  const contentRef = useRef(contentBounds);
+  contentRef.current = contentBounds;
+  const insetRef = useRef(inset);
+  insetRef.current = inset;
+  const matRef = useRef(mat);
+  matRef.current = mat;
   // Native listeners are registered once and pointer handlers run between renders; both read
   // these rather than a render's closure, so they see the selection the user just made.
   const viewRef = useRef(view);
@@ -204,16 +223,21 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     viewRef.current = v;
     setViewState(v);
   }, []);
-  const requestFit = useCallback(() => setFitEpoch((n) => n + 1), []);
+  const requestFit = useCallback(() => setFitReq((r) => ({ kind: "mat", n: r.n + 1 })), []);
+  const requestFitContent = useCallback(() => setFitReq((r) => ({ kind: "content", n: r.n + 1 })), []);
+  // The floor follows the mat. Falling back to the bed only happens before the mat exists.
+  const zoomTarget = mat ?? artboard;
   const minScale = useMemo(
-    () => (artboard && size.w > 0 && size.h > 0 ? minScaleFor(artboard, size) : 0),
-    [artboard, size],
+    () => (zoomTarget && size.w > 0 && size.h > 0 ? minScaleFor(zoomTarget, size, FIT_MARGIN_PX, inset) : 0),
+    [zoomTarget, size, inset],
   );
   const zoomBy = useCallback(
     (screen: Pt, factor: number) => setView(zoomAt(viewRef.current, screen, factor, minScale)),
     [minScale, setView],
   );
   const centre = useCallback((): Pt => ({ x: size.w / 2, y: size.h / 2 }), [size]);
+  const zoomIn = useCallback(() => zoomBy(centre(), ZOOM_STEP), [centre, zoomBy]);
+  const zoomOut = useCallback(() => zoomBy(centre(), 1 / ZOOM_STEP), [centre, zoomBy]);
 
   // The one place the renderer is told what to show. Pointer moves call it, and so does App's
   // effect on any view, size, scene or selection change: a separate redraw from the committed scene
@@ -291,18 +315,31 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     return () => ro.disconnect();
   }, [canvasRef, rendererRef]);
 
-  // Fit on first layout, on a new artboard (machine switch, project open) and on request. The
-  // artboard is compared by its key, not the object: a snapshot rebuilds the object on every
-  // edit, and an edit is not a reason to throw away the operator's zoom.
-  const artboardKey = artboard ? `${artboard.x},${artboard.y},${artboard.w},${artboard.h}` : null;
+  // Fit the mat on first layout, when the mat changes (machine switch, a different preset) and on
+  // request. The key is the mat's numbers, not the object: a snapshot rebuilds it on every edit,
+  // and an edit is not a reason to throw away the operator's zoom. Resizing is not in the key, so
+  // a window resize does not refit; the size is a dependency only so the first non-zero size does.
+  const matKey = mat ? `${mat.x},${mat.y},${mat.w},${mat.h}` : null;
+  const insetKey = `${inset.left},${inset.top},${inset.right},${inset.bottom}`;
   const fittedFor = useRef<string | null>(null);
+  const lastMatKey = useRef<string | null>(null);
   useEffect(() => {
-    if (!artboard || size.w === 0 || size.h === 0) return;
-    const key = `${artboardKey}#${fitEpoch}`;
+    const matNow = matRef.current;
+    if (!matNow || matKey === null || size.w === 0 || size.h === 0) return;
+    const matChanged = matKey !== lastMatKey.current;
+    lastMatKey.current = matKey;
+    // A machine change has to show the new mat even when the last request was Fit content.
+    // Recording that as a mat request keeps the follow-up render from immediately fitting content
+    // again: its key matches the mat fit this run already stored.
+    if (matChanged && fitReq.kind !== "mat") setFitReq({ kind: "mat", n: fitReq.n });
+    const kind = matChanged ? "mat" : fitReq.kind;
+    const key = `${kind}#${fitReq.n}#${matKey}#${insetKey}`;
     if (fittedFor.current === key) return;
     fittedFor.current = key;
-    setView(fitView(artboard, size));
-  }, [artboardKey, fitEpoch, size, setView]);
+    const content = contentRef.current;
+    const useContent = kind === "content" && content !== null && content.w > 0 && content.h > 0;
+    setView(fitView(useContent ? content : matNow, size, useContent ? CONTENT_FIT_MARGIN_PX : FIT_MARGIN_PX, insetRef.current));
+  }, [fitReq, matKey, insetKey, size.w, size.h, setView]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -630,6 +667,9 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     size,
     cursor: cursorScreen ? screenToWorld(view, cursorScreen) : null,
     requestFit,
+    requestFitContent,
+    zoomIn,
+    zoomOut,
     repaint,
     editsLock: editsLockNow(),
     editsLockNow,

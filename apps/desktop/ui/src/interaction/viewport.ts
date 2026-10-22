@@ -15,35 +15,46 @@ export type Size = { w: number; h: number };
 export const CSS_PX_PER_MM = 96 / 25.4;
 export const MAX_SCALE = 64 * CSS_PX_PER_MM; // 6400%
 export const FIT_MARGIN_PX = 24;
+/** Air around the artwork for Fit content. The mat fit keeps FIT_MARGIN_PX. */
+export const CONTENT_FIT_MARGIN_PX = 80;
 export const ZOOM_STEP = 1.25;
+
+/** CSS px the fit must leave clear: rulers on the left and top, nothing required on the other edges. */
+export type Inset = { left: number; top: number; right: number; bottom: number };
+
+const ZERO_INSET: Inset = { left: 0, top: 0, right: 0, bottom: 0 };
 /** Pinch reports a few px per event and a mouse notch about 100. An exponential keeps both
  *  proportional, and zooming in then out by the same delta lands exactly where it started. */
 export const WHEEL_ZOOM_RATE = 0.01;
 
 export const IDENTITY_VIEW: View = { scale: 1, tx: 0, ty: 0 };
 
-export function fitView(artboard: Bounds, size: Size): View {
-  if (artboard.w <= 0 || artboard.h <= 0) {
+export function fitView(target: Bounds, size: Size, margin = FIT_MARGIN_PX, inset: Inset = ZERO_INSET): View {
+  if (target.w <= 0 || target.h <= 0) {
     return {
       scale: CSS_PX_PER_MM,
-      tx: FIT_MARGIN_PX - artboard.x * CSS_PX_PER_MM,
-      ty: FIT_MARGIN_PX - artboard.y * CSS_PX_PER_MM,
+      tx: margin + inset.left - target.x * CSS_PX_PER_MM,
+      ty: margin + inset.top - target.y * CSS_PX_PER_MM,
     };
   }
-  const availW = Math.max(size.w - 2 * FIT_MARGIN_PX, 1);
-  const availH = Math.max(size.h - 2 * FIT_MARGIN_PX, 1);
-  const scale = Math.min(availW / artboard.w, availH / artboard.h);
+  const availW = Math.max(size.w - 2 * margin - inset.left - inset.right, 1);
+  const availH = Math.max(size.h - 2 * margin - inset.top - inset.bottom, 1);
+  const scale = Math.min(availW / target.w, availH / target.h);
+  // With a zero inset this is `(size - target * scale) / 2`, the centring the older call had.
+  const x0 = inset.left + margin + (availW - target.w * scale) / 2;
+  const y0 = inset.top + margin + (availH - target.h * scale) / 2;
   return {
     scale,
-    tx: (size.w - artboard.w * scale) / 2 - artboard.x * scale,
-    ty: (size.h - artboard.h * scale) / 2 - artboard.y * scale,
+    tx: x0 - target.x * scale,
+    ty: y0 - target.y * scale,
   };
 }
 
-/** Far enough out to see the artboard small with room around it, and no further: past that the
- *  canvas is empty space and the way back is long. */
-export function minScaleFor(artboard: Bounds, size: Size): number {
-  return Math.min(fitView(artboard, size).scale / 4, MAX_SCALE);
+/** Far enough out to see the fitted target small with room around it, and no further: past that the
+ *  canvas is empty space and the way back is long. The caller passes the mat, not the machine bed,
+ *  so the floor is not stuck at a few percent of a 3 m roll. */
+export function minScaleFor(target: Bounds, size: Size, margin = FIT_MARGIN_PX, inset: Inset = ZERO_INSET): number {
+  return Math.min(fitView(target, size, margin, inset).scale / 4, MAX_SCALE);
 }
 
 export function zoomAt(v: View, screen: Pt, factor: number, minScale: number): View {

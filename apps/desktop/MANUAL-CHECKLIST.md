@@ -118,8 +118,7 @@ real network can confirm the swap end to end.
       size — record how far a 100 mm rect is from 100 mm on a ruler, with the display and its OS
       scaling (it is exact only at the reference density; per-monitor calibration is a ponytail).
 - [ ] Mouse (Windows/Linux): the wheel pans; Ctrl-wheel zooms; middle-drag pans; Space-drag pans.
-- [ ] Switch machine Cameo 5 ⇄ Puma IV — the view refits to the new artboard. Resizing the window
-      does not refit.
+- [ ] Switch machine Cameo 5 ⇄ Puma IV — the view refits to the new mat (12×12 / 12×24 / roll), not the whole bed. Resizing the window does not refit.
 - [ ] Marquee a word of imported text; Shift-drag a corner — it scales proportionally; Alt-drag
       scales from the centre; one undo reverts each gesture.
 - [ ] Pinch-zoom or scroll-pan while dragging a handle — the shape keeps following the pointer

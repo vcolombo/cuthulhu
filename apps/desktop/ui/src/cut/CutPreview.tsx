@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useRef } from "react";
 import type { Scene } from "../render/hittest";
+import { vinylDisplay } from "../render/vinyl";
+import { useTheme } from "../useTheme";
 import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds } from "./viewmodel";
 import type { PassKey } from "../ipc";
 
@@ -41,6 +43,7 @@ type Props = {
  *  they stay legible at any fitted scale. */
 export function CutPreview({ scene, artboard, passes, travel }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const theme = useTheme();
 
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");
@@ -81,7 +84,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
       // A pass with no colour to draw in — the colourless pass, the single pass, or a
       // preset-keyed one — keeps the text colour it always had.
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : text;
+      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme.resolved).stroke : text;
       for (const nodeId of pass.nodeIds) {
         const node = nodesById.get(nodeId);
         if (!node) continue;
@@ -139,7 +142,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
       // A pass with no colour to draw in — the colourless pass, the single pass, or a
       // preset-keyed one — keeps the text colour it always had.
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? cssColor(parsed.color) : text;
+      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme.resolved).stroke : text;
       pass.nodeIds.forEach((nodeId, shapeIndex) => {
         const node = nodesById.get(nodeId);
         if (!node) return;
@@ -180,7 +183,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     if (clipped.top) edge(0, 0.5, size.w, 0.5);
     if (clipped.bottom) edge(0, size.h - 0.5, size.w, size.h - 0.5);
     ctx.setLineDash([]);
-  }, [scene, artboard, passes, travel]);
+  }, [scene, artboard, passes, travel, theme.resolved]);
 
   // A canvas has no accessible name of its own, and this one carries the answer to "what is about
   // to be cut" — so it says what it drew: the passes that will run and the moves between them.

@@ -10,7 +10,17 @@ export type ShapeGeom =
 /** `bounds` is the world-space axis-aligned box — what a marquee tests, and all a node without
  *  geometry has. `local` is the shape's own box before `world`: what a click is tested against,
  *  so a rotated shape is hit where it is drawn rather than across its whole bounding box. */
-export type SceneNode = { id: number; bounds: Bounds; local?: Bounds; shape?: ShapeGeom; world?: Affine6 };
+export type SceneNode = {
+  id: number;
+  bounds: Bounds;
+  local?: Bounds;
+  shape?: ShapeGeom;
+  world?: Affine6;
+  /** Colour-mode vinyl, 0xRRGGBBAA. Null when neither channel is visible. Absent on fixtures that predate it. */
+  vinyl?: number | null;
+  /** False when the shape is NoCut. Absent means it cuts, so older scenes still fill. */
+  cut?: boolean;
+};
 export type Scene = { nodes: SceneNode[] };
 
 /** The box around every one of `boxes`, which must not be empty. Align's units, the selection

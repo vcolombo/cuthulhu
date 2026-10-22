@@ -1,18 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import { useEffect, useState } from "react";
 import { Crosshair, Maximize2, ZoomIn } from "lucide-react";
 import type { MachineProfile } from "../App";
 import type { LengthUnit } from "../length";
-import { formatLength } from "../length";
+import { formatLength, unitToMm } from "../length";
 import type { CutStatus, DeviceInfo, PairedHostView, Phase } from "../ipc";
+import { matKindLabel, type MatKind } from "../render/mat";
+
+type MatControl = {
+  kind: MatKind;
+  kinds: MatKind[];
+  rollLengthMm: number;
+  onKind: (kind: MatKind) => void;
+  onRollLength: (mm: number) => void;
+};
 
 type Props = {
   device: DeviceInfo | null;
   profile: MachineProfile | null;
   machines: MachineProfile[];
   hosts: PairedHostView[];
-  artboard: { w: number; h: number } | null;
+  /** Null until a document is loaded. The mat is view-only; the bed is not what this bar reports. */
+  mat: MatControl | null;
   status: CutStatus;
-  /** Null until a document is loaded: there is no artboard to be zoomed relative to. */
+  /** Null until a document is loaded: there is no mat to be zoomed relative to. */
   zoomPercent: number | null;
   /** Pointer position in document millimetres, or null when the pointer is off the canvas. */
   cursor: { x: number; y: number } | null;
@@ -27,9 +38,29 @@ function phaseDot(phase: Phase): string {
   return "var(--accent-ink)";
 }
 
-function bed(mm: number, unit: LengthUnit): string {
-  if (unit === "mm" && Number.isInteger(mm)) return String(mm);
-  return formatLength(mm, unit);
+function RollLength({ mm, unit, onCommit }: { mm: number; unit: LengthUnit; onCommit: (mm: number) => void }) {
+  const [text, setText] = useState(() => formatLength(mm, unit));
+  useEffect(() => setText(formatLength(mm, unit)), [mm, unit]);
+  const commit = () => {
+    const n = Number(text);
+    if (!Number.isFinite(n)) {
+      setText(formatLength(mm, unit));
+      return;
+    }
+    onCommit(unitToMm(n, unit));
+  };
+  return (
+    <input
+      aria-label="Roll length"
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+      }}
+      className="h-6 w-16 rounded-sm border border-border bg-panel px-1 text-xs text-foreground"
+    />
+  );
 }
 
 /** The cursor string the wheel-pan test reads. Millimetres keep two spaces before `y`. */
@@ -38,7 +69,7 @@ function cursorText(cursor: { x: number; y: number }, unit: LengthUnit): string 
   return `x ${formatLength(cursor.x, "in")}  y ${formatLength(cursor.y, "in")} in`;
 }
 
-export function StatusBar({ device, profile, machines, hosts, artboard, status, zoomPercent, cursor, selection, unit }: Props) {
+export function StatusBar({ device, profile, machines, hosts, mat, status, zoomPercent, cursor, selection, unit }: Props) {
   const connectedName = device ? (machines.find((machine) => machine.id === device.machine_id)?.name ?? device.machine_id) : null;
   const where = device
     ? device.host === null
@@ -57,9 +88,24 @@ export function StatusBar({ device, profile, machines, hosts, artboard, status, 
     <footer className="flex h-8 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t border-border bg-panel px-3 text-xs text-muted-foreground">
       <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: phaseDot(status.phase) }} aria-hidden />
       <span className="truncate text-foreground">{machineText}</span>
-      {artboard ? (
-        <span>
-          {bed(artboard.w, unit)} × {bed(artboard.h, unit)} {unit}
+      {mat ? (
+        <span className="flex items-center gap-1.5">
+          <span>Mat</span>
+          <select
+            aria-label="Mat size"
+            value={mat.kind}
+            onChange={(e) => mat.onKind(e.target.value as MatKind)}
+            className="h-6 rounded-sm border border-border bg-panel px-1 text-xs text-foreground"
+          >
+            {mat.kinds.map((kind) => (
+              <option key={kind} value={kind}>
+                {matKindLabel(kind, unit)}
+              </option>
+            ))}
+          </select>
+          {mat.kind === "roll" ? (
+            <RollLength mm={mat.rollLengthMm} unit={unit} onCommit={mat.onRollLength} />
+          ) : null}
         </span>
       ) : null}
       <span className="flex items-center gap-1.5">
@@ -106,3 +152,4 @@ export function StatusBar({ device, profile, machines, hosts, artboard, status, 
     </footer>
   );
 }
+

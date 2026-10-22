@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
 import {
-  CSS_PX_PER_MM, FIT_MARGIN_PX, MAX_SCALE, fitView, minScaleFor, panBy, screenToWorld,
+  CSS_PX_PER_MM, CONTENT_FIT_MARGIN_PX, FIT_MARGIN_PX, MAX_SCALE, fitView, minScaleFor, panBy, screenToWorld,
   wheelFactor, worldToScreen, zoomAt, zoomPercent,
 } from "./viewport";
 import type { Pt } from "../render/affine";
@@ -53,6 +53,28 @@ describe("viewport", () => {
 
   it("the zoom floor is a quarter of fit", () => {
     expect(minScaleFor(artboard, size)).toBeCloseTo(fitView(artboard, size).scale / 4, 9);
+  });
+
+  it("fits a 12 in mat far larger than a 3 m bed, and the floor follows that target", () => {
+    const window = { w: 900, h: 700 };
+    const bed = { x: 0, y: 0, w: 330, h: 3000 };
+    const mat = { x: 0, y: 0, w: 12 * 25.4, h: 12 * 25.4 };
+    expect(fitView(mat, window).scale).toBeGreaterThan(fitView(bed, window).scale * 5);
+    expect(minScaleFor(mat, window)).toBeGreaterThan(minScaleFor(bed, window));
+  });
+
+  it("keeps a ruler inset outside the margin without moving a zero inset", () => {
+    const plain = fitView(artboard, size);
+    const inset = fitView(artboard, size, FIT_MARGIN_PX, { left: 24, top: 24, right: 0, bottom: 0 });
+    expect(plain.tx).toBeCloseTo((size.w - artboard.w * plain.scale) / 2, 9);
+    const top = worldToScreen(inset, { x: 0, y: 0 });
+    expect(top.y).toBeCloseTo(FIT_MARGIN_PX + 24, 9);
+    expect(inset.scale).toBeLessThan(plain.scale);
+  });
+
+  it("gives Fit content more air than the mat fit", () => {
+    const artwork = { x: 0, y: 0, w: 40, h: 20 };
+    expect(fitView(artwork, size, CONTENT_FIT_MARGIN_PX).scale).toBeLessThan(fitView(artwork, size).scale);
   });
 
   it("a wheel delta and its negation cancel, and scrolling up zooms in", () => {

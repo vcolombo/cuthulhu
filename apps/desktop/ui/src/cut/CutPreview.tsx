@@ -168,6 +168,9 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     // on every shape of a pass, so a pass drawn on top of another left a single "2".
     let cutOrder = 0;
     passes.forEach((pass) => {
+      // A disabled pass is drawn dimmed above and is not cut, so a number on it would be a
+      // shape the blade never meets and would shift the badges of the ones it does.
+      if (!pass.enabled) return;
       const parsed = parsePassKey(pass.key);
       const display = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme) : null;
       const color = display?.stroke ?? text;

@@ -138,4 +138,30 @@ describe("CutPreview drawing", () => {
     expect(fit?.[4]).toBeCloseTo(expected.tx);
     expect(fit?.[5]).toBeCloseTo(expected.ty);
   });
+
+  it("numbers only the shapes an enabled pass will cut", async () => {
+    const draws: Draw[] = [];
+    HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement) {
+      return recordingContext(this, draws, []);
+    } as unknown as typeof HTMLCanvasElement.prototype.getContext;
+    const scene: Scene = { nodes: [rect(1, 0), rect(2, 20), rect(3, 40)] };
+    const passes: PreviewPass[] = [
+      { key: "color:ff0000ff", nodeIds: [1, 2], starts: [null, null], enabled: false, weed: [] },
+      { key: "color:00ff00ff", nodeIds: [3], starts: [null], enabled: true, weed: [] },
+    ];
+    el = document.createElement("div");
+    document.body.appendChild(el);
+    root = createRoot(el);
+    await act(async () => {
+      root.render(createElement(CutPreview, { scene, artboard: { x: 0, y: 0, w: 100, h: 100 }, passes, travel: [], theme: "light" }));
+    });
+
+    const fills = draws.filter((d) => d.op === "fill").map((d) => d.style);
+    expect(fills).toEqual([
+      vinylDisplay(0xff0000ff, "light").fill,
+      vinylDisplay(0xff0000ff, "light").fill,
+      vinylDisplay(0x00ff00ff, "light").fill,
+    ]);
+    expect(draws.filter((d) => d.op === "fillText").map((d) => d.text)).toEqual(["1"]);
+  });
 });

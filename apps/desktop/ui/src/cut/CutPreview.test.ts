@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { describe, it, expect } from "vitest";
-import { cssColor } from "./CutPreview";
+// @vitest-environment happy-dom
+import { act, createElement } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it } from "vitest";
+import type { Scene } from "../render/hittest";
+import { vinylDisplay } from "../render/vinyl";
+import { cssColor, CutPreview, type PreviewPass } from "./CutPreview";
 
 describe("cssColor", () => {
   it("unpacks 0xRRGGBBAA into an rgba() string", () => {
@@ -9,5 +14,97 @@ describe("cssColor", () => {
   });
   it("handles zero alpha", () => {
     expect(cssColor(0x00000000)).toBe("rgba(0, 0, 0, 0)");
+  });
+});
+
+type Draw = { op: "fill" | "fillText"; style: string; text?: string };
+
+function recordingContext(canvas: HTMLCanvasElement, draws: Draw[]) {
+  const ctx = {
+    canvas,
+    fillStyle: "",
+    strokeStyle: "",
+    lineWidth: 1,
+    globalAlpha: 1,
+    font: "",
+    textAlign: "start",
+    textBaseline: "alphabetic",
+    setTransform() {},
+    clearRect() {},
+    fillRect() {},
+    strokeRect() {},
+    beginPath() {},
+    moveTo() {},
+    lineTo() {},
+    arc() {},
+    setLineDash() {},
+    // The disc behind a number is fill() with no path. A shape fill hands over the path.
+    fill(path?: unknown) {
+      if (path) draws.push({ op: "fill", style: String(ctx.fillStyle) });
+    },
+    stroke() {},
+    fillText(text: string) {
+      draws.push({ op: "fillText", style: String(ctx.fillStyle), text });
+    },
+  };
+  return ctx;
+}
+
+function rect(id: number, x: number): Scene["nodes"][number] {
+  return {
+    id,
+    bounds: { x, y: 0, w: 10, h: 10 },
+    shape: { t: "rect", w: 10, h: 10 },
+    world: [1, 0, 0, 1, x, 0],
+  };
+}
+
+// happy-dom provides DOMMatrix and not Path2D. The preview only needs a path it can hand to fill().
+if (typeof globalThis.Path2D === "undefined") {
+  globalThis.Path2D = class Path2D {
+    rect() {}
+    ellipse() {}
+    addPath() {}
+  } as unknown as typeof Path2D;
+}
+
+describe("CutPreview drawing", () => {
+  let root: Root;
+  let el: HTMLDivElement;
+  const original = HTMLCanvasElement.prototype.getContext;
+
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = original;
+    act(() => root.unmount());
+    el.remove();
+  });
+
+  it("fills each colour pass from vinylDisplay and numbers every shape in cut order", async () => {
+    const draws: Draw[] = [];
+    HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement) {
+      return recordingContext(this, draws);
+    } as unknown as typeof HTMLCanvasElement.prototype.getContext;
+    const scene: Scene = { nodes: [rect(1, 0), rect(2, 20), rect(3, 40)] };
+    const passes: PreviewPass[] = [
+      { key: "color:ff0000ff", nodeIds: [1, 2], starts: [null, null], enabled: true, weed: [] },
+      { key: "color:00ff00ff", nodeIds: [3], starts: [null], enabled: true, weed: [] },
+    ];
+    el = document.createElement("div");
+    document.body.appendChild(el);
+    root = createRoot(el);
+    await act(async () => {
+      root.render(createElement(CutPreview, { scene, artboard: { x: 0, y: 0, w: 100, h: 100 }, passes, travel: [], theme: "light" }));
+    });
+
+    const fills = draws.filter((d) => d.op === "fill").map((d) => d.style);
+    expect(fills).toEqual([
+      vinylDisplay(0xff0000ff, "light").fill,
+      vinylDisplay(0xff0000ff, "light").fill,
+      vinylDisplay(0x00ff00ff, "light").fill,
+    ]);
+    // A badge per pass would read "1", "1", "2": the second shape of the red pass is still pass 1.
+    expect(draws.filter((d) => d.op === "fillText").map((d) => d.text)).toEqual(["1", "2", "3"]);
   });
 });

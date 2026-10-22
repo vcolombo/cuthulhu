@@ -42,6 +42,16 @@ describe("vinylName", () => {
     expect(vinylName(0xff0000ff)).toBe("Red vinyl");
     expect(vinylName("#00ff00")).toBe("#00ff00");
     expect(vinylName("oklch(0.72 0.15 82)")).toBe("Gold vinyl");
+    // 12.496 to Red, and 12.501. A limit anywhere else in (10, 33) would still pass the two above.
+    expect(vinylName("#e04860")).toBe("Red vinyl");
+    expect(vinylName("#a84818")).toBe("#a84818");
+    // Blue's nearest swatch is Purple at about 13.6, which is past the limit.
+    expect(vinylName("#0000ff")).toBe("#0000ff");
+    expect(vinylName("rgb(0, 255, 0)")).toBe("#00ff00");
+    expect(vinylName("lime")).toBe("#00ff00");
+    expect(vinylName("oklch(0.7 0.17 145)")).toBe("#4db956");
+    expect(vinylName("not-a-color")).toBe("not-a-color");
+    expect(vinylName("#gggggg")).toBe("#gggggg");
   });
 });
 

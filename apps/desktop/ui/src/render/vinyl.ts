@@ -81,17 +81,21 @@ export function selectionHasFaintVinyl(nodes: Record<string, WalkNode>, selected
 const VINYL_NAME_LIMIT = 12.5;
 const vinylDelta = differenceCiede2000();
 
-/** "Red vinyl", or a `#rrggbb` when no built-in swatch is that colour. */
+/** "Red vinyl", or a `#rrggbb` when no built-in swatch is that colour.
+ *  Anything culori cannot read comes back unchanged: a `#` in front of `rgb(...)` is not a colour,
+ *  and an unreadable string used to throw inside the difference. */
 export function vinylName(rgba: number | string): string {
-  const css = (typeof rgba === "number" ? rgbaToHex(rgba) : rgba.trim()).toLowerCase();
+  const given = typeof rgba === "number" ? rgbaToHex(rgba) : rgba.trim();
+  const hex = formatHex(given)?.toLowerCase();
+  if (!hex) return given;
   let best: { name: string; delta: number } | null = null;
   for (const swatch of VINYL_SWATCHES) {
-    const delta = vinylDelta(css, swatch.oklch);
+    const delta = vinylDelta(hex, swatch.oklch);
     if (!Number.isFinite(delta)) continue;
     if (best === null || delta < best.delta) best = { name: swatch.name, delta };
   }
   if (best !== null && best.delta <= VINYL_NAME_LIMIT) return `${best.name} vinyl`;
-  return css.startsWith("#") ? css : `#${css}`;
+  return hex;
 }
 
 function rgbaToHex(rgba: number): string {

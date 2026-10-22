@@ -3934,6 +3934,7 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await fillSendLevels(page);
     await goToSendStep(page, 3);
     await expect(dialog.getByRole("img", { name: /Cut preview/ })).toBeVisible();
+    await expect(dialog.getByText("Silhouette Cameo 5 Alpha").first()).toBeVisible();
     await expect(dialog.getByText("Red vinyl").first()).toBeVisible();
     await expect(dialog.getByText("#00ff00").first()).toBeVisible();
     await expect(dialog.getByText(/Speed 10 · force 10 · 1×/).first()).toBeVisible();

@@ -250,6 +250,7 @@ describe("droppedPassIndex", () => {
     expect(droppedPassIndex("2")).toBe(2);
     expect(droppedPassIndex("1.")).toBeNull();
     expect(droppedPassIndex("")).toBeNull();
+    expect(droppedPassIndex(" ")).toBeNull();
     expect(droppedPassIndex("foo")).toBeNull();
     expect(droppedPassIndex("1.5")).toBeNull();
     expect(droppedPassIndex("01")).toBeNull();

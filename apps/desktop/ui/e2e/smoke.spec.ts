@@ -1383,7 +1383,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
     machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
     // Empty unless a test asks for a host, so existing assertions (device list, connect flow)
     // are unaffected.
-    list_hosts: () => hosts,
+    list_hosts: () => {
+      const hooks = window as unknown as { __hostListCalls?: number };
+      hooks.__hostListCalls = (hooks.__hostListCalls ?? 0) + 1;
+      return hosts;
+    },
     // Sends no token, so it answers whatever the address is — mirroring a TLS handshake that
     // has vouched for nothing yet.
     probe_host: () => HOST_FINGERPRINT,
@@ -3328,6 +3332,42 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
   await expect(banner).toHaveCount(0);
 });
 
+// The sheet's own material control, not the per-row picker and not the properties panel
+// (those share the accessible name). One choice is every pass, and a typed speed would
+// otherwise hide the preset's own.
+test("a material preset applies to every pass and clears a typed level", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedUserPreset: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await fillSendLevels(page);
+  await expect(dialog.getByLabel("Speed for pass 1")).toHaveValue("10");
+
+  await dialog.getByLabel("Material preset").selectOption("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 1")).toHaveValue("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 2")).toHaveValue("preset:cameo5-htv");
+  // The typed 10 is gone; the field shows the preset's own speed.
+  await expect(dialog.getByLabel("Speed for pass 1")).toHaveValue("5");
+  await expect(dialog.getByLabel("Force for pass 1")).toHaveValue("20");
+
+  await dialog.getByLabel("Preset for pass 2").selectOption("no-preset");
+  await expect(dialog.getByLabel("Material preset")).toHaveValue("mixed");
+  await dialog.getByLabel("Material preset").evaluate((el) => {
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(dialog.getByLabel("Preset for pass 1")).toHaveValue("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 2")).toHaveValue("no-preset");
+
+  await dialog.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showPresetEditor(page);
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Delete preset").click();
+  // The id is no longer in the list. The select keeps it, rather than falling through to No preset.
+  await expect(dialog.getByLabel("Material preset")).toHaveValue("preset:card-stock");
+});
+
 // The one test that drives the Cut Host surface end to end. It is here rather than in a unit
 // test because the parts it checks are exactly the ones a unit test cannot: that the grouped
 // list reaches the dialog at all, and that a refusal from the backend leaves the row on screen.
@@ -3340,6 +3380,13 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // never paired (#42).
   await expect(page.getByText("Workshop Pi")).toBeVisible();
   await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  // Listed, and not choosable: Connect and the radio stay off until the host answers.
+  const hostCutters = page.getByRole("radiogroup", { name: "Workshop Pi" });
+  await expect(hostCutters.getByRole("radio", { name: "cameo5" })).toBeDisabled();
+  await expect(hostCutters.getByRole("button", { name: "Connect", exact: true })).toBeDisabled();
+  const listed = await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0);
+  await page.getByRole("button", { name: "Retry Workshop Pi" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBeGreaterThan(listed);
   // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
   // badge says so rather than offering a cut for a status nobody has asked for.
   await expect(page.getByText("Unknown")).toHaveCount(3);

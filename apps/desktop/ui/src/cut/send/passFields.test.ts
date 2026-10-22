@@ -91,6 +91,14 @@ describe("collectPassIssues", () => {
     expect(collectPassIssues([row({ presetId: "vinyl", speed: 10, force: 10 })], lookup([], false), CAMEO, RANGES)).toEqual([]);
     // A machine that cannot set speed does not flag a speed it will not send.
     expect(collectPassIssues([over], lookup([], false), PUMA, RANGES)).toEqual([]);
+    // Force and repeat are their own arms: a speed check does not exercise either.
+    expect(collectPassIssues([row({ presetId: "vinyl", speed: 10, force: 99 })], lookup([], false), CAMEO, RANGES)).toEqual([
+      { index: 0, field: "force", message: "Use 1–33" },
+    ]);
+    expect(collectPassIssues([row({ presetId: "vinyl", speed: 10, force: 10, repeatCount: 1.5 })], lookup([], true), CAMEO, RANGES)).toEqual([
+      { index: 0, field: "repeat", message: "Use 1–10" },
+    ]);
+    expect(collectPassIssues([row({ presetId: "vinyl", force: 99 })], lookup([], false), PUMA, RANGES)).toEqual([]);
   });
 
   it("refuses a level that is not a whole number", () => {

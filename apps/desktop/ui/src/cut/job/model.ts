@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import type { CutStatus, DeviceError, Grouping, PassKey, Phase } from "../../ipc";
-import { vinylName } from "../../render/vinyl";
-import { parsePassKey, passRowLabel, type PresetLookup } from "../viewmodel";
 
 /** Every pass row from the accepted cut, in plan order, including rows that were switched off.
  *  The worker's pass index counts only the passes it was given (`PassPosition` into that vec,
@@ -9,9 +7,11 @@ import { parsePassKey, passRowLabel, type PresetLookup } from "../viewmodel";
  *  the index were used on this list directly, so `currentPass` skips those rows. */
 export type JobSnapshot = {
   grouping: Grouping;
-  passes: { key: PassKey; shapeCount: number; enabled: boolean }[];
-  /** The worker's id for this accept. `get_device_state` has no job id, so a poll that still
-   *  shows the previous ending can be told from this cut only when an event names this one. */
+  /** Name and swatch are resolved when the cut is accepted. Reading them again later would
+   *  see an empty preset list and call every preset pass "(name unread)" for the whole job. */
+  passes: { key: PassKey; shapeCount: number; enabled: boolean; name: string; swatch: string | null }[];
+  /** The id this accept was given. A remote accept reports 0, and the status's own id is
+   *  what a later poll is matched against. */
   jobId: number;
 };
 
@@ -24,8 +24,6 @@ export type JobSurface =
   | "completed"
   | "cancelled"
   | "cancelling";
-
-const UNREAD_PRESETS: PresetLookup = { presets: [], loaded: false };
 
 /** Mirrors `CutStatus::is_active`. A finished cut rests on Idle, so Idle is not active. */
 export function jobIsActive(phase: Phase): boolean {
@@ -146,11 +144,5 @@ export function currentPass(snapshot: JobSnapshot | null, status: CutStatus): {
   if (snapshot === null || status.pass === null) return null;
   const pass = snapshot.passes.filter((row) => row.enabled)[status.pass.index];
   if (pass === undefined) return null;
-  const parsed = parsePassKey(pass.key);
-  if (parsed.kind === "color" && parsed.color !== null) {
-    const swatch = `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`;
-    return { key: pass.key, shapeCount: pass.shapeCount, swatch, name: vinylName(swatch) };
-  }
-  const label = passRowLabel(pass.key, UNREAD_PRESETS, snapshot.grouping);
-  return { key: pass.key, shapeCount: pass.shapeCount, swatch: label.swatch, name: label.text ?? pass.key };
+  return { key: pass.key, shapeCount: pass.shapeCount, swatch: pass.swatch, name: pass.name };
 }

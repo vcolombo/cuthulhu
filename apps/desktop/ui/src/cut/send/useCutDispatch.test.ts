@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeviceInfo } from "../../ipc";
 import type { InstalledPlan } from "./useCutPlan";
+import type { Preset, PresetLookup } from "../viewmodel";
 import { useCutDispatch } from "./useCutDispatch";
 
 const ipc = vi.hoisted(() => ({
@@ -33,26 +34,41 @@ const plan: InstalledPlan = {
   travel: [],
 };
 
+const lookup: PresetLookup = { presets: [], loaded: true };
+
+const htv: Preset = {
+  id: "cameo5-htv",
+  name: "Heat transfer",
+  machine_id: "cameo5",
+  settings: { speed: null, force: null, repeat_count: 1 },
+  builtin: true,
+};
+
 function Host({
   api,
   onStalePlan,
   onError,
   onAccepted,
+  installed = plan,
+  presets = lookup,
 }: {
   api: { current: DispatchApi | null };
   onStalePlan: () => void;
   onError: (msg: string) => void;
   onAccepted: (snapshot: { passes: { key: string }[] }) => void;
+  installed?: InstalledPlan;
+  presets?: PresetLookup;
 }) {
   api.current = useCutDispatch({
     connected: { instance_id: "usb:mock" } as DeviceInfo,
-    plan,
+    plan: installed,
     replanning: false,
     weedSettled: true,
     canSend: () => true,
     onStalePlan,
     onError,
     onAccepted,
+    presetLookup: presets,
   });
   return null;
 }
@@ -117,10 +133,31 @@ describe("useCutDispatch", () => {
       jobId: 4,
       grouping: "Color",
       passes: [
-        { key: "color:ff0000ff", shapeCount: 2, enabled: true },
-        { key: "color:00ff00ff", shapeCount: 1, enabled: false },
+        { key: "color:ff0000ff", shapeCount: 2, enabled: true, name: "Red vinyl", swatch: "#ff0000" },
+        { key: "color:00ff00ff", shapeCount: 1, enabled: false, name: "#00ff00", swatch: "#00ff00" },
       ],
     }]);
+  });
+
+  it("stores the preset name from the list held when the cut was accepted", async () => {
+    ipc.cut.mockResolvedValue({ job_id: 4, duplicate: false });
+    const presetPlan: InstalledPlan = {
+      ...plan,
+      grouping: "Preset",
+      rows: [{ ...plan.rows[0], key: "preset:cameo5-htv" }],
+    };
+    await act(async () => {
+      root.render(createElement(Host, {
+        api,
+        onStalePlan: () => { stale += 1; },
+        onError: (msg) => errors.push(msg),
+        onAccepted: (snapshot) => accepted.push(snapshot),
+        installed: presetPlan,
+        presets: { presets: [htv], loaded: true },
+      }));
+    });
+    await act(async () => { api.current?.startCut(); });
+    expect(accepted[0]?.passes[0]).toMatchObject({ name: "Heat transfer", swatch: null });
   });
 
   it("keeps the sheet's passes when the host had already accepted the cut", async () => {

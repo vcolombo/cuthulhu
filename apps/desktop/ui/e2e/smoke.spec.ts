@@ -573,10 +573,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     pass: { index: number; total: number } | null;
     sent: { sent: number; total: number } | null;
     error: unknown;
+    jobId: number;
   };
   type DeviceEvent = { job_id: number; kind: unknown; status: CutStatus };
 
   const NO_ACTIONS: Actions = { cut: false, cancel: false, resume: false, confirm: false };
+  // Read by `statusOf` as each status is built, including the constants below.
+  let jobId: number | null = null;
   const statusOf = (phase: string, actions: Partial<Actions> = {}, rest: Partial<CutStatus> = {}): CutStatus => ({
     phase,
     ended: null,
@@ -584,6 +587,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     pass: null,
     sent: null,
     error: null,
+    jobId: jobId ?? 0,
     ...rest,
   });
   const DISCONNECTED = statusOf("Disconnected");
@@ -591,7 +595,6 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
   // `Idle` alone is a device that has cut nothing; a job that ran to the end rests on
   // the same phase and says so through `ended`, which is the whole of the difference.
   const IDLE = statusOf("Idle", { cut: true });
-  const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
 
   const devices: DeviceInfo[] = [
     { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
@@ -635,12 +638,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
   // until the transport is re-opened. `Idle` on both sides of the reconnect, which is exactly why
   // the control is derived from `actions` and not from the phase.
   let status: CutStatus = opts?.seedRemoteConnected
-    ? { phase: "Idle", ended: "Cancelled", actions: { ...NO_ACTIONS }, pass: null, sent: null, error: null }
+    ? { phase: "Idle", ended: "Cancelled", actions: { ...NO_ACTIONS }, pass: null, sent: null, error: null, jobId: 0 }
     : DISCONNECTED;
   let deviceStateCalls = 0;
   let listDeviceCalls = 0;
   let nextJobId = 1;
-  let jobId: number | null = null;
   let planPasses: { key: string; enabled: boolean }[] = [];
   type CutRequest = {
     device_instance_id: string;
@@ -1048,7 +1050,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
         // "finished" would show a completed job as still cutting; only the Idle status
         // below says the job is over.
         emit("JobComplete");
-        status = COMPLETED;
+        status = statusOf("Idle", { cut: true }, { ended: "Completed" });
         emit("StateChanged");
         // Production releases the job id once the job is over: all later lifecycle
         // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
@@ -1334,7 +1336,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
     confirm_pass_done: () => {
-      status = COMPLETED;
+      status = statusOf("Idle", { cut: true }, { ended: "Completed" });
       emit("StateChanged");
       return null;
     },

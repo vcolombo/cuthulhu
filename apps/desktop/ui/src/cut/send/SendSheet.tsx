@@ -124,6 +124,7 @@ export function SendSheet({
     canSend: () => !plan.stalePlan && collectPassIssues(plan.plan?.rows ?? [], presets.presetLookup, presets.caps, ranges).length === 0,
     onStalePlan: () => plan.setStalePlan(true),
     onError,
+    presetLookup: presets.presetLookup,
     onAccepted: (snapshot) => {
       onJobAccepted(snapshot);
       onClose();
@@ -190,7 +191,7 @@ export function SendSheet({
                   Three quick steps. Nothing is cut until you press Start cut.
                 </SheetDescription>
               </div>
-              <button type="button" aria-label="Close" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => guardUnsaved(onClose)}>
+              <button type="button" aria-label="Close" data-ink="muted" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => guardUnsaved(onClose)}>
                 <X className="size-4" aria-hidden />
               </button>
             </div>
@@ -221,6 +222,7 @@ export function SendSheet({
                       <button
                         type="button"
                         disabled={!opened}
+                        data-ink={opened ? "faded" : "muted"}
                         onClick={() => go(number)}
                         className={cn("flex items-center gap-2 text-sm", opened ? "text-foreground/80 hover:text-foreground" : "text-muted-foreground")}
                       >

@@ -28,6 +28,7 @@ vi.mock("../ipc", () => ({
     pass: null,
     sent: null,
     error: null,
+    jobId: 0,
   },
   getDeviceState: () => ipc.getDeviceState(),
   listHosts: () => ipc.listHosts(),
@@ -76,14 +77,24 @@ function snapshot(jobId: number): JobSnapshot {
     jobId,
     grouping: "Color",
     passes: [
-      { key: "color:ff0000ff", shapeCount: 1, enabled: true },
-      { key: "color:d39900ff", shapeCount: 1, enabled: true },
+      { key: "color:ff0000ff", shapeCount: 1, enabled: true, name: "Red vinyl", swatch: "#ff0000" },
+      { key: "color:d39900ff", shapeCount: 1, enabled: true, name: "Gold vinyl", swatch: "#d39900" },
     ],
   };
 }
 
 function emit(jobId: number, next: CutStatus) {
-  for (const listener of [...listeners]) listener({ payload: { job_id: jobId, kind: "StateChanged", status: next } });
+  const status = { ...next, jobId };
+  for (const listener of [...listeners]) listener({ payload: { job_id: jobId, kind: "StateChanged", status } });
+}
+
+function done(jobId: number): CutStatus {
+  return status({
+    phase: "Idle",
+    ended: "Completed",
+    jobId,
+    actions: { cut: true, cancel: false, resume: false, confirm: false },
+  });
 }
 
 describe("useJob", () => {
@@ -124,10 +135,11 @@ describe("useJob", () => {
   }
 
   it("replaces a finished job when the next Sending event has not arrived", async () => {
-    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    ipc.getDeviceState.mockResolvedValue(done(1));
     await mount();
     await act(async () => { api.current?.attach(REMOTE); });
-    await act(async () => { emit(1, COMPLETED); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
     await act(async () => { api.current?.remember(snapshot(2)); });
 
     expect(api.current?.status.phase).toBe("Sending");
@@ -143,6 +155,7 @@ describe("useJob", () => {
 
     const sending = status({
       phase: "Sending",
+      jobId: 2,
       actions: { cut: false, cancel: true, resume: false, confirm: false },
       pass: { index: 0, total: 2 },
       sent: { sent: 0, total: 100 },
@@ -150,17 +163,19 @@ describe("useJob", () => {
     await act(async () => { emit(2, sending); });
     expect(api.current?.status).toEqual(sending);
 
-    await act(async () => { emit(2, COMPLETED); });
-    expect(api.current?.status).toEqual(COMPLETED);
+    await act(async () => { emit(2, done(2)); });
+    expect(api.current?.status).toEqual(done(2));
   });
 
-  it("accepts a remote cut's identical ending once the host has shown it active", async () => {
-    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+  it("shows a remote cut that ends the same way as the one before it", async () => {
+    ipc.getDeviceState.mockResolvedValue(done(1));
     await mount();
     await act(async () => { api.current?.attach(REMOTE); });
-    await act(async () => { emit(1, COMPLETED); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
     await act(async () => { api.current?.remember(snapshot(0)); });
     expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(0);
 
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(api.current?.status.phase).toBe("Sending");
@@ -168,6 +183,7 @@ describe("useJob", () => {
 
     const sending = status({
       phase: "Sending",
+      jobId: 2,
       actions: { cut: false, cancel: true, resume: false, confirm: false },
       pass: { index: 0, total: 1 },
       sent: { sent: 10, total: 100 },
@@ -176,9 +192,46 @@ describe("useJob", () => {
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(api.current?.status).toEqual(sending);
 
-    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    ipc.getDeviceState.mockResolvedValue(done(2));
     await act(async () => { await api.current?.refreshDeviceState(); });
-    expect(api.current?.status).toEqual(COMPLETED);
+    expect(api.current?.status).toEqual(done(2));
+  });
+
+  it("keeps two jobs that finish the same way", async () => {
+    ipc.getDeviceState.mockResolvedValue(done(4));
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(4)); });
+    await act(async () => { emit(4, done(4)); });
+    expect(api.current?.status).toEqual(done(4));
+
+    await act(async () => { api.current?.remember(snapshot(5)); });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(5);
+    await act(async () => { emit(5, done(5)); });
+    expect(api.current?.status).toEqual(done(5));
+    expect(api.current?.offlineHost).toBeNull();
+  });
+
+  it("drops a late status from the previous job", async () => {
+    ipc.getDeviceState.mockResolvedValue(done(4));
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(4)); });
+    await act(async () => { emit(4, done(4)); });
+    await act(async () => { api.current?.remember(snapshot(5)); });
+    const sending = status({
+      phase: "Sending",
+      jobId: 5,
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+    });
+    await act(async () => { emit(5, sending); });
+    await act(async () => { emit(4, done(4)); });
+    expect(api.current?.status).toEqual(sending);
+
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status).toEqual(sending);
+    expect(api.current?.offlineHost).toBeNull();
   });
 
   it("does not let a poll that started before accept clear the previous ending", async () => {
@@ -191,15 +244,17 @@ describe("useJob", () => {
     });
     await mount();
     await act(async () => { api.current?.attach(REMOTE); });
-    await act(async () => { emit(1, COMPLETED); });
+    await act(async () => { emit(1, done(1)); });
 
     let pending: Promise<void> | undefined;
     await act(async () => { pending = api.current?.refreshDeviceState(); });
     await act(async () => { api.current?.remember(snapshot(0)); });
     expect(api.current?.status.pass).toBeNull();
+    expect(api.current?.status.ended).toBeNull();
 
     const staleSending = status({
       phase: "Sending",
+      jobId: 1,
       actions: { cut: false, cancel: true, resume: false, confirm: false },
       pass: { index: 0, total: 1 },
       sent: { sent: 10, total: 100 },
@@ -211,19 +266,19 @@ describe("useJob", () => {
     expect(api.current?.status.pass).toBeNull();
     expect(api.current?.status.ended).toBeNull();
 
-    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    ipc.getDeviceState.mockResolvedValue(done(1));
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(api.current?.status.phase).toBe("Sending");
     expect(api.current?.status.ended).toBeNull();
   });
 
   it("keeps a failure that arrived before the cut was accepted", async () => {
-    const failed = status({ phase: "Failed", error: "Timeout" });
+    const failed = status({ phase: "Failed", error: "Timeout", jobId: 2 });
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();
     await act(async () => { api.current?.attach(REMOTE); });
     await act(async () => { api.current?.remember(snapshot(1)); });
-    await act(async () => { emit(1, COMPLETED); });
+    await act(async () => { emit(1, done(1)); });
     await act(async () => {
       emit(2, status({ phase: "Sending", actions: { cut: false, cancel: true, resume: false, confirm: false } }));
       emit(2, failed);
@@ -231,7 +286,7 @@ describe("useJob", () => {
     await act(async () => { api.current?.remember(snapshot(2)); });
     expect(api.current?.status).toEqual(failed);
 
-    ipc.getDeviceState.mockResolvedValue(COMPLETED);
+    ipc.getDeviceState.mockResolvedValue(done(1));
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(api.current?.status).toEqual(failed);
   });
@@ -389,6 +444,6 @@ describe("useJob", () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(ipc.cancelCut).toHaveBeenCalledOnce();
-    expect(api.current?.status).toEqual(SWAP);
+    expect(api.current?.status).toEqual({ ...SWAP, jobId: 1 });
   });
 });

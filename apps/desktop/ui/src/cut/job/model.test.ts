@@ -35,9 +35,9 @@ const snapshot: JobSnapshot = {
   jobId: 1,
   grouping: "Color",
   passes: [
-    { key: "color:ff0000ff", shapeCount: 2, enabled: true },
-    { key: "color:00ff00ff", shapeCount: 1, enabled: true },
-    { key: "color:d39900ff", shapeCount: 3, enabled: true },
+    { key: "color:ff0000ff", shapeCount: 2, enabled: true, name: "Red vinyl", swatch: "#ff0000" },
+    { key: "color:00ff00ff", shapeCount: 1, enabled: true, name: "#00ff00", swatch: "#00ff00" },
+    { key: "color:d39900ff", shapeCount: 3, enabled: true, name: "Gold vinyl", swatch: "#d39900" },
   ],
 };
 
@@ -46,9 +46,9 @@ const disabledMiddle: JobSnapshot = {
   jobId: 1,
   grouping: "Color",
   passes: [
-    { key: "color:ff0000ff", shapeCount: 1, enabled: true },
-    { key: "color:00ff00ff", shapeCount: 1, enabled: false },
-    { key: "color:d39900ff", shapeCount: 1, enabled: true },
+    { key: "color:ff0000ff", shapeCount: 1, enabled: true, name: "Red vinyl", swatch: "#ff0000" },
+    { key: "color:00ff00ff", shapeCount: 1, enabled: false, name: "#00ff00", swatch: "#00ff00" },
+    { key: "color:d39900ff", shapeCount: 1, enabled: true, name: "Gold vinyl", swatch: "#d39900" },
   ],
 };
 
@@ -121,6 +121,19 @@ describe("pass copy", () => {
       shapeCount: 1,
     });
     expect(currentPass(disabledMiddle, status({ phase: "Sending", pass: { index: 2, total: 2 } }))).toBeNull();
+  });
+
+  it("uses the name stored when the cut was accepted", () => {
+    const preset: JobSnapshot = {
+      jobId: 2,
+      grouping: "Preset",
+      passes: [{ key: "preset:cameo5-htv", shapeCount: 1, enabled: true, name: "Heat transfer", swatch: null }],
+    };
+    expect(currentPass(preset, status({ phase: "Sending", pass: { index: 0, total: 1 } }))).toMatchObject({
+      name: "Heat transfer",
+      swatch: null,
+      key: "preset:cameo5-htv",
+    });
   });
 
   it("animates only while a pass is still sending", () => {

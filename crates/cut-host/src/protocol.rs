@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 pub struct DispatchId(pub String);
 
 /// Everything a reattaching client needs about one cutter in a single value.
-/// `job_id` rides alongside `CutStatus` because the status alone cannot say
-/// *whose* finished Job it is describing.
+/// `job_id` is the id recorded when `cut()` returned. `CutStatus::job_id` is the
+/// id the worker published with that status, which is what a poll matches a job
+/// by. The slot's copy can still be `None` before that return.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub info: DeviceInfo,
@@ -199,6 +200,7 @@ mod tests {
             pass: Some(PassPosition { index: 2, total: 5 }),
             sent: Some(ByteProgress { sent: 4096, total: 20480 }),
             error: Some(DeviceError::Timeout),
+            job_id: 9,
         }
     }
 
@@ -227,6 +229,7 @@ mod tests {
                 assert_eq!(s[0].status.pass, Some(PassPosition { index: 2, total: 5 }));
                 assert_eq!(s[0].status.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
                 assert_eq!(s[0].status.error, Some(DeviceError::Timeout));
+                assert_eq!(s[0].status.job_id, 9);
                 assert_eq!(s[0].job_id, Some(7));
             }
             other => panic!("round trip changed the variant: {other:?}"),

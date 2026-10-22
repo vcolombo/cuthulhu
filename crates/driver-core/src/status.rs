@@ -68,6 +68,10 @@ pub struct CutStatus {
     pub pass: Option<PassPosition>,
     pub sent: Option<ByteProgress>,
     pub error: Option<DeviceError>,
+    /// Whose cut this is. Lifecycle reports use 0. A finished job rests on `Idle`,
+    /// which has no id of its own, so two jobs that end the same way would publish
+    /// equal statuses without this copied across.
+    pub job_id: u64,
 }
 
 impl CutStatus {
@@ -75,7 +79,7 @@ impl CutStatus {
     /// `DeviceManager` in an `Option` it empties at shutdown, and a status is
     /// still owed after that.
     pub fn disconnected() -> CutStatus {
-        status_of(&DeviceState::Disconnected, 0, None)
+        status_of(&DeviceState::Disconnected, 0, None, 0)
     }
 
     /// True while a cut is mid-flight — what the window-close guard asks.
@@ -90,7 +94,12 @@ impl CutStatus {
 /// `ended` is the outcome the worker remembers for a job that ran to the end. A
 /// cancelled job needs no such memory: it rests on a state of its own, so it can
 /// say how it ended from the state alone.
-pub(crate) fn status_of(state: &DeviceState, total_passes: usize, ended: Option<Ended>) -> CutStatus {
+pub(crate) fn status_of(
+    state: &DeviceState,
+    total_passes: usize,
+    ended: Option<Ended>,
+    job_id: u64,
+) -> CutStatus {
     let ended = match state {
         DeviceState::Cancelled { .. } => Some(Ended::Cancelled),
         // A fault is not an ending, and callers render `ended` and `Failed`
@@ -149,7 +158,7 @@ pub(crate) fn status_of(state: &DeviceState, total_passes: usize, ended: Option<
         ),
         DeviceState::Error(e) => (Phase::Failed, Actions::default(), None, None, Some(e.clone())),
     };
-    CutStatus { phase, ended, actions, pass, sent, error }
+    CutStatus { phase, ended, actions, pass, sent, error, job_id }
 }
 
 #[cfg(test)]
@@ -162,20 +171,20 @@ mod tests {
     /// manager.rs's `cut`, `resume` and `confirm_pass_done`.
     #[test]
     fn actions_state_which_calls_are_legal() {
-        let idle = status_of(&DeviceState::Idle, 0, None);
+        let idle = status_of(&DeviceState::Idle, 0, None, 0);
         assert_eq!(idle.phase, Phase::Idle);
         assert!(idle.actions.cut && !idle.actions.cancel && !idle.actions.resume && !idle.actions.confirm);
 
-        let swap = status_of(&DeviceState::WaitingForColorSwap { job_id: 1, next_pass_index: 1 }, 3, None);
+        let swap = status_of(&DeviceState::WaitingForColorSwap { job_id: 1, next_pass_index: 1 }, 3, None, 1);
         assert_eq!(swap.phase, Phase::AwaitingColorSwap);
         assert!(swap.actions.resume && swap.actions.cancel && !swap.actions.cut && !swap.actions.confirm);
 
-        let await_done = status_of(&DeviceState::AwaitingCompletion { job_id: 1, pass_index: 0 }, 2, None);
+        let await_done = status_of(&DeviceState::AwaitingCompletion { job_id: 1, pass_index: 0 }, 2, None, 1);
         assert_eq!(await_done.phase, Phase::AwaitingConfirmation);
         assert!(await_done.actions.confirm && await_done.actions.cancel && !await_done.actions.resume);
 
         let sending = status_of(
-            &DeviceState::Transmitting { job_id: 1, pass_index: 0, submitted_bytes: 40, total_bytes: 100 }, 2, None);
+            &DeviceState::Transmitting { job_id: 1, pass_index: 0, submitted_bytes: 40, total_bytes: 100 }, 2, None, 1);
         assert_eq!(sending.phase, Phase::Sending);
         assert!(sending.actions.cancel && !sending.actions.cut);
     }
@@ -185,7 +194,7 @@ mod tests {
     #[test]
     fn sending_carries_pass_and_byte_position() {
         let s = status_of(
-            &DeviceState::Transmitting { job_id: 7, pass_index: 1, submitted_bytes: 4096, total_bytes: 20480 }, 3, None);
+            &DeviceState::Transmitting { job_id: 7, pass_index: 1, submitted_bytes: 4096, total_bytes: 20480 }, 3, None, 7);
         assert_eq!(s.pass, Some(PassPosition { index: 1, total: 3 }));
         assert_eq!(s.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
     }
@@ -195,18 +204,18 @@ mod tests {
     /// memory of what it had seen.
     #[test]
     fn a_finished_cut_and_a_cancelled_one_are_distinguishable() {
-        let fresh = status_of(&DeviceState::Idle, 0, None);
+        let fresh = status_of(&DeviceState::Idle, 0, None, 0);
         assert_eq!(fresh.phase, Phase::Idle);
         assert_eq!(fresh.ended, None, "nothing has run yet");
 
-        let finished = status_of(&DeviceState::Idle, 3, Some(Ended::Completed));
+        let finished = status_of(&DeviceState::Idle, 3, Some(Ended::Completed), 4);
         assert_eq!(finished.phase, Phase::Idle, "phase says what is happening now");
         assert_eq!(finished.ended, Some(Ended::Completed));
 
         // Passed no remembered outcome on purpose: a cancelled job rests on a state of
         // its own, so it says how it ended without the worker having to remember.
         let cancelled = status_of(
-            &DeviceState::Cancelled { job_id: 1, pass_index: 1, submitted_bytes: 40, completion_known: true }, 3, None);
+            &DeviceState::Cancelled { job_id: 1, pass_index: 1, submitted_bytes: 40, completion_known: true }, 3, None, 1);
         assert_eq!(cancelled.phase, Phase::Idle, "a cancelled job is no longer in flight");
         assert_eq!(cancelled.ended, Some(Ended::Cancelled));
         assert_eq!(cancelled.pass, Some(PassPosition { index: 1, total: 3 }));
@@ -224,6 +233,7 @@ mod tests {
                 &DeviceState::Cancelled { job_id: 1, pass_index: 0, submitted_bytes: 40, completion_known },
                 2,
                 None,
+                1,
             )
         };
         assert!(cancelled(true).actions.cut, "a poll saw the machine at rest, so another Job may start");
@@ -241,7 +251,7 @@ mod tests {
     fn a_fault_is_not_an_ending() {
         // Handed a remembered completion on purpose: the fault has to clear it, not
         // merely fail to add one.
-        let failed = status_of(&DeviceState::Error(DeviceError::Timeout), 1, Some(Ended::Completed));
+        let failed = status_of(&DeviceState::Error(DeviceError::Timeout), 1, Some(Ended::Completed), 0);
         assert_eq!(failed.phase, Phase::Failed);
         assert_eq!(failed.ended, None);
         assert_eq!(failed.error, Some(DeviceError::Timeout));
@@ -258,10 +268,23 @@ mod tests {
             DeviceState::CancelRequested { job_id: 1 },
             DeviceState::Stopping { job_id: 1 },
         ] {
-            assert!(status_of(&state, 2, None).is_active(), "{state:?} is mid-flight");
+            assert!(status_of(&state, 2, None, 1).is_active(), "{state:?} is mid-flight");
         }
         for state in [DeviceState::Idle, DeviceState::Disconnected] {
-            assert!(!status_of(&state, 0, None).is_active(), "{state:?} is not mid-flight");
+            assert!(!status_of(&state, 0, None, 0).is_active(), "{state:?} is not mid-flight");
         }
+    }
+
+    /// `Idle` carries no job of its own. The id has to ride on the status, or two
+    /// jobs that finish the same way publish one value and the later one is dropped.
+    #[test]
+    fn two_finished_jobs_keep_the_ids_they_were_emitted_with() {
+        let first = status_of(&DeviceState::Idle, 0, Some(Ended::Completed), 4);
+        let second = status_of(&DeviceState::Idle, 0, Some(Ended::Completed), 5);
+        assert_eq!(first.phase, second.phase);
+        assert_eq!(first.ended, second.ended);
+        assert_eq!(first.job_id, 4);
+        assert_eq!(second.job_id, 5);
+        assert_ne!(first, second);
     }
 }

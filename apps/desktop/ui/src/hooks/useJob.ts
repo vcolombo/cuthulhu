@@ -16,27 +16,8 @@ const ACCEPTED_STATUS: ipc.CutStatus = {
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 };
-
-/** An ending a later poll can still be holding. Plain Idle and Disconnected are how a
- *  cutter connects, so latching those would swallow the next connect. */
-function jobEnding(status: ipc.CutStatus): boolean {
-  return status.ended !== null || status.phase === "Failed" || status.phase === "Cancelling";
-}
-
-function sameStatus(a: ipc.CutStatus, b: ipc.CutStatus): boolean {
-  if (a.phase !== b.phase || a.ended !== b.ended) return false;
-  const aa = a.actions;
-  const bb = b.actions;
-  if (aa.cut !== bb.cut || aa.cancel !== bb.cancel || aa.resume !== bb.resume || aa.confirm !== bb.confirm) return false;
-  if (a.pass === null || b.pass === null) {
-    if (a.pass !== b.pass) return false;
-  } else if (a.pass.index !== b.pass.index || a.pass.total !== b.pass.total) return false;
-  if (a.sent === null || b.sent === null) {
-    if (a.sent !== b.sent) return false;
-  } else if (a.sent.sent !== b.sent.sent || a.sent.total !== b.sent.total) return false;
-  return JSON.stringify(a.error) === JSON.stringify(b.error);
-}
 
 function sameHost(a: ipc.PairedHostView | null, b: ipc.PairedHostView): boolean {
   return a !== null && a.id === b.id && a.name === b.name && a.address === b.address && a.unreachable === b.unreachable;
@@ -74,49 +55,31 @@ export function useJob(onError: (message: string) => void) {
   const cancelQueuedRef = useRef(false);
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
-  /** The ending `remember` replaced. A poll has no job id, so the same value coming
-   *  back is the previous cut, not this one finishing the same way. The placeholder
-   *  Sending is local and does not clear it; a polled active phase does. */
-  const staleStatusRef = useRef<ipc.CutStatus | null>(null);
-  const lastTerminalRef = useRef<ipc.CutStatus | null>(null);
+  /** The id this session accepted. Null when a remote accept reported none. */
   const acceptedJobRef = useRef<number | null>(null);
-  const seenJobRef = useRef<number | null>(null);
-  /** Bumped in `remember`. A read started before this accept can still resolve with
-   *  the previous cut's Sending, and that must not clear the latched ending. */
+  /** When the accept reported no id, a status at or below this is the previous cut. */
+  const floorRef = useRef(0);
+  /** Bumped in `remember`. A read started before this accept still belongs to the
+   *  previous aim, and must not land on the surface this accept just put up. */
   const acceptGenRef = useRef(0);
 
-  const ingest = useCallback((next: ipc.CutStatus, eventJobId?: number) => {
+  const ingest = useCallback((next: ipc.CutStatus) => {
     if (offlineRef.current) return;
-    // A host blip's live read is Disconnected, and it is not the job. The poll freezes
-    // instead; applying it here would drop the pass the operator is still watching.
-    if (
-      hostIdRef.current !== null
-      && snapshotRef.current !== null
-      && jobIsActive(statusRef.current.phase)
-      && next.phase === "Disconnected"
-    ) {
-      return;
-    }
-    const accepted = acceptedJobRef.current;
-    // Ids only increase, and 0 is a lifecycle event. A smaller id is the previous
-    // cut. A larger one can arrive before accept returns: that is this cut, and a
-    // failure in that window has to land.
-    if (eventJobId !== undefined && eventJobId !== 0 && accepted !== null && eventJobId < accepted) return;
-    const namesThisCut = eventJobId !== undefined && eventJobId !== 0 && eventJobId === accepted;
-    const stale = staleStatusRef.current;
-    // The replaced ending can be the initial Disconnected. Once the aim is gone, that
-    // same phase is the detach, and keeping it out would leave Resume on screen.
-    const detached = next.phase === "Disconnected" && hostIdRef.current === null;
-    if (stale !== null && sameStatus(next, stale) && !namesThisCut && !detached) return;
-    // A remote accept reports job id 0 (`execute_cut`'s ponytail: `Accepted` carries
-    // none), so a poll cannot name this cut. Seeing it active is the proof the host
-    // has left the previous ending; a later identical Idle is then this cut finishing.
-    if (jobIsActive(next.phase) || namesThisCut) staleStatusRef.current = null;
-    if (eventJobId !== undefined && eventJobId !== 0) seenJobRef.current = eventJobId;
-    // This cut's own failure can arrive before accept returns. Recording it as the
-    // previous ending is what would make `remember` paint Sending over Cut failed.
-    if (jobEnding(next) && !(eventJobId !== undefined && eventJobId !== 0 && accepted !== null && eventJobId !== accepted)) {
-      lastTerminalRef.current = next;
+    // A host that is still aimed does not go idle by reporting Disconnected. That
+    // read is a blip; the poll freezes the last status instead.
+    if (hostIdRef.current !== null && next.phase === "Disconnected") return;
+    const id = next.jobId;
+    // 0 is a lifecycle report, not an older job. A smaller id is the previous cut.
+    // A larger one can arrive before accept returns: that is this cut.
+    if (id !== 0) {
+      const accepted = acceptedJobRef.current;
+      if (accepted !== null && id < accepted) return;
+      if (accepted === null && id <= floorRef.current) return;
+      // The first id of a cut whose accept named none. A higher id that arrives
+      // while one is already accepted is the next cut, and stays above the floor
+      // until `remember` claims it — raising the floor here would hide that cut.
+      if (accepted === null) floorRef.current = id;
+      acceptedJobRef.current = id;
     }
     statusRef.current = next;
     setStatus(next);
@@ -248,7 +211,7 @@ export function useJob(onError: (message: string) => void) {
 
   useEffect(() => {
     const unlisten = listen<ipc.DeviceEvent>("device-event", (event) => {
-      ingest(event.payload.status, event.payload.job_id);
+      ingest(event.payload.status);
     });
     return () => {
       unlisten.then((stop) => stop());
@@ -287,22 +250,28 @@ export function useJob(onError: (message: string) => void) {
     setSnapshot(next);
     setDismissed(false);
     cancelQueuedRef.current = false;
-    acceptedJobRef.current = next.jobId;
     const prev = statusRef.current;
-    // The worker can report this cut, including an immediate failure, before accept
-    // returns. That status is the job. Only an ending from before it is replaced.
-    const alreadyThisCut = seenJobRef.current === next.jobId;
-    if (!alreadyThisCut && !jobIsActive(prev.phase)) {
-      if (jobEnding(prev)) {
-        lastTerminalRef.current = prev;
-        staleStatusRef.current = prev;
+    if (next.jobId !== 0) {
+      acceptedJobRef.current = next.jobId;
+      floorRef.current = next.jobId;
+    } else {
+      // `Accepted` carries no id. An id above the floor is this cut, published
+      // before the accept returned. Anything else on screen is the previous cut.
+      const early = prev.jobId !== 0 && prev.jobId > floorRef.current && acceptedJobRef.current === prev.jobId;
+      if (early) {
+        floorRef.current = prev.jobId;
+        return;
       }
-      statusRef.current = ACCEPTED_STATUS;
-      setStatus(ACCEPTED_STATUS);
-      setLastStatusAt(Date.now());
-    } else if (lastTerminalRef.current !== null && jobEnding(lastTerminalRef.current) && !sameStatus(lastTerminalRef.current, prev)) {
-      staleStatusRef.current = lastTerminalRef.current;
+      if (prev.jobId !== 0) floorRef.current = prev.jobId;
+      acceptedJobRef.current = null;
     }
+    // This cut can publish, including a failure, before accept returns. That status
+    // is the job. Replacing it would hide the only one this cut is going to emit.
+    if (next.jobId !== 0 && prev.jobId === next.jobId) return;
+    const placeholder: ipc.CutStatus = { ...ACCEPTED_STATUS, jobId: next.jobId };
+    statusRef.current = placeholder;
+    setStatus(placeholder);
+    setLastStatusAt(Date.now());
   }, []);
 
   const dismiss = useCallback(() => setDismissed(true), []);

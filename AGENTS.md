@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# CLAUDE.md
+# Shared agent guidance
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides shared agent guidance when working with code in this repository.
 
 ## What this is
 

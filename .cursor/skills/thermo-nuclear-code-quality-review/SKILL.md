@@ -1,6 +1,7 @@
 ---
 name: thermo-nuclear-code-quality-review
 description: Run an extremely strict maintainability and code-quality review of a branch or PR diff. Pushes for structural simplification ("code judo"), flags spaghetti growth, files crossing 1k lines, leaky boundaries, thin wrappers and cast-heavy contracts. Use for PR reviews, including the thermo draft-review automation.
+disable-model-invocation: true
 ---
 
 # Thermo-Nuclear Code Quality Review

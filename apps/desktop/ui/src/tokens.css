@@ -173,55 +173,41 @@ body {
   box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
 }
 
-/* Tailwind's preflight sets `appearance: button` inside `@layer base`. Chromium
-   then paints ButtonText, and that used color stays the light foreground after
-   the page flips to dark — enabled labels render dark-on-dark while an explicit
-   `color` on a non-button updates. Unlayered so it wins over the preflight.
-   Checkboxes and radios keep their native appearance. `color` is left to the
-   utilities: an unlayered `color: inherit` would beat `text-foreground`. */
+/* Tailwind's preflight sets `appearance: button` and `color: inherit` inside
+   `@layer base`. Unlayered, so this wins, and the same rule matches in light
+   and dark: the ink is the token, which already changes with the theme. A
+   selector that only starts matching when `.dark` is added is what a theme
+   flip has to wait on, and a full-page shot of that frame was still the
+   previous ink. Checkboxes and radios keep their native appearance. A button
+   that names its own colour is restated below, or a primary label would
+   become body text. */
 button,
 input:where([type="button"], [type="reset"], [type="submit"]) {
   appearance: none;
-}
-
-/* Chromium does not repaint a button's used `color` when `color-scheme` flips,
-   even when that color is a variable that already holds the new theme. The
-   light foreground (`#012f36`) stays painted on the dark panel, which is how
-   Collapse, Undo and the inactive tabs disappeared. A rule that starts or
-   stops matching on the flip replaces the used value. A button that names its
-   own color is restated underneath, or a primary label would become body text.
-   The active tab keeps the unlayered rule further down: it is more specific
-   than `.dark button`, and the muted restatement excludes `data-state=active`. */
-:root:not(.dark) button:not([data-state="active"]),
-:root:not(.dark) input:where([type="button"], [type="reset"], [type="submit"]) {
   color: var(--foreground);
 }
-.dark button:not([data-state="active"]),
-.dark input:where([type="button"], [type="reset"], [type="submit"]) {
-  color: var(--foreground);
-}
-:root:not(.dark) button.text-primary-foreground,
-.dark button.text-primary-foreground {
-  color: var(--primary-foreground);
-}
-:root:not(.dark) button.text-muted-foreground:not([data-state="active"]),
-.dark button.text-muted-foreground:not([data-state="active"]) {
-  color: var(--muted-foreground);
-}
-:root:not(.dark) button.text-destructive,
-.dark button.text-destructive {
-  color: var(--destructive);
-}
-:root:not(.dark) button.text-accent-ink,
-.dark button.text-accent-ink {
+/* Inactive tabs stay on the muted token (the restatement below). The active
+   tab names accent ink in both themes; the dark rule further down puts the
+   darker teal on the white pill, which is the pairing that stays above 4.5:1. */
+button[role="tab"][data-state="active"] {
   color: var(--accent-ink);
 }
-:root:not(.dark) button.text-warning,
-.dark button.text-warning {
+button.text-primary-foreground {
+  color: var(--primary-foreground);
+}
+button.text-muted-foreground:not([data-state="active"]) {
+  color: var(--muted-foreground);
+}
+button.text-destructive {
+  color: var(--destructive);
+}
+button.text-accent-ink {
+  color: var(--accent-ink);
+}
+button.text-warning {
   color: var(--warning);
 }
-:root:not(.dark) button.text-success,
-.dark button.text-success {
+button.text-success {
   color: var(--success);
 }
 

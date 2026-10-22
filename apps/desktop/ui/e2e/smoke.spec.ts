@@ -218,11 +218,13 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
   }
 
   // Screenshot seed only. Green is not a named swatch; gold is, so the swap bar can say "Gold vinyl".
+  // A rect is drawn from its transform (`buildScene` uses w/h at the local origin). An x on the
+  // rect leaves both squares on the same point, and red over gold reads as one orange square.
   if (opts?.seedRedGold) {
     const redId = nextId++;
     doc.nodes[redId] = {
       id: redId,
-      kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
+      kind: { Shape: { Rect: { w: 10, h: 10 } } },
       transform: [1, 0, 0, 1, 0, 0],
       style: { stroke: 0xff0000ff, fill: null },
       children: [],
@@ -232,8 +234,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     const goldId = nextId++;
     doc.nodes[goldId] = {
       id: goldId,
-      kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
-      transform: [1, 0, 0, 1, 0, 0],
+      kind: { Shape: { Rect: { w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 30, 0],
       style: { stroke: 0xd39900ff, fill: null },
       children: [],
       cut_line_type: "Cut",
@@ -6234,6 +6236,10 @@ test("the boot script paints the cached theme before preferences answer", async 
 
 async function paintContrast(page: Page, locator: Locator) {
   const bytes = (await locator.screenshot()) as unknown as Uint8Array;
+  return contrastFromPng(page, bytes);
+}
+
+async function contrastFromPng(page: Page, bytes: Uint8Array) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   const rgba = await page.evaluate(async (png) => {
@@ -6467,3 +6473,155 @@ test("Option+S subtracts when the produced character is not s", async ({ page })
   });
   await expect.poll(() => page.evaluate(() => (window as unknown as { __booleanOp?: string }).__booleanOp)).toBe("Subtract");
 });
+
+/** Boxes first, then one full-page shot. A later clip is a different paint: the
+ *  screenshot walk captures the frame the theme click returns on. */
+async function contrastsOnPageShot(
+  page: Page,
+  items: { name: string; locator: Locator }[],
+) {
+  const regions: { name: string; box: { x: number; y: number; width: number; height: number } }[] = [];
+  for (const item of items) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    regions.push({ name: item.name, box });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const crops = await page.evaluate(
+    async (payload: {
+      png: string;
+      regions: { name: string; box: { x: number; y: number; width: number; height: number } }[];
+    }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${payload.png}`;
+      await img.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no canvas");
+      ctx.drawImage(img, 0, 0);
+      const scale = img.naturalWidth / window.innerWidth;
+      return payload.regions.map((region) => {
+        const data = ctx.getImageData(
+          Math.round(region.box.x * scale),
+          Math.round(region.box.y * scale),
+          Math.max(1, Math.round(region.box.width * scale)),
+          Math.max(1, Math.round(region.box.height * scale)),
+        ).data;
+        return { name: region.name, rgba: Array.from(data) };
+      });
+    },
+    { png: btoa(binary), regions },
+  );
+  return crops.map((crop) => ({ name: crop.name, hit: renderedContrastFromPixels(crop.rgba) }));
+}
+
+const JOB_INK = [
+  { name: "Cancel job", role: "button" as const, min: 4.5 },
+  { name: "Collapse", role: "button" as const, min: 4.5 },
+  { name: "Import", role: "button" as const, min: 4.5 },
+  { name: "File", role: "button" as const, min: 4.5 },
+  { name: "Fit mat", role: "button" as const, min: 4.5 },
+  { name: "Properties", role: "tab" as const, min: 4.5 },
+  { name: "Undo", role: "button" as const, min: 3 },
+];
+
+async function openSwap(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+}
+
+function jobInkLocators(page: Page) {
+  return JOB_INK.map((item) => ({
+    ...item,
+    locator: page.getByRole(item.role, { name: item.name, exact: true }),
+  }));
+}
+
+test("a cold dark boot paints job controls on the full-page shot", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await openSwap(page);
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const samples = await contrastsOnPageShot(page, jobInkLocators(page));
+  assertDarkJobInk(samples);
+});
+
+test("a light-to-dark switch paints job controls on the screenshot the walk takes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await openSwap(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  const items = jobInkLocators(page);
+  const regions: { name: string; min: number; locator: Locator }[] = [];
+  for (const item of items) regions.push(item);
+  // Boxes before the click. Anything awaited after the click lets the old
+  // transition finish, which is the measurement the full-page shot does not get.
+  const boxed: { name: string; min: number; box: { x: number; y: number; width: number; height: number } }[] = [];
+  for (const item of regions) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    boxed.push({ name: item.name, min: item.min, box });
+  }
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const crops = await page.evaluate(
+    async (payload: {
+      png: string;
+      regions: { name: string; box: { x: number; y: number; width: number; height: number } }[];
+    }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${payload.png}`;
+      await img.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no canvas");
+      ctx.drawImage(img, 0, 0);
+      const scale = img.naturalWidth / window.innerWidth;
+      return payload.regions.map((region) => {
+        const data = ctx.getImageData(
+          Math.round(region.box.x * scale),
+          Math.round(region.box.y * scale),
+          Math.max(1, Math.round(region.box.width * scale)),
+          Math.max(1, Math.round(region.box.height * scale)),
+        ).data;
+        return { name: region.name, rgba: Array.from(data) };
+      });
+    },
+    { png: btoa(binary), regions: boxed },
+  );
+  assertDarkJobInk(crops.map((crop, i) => ({
+    name: crop.name,
+    min: boxed[i].min,
+    hit: renderedContrastFromPixels(crop.rgba),
+  })));
+});
+
+function assertDarkJobInk(samples: { name: string; min?: number; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    const min = sample.min ?? JOB_INK.find((item) => item.name === sample.name)?.min ?? 4.5;
+    console.log("job ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.background[0], `${sample.name} background`).toBeLessThan(80);
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(min);
+  }
+}

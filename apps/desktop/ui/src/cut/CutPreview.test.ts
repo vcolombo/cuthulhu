@@ -35,7 +35,7 @@ describe("cssColor", () => {
 
 type Draw = { op: "fill" | "fillText"; style: string; text?: string };
 
-function recordingContext(canvas: HTMLCanvasElement, draws: Draw[]) {
+function recordingContext(canvas: HTMLCanvasElement, draws: Draw[], transforms: number[][]) {
   const ctx = {
     canvas,
     fillStyle: "",
@@ -45,7 +45,7 @@ function recordingContext(canvas: HTMLCanvasElement, draws: Draw[]) {
     font: "",
     textAlign: "start",
     textBaseline: "alphabetic",
-    setTransform() {},
+    setTransform(...args: number[]) { transforms.push(args); },
     clearRect() {},
     fillRect() {},
     strokeRect() {},
@@ -99,8 +99,9 @@ describe("CutPreview drawing", () => {
 
   it("fills each colour pass from vinylDisplay and numbers every shape in cut order", async () => {
     const draws: Draw[] = [];
+    const transforms: number[][] = [];
     HTMLCanvasElement.prototype.getContext = function (this: HTMLCanvasElement) {
-      return recordingContext(this, draws);
+      return recordingContext(this, draws, transforms);
     } as unknown as typeof HTMLCanvasElement.prototype.getContext;
     const scene: Scene = { nodes: [rect(1, 0), rect(2, 20), rect(3, 40)] };
     const passes: PreviewPass[] = [
@@ -122,5 +123,19 @@ describe("CutPreview drawing", () => {
     ]);
     // A badge per pass would read "1", "1", "2": the second shape of the red pass is still pass 1.
     expect(draws.filter((d) => d.op === "fillText").map((d) => d.text)).toEqual(["1", "2", "3"]);
+
+    // The fit the effect actually used. A 16px margin leaves the badge on the frame and still
+    // passes the fill and number checks above.
+    const canvas = el.querySelector("canvas");
+    expect(canvas).toBeTruthy();
+    const expected = cutPreviewViewport(
+      { x: 0, y: 0, w: 50, h: 10 },
+      { x: 0, y: 0, w: 100, h: 100 },
+      { w: canvas?.width ?? 0, h: canvas?.height ?? 0 },
+    );
+    const fit = transforms.find((args) => args[0] !== 1);
+    expect(fit?.[0]).toBeCloseTo(expected.scale);
+    expect(fit?.[4]).toBeCloseTo(expected.tx);
+    expect(fit?.[5]).toBeCloseTo(expected.ty);
   });
 });

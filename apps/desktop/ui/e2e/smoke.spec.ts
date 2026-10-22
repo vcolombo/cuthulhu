@@ -3944,8 +3944,13 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await expect(redName).toBeVisible();
     await expect(greenName).toBeVisible();
     // The settings used to share the name's line, and the name ellipsized to "Red …".
+    // These two fit the column, so width alone would stay green with truncate put back.
     for (const name of [redName, greenName]) {
       expect(await name.evaluate((node) => node.scrollWidth > node.clientWidth + 1)).toBe(false);
+      expect(await name.evaluate((node) => {
+        const style = getComputedStyle(node);
+        return style.textOverflow === "ellipsis" || style.whiteSpace === "nowrap";
+      })).toBe(false);
     }
     const nameBox = await redName.boundingBox();
     const speedLine = dialog.getByText(/Speed 10 · force 10 · 1×/).first();

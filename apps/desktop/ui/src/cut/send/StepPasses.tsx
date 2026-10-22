@@ -545,7 +545,9 @@ export function StepPasses({
 }
 
 function columns(showSpeed: boolean, showForce: boolean): string {
-  return ["20px", "minmax(0,1fr)", showSpeed ? "104px" : null, showForce ? "104px" : null, "72px", "44px"]
+  // min-content, not 0: the fixed columns already fill a narrow sheet, and a 0 minimum
+  // collapsed this one so the pass name was clipped to nothing.
+  return ["20px", "minmax(min-content,1fr)", showSpeed ? "104px" : null, showForce ? "104px" : null, "72px", "44px"]
     .filter((column) => column !== null)
     .join(" ");
 }

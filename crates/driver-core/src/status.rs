@@ -70,7 +70,10 @@ pub struct CutStatus {
     pub error: Option<DeviceError>,
     /// Whose cut this is. Lifecycle reports use 0. A finished job rests on `Idle`,
     /// which has no id of its own, so two jobs that end the same way would publish
-    /// equal statuses without this copied across.
+    /// equal statuses without this copied across. Absent on the wire is that same
+    /// 0: a Cut Host from before the field existed omits it, and the protocol has
+    /// no version with which to refuse that peer.
+    #[serde(default)]
     pub job_id: u64,
 }
 

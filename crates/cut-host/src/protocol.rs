@@ -257,6 +257,44 @@ mod tests {
         }
     }
 
+    /// A host built before `CutStatus::job_id` omits the field. The desktop still
+    /// has to read the snapshot and the event; 0 is the no-job value the field
+    /// defaults to, which is what a lifecycle report already publishes.
+    #[test]
+    fn a_status_that_omits_job_id_reads_as_no_job() {
+        let snapshot = Response::Snapshots(vec![DeviceSnapshot {
+            info: a_device(),
+            status: a_populated_status(),
+            job_id: Some(7),
+        }]);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json["Snapshots"][0]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Response = serde_json::from_value(json).unwrap();
+        match back {
+            Response::Snapshots(s) => {
+                assert_eq!(s[0].status.job_id, 0);
+                assert_eq!(s[0].status.phase, Phase::Sending);
+                assert_eq!(s[0].job_id, Some(7));
+            }
+            other => panic!("omitted job id changed the variant: {other:?}"),
+        }
+
+        let event = Event {
+            device: "usb:1:4".into(),
+            event: DeviceEvent {
+                job_id: 3,
+                kind: DeviceEventKind::StateChanged,
+                status: a_populated_status(),
+            },
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["event"]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back.event.job_id, 3);
+        assert_eq!(back.event.status.job_id, 0);
+        assert_eq!(back.event.status.phase, Phase::Sending);
+    }
+
     #[test]
     fn an_event_keeps_its_device_and_its_job() {
         let sent = Event {

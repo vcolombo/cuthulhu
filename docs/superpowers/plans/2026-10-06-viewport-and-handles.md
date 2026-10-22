@@ -49,7 +49,7 @@
 - **`apps/desktop/ipc-inventory.json` must not change.** No command, argument name or `#[tauri::command]` attribute moves; `commit_transform(ids, m)` already takes any affine.
 - **The e2e fake mirrors the real backend** (`CLAUDE.md`, *Desktop app*). Its `commit_transform` keeps only the translation today; Task 10 makes it compose the full matrix, because a fake that drops scale and rotation passes a frontend whose preview and commit disagree.
 - **Comments explain why, not what.** `// ponytail:` marks a deliberate simplification with its ceiling and upgrade path; this plan specifies five.
-- **Vocabulary:** `CONTEXT.md` gains nothing — view, handle and marquee are UI terms, not domain ones. Do not call a Node a "layer" or an "object" in new code; it is a Node, or a shape when it is one.
+- **Vocabulary:** `GLOSSARY.md` gains nothing — view, handle and marquee are UI terms, not domain ones. Do not call a Node a "layer" or an "object" in new code; it is a Node, or a shape when it is one.
 - **Out of scope, and must not creep in:** snapping and smart guides, align/distribute, group/ungroup on canvas, the ∠ properties field, weed lines, outline-accurate hit-testing, persisting the view, flip/mirror. Each is named in the spec's *Out of scope* as its own follow-up.
 
 ## File Structure

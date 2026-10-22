@@ -178,7 +178,7 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
 
 ## Conventions
 
-- **`CONTEXT.md` is normative vocabulary.** It defines Document, Node, Delta, DocumentPass,
+- **`GLOSSARY.md` is normative vocabulary.** It defines Document, Node, Delta, DocumentPass,
   PassKey, Grouping, PresetAssignment, DocumentPasses, PassSelection, CutPlan, Preflight,
   Settings, MaterialPreset, MachineProfile, MachineCaps, Driver, Transport, Job, Pass — each with
   an explicit `_Avoid_` list (no "layer" for DocumentPass, no "backend"/"plugin" for Driver, no
@@ -221,7 +221,7 @@ Default triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `rea
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
 
 ### PR review
 

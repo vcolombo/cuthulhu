@@ -17,7 +17,7 @@ Spec: `docs/superpowers/specs/2026-07-28-dry-run-framing-design.md`.
 - **SPDX header on every file**: `// SPDX-License-Identifier: GPL-3.0-or-later`. Every file this plan touches already has one; do not disturb it.
 - **`cargo test --workspace --locked`** is what CI runs. `--locked` is mandatory. This plan adds no dependency, so `Cargo.lock` must not change — if it does, something went wrong.
 - **Comments explain why, not what.** Do not add restating comments. Where a step below carries a comment, that comment is part of the deliverable.
-- **`CONTEXT.md` is normative vocabulary.** Use **Pass** (not run/cycle/layer), **Driver** (not backend/plugin). `CONTEXT.md:102` defines a Driver as what produces the bytes "to open, park and close a cutting session" — that is where `open_pass`/`close_pass` get their names.
+- **`GLOSSARY.md` is normative vocabulary.** Use **Pass** (not run/cycle/layer), **Driver** (not backend/plugin). `GLOSSARY.md:102` defines a Driver as what produces the bytes "to open, park and close a cutting session" — that is where `open_pass`/`close_pass` get their names.
 - **Commit subjects are imperative with the reason attached**, e.g. "Share one device backend factory, since the reason for copying it was never true".
 - **No AI attribution** in commits, comments, or documentation.
 - Tasks 2 and 3 are behaviour-preserving. The bytes on the wire must be identical before and after; the existing tests are the proof, and any change to them is a signal the refactor went wrong.

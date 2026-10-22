@@ -19,7 +19,7 @@ impl std::fmt::Display for CmdError {
             //
             // "node", not "shape": every command here takes ids straight from the selection, and
             // the Layers panel selects Groups and Layers too, so the id that went stale is as
-            // often a container. Node is CONTEXT.md's word for all three.
+            // often a container. Node is GLOSSARY.md's word for all three.
             CmdError::NotFound => write!(f, "the node or machine this command names is not there"),
             // Split off `NotFound` rather than widening it: a node with no parent is present,
             // and saying it "is not there" was the third rewording that sentence needed. Reached

@@ -40,7 +40,7 @@ modes.
 Adding a variant later is a one-line change here and a match arm wherever it is consumed, which
 is the point of an enum over a bool.
 
-`CONTEXT.md` gains the term, and its ColorPass entry stops being true as written —
+`GLOSSARY.md` gains the term, and its ColorPass entry stops being true as written —
 "A shape with no stroke belongs to no ColorPass and is not cut" becomes a statement about
 `CutLineType`. `docs/superpowers/specs/2026-07-22-editor-shell-design.md:85` ("for a cutting
 tool, *stroke = the cut line*") is superseded and should say so rather than be edited silently;

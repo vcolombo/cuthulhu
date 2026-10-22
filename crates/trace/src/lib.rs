@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(TraceError::EmptyResult.code(), "empty");
     }
 
-    /// CONTEXT.md puts "options" on TraceControls' _Avoid_ list; the error a bad control raises
+    /// GLOSSARY.md puts "options" on TraceControls' _Avoid_ list; the error a bad control raises
     /// has to follow the vocabulary or it reintroduces the word at the exact moment it matters.
     #[test]
     fn rejected_control_speaks_of_controls_not_options() {

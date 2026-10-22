@@ -19,7 +19,7 @@
 - The CI cross build `cross build --release --locked --target aarch64-unknown-linux-gnu -p cut-host --bin cuthulhu-cutd` must keep working — after this plan, with `--no-default-features` added.
 - Comments explain why, not what; `// ponytail:` marks a deliberate simplification with its ceiling and upgrade path.
 - Commit subjects are imperative with the reason attached.
-- Vocabulary per `CONTEXT.md` (a Cut Host is a host; never "backend").
+- Vocabulary per `GLOSSARY.md` (a Cut Host is a host; never "backend").
 - Error prose matches `ClientError::Transport`'s existing voice: lower-case sentences naming what the operator can act on.
 - Every task ends green: `cargo test -p cut-host` at minimum, full workspace before each commit.
 

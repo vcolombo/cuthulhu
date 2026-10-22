@@ -111,7 +111,7 @@ and `{:?}` in operator text is the thing this candidate exists to remove.
 
 Two wordings are chosen against what the code says today, for reasons worth recording:
 
-`NothingToCut` avoids "enabled pass". `CONTEXT.md` lists *enabled pass* under `_Avoid_`, and
+`NothingToCut` avoids "enabled pass". `GLOSSARY.md` lists *enabled pass* under `_Avoid_`, and
 `CLAUDE.md` states the rule it protects: "A pass is not 'enabled/disabled': a colour nobody lists in
 `PlanOptions::passes` is not cut." The desktop's current `"no enabled pass has any geometry"`
 describes a flag that is not the mechanism.

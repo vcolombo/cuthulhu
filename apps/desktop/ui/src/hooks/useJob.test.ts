@@ -357,6 +357,27 @@ describe("useJob", () => {
     expect(api.current?.status.actions.resume).toBe(false);
   });
 
+  it("shows a smaller job id after the aimed cutter changes", async () => {
+    const other = { ...REMOTE, instance_id: "usb:pi:D" } as DeviceInfo;
+    const first = done(5);
+    const second = status({
+      phase: "Sending",
+      jobId: 2,
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+    });
+    ipc.getDeviceState.mockResolvedValue(first);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(5)); });
+    await act(async () => { emit(5, first); });
+    expect(api.current?.status.jobId).toBe(5);
+
+    ipc.getDeviceState.mockResolvedValue(second);
+    await act(async () => { api.current?.attach(other); });
+    await act(async () => { emit(2, second); });
+    expect(api.current?.status).toEqual(second);
+  });
+
   it("does not let the previous cutter's poll replace the one now aimed on the same host", async () => {
     const other = { ...REMOTE, instance_id: "usb:pi:D" } as DeviceInfo;
     const idle = status({ phase: "Idle", actions: { cut: true, cancel: false, resume: false, confirm: false } });

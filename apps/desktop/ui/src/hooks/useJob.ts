@@ -187,6 +187,14 @@ export function useJob(onError: (message: string) => void) {
       aimGenRef.current += 1;
       // The queued cancel named the cutter we just left.
       cancelQueuedRef.current = false;
+      // Job ids start over on each cutter. Keeping the previous floor would drop
+      // a smaller id on the one now aimed, and cancel would hit that cutter while
+      // the old job stayed on screen. Clearing the floor on the way out would let
+      // a late event from the cutter we left back in; the detach read replaces it.
+      if (instance !== null) {
+        acceptedJobRef.current = null;
+        floorRef.current = 0;
+      }
     }
     instanceRef.current = instance;
     hostIdRef.current = next;

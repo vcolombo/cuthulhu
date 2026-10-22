@@ -255,6 +255,8 @@ describe("reorderTo", () => {
     expect(reorderTo(rows, 1, 1)).toBeNull();
     expect(reorderTo(rows, -1, 0)).toBeNull();
     expect(reorderTo(rows, 0, 3)).toBeNull();
+    expect(reorderTo(rows, Number.NaN, 1)).toBeNull();
+    expect(reorderTo(rows, 1.5, 0)).toBeNull();
   });
 });
 

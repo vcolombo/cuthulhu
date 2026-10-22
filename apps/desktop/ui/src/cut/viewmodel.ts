@@ -163,6 +163,9 @@ export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] 
 /** Drag a row from `from` to `to`. Null when nothing moves, so a drop on the same row
  *  does not ask the planner for travel it already has. */
 export function reorderTo<T>(rows: T[], from: number, to: number): T[] | null {
+  // `NaN` fails every one of the comparisons below, and `splice` then treats it as 0,
+  // so a drop that is not an index would move the first pass.
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return null;
   if (from === to || from < 0 || to < 0 || from >= rows.length || to >= rows.length) return null;
   const next = rows.slice();
   const [row] = next.splice(from, 1);

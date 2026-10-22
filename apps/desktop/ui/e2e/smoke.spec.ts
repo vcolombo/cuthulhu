@@ -3095,6 +3095,28 @@ test("dragging a pass asks the backend for travel in the new order", async ({ pa
   ]]);
 });
 
+test("a drop that is not a pass index leaves the order alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+
+  await page.getByTestId("cut-pass-row").nth(1).evaluate((row) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "foo");
+    row.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
+    row.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
+  });
+
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: unknown[] }).__travelRequests,
+  );
+  expect(requests ?? []).toEqual([]);
+});
+
 test("the mini mat names the pass under the pointer and dims the others", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

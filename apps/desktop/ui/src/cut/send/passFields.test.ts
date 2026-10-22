@@ -83,6 +83,25 @@ describe("collectPassIssues", () => {
     expect(collectPassIssues([named, blank], lookup([], true), CAMEO, RANGES)).toEqual(issues);
   });
 
+  it("refuses an override the operator typed on a preset the list has not resolved", () => {
+    const over = row({ presetId: "vinyl", speed: 99, force: 10 });
+    const issue = [{ index: 0, field: "speed", message: "Use 1–30" }];
+    expect(collectPassIssues([over], lookup([], false), CAMEO, RANGES)).toEqual(issue);
+    expect(collectPassIssues([over], lookup([], true), CAMEO, RANGES)).toEqual(issue);
+    expect(collectPassIssues([row({ presetId: "vinyl", speed: 10, force: 10 })], lookup([], false), CAMEO, RANGES)).toEqual([]);
+    // A machine that cannot set speed does not flag a speed it will not send.
+    expect(collectPassIssues([over], lookup([], false), PUMA, RANGES)).toEqual([]);
+  });
+
+  it("refuses a level that is not a whole number", () => {
+    expect(collectPassIssues([row({ speed: 1.5, force: 10 })], lookup(), CAMEO, RANGES)).toEqual([
+      { index: 0, field: "speed", message: "Use 1–30" },
+    ]);
+    expect(collectPassIssues([row({ speed: 10, force: 10, repeatCount: 1.5 })], lookup(), CAMEO, RANGES)).toEqual([
+      { index: 0, field: "repeat", message: "Use 1–10" },
+    ]);
+  });
+
   it("refuses a speed outside the ranges, including zero", () => {
     expect(collectPassIssues([row({ speed: 99, force: 10 })], lookup(), CAMEO, RANGES)).toEqual([
       { index: 0, field: "speed", message: "Use 1–30" },

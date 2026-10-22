@@ -3138,6 +3138,9 @@ test("an inch weed margin is a view of the millimetre draft", async ({ page }) =
   await page.getByLabel("Weed border").check();
   const margin = page.getByLabel("Weed margin");
   await expect(margin).toHaveValue("0.12");
+  await margin.fill("2");
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.02–1.97 in" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
   await margin.fill("1");
   await fillSendLevels(page);
   await startCut(page);

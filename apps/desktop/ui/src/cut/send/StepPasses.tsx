@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { ChevronDown, GripVertical } from "lucide-react";
 import type { LengthUnit } from "../../length";
 import { formatLength, unitToMm } from "../../length";
@@ -65,6 +65,7 @@ export function StepPasses({
   weedDraft,
   weedRead,
   changeWeed,
+  onWeedEditing,
   planRows,
   planGrouping,
   skippedNotCut,
@@ -112,6 +113,8 @@ export function StepPasses({
   weedDraft: WeedDraft;
   weedRead: WeedRead;
   changeWeed: (next: WeedDraft) => void;
+  /** True while an inch field holds a fragment that is not a millimetre value yet. */
+  onWeedEditing: (editing: boolean) => void;
   planRows: PassRow[] | null;
   planGrouping: ipc.Grouping | null;
   skippedNotCut: number | null;
@@ -126,6 +129,16 @@ export function StepPasses({
   // Open, so the weed controls are on the step the moment it is. Collapsing is a look, not a gate.
   const [weedOpen, setWeedOpen] = useState(true);
   const [highlight, setHighlight] = useState<number | null>(null);
+  // The inch text of a field that is not a finished number yet (`1.`). It stays out of the
+  // millimetre draft: writing it would either snap the field or plan a length nobody typed.
+  const [inchPending, setInchPending] = useState<Partial<Record<WeedField, string>>>({});
+  useEffect(() => {
+    setInchPending({});
+    onWeedEditing(false);
+    // Leaving the step drops the fragment with it. The sheet would otherwise keep Next
+    // gated on an edit the fields are no longer showing.
+    return () => onWeedEditing(false);
+  }, [unit, onWeedEditing]);
   const rows = planRows ?? [];
   const showSpeed = caps.supportsSpeed;
   const showForce = caps.supportsForce;
@@ -135,9 +148,15 @@ export function StepPasses({
   // Not disabled while a replan is in flight, unlike the row controls: every keystroke replans,
   // and a field that locked itself mid-word would lose the caret. These fields are not rows, so
   // nothing typed here is discarded by the plan that lands.
+  const setPending = (next: Partial<Record<WeedField, string>>) => {
+    setInchPending(next);
+    onWeedEditing(Object.keys(next).length > 0);
+  };
+
   const weedInput = (field: WeedField, name: string, off: boolean) => {
     const error = weedRead.ok ? undefined : weedRead.errors[field];
     const label = `${name} (${unit})`;
+    const pending = unit === "in" ? inchPending[field] : undefined;
     return (
       <label className="flex items-center gap-2 text-sm">
         {label}
@@ -145,14 +164,26 @@ export function StepPasses({
           aria-label={`Weed ${label.toLowerCase()}`}
           type="number"
           step="0.1"
-          value={unit === "mm" ? weedDraft[field] : lengthFromDraft(weedDraft[field])}
+          value={pending !== undefined ? pending : unit === "mm" ? weedDraft[field] : lengthFromDraft(weedDraft[field])}
           disabled={off}
-          aria-invalid={error !== undefined}
-          onChange={(event) => changeWeed({
-            ...weedDraft,
-            [field]: unit === "mm" ? event.target.value : lengthToDraft(event.target.value),
-          })}
-          className={cn("h-8 w-24 rounded-md border bg-background px-2 text-sm", error ? "border-destructive" : "border-input")}
+          aria-invalid={error !== undefined || pending !== undefined}
+          onChange={(event) => {
+            const typed = event.target.value;
+            if (unit !== "mm" && !inchReady(typed)) {
+              setPending({ ...inchPending, [field]: typed });
+              return;
+            }
+            if (pending !== undefined) {
+              const rest = { ...inchPending };
+              delete rest[field];
+              setPending(rest);
+            }
+            changeWeed({
+              ...weedDraft,
+              [field]: unit === "mm" ? typed : lengthToDraft(typed),
+            });
+          }}
+          className={cn("h-8 w-24 rounded-md border bg-background px-2 text-sm", error || pending !== undefined ? "border-destructive" : "border-input")}
         />
       </label>
     );
@@ -450,7 +481,7 @@ export function StepPasses({
             {weedInput("clearance", "Clearance", !weedDraft.border || weedDraft.lines === "None")}
             {!weedRead.ok ? (
               <div role="alert" className="text-sm text-destructive">
-                {Object.values(weedRead.errors).join(". ")}.
+                {Object.values(weedRead.errors).map((message) => weedMessage(message, unit)).join(". ")}.
               </div>
             ) : null}
           </fieldset>
@@ -477,17 +508,39 @@ function materialValue(rows: PassRow[]): string {
   return first === null ? "no-preset" : `preset:${first}`;
 }
 
+/** A finished inch amount. `1.` is still being typed: `Number` would call it 1 and the field would snap. */
+function settledInch(typed: string): number | null {
+  const trimmed = typed.trim();
+  if (!/^-?\d+(\.\d+)?$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : null;
+}
+
+/** True when the inch field can be written into the millimetre draft. Empty is written. */
+export function inchReady(typed: string): boolean {
+  return typed.trim() === "" || settledInch(typed) !== null;
+}
+
 /** Inches are a view of the millimetre draft. A fragment that is not a number yet is left as typed. */
 export function lengthFromDraft(stored: string): string {
   if (stored.trim() === "") return "";
-  const value = Number(stored);
-  return Number.isFinite(value) ? formatLength(value, "in") : stored;
+  const value = settledInch(stored);
+  return value === null ? stored : formatLength(value, "in");
 }
 
 export function lengthToDraft(typed: string): string {
   if (typed.trim() === "") return "";
-  const value = Number(typed);
-  return Number.isFinite(value) ? String(unitToMm(value, "in")) : typed;
+  const value = settledInch(typed);
+  return value === null ? typed : String(unitToMm(value, "in"));
+}
+
+/** The weed sentences are written in millimetres, which is what the draft stores. An inch field quotes the same bounds in inches. */
+export function weedMessage(message: string, unit: LengthUnit): string {
+  if (unit === "mm") return message;
+  return message
+    .replace(/(\d+(?:\.\d+)?)–(\d+(?:\.\d+)?) mm/g, (_, min: string, max: string) =>
+      `${formatLength(Number(min), "in")}–${formatLength(Number(max), "in")} in`)
+    .replace(/ of mm/g, " of in");
 }
 
 function LevelField({

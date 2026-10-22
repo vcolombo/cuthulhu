@@ -70,7 +70,10 @@ export function SendSheet({
   const [reached, setReached] = useState<SendStep>(1);
   const [editorOpen, setEditorOpen] = useState(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
-  const opened = useRef(true);
+  // Compared, not cleared: StrictMode runs this effect twice on mount and a flag flipped on
+  // the first run focuses the heading as the sheet opens, ahead of the dialog's own focus.
+  const stepSeen = useRef(step);
+  const [weedEditing, setWeedEditing] = useState(false);
   const device = useDeviceList({ refreshDeviceState, onError, onReconnect });
 
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
@@ -119,10 +122,8 @@ export function SendSheet({
 
   // Moving between steps, not the open itself: the dialog's own focus lands on the first control.
   useEffect(() => {
-    if (opened.current) {
-      opened.current = false;
-      return;
-    }
+    if (stepSeen.current === step) return;
+    stepSeen.current = step;
     headingRef.current?.focus();
   }, [step]);
 
@@ -153,7 +154,7 @@ export function SendSheet({
   // which is the window a retarget's new plan has not installed yet.
   const readyCutter = connected !== null && status.actions.cut;
   const passesReady = plan.plan !== null && rows.length > 0 && !plan.replanning && plan.weedSettled
-    && issues.length === 0 && !machineMismatch && readyCutter && !dispatch.cutInFlight;
+    && !weedEditing && issues.length === 0 && !machineMismatch && readyCutter && !dispatch.cutInFlight;
   // The first Start is what discovers a stale plan. Only the ones after the refusal wait.
   const startReady = passesReady && !plan.stalePlan;
 
@@ -326,6 +327,7 @@ export function SendSheet({
                 weedDraft={plan.weedDraft}
                 weedRead={plan.weedRead}
                 changeWeed={plan.changeWeed}
+                onWeedEditing={setWeedEditing}
                 planRows={plan.plan?.rows ?? null}
                 planGrouping={plan.plan?.grouping ?? null}
                 skippedNotCut={plan.plan?.skippedNotCut ?? null}

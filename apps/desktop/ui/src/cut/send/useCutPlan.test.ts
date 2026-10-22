@@ -156,4 +156,54 @@ describe("useCutPlan", () => {
     // spread is that restore: a failure must not leave the picker on a mode the plan is not.
     expect(weedChanges).toEqual([{ border: false, margin: "", lines: "None", spacing: "", clearance: "" }]);
   });
+
+  it("plans the grouping now selected when a replan captured earlier runs late", async () => {
+    let resolveFirst: (value: PlanCutResponse) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveFirst = resolve;
+      }),
+    );
+    await act(async () => {
+      root.render(render());
+    });
+    await act(async () => {
+      resolveFirst(planResponse("color", "color:ff0000ff"));
+    });
+    const held = api.current?.replan;
+    expect(held).toBeTypeOf("function");
+
+    let resolveSingle: (value: PlanCutResponse) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveSingle = resolve;
+      }),
+    );
+    await act(async () => {
+      api.current?.setGrouping("Single");
+      api.current?.replan("Single");
+    });
+    await act(async () => {
+      resolveSingle(planResponse("single", "all"));
+    });
+    expect(api.current?.plan?.grouping).toBe("Single");
+
+    let rejectHeld: (reason: unknown) => void = () => {};
+    ipc.planCut.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => {
+        rejectHeld = reject;
+      }),
+    );
+    await act(async () => {
+      held?.();
+    });
+    expect(ipc.planCut).toHaveBeenLastCalledWith("Single", null);
+
+    await act(async () => {
+      rejectHeld({ code: "plan_error", message: "late" });
+    });
+    expect(api.current?.plan?.revision).toBe("single");
+    expect(api.current?.grouping).toBe("Single");
+    expect(errors[errors.length - 1]).toBe("late");
+  });
 });

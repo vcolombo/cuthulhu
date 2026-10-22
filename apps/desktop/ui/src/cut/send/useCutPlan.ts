@@ -80,6 +80,15 @@ export function useCutPlan({
    *  request went out: what it carries over must be the arrangement on screen now. */
   const planRef = useRef(plan);
   planRef.current = plan;
+  /** Connect and Convert await before they replan, and the grouping select stays usable in that
+   *  window. A function closed over the click would plan the mode the operator has since left, and
+   *  a failure would put the picker back on that click's plan. */
+  const groupingRef = useRef(grouping);
+  groupingRef.current = grouping;
+  const weedReadRef = useRef(weedRead);
+  weedReadRef.current = weedRead;
+  const weedDraftRef = useRef(weedDraft);
+  weedDraftRef.current = weedDraft;
   /** Counts weed edits, so a refused replan puts the controls back only if nothing was typed since
    *  it went out: typing that plans nothing (a cleared field) does not move `planSeq`. */
   const weedEdits = useRef(0);
@@ -113,13 +122,13 @@ export function useCutPlan({
   // A draft that does not read plans with the weed already installed, so Replan still works.
   // `keepRows` carries the operator's arrangement into the new rows (`carryRows`): a weed edit
   // changes no pass. Every other replan starts the rows afresh, as it always has.
-  const replan = (
-    mode: ipc.Grouping = grouping,
-    weedOptions: ipc.WeedOptions | null = weedRead.ok ? weedRead.options : plan?.weed ?? null,
-    keepRows = false,
-  ) => {
+  const replan = (mode?: ipc.Grouping, weedOptions?: ipc.WeedOptions | null, keepRows = false) => {
+    const chosen = mode ?? groupingRef.current;
+    const read = weedReadRef.current;
+    const chosenWeed = weedOptions !== undefined ? weedOptions : read.ok ? read.options : planRef.current?.weed ?? null;
     const seq = ++planSeq.current;
     const editAt = weedEdits.current;
+    const restore = planRef.current;
     setReplanning(true);
     // Nothing is cleared or orphaned on the way out. The previous plan stays installed until this
     // reply lands, and if the reply is a failure it stays installed for good — so both the travel
@@ -132,7 +141,7 @@ export function useCutPlan({
     // rows a pending reply was computed for stop being the rows on screen. A reply landing before
     // then was asked for against the plan that is still installed, so it is not stale at all.
     ipc
-      .planCut(mode, weedOptions)
+      .planCut(chosen, chosenWeed)
       .then((response) => {
         if (seq !== planSeq.current) return; // a newer Replan owns the dialog now
         // The rows are about to change, so every travel reply owed to the old ones is stale from
@@ -155,10 +164,10 @@ export function useCutPlan({
           repeatCount: null,
         }));
         const prev = planRef.current;
-        const rows = keepRows && prev !== null && prev.grouping === mode ? carryRows(prev.rows, fresh) : fresh;
+        const rows = keepRows && prev !== null && prev.grouping === chosen ? carryRows(prev.rows, fresh) : fresh;
         const installed: InstalledPlan = {
-          grouping: mode,
-          weed: weedOptions,
+          grouping: chosen,
+          weed: chosenWeed,
           revision: response.doc_revision,
           skippedNotCut: response.skipped_not_cut,
           rows,
@@ -176,10 +185,10 @@ export function useCutPlan({
         // so the picker goes back to *its* grouping. Left showing the mode nobody managed to
         // plan, the dialog would offer a Cut it cannot keep: the operator reads "one pass" and
         // the machine does the split the old plan still holds.
-        setGrouping(plan?.grouping ?? "Color");
+        setGrouping(restore?.grouping ?? "Color");
         // The weed controls go back to the installed plan's too, for the same reason.
-        if (plan !== null && weedEdits.current === editAt) {
-          onWeedChange(plan.weed ? weedDraftFrom(plan.weed, true) : { ...weedDraft, border: false });
+        if (restore !== null && weedEdits.current === editAt) {
+          onWeedChange(restore.weed ? weedDraftFrom(restore.weed, true) : { ...weedDraftRef.current, border: false });
         }
         onError(ipc.ipcErrorMessage(e));
       })

@@ -306,7 +306,8 @@ export function StepPasses({
                 aria-label={`Repeat count for pass ${i + 1}`}
                 type="number"
                 disabled={replanning}
-                min={1}
+                min={ranges?.repeatCount.min}
+                max={ranges?.repeatCount.max}
                 value={eff.repeatCount ?? ""}
                 placeholder="repeat"
                 onChange={(e) => updateRow(i, { repeatCount: e.target.value === "" ? null : Number(e.target.value) })}

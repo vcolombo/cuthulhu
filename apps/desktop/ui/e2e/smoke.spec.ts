@@ -3411,14 +3411,26 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
 // the counter to move stays green when the button does nothing. Time is frozen here, and the
 // click is the only thing that can ask again.
 test("Retry on an unreachable host asks for the list again", async ({ page }) => {
+  // `install()` alone leaves the fake clock running, and the sheet polls `list_hosts` every
+  // second while a host is paired. `expect.poll` waits five seconds, so that tick alone reaches
+  // `listed + 1` and a Retry that does nothing still passes. `pauseAt` is what stops the tick.
+  // The pause is after the row is on screen: pausing through load stalls the timers the page
+  // needs to finish opening. Jumping to the pause fires a timer that was already due at most
+  // once, so the count is read after that jump, not before it.
   await page.clock.install();
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await expect(page.getByRole("button", { name: "Retry Workshop Pi" })).toBeVisible();
+  const pageNow = await page.evaluate(() => Date.now());
+  await page.clock.pauseAt(pageNow + 1000);
   const listed = await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0);
   await page.getByRole("button", { name: "Retry Workshop Pi" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBe(listed + 1);
+  // Wall time, with the page clock still paused. A tick that was only quiet for the click
+  // would land inside this wait and the count would move.
+  await page.waitForTimeout(1500);
+  expect(await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBe(listed + 1);
 });
 
 // The absence is its own test because every path to the warning goes through a host, and a desktop

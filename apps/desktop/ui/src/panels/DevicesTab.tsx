@@ -30,7 +30,7 @@ export function DevicesTab({ devices, hosts, active, machines, listError, onPick
     return (
       <div style={{ padding: 12, fontSize: 12, color: "var(--muted-foreground)", display: "flex", flexDirection: "column", gap: 8 }}>
         <p style={{ margin: 0 }}>No cutters yet.</p>
-        <p style={{ margin: 0 }}>Pair a Cut Host from Send to cutter. A cutter plugged into this computer shows up here once it is listed.</p>
+        <p style={{ margin: 0 }}>To pair a Cut Host, open “Send to cutter”. A cutter plugged into this computer shows up here once it is listed.</p>
       </div>
     );
   }

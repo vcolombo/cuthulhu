@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
 import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import type { LengthUnit } from "./length";
+
+export type { LengthUnit };
 
 // ponytail: loose types for delta/snapshot payloads until Rust shape mirrors TS
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -417,7 +420,6 @@ export async function pickImagePath(): Promise<string | null> {
 }
 
 export type Appearance = "light" | "dark" | "system";
-export type LengthUnit = "in" | "mm";
 /** `units` is null until a choice has been saved. The UI resolves the region once and writes it. */
 export type Preferences = { appearance: Appearance; units: LengthUnit | null };
 

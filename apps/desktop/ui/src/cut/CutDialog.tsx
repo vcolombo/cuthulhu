@@ -78,7 +78,7 @@ type Props = {
   docMachineId: string | null;
   status: ipc.CutStatus;
   refreshDeviceState: () => Promise<void>;
-  onConvertMachine: (machineId: string) => void;
+  onConvertMachine: (machineId: string) => boolean | Promise<boolean>;
   /** The connected cutter, from the one store the pill and the status bar read. */
   connected: ipc.DeviceInfo | null;
   /** Resolves true when the document was retargeted to this cutter, which stales an open plan. */
@@ -1081,8 +1081,11 @@ export function CutDialog({
             <button
               style={btn}
               onClick={() => {
-                // The conversion is the document change. The plan has to follow it, same as a connect.
-                void Promise.resolve(onConvertMachine(connected.machine_id)).then(() => replan());
+                // The conversion is the document change. A refused set_machine leaves the open plan,
+                // which still matches the document (Bugbot on #313).
+                void Promise.resolve(onConvertMachine(connected.machine_id)).then((changed) => {
+                  if (changed) replan();
+                });
               }}
             >
               Convert to {connected.machine_id}

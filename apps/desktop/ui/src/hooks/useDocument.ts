@@ -5,8 +5,7 @@ import type { DocSnapshot, MachineProfile } from "../App";
 import type { Preset } from "../cut/viewmodel";
 import type { EditsLock } from "../interaction/useCanvasInteraction";
 import * as ipc from "../ipc";
-
-export type HistoryFlags = { can_undo: boolean; can_redo: boolean };
+import type { HistoryFlags } from "../ipc";
 
 const NO_HISTORY: HistoryFlags = { can_undo: false, can_redo: false };
 
@@ -89,7 +88,9 @@ export function useDocument(editsLockNow: { current: () => EditsLock }) {
     // snapshot is what the canvas needs, and a missing flag must not lock the document (#308).
     try {
       const flags = await ipc.history();
-      if (gen === docGen.current) setHistory(flags);
+      // The reply is the stacks at the moment it ran, which may be an earlier refresh than the
+      // snapshot now on screen. Installing it would put Undo and Redo back (Bugbot on #313).
+      if (gen === docGen.current && asked === snapshotShown.current) setHistory(flags);
     } catch {
       /* keep the previous flags */
     }

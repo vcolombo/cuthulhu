@@ -24,7 +24,7 @@ async function fileAction(page: Page, name: string) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -288,10 +288,29 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     reorder: () => unimplemented("reorder"),
     // The stacks are not the document. Nothing in the suite undoes, and the buttons stay disabled
     // while both flags are false.
-    history: () => ({ can_undo: false, can_redo: false }),
+    history: () => {
+      if (!opts?.holdHistory) return { can_undo: false, can_redo: false };
+      // Queued so a test can answer a later refresh before an earlier one. The flags belong to
+      // the snapshot that asked, and a late reply must not rewind Undo.
+      return new Promise((resolve) => {
+        const w = window as unknown as {
+          __historyWaiters?: Array<(flags: { can_undo: boolean; can_redo: boolean }) => void>;
+          __releaseLastHistory?: (flags: { can_undo: boolean; can_redo: boolean }) => void;
+        };
+        w.__historyWaiters = w.__historyWaiters ?? [];
+        w.__historyWaiters.push(resolve);
+        w.__releaseLastHistory = (flags) => {
+          const waiter = w.__historyWaiters?.pop();
+          waiter?.(flags);
+        };
+      });
+    },
     undo: () => unimplemented("undo"),
     redo: () => unimplemented("redo"),
-    boolean_op: () => unimplemented("boolean_op"),
+    boolean_op: (a) => {
+      (window as unknown as { __booleanOp?: unknown }).__booleanOp = a.op;
+      return unimplemented("boolean_op");
+    },
     import_svg: (a) => {
       (window as unknown as { __docOrder?: string[] }).__docOrder?.push("import_svg");
       const id = nextId++;
@@ -320,6 +339,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return load();
     },
     set_machine: (a) => {
+      if (opts?.failSetMachine) throw new Error("could not set the machine");
       const m = machines.find((p) => p.id === a.machineId);
       if (!m) throw new Error("unknown machine");
       doc.machine = m;
@@ -871,6 +891,19 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       emit("StateChanged");
       status = IDLE;
       emit("StateChanged");
+      if (info.host !== null) {
+        // Aiming at a host releases the local manager. That Disconnected is emitted on the
+        // bridge after this command has answered, so it can land after the UI stores the host.
+        // The cell stays the host's status: get_device_state is aimed at the host, and the
+        // event is only the local transport letting go.
+        setTimeout(() => {
+          const ev: DeviceEvent = { job_id: jobId ?? 0, kind: "StateChanged", status: DISCONNECTED };
+          for (const id of eventNameToIds.get("device-event") ?? []) {
+            callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
+          }
+          (window as unknown as { __hostReleaseEmitted?: boolean }).__hostReleaseEmitted = true;
+        }, 0);
+      }
       return null;
     },
     disconnect_device: () => {
@@ -896,6 +929,8 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
     },
     get_connected_device: () => connected,
     plan_cut: (a) => {
+      const planned = (window as unknown as { __planCalls?: number }).__planCalls ?? 0;
+      (window as unknown as { __planCalls?: number }).__planCalls = planned + 1;
       // A planner that refuses is an ordinary outcome — a font that will not resolve, a shape
       // with no outline — and the dialog has to survive one without lying about what it will
       // cut next.
@@ -1285,17 +1320,27 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview
       return read();
     },
     set_preferences: (a) => {
-      const raw = sessionStorage.getItem("cuthulhu.preferences");
-      const parsed = raw ? (JSON.parse(raw) as { appearance?: string; units?: string }) : {};
-      const appearance = a.appearance == null ? (parsed.appearance ?? "system") : a.appearance;
-      const units = a.units == null ? (parsed.units === "in" || parsed.units === "mm" ? parsed.units : "mm") : a.units;
-      if (appearance !== "light" && appearance !== "dark" && appearance !== "system") {
-        throw new Error("appearance is not light, dark, or system");
+      const write = () => {
+        const raw = sessionStorage.getItem("cuthulhu.preferences");
+        const parsed = raw ? (JSON.parse(raw) as { appearance?: string; units?: string }) : {};
+        const appearance = a.appearance == null ? (parsed.appearance ?? "system") : a.appearance;
+        const units = a.units == null ? (parsed.units === "in" || parsed.units === "mm" ? parsed.units : "mm") : a.units;
+        if (appearance !== "light" && appearance !== "dark" && appearance !== "system") {
+          throw new Error("appearance is not light, dark, or system");
+        }
+        if (units !== "in" && units !== "mm") throw new Error("units are not in or mm");
+        const prefs = { appearance, units };
+        sessionStorage.setItem("cuthulhu.preferences", JSON.stringify(prefs));
+        return prefs;
+      };
+      // The first unit write is the region default. Held, a click can land while it is in flight.
+      if (opts?.holdFirstUnitSave && a.units != null && !(window as unknown as { __heldUnitSave?: boolean }).__heldUnitSave) {
+        (window as unknown as { __heldUnitSave?: boolean }).__heldUnitSave = true;
+        return new Promise((resolve) => {
+          (window as unknown as { __releaseUnitSave?: () => void }).__releaseUnitSave = () => resolve(write());
+        });
       }
-      if (units !== "in" && units !== "mm") throw new Error("units are not in or mm");
-      const prefs = { appearance, units };
-      sessionStorage.setItem("cuthulhu.preferences", JSON.stringify(prefs));
-      return prefs;
+      return write();
     },
   } as Record<string, (args: Record<string, unknown>) => unknown>);
 
@@ -5227,4 +5272,90 @@ test("a machine with no saved unit takes inches from en-US once and then keeps t
   await page.reload();
   await expect(inches).toHaveAttribute("aria-pressed", "true");
   await expect(millimetres).toHaveAttribute("aria-pressed", "false");
+});
+
+test("a unit chosen while the region save is in flight is the one that sticks", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "language", {
+      configurable: true,
+      get: () => "en-US",
+    });
+  });
+  await page.addInitScript(installMockTauri, { unsetUnits: true, holdFirstUnitSave: true });
+  await page.goto("/");
+  await expect.poll(() =>
+    page.evaluate(() => typeof (window as unknown as { __releaseUnitSave?: unknown }).__releaseUnitSave === "function"),
+  ).toBe(true);
+  await page.getByRole("button", { name: "mm", exact: true }).click();
+  await page.evaluate(() => (window as unknown as { __releaseUnitSave: () => void }).__releaseUnitSave());
+  await expect(page.getByRole("button", { name: "mm", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() =>
+    page.evaluate(() => (JSON.parse(sessionStorage.getItem("cuthulhu.preferences") || "{}") as { units?: string }).units),
+  ).toBe("mm");
+});
+
+test("aiming at a host keeps the cutter after the local manager reports Disconnected", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: /No cutter connected/ }).click();
+  await page.getByRole("menuitem", { name: /this computer/ }).first().click();
+  await expect(page.getByRole("button", { name: /Active cutter/ })).toBeVisible();
+
+  await page.getByRole("button", { name: /Active cutter/ }).click();
+  await page.getByRole("menuitem", { name: /Workshop Pi/ }).click();
+  await expect.poll(() =>
+    page.evaluate(() => (window as unknown as { __hostReleaseEmitted?: boolean }).__hostReleaseEmitted === true),
+  ).toBe(true);
+  await expect(page.getByRole("button", { name: /Active cutter: Silhouette Cameo 5 Alpha/ })).toContainText("Workshop Pi");
+});
+
+test("a history reply from an earlier refresh does not rewind Undo", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { holdHistory: true });
+  await page.goto("/");
+  const waiters = () =>
+    page.evaluate(() => ((window as unknown as { __historyWaiters?: unknown[] }).__historyWaiters ?? []).length);
+  // StrictMode runs the mount refresh twice. Both are queued before the edit's.
+  await expect.poll(waiters).toBe(2);
+  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.mouse.click(400, 300);
+  await expect.poll(waiters).toBe(3);
+
+  const releaseLast = (canUndo: boolean) =>
+    page.evaluate((undo) => {
+      (window as unknown as { __releaseLastHistory: (flags: { can_undo: boolean; can_redo: boolean }) => void }).__releaseLastHistory({
+        can_undo: undo,
+        can_redo: false,
+      });
+    }, canUndo);
+  // The edit's reply is the newest. The two mount replies are older and must not land after it.
+  await releaseLast(true);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+  await releaseLast(false);
+  await releaseLast(false);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+});
+
+test("a refused machine change does not rebuild the open plan", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failSetMachine: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByTestId("cut-pass-row").first()).toBeVisible();
+  const before = await page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0);
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await expect(page.getByText("could not set the machine")).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0)).toBe(before);
+});
+
+test("Option+S subtracts when the produced character is not s", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click();
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await page.evaluate(() => {
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ß", code: "KeyS", metaKey: true, altKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __booleanOp?: string }).__booleanOp)).toBe("Subtract");
 });

@@ -449,17 +449,18 @@ export function App() {
         if (selected.length >= 2) onBooleanOp("Union");
         return;
       }
-      if (mod && e.altKey && key === "s") {
+      // Option on macOS and AltGr change `e.key` (Option+S is "ß"), so the physical key is `e.code`.
+      if (mod && e.altKey && e.code === "KeyS") {
         e.preventDefault();
         if (selected.length >= 2) onBooleanOp("Subtract");
         return;
       }
-      if (mod && e.altKey && key === "i") {
+      if (mod && e.altKey && e.code === "KeyI") {
         e.preventDefault();
         if (selected.length >= 2) onBooleanOp("Intersect");
         return;
       }
-      if (mod && e.altKey && key === "e") {
+      if (mod && e.altKey && e.code === "KeyE") {
         e.preventDefault();
         if (selected.length >= 2) onBooleanOp("Exclude");
         return;

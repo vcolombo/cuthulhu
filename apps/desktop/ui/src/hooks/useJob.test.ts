@@ -456,13 +456,13 @@ describe("useJob", () => {
   it("refreshes after resume, cancel and confirm land, and reports a refusal without refreshing", async () => {
     await mount();
     ipc.getDeviceState.mockClear();
-    const commands: [keyof typeof ipc, () => void][] = [
-      ["resumeCut", () => api.current?.resume()],
-      ["cancelCut", () => api.current?.cancel()],
-      ["confirmPassDone", () => api.current?.confirmPassDone()],
+    const commands: [typeof ipc.resumeCut, () => void][] = [
+      [ipc.resumeCut, () => api.current?.resume()],
+      [ipc.cancelCut, () => api.current?.cancel()],
+      [ipc.confirmPassDone, () => api.current?.confirmPassDone()],
     ];
-    for (const [method, run] of commands) {
-      ipc[method].mockResolvedValueOnce(undefined);
+    for (const [mock, run] of commands) {
+      mock.mockResolvedValueOnce(undefined);
       await act(async () => {
         run();
       });
@@ -471,8 +471,8 @@ describe("useJob", () => {
     expect(errors).toEqual([]);
 
     ipc.getDeviceState.mockClear();
-    for (const [method, run] of commands) {
-      ipc[method].mockRejectedValueOnce("the cutter is busy");
+    for (const [mock, run] of commands) {
+      mock.mockRejectedValueOnce("the cutter is busy");
       await act(async () => {
         run();
       });

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { ChevronDown, GripVertical } from "lucide-react";
 import type { LengthUnit } from "../../length";
-import { formatLength, unitToMm } from "../../length";
+import { formatLength, MM_PER_IN, unitToMm } from "../../length";
 import { vinylDisplay } from "../../render/vinyl";
 import type { Scene } from "../../render/hittest";
 import type { ResolvedTheme } from "../../theme";
@@ -129,15 +129,38 @@ export function StepPasses({
   // Open, so the weed controls are on the step the moment it is. Collapsing is a look, not a gate.
   const [weedOpen, setWeedOpen] = useState(true);
   const [highlight, setHighlight] = useState<number | null>(null);
-  // The inch text of a field that is not a finished number yet (`1.`). It stays out of the
-  // millimetre draft: writing it would either snap the field or plan a length nobody typed.
+  // Inch text that has not been committed. A number input never reports `1.` — Chromium
+  // turns both the `1` and the `.` into `"1"` — so the field is text, and the millimetre
+  // draft is written only once the text is a finished amount. Writing `1` on the keystroke
+  // would format it back as `1.00` and the decimal could not be typed.
   const [inchPending, setInchPending] = useState<Partial<Record<WeedField, string>>>({});
+  const inchPendingRef = useRef(inchPending);
+  const weedDraftRef = useRef(weedDraft);
+  const changeWeedRef = useRef(changeWeed);
+  inchPendingRef.current = inchPending;
+  weedDraftRef.current = weedDraft;
+  changeWeedRef.current = changeWeed;
   useEffect(() => {
+    inchPendingRef.current = {};
     setInchPending({});
     onWeedEditing(false);
-    // Leaving the step drops the fragment with it. The sheet would otherwise keep Next
-    // gated on an edit the fields are no longer showing.
-    return () => onWeedEditing(false);
+    return () => {
+      // A finished inch that never blurred still has to land, or leaving the step cuts the
+      // margin from before the keystrokes. A fragment (`1.`) is dropped: it is not a length,
+      // and Next was held for as long as the field was showing it.
+      const pending = inchPendingRef.current;
+      const draft = { ...weedDraftRef.current };
+      let commit = false;
+      for (const field of Object.keys(pending) as WeedField[]) {
+        const typed = pending[field];
+        if (typed === undefined || !inchReady(typed)) continue;
+        draft[field] = lengthToDraft(typed);
+        commit = true;
+      }
+      inchPendingRef.current = {};
+      if (commit) changeWeedRef.current(draft);
+      onWeedEditing(false);
+    };
   }, [unit, onWeedEditing]);
   const rows = planRows ?? [];
   const showSpeed = caps.supportsSpeed;
@@ -145,45 +168,57 @@ export function StepPasses({
   const skipped = skippedNotCut ?? 0;
   const material = materialValue(rows);
 
-  // Not disabled while a replan is in flight, unlike the row controls: every keystroke replans,
-  // and a field that locked itself mid-word would lose the caret. These fields are not rows, so
-  // nothing typed here is discarded by the plan that lands.
+  // Not disabled while a replan is in flight, unlike the row controls. A millimetre keystroke
+  // replans at once, and a field that locked itself mid-word would lose the caret. An inch
+  // stays as typed until blur, so the draft is not a length the field has already stopped showing.
   const setPending = (next: Partial<Record<WeedField, string>>) => {
+    inchPendingRef.current = next;
     setInchPending(next);
     onWeedEditing(Object.keys(next).length > 0);
+  };
+
+  const commitInch = (field: WeedField, typed: string) => {
+    if (!inchReady(typed)) return;
+    const rest = { ...inchPendingRef.current };
+    delete rest[field];
+    setPending(rest);
+    changeWeed({ ...weedDraftRef.current, [field]: lengthToDraft(typed) });
   };
 
   const weedInput = (field: WeedField, name: string, off: boolean) => {
     const error = weedRead.ok ? undefined : weedRead.errors[field];
     const label = `${name} (${unit})`;
     const pending = unit === "in" ? inchPending[field] : undefined;
+    // A fragment is invalid on its own. A committed draft error stays hidden while a newer
+    // keystroke is still on screen, or the alert would describe a length the field is not showing.
+    const fragment = pending !== undefined && !inchReady(pending);
+    const showError = fragment || (error !== undefined && pending === undefined);
     return (
       <label className="flex items-center gap-2 text-sm">
         {label}
         <input
           aria-label={`Weed ${label.toLowerCase()}`}
-          type="number"
-          step="0.1"
+          type="text"
+          inputMode="decimal"
+          autoComplete="off"
           value={pending !== undefined ? pending : unit === "mm" ? weedDraft[field] : lengthFromDraft(weedDraft[field])}
           disabled={off}
-          aria-invalid={error !== undefined || pending !== undefined}
+          aria-invalid={showError}
           onChange={(event) => {
             const typed = event.target.value;
-            if (unit !== "mm" && !inchReady(typed)) {
-              setPending({ ...inchPending, [field]: typed });
+            if (unit === "mm") {
+              changeWeed({ ...weedDraft, [field]: typed });
               return;
             }
-            if (pending !== undefined) {
-              const rest = { ...inchPending };
-              delete rest[field];
-              setPending(rest);
-            }
-            changeWeed({
-              ...weedDraft,
-              [field]: unit === "mm" ? typed : lengthToDraft(typed),
-            });
+            setPending({ ...inchPendingRef.current, [field]: typed });
           }}
-          className={cn("h-8 w-24 rounded-md border bg-background px-2 text-sm", error || pending !== undefined ? "border-destructive" : "border-input")}
+          onBlur={() => {
+            if (unit !== "in") return;
+            const typed = inchPendingRef.current[field];
+            if (typed === undefined) return;
+            commitInch(field, typed);
+          }}
+          className={cn("h-8 w-24 rounded-md border bg-background px-2 text-sm", showError ? "border-destructive" : "border-input")}
         />
       </label>
     );
@@ -480,9 +515,7 @@ export function StepPasses({
             {weedInput("spacing", "Spacing", !weedDraft.border || weedDraft.lines === "None")}
             {weedInput("clearance", "Clearance", !weedDraft.border || weedDraft.lines === "None")}
             {!weedRead.ok ? (
-              <div role="alert" className="text-sm text-destructive">
-                {Object.values(weedRead.errors).map((message) => weedMessage(message, unit)).join(". ")}.
-              </div>
+              <WeedAlert errors={weedRead.errors} pending={inchPending} unit={unit} />
             ) : null}
           </fieldset>
         ) : null}
@@ -539,8 +572,39 @@ export function weedMessage(message: string, unit: LengthUnit): string {
   if (unit === "mm") return message;
   return message
     .replace(/(\d+(?:\.\d+)?)–(\d+(?:\.\d+)?) mm/g, (_, min: string, max: string) =>
-      `${formatLength(Number(min), "in")}–${formatLength(Number(max), "in")} in`)
+      `${inchBound(Number(min), "min")}–${inchBound(Number(max), "max")} in`)
     .replace(/ of mm/g, " of in");
+}
+
+/** Inch hundredths that `unitToMm` still places inside the millimetre bound. `formatLength`
+ *  rounds 50 mm out to 1.97 in, and 1.97 in is 50.038 mm, which the same check then refuses. */
+function inchBound(mm: number, edge: "min" | "max"): string {
+  const hundredths = (mm / MM_PER_IN) * 100;
+  const nearest = Math.round(hundredths);
+  const exact = Math.abs(hundredths - nearest) < 1e-6 ? nearest : hundredths;
+  const stepped = edge === "min" ? Math.ceil(exact) : Math.floor(exact);
+  return (stepped / 100).toFixed(2);
+}
+
+function WeedAlert({
+  errors,
+  pending,
+  unit,
+}: {
+  errors: Partial<Record<WeedField, string>>;
+  pending: Partial<Record<WeedField, string>>;
+  unit: LengthUnit;
+}) {
+  const text = (Object.entries(errors) as [WeedField, string][])
+    .filter(([field]) => pending[field] === undefined)
+    .map(([, message]) => weedMessage(message, unit))
+    .join(". ");
+  if (text === "") return null;
+  return (
+    <div role="alert" className="text-sm text-destructive">
+      {text}.
+    </div>
+  );
 }
 
 function LevelField({

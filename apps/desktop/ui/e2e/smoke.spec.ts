@@ -3160,10 +3160,26 @@ test("an inch weed margin is a view of the millimetre draft", async ({ page }) =
   await page.getByLabel("Weed border").check();
   const margin = page.getByLabel("Weed margin");
   await expect(margin).toHaveValue("0.12");
+  const plans = () => page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0);
+  const before = await plans();
+  // Keystrokes, not a filled value: a number input reports both `1` and `.` as "1".
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.");
+  await expect(margin).toHaveValue("1.");
+  await margin.blur();
+  await expect(margin).toHaveValue("1.");
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+  expect(await plans()).toBe(before);
+
   await margin.fill("2");
-  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.02–1.97 in" })).toBeVisible();
+  await expect(margin).toHaveValue("2");
+  await margin.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.02–1.96 in" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
   await margin.fill("1");
+  await margin.blur();
+  await expect(margin).toHaveValue("1.00");
   await fillSendLevels(page);
   await startCut(page);
   const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };

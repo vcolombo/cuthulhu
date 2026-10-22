@@ -101,12 +101,13 @@ describe("useJob", () => {
   let root: Root;
   let el: HTMLDivElement;
   const api = { current: null as JobApi | null };
+  const errors: string[] = [];
 
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
   function render(): ReactNode {
     return createElement(() => {
-      api.current = useJob(() => {});
+      api.current = useJob((message) => errors.push(message));
       return null;
     });
   }
@@ -116,10 +117,15 @@ describe("useJob", () => {
     ipc.getDeviceState.mockReset();
     ipc.listHosts.mockReset();
     ipc.cancelCut.mockReset();
+    ipc.resumeCut.mockReset();
+    ipc.confirmPassDone.mockReset();
     ipc.getDeviceState.mockResolvedValue(DISCONNECTED_STATUS);
     ipc.listHosts.mockResolvedValue([HOST]);
     ipc.cancelCut.mockResolvedValue(undefined);
+    ipc.resumeCut.mockResolvedValue(undefined);
+    ipc.confirmPassDone.mockResolvedValue(undefined);
     api.current = null;
+    errors.length = 0;
     el = document.createElement("div");
     document.body.appendChild(el);
     root = createRoot(el);
@@ -445,5 +451,33 @@ describe("useJob", () => {
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(ipc.cancelCut).toHaveBeenCalledOnce();
     expect(api.current?.status).toEqual({ ...SWAP, jobId: 1 });
+  });
+
+  it("refreshes after resume, cancel and confirm land, and reports a refusal without refreshing", async () => {
+    await mount();
+    ipc.getDeviceState.mockClear();
+    const commands: [keyof typeof ipc, () => void][] = [
+      ["resumeCut", () => api.current?.resume()],
+      ["cancelCut", () => api.current?.cancel()],
+      ["confirmPassDone", () => api.current?.confirmPassDone()],
+    ];
+    for (const [method, run] of commands) {
+      ipc[method].mockResolvedValueOnce(undefined);
+      await act(async () => {
+        run();
+      });
+    }
+    expect(ipc.getDeviceState).toHaveBeenCalledTimes(3);
+    expect(errors).toEqual([]);
+
+    ipc.getDeviceState.mockClear();
+    for (const [method, run] of commands) {
+      ipc[method].mockRejectedValueOnce("the cutter is busy");
+      await act(async () => {
+        run();
+      });
+    }
+    expect(ipc.getDeviceState).not.toHaveBeenCalled();
+    expect(errors).toEqual(["the cutter is busy", "the cutter is busy", "the cutter is busy"]);
   });
 });

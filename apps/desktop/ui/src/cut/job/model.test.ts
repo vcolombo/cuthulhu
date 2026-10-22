@@ -32,6 +32,7 @@ function status(patch: Partial<CutStatus> & Pick<CutStatus, "phase">): CutStatus
 }
 
 const snapshot: JobSnapshot = {
+  jobId: 1,
   grouping: "Color",
   passes: [
     { key: "color:ff0000ff", shapeCount: 2, enabled: true },
@@ -42,6 +43,7 @@ const snapshot: JobSnapshot = {
 
 /** Green is switched off between red and gold. The worker's index 1 is gold, the second pass it was given. */
 const disabledMiddle: JobSnapshot = {
+  jobId: 1,
   grouping: "Color",
   passes: [
     { key: "color:ff0000ff", shapeCount: 1, enabled: true },

@@ -10,6 +10,9 @@ import { parsePassKey, passRowLabel, type PresetLookup } from "../viewmodel";
 export type JobSnapshot = {
   grouping: Grouping;
   passes: { key: PassKey; shapeCount: number; enabled: boolean }[];
+  /** The worker's id for this accept. `get_device_state` has no job id, so a poll that still
+   *  shows the previous ending can be told from this cut only when an event names this one. */
+  jobId: number;
 };
 
 export type JobSurface =

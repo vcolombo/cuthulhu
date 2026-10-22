@@ -210,6 +210,19 @@ button.text-primary-foreground {
 button.text-muted-foreground:not([data-state="active"]) {
   color: var(--muted-foreground);
 }
+/* Hover utilities live in a layer, so they lose to the rules above. Restated
+   here, still unlayered, and only for a button that asked for the hover: a
+   layered color is what left the previous theme's ink on the flip frame. */
+button.text-muted-foreground.hover\:text-foreground:not([data-state="active"]):hover {
+  color: var(--foreground);
+}
+button.text-foreground\/80 {
+  color: var(--foreground);
+  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+}
+button.text-foreground\/80.hover\:text-foreground:hover {
+  color: var(--foreground);
+}
 button.text-destructive {
   color: var(--destructive);
 }

@@ -8,7 +8,7 @@ import type { InstalledPlan } from "./useCutPlan";
 import { useCutDispatch } from "./useCutDispatch";
 
 const ipc = vi.hoisted(() => ({
-  cut: vi.fn<() => Promise<{ duplicate: boolean }>>(),
+  cut: vi.fn<() => Promise<{ job_id: number; duplicate: boolean }>>(),
 }));
 
 vi.mock("../../ipc", () => ({
@@ -110,10 +110,11 @@ describe("useCutDispatch", () => {
   });
 
   it("remembers every planned pass, including one that is switched off", async () => {
-    ipc.cut.mockResolvedValue({ duplicate: false });
+    ipc.cut.mockResolvedValue({ job_id: 4, duplicate: false });
     await act(async () => { root.render(render()); });
     await act(async () => { api.current?.startCut(); });
     expect(accepted).toEqual([{
+      jobId: 4,
       grouping: "Color",
       passes: [
         { key: "color:ff0000ff", shapeCount: 2, enabled: true },
@@ -123,7 +124,7 @@ describe("useCutDispatch", () => {
   });
 
   it("keeps the sheet's passes when the host had already accepted the cut", async () => {
-    ipc.cut.mockResolvedValue({ duplicate: true });
+    ipc.cut.mockResolvedValue({ job_id: 4, duplicate: true });
     await act(async () => { root.render(render()); });
     await act(async () => { api.current?.startCut(); });
     expect(accepted).toEqual([]);

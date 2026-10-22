@@ -55,6 +55,7 @@ export function useCutDispatch({
         setAlreadyAccepted(started.duplicate);
         if (started.duplicate || plan === null) return;
         onAccepted?.({
+          jobId: started.job_id,
           grouping: plan.grouping,
           // Disabled rows stay. The worker never sees them, and dropping them here would make
           // its enabled-pass index point at the wrong vinyl.

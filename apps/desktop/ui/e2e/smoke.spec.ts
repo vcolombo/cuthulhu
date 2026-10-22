@@ -3108,7 +3108,7 @@ test("a drop that is not a pass index leaves the order alone", async ({ page }) 
   await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
   const row = page.getByTestId("cut-pass-row").nth(1);
 
-  for (const payload of ["foo", "1.", ""]) {
+  for (const payload of ["foo", "1.", "", " "]) {
     await row.evaluate((target, text) => {
       const data = new DataTransfer();
       data.setData("text/plain", text);
@@ -3384,9 +3384,6 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   const hostCutters = page.getByRole("radiogroup", { name: "Workshop Pi" });
   await expect(hostCutters.getByRole("radio", { name: "cameo5" })).toBeDisabled();
   await expect(hostCutters.getByRole("button", { name: "Connect", exact: true })).toBeDisabled();
-  const listed = await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0);
-  await page.getByRole("button", { name: "Retry Workshop Pi" }).click();
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBeGreaterThan(listed);
   // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
   // badge says so rather than offering a cut for a status nobody has asked for.
   await expect(page.getByText("Unknown")).toHaveCount(3);
@@ -3408,6 +3405,20 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
+});
+
+// The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for
+// the counter to move stays green when the button does nothing. Time is frozen here, and the
+// click is the only thing that can ask again.
+test("Retry on an unreachable host asks for the list again", async ({ page }) => {
+  await page.clock.install();
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Retry Workshop Pi" })).toBeVisible();
+  const listed = await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0);
+  await page.getByRole("button", { name: "Retry Workshop Pi" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBe(listed + 1);
 });
 
 // The absence is its own test because every path to the warning goes through a host, and a desktop

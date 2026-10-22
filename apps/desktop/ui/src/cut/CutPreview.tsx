@@ -3,8 +3,21 @@ import { useEffect, useRef } from "react";
 import type { Scene, SceneNode } from "../render/hittest";
 import { vinylDisplay } from "../render/vinyl";
 import type { ResolvedTheme } from "../theme";
-import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds } from "./viewmodel";
+import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds, type Bounds } from "./viewmodel";
 import type { PassKey } from "../ipc";
+
+/** The order badge is a disc drawn on the shape's corner, so it hangs past the box the fit
+ *  measures. The gap after it is what keeps that disc off the frame. */
+export const PREVIEW_BADGE_PX = 7;
+export const PREVIEW_GAP_PX = 20;
+
+export function cutPreviewViewport(
+  content: Bounds | null,
+  artboard: Bounds,
+  canvas: { w: number; h: number },
+) {
+  return fitViewport(content, artboard, canvas, PREVIEW_BADGE_PX + PREVIEW_GAP_PX);
+}
 
 const FALLBACK_BORDER = "#2E2E34";
 const FALLBACK_PANEL = "#1F1F23";
@@ -66,7 +79,7 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     // The border stands outside every shape by its margin, so a fit to the shapes alone would crop it.
     const weedBoxes = passes.flatMap((p) => polylineBounds(p.weed));
     const size = { w: canvas.width, h: canvas.height };
-    const vp = fitViewport(contentBounds([...drawn, ...weedBoxes], travel), artboard, size, 16);
+    const vp = cutPreviewViewport(contentBounds([...drawn, ...weedBoxes], travel), artboard, size);
 
     ctx.setTransform(vp.scale, 0, 0, vp.scale, vp.tx, vp.ty);
     ctx.fillStyle = mat;

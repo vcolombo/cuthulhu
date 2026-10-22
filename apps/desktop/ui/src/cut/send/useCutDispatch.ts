@@ -50,8 +50,12 @@ export function useCutDispatch({
       // same either way and only the host knows which happened.
       .then((started) => setAlreadyAccepted(started.duplicate))
       .catch((e) => {
-        const code = ipc.ipcErrorCode(e);
-        if (code === "stale_plan") onStalePlan();
+        // The open sheet already says the design changed and offers Replan. Toasting the same
+        // refusal repeats that banner and covers the summary beside it.
+        if (ipc.ipcErrorCode(e) === "stale_plan") {
+          onStalePlan();
+          return;
+        }
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => setCutInFlight(false));

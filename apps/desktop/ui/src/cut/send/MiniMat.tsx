@@ -24,9 +24,7 @@ export function MiniMat({
   const byId = new Map(scene.nodes.map((node) => [node.id, node]));
   const highlighted = highlight === null ? null : passes[highlight] ?? null;
   const boxes = passes.flatMap((pass) => pass.nodeIds.map((id) => byId.get(id)?.bounds)).filter((box) => box !== undefined);
-  const box = boxes.length === 0
-    ? artboard
-    : pad(union(boxes), artboard);
+  const box = miniMatFrame(boxes, artboard);
   return (
     <svg
       viewBox={`${box.x} ${box.y} ${box.w} ${box.h}`}
@@ -73,15 +71,13 @@ function union(boxes: { x: number; y: number; w: number; h: number }[]) {
   return { x: x0, y: y0, w: Math.max(x1 - x0, 1), h: Math.max(y1 - y0, 1) };
 }
 
-/** A margin around the shapes, without wandering off into an empty roll. */
-function pad(
-  box: { x: number; y: number; w: number; h: number },
+/** The shapes, or the whole mat when there are none, with a margin that stays even on the mat's
+ *  edge. Clamping that margin to the artboard put the frame on a shape that starts at the origin. */
+export function miniMatFrame(
+  boxes: { x: number; y: number; w: number; h: number }[],
   artboard: { x: number; y: number; w: number; h: number },
 ) {
+  const box = boxes.length === 0 ? artboard : union(boxes);
   const margin = Math.max(box.w, box.h) * 0.2;
-  const x = Math.max(artboard.x, box.x - margin);
-  const y = Math.max(artboard.y, box.y - margin);
-  const x1 = Math.min(artboard.x + artboard.w, box.x + box.w + margin);
-  const y1 = Math.min(artboard.y + artboard.h, box.y + box.h + margin);
-  return { x, y, w: Math.max(x1 - x, 1), h: Math.max(y1 - y, 1) };
+  return { x: box.x - margin, y: box.y - margin, w: box.w + margin * 2, h: box.h + margin * 2 };
 }

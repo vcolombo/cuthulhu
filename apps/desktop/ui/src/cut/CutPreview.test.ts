@@ -5,7 +5,23 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Scene } from "../render/hittest";
 import { vinylDisplay } from "../render/vinyl";
-import { cssColor, CutPreview, type PreviewPass } from "./CutPreview";
+import { cssColor, cutPreviewViewport, CutPreview, PREVIEW_BADGE_PX, PREVIEW_GAP_PX, type PreviewPass } from "./CutPreview";
+
+describe("cutPreviewViewport", () => {
+  it("keeps the shape and its order badge inside the frame", () => {
+    const canvas = { w: 400, h: 300 };
+    const content = { x: 0, y: 0, w: 40, h: 10 };
+    const vp = cutPreviewViewport(content, { x: 0, y: 0, w: 330, h: 3000 }, canvas);
+    const left = content.x * vp.scale + vp.tx;
+    const top = content.y * vp.scale + vp.ty;
+    const right = (content.x + content.w) * vp.scale + vp.tx;
+    const bottom = (content.y + content.h) * vp.scale + vp.ty;
+    expect(left - PREVIEW_BADGE_PX).toBeGreaterThanOrEqual(PREVIEW_GAP_PX - 0.5);
+    expect(top - PREVIEW_BADGE_PX).toBeGreaterThanOrEqual(PREVIEW_GAP_PX - 0.5);
+    expect(right + PREVIEW_BADGE_PX).toBeLessThanOrEqual(canvas.w - PREVIEW_GAP_PX + 0.5);
+    expect(bottom + PREVIEW_BADGE_PX).toBeLessThanOrEqual(canvas.h - PREVIEW_GAP_PX + 0.5);
+  });
+});
 
 describe("cssColor", () => {
   it("unpacks 0xRRGGBBAA into an rgba() string", () => {

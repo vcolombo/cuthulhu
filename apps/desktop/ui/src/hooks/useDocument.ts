@@ -6,6 +6,7 @@ import type { Preset } from "../cut/viewmodel";
 import type { EditsLock } from "../interaction/useCanvasInteraction";
 import * as ipc from "../ipc";
 import type { HistoryFlags } from "../ipc";
+import { toastCopy } from "./toastCopy";
 
 const NO_HISTORY: HistoryFlags = { can_undo: false, can_redo: false };
 
@@ -35,13 +36,14 @@ export function useDocument(editsLockNow: { current: () => EditsLock }) {
     if (value === prev) return;
     if (prev) toast.dismiss(prev);
     if (value) {
-      toast.error(value, {
+      const shown = toastCopy(value);
+      toast.error(shown, {
         id: value,
         duration: 12000,
         action: {
           label: "Copy details",
           onClick: () => {
-            void navigator.clipboard?.writeText(value);
+            void navigator.clipboard?.writeText(shown);
           },
         },
       });

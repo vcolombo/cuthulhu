@@ -69,12 +69,14 @@ export function StepPreview({
             const swatch = label.swatch !== null ? vinylDisplay(label.swatch, theme).swatch : null;
             const effective = effectiveSettings(pass, presetLookup);
             return (
-              <div key={pass.key} className="flex items-center gap-2 text-xs">
+              <div key={pass.key} className="flex items-start gap-2 text-xs">
                 <span className="tabular text-muted-foreground">{index + 1}.</span>
-                {swatch !== null ? <span className="inline-block size-3 rounded-sm" style={{ background: swatch }} /> : null}
-                <span className="truncate">{label.text ?? "This pass"}</span>
-                <span className="ml-auto shrink-0 tabular text-muted-foreground">
-                  Speed {shown(effective.speed)} · force {shown(effective.force)} · {shown(effective.repeatCount)}×
+                {swatch !== null ? <span className="mt-0.5 inline-block size-3 shrink-0 rounded-sm" style={{ background: swatch }} /> : null}
+                <span>
+                  <span className="block">{label.text ?? "This pass"}</span>
+                  <span className="mt-0.5 block tabular text-muted-foreground">
+                    Speed {shown(effective.speed)} · force {shown(effective.force)} · {shown(effective.repeatCount)}×
+                  </span>
                 </span>
               </div>
             );

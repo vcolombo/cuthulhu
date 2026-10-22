@@ -3926,6 +3926,10 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await expect(dialog.locator(`[id="${describedBy}"]`)).toHaveText("Use 1–30");
     await expect(speed).toHaveCSS("border-color", theme === "light" ? "rgb(201, 35, 36)" : "rgb(255, 107, 99)");
     await expect(dialog.getByText("Red vinyl").first()).toBeVisible();
+    // A shape that starts on the mat's edge used to be the edge of this picture.
+    const matBox = (await dialog.getByRole("img", { name: "Shapes in this pass" }).getAttribute("viewBox"))?.split(/[ ,]/).map(Number);
+    expect(matBox?.[0]).toBeLessThan(0);
+    expect(matBox?.[1]).toBeLessThan(0);
     await expect(dialog.getByRole("button", { name: "Weeding", exact: true })).toHaveAttribute("aria-expanded", "false");
     await expect(dialog.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
     await expect(dialog.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
@@ -3935,9 +3939,20 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await goToSendStep(page, 3);
     await expect(dialog.getByRole("img", { name: /Cut preview/ })).toBeVisible();
     await expect(dialog.getByText("Silhouette Cameo 5 Alpha").first()).toBeVisible();
-    await expect(dialog.getByText("Red vinyl").first()).toBeVisible();
-    await expect(dialog.getByText("#00ff00").first()).toBeVisible();
-    await expect(dialog.getByText(/Speed 10 · force 10 · 1×/).first()).toBeVisible();
+    const redName = dialog.getByText("Red vinyl", { exact: true });
+    const greenName = dialog.getByText("#00ff00", { exact: true });
+    await expect(redName).toBeVisible();
+    await expect(greenName).toBeVisible();
+    // The settings used to share the name's line, and the name ellipsized to "Red …".
+    for (const name of [redName, greenName]) {
+      expect(await name.evaluate((node) => node.scrollWidth > node.clientWidth + 1)).toBe(false);
+    }
+    const nameBox = await redName.boundingBox();
+    const speedLine = dialog.getByText(/Speed 10 · force 10 · 1×/).first();
+    await expect(speedLine).toBeVisible();
+    const speedBox = await speedLine.boundingBox();
+    if (!nameBox || !speedBox) throw new Error("pass name or its settings have no box");
+    expect(speedBox.y).toBeGreaterThan(nameBox.y);
     await expect(dialog.getByRole("button", { name: "Start Cut" })).toBeEnabled();
     await shot(`send-step3-${theme}`);
 
@@ -3945,22 +3960,8 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await dialog.getByRole("button", { name: "Start Cut" }).click();
     await expect(dialog.getByText("Your design changed.")).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Replan" })).toBeEnabled();
-    const toast = page.locator("[data-sonner-toast]").first();
-    await expect(toast).toContainText(/changed since the cut/);
-    await expect(toast.getByRole("button", { name: "Copy details" })).toBeVisible();
-    const viewport = page.viewportSize();
-    if (!viewport) throw new Error("no viewport");
-    await expect.poll(async () => {
-      const box = await toast.boundingBox();
-      const back = await dialog.getByRole("button", { name: "Back", exact: true }).boundingBox();
-      if (!box || !back) return "missing";
-      const onScreen = box.x >= -0.5 && box.y >= -0.5
-        && box.x + box.width <= viewport.width + 0.5
-        && box.y + box.height <= viewport.height + 0.5;
-      const overlaps = box.x < back.x + back.width && box.x + box.width > back.x
-        && box.y < back.y + back.height && box.y + box.height > back.y;
-      return onScreen && !overlaps ? "clear" : `toast ${box.x},${box.y} ${box.width}x${box.height} back ${back.x},${back.y}`;
-    }).toBe("clear");
+    // The banner is the refusal. A toast of the same one used to cover the summary card.
+    await expect(page.locator("[data-sonner-toast]")).toHaveCount(0);
     await shot(`send-stale-replan-${theme}`);
     await dialog.getByRole("button", { name: "Close" }).click();
     await expect(page.getByRole("dialog")).toHaveCount(0);

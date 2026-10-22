@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import type { MachineProfile } from "../App";
 import type { Bounds } from "../render/hittest";
 import type { CutLineTypeJson } from "./cutLineType";
 import type { PresetAssignmentJson } from "../ipc";
@@ -27,6 +28,10 @@ type Props = {
   onDistribute: (axis: Axis) => void;
   onChangeCutLineType: (v: CutLineTypeJson) => void;
   onChangeMaterialPreset: (v: PresetAssignmentJson) => void;
+  /** Document machine, chosen without connecting a cutter. Always shown: a selection still has a page. */
+  machines?: MachineProfile[];
+  machineId?: string | null;
+  onDesignFor?: (machineId: string) => void;
 };
 
 /** What the material row reads for each state. Exported for its own test: it is the consumer
@@ -51,9 +56,30 @@ export function materialLabel(
 
 export function PropertiesPanel({ bounds, cutLineType, materialPreset, effectiveMaterial, presets,
                                   onChangeX, onChangeY, onChangeW, onChangeH, unitCount, editsLocked, distributeBlocked, onAlign, onDistribute,
-                                  onChangeCutLineType, onChangeMaterialPreset }: Props) {
+                                  onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor }: Props) {
   return (
     <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" }}>
+      {onDesignFor ? (
+        <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+          Design for
+          <select
+            aria-label="Design for"
+            value={machineId ?? ""}
+            onChange={(e) => {
+              if (e.target.value) onDesignFor(e.target.value);
+            }}
+          >
+            <option value="" disabled>
+              Select machine
+            </option>
+            {(machines ?? []).map((machine) => (
+              <option key={machine.id} value={machine.id}>
+                {machine.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       <div style={{ fontSize: 11, color: "var(--muted-foreground)", textTransform: "uppercase" }}>Properties</div>
       {bounds ? (
         <>

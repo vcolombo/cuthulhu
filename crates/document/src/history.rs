@@ -31,6 +31,16 @@ impl Editor {
         Some(forward)
     }
 
+    /// Whether Undo would change the document. The UI disables the control from this rather
+    /// than guessing from the last command it sent (#308).
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
     /// Replace `ids` with the boolean-op result, committed as one undoable step.
     pub fn boolean(&mut self, ids: &[NodeId], op: geometry::BoolOp) -> Result<Delta, CmdError> {
         let mut d = crate::commands::boolean_op(&self.doc, ids, op)?;
@@ -70,6 +80,27 @@ mod tests {
 
         ed.redo().unwrap();
         assert!(ed.doc.get(id).is_some());
+    }
+
+    #[test]
+    fn can_undo_and_can_redo_follow_the_stacks() {
+        let mut ed = Editor::new();
+        assert!(!ed.can_undo());
+        assert!(!ed.can_redo());
+        let id = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add {
+            parent: ed.doc.root,
+            index: 0,
+            node: Node::shape(id, ShapeKind::Rect { w: 1.0, h: 1.0 }),
+        }]));
+        assert!(ed.can_undo());
+        assert!(!ed.can_redo());
+        ed.undo().unwrap();
+        assert!(!ed.can_undo());
+        assert!(ed.can_redo());
+        ed.redo().unwrap();
+        assert!(ed.can_undo());
+        assert!(!ed.can_redo());
     }
 
     #[test]

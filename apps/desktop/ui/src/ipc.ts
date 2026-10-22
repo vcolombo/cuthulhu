@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
 import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import type { LengthUnit } from "./length";
+
+export type { LengthUnit };
 
 // ponytail: loose types for delta/snapshot payloads until Rust shape mirrors TS
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -49,6 +52,13 @@ export async function setCutLineType(args: Args) {
 
 export async function setMaterialPreset(args: Args) {
   return invoke("set_material_preset", args);
+}
+
+export type HistoryFlags = { can_undo: boolean; can_redo: boolean };
+
+/** The editor's undo stacks. Kept off the document snapshot: that JSON is the project shape (#308). */
+export async function history(): Promise<HistoryFlags> {
+  return invoke("history", {});
 }
 
 export async function undo() {
@@ -410,12 +420,14 @@ export async function pickImagePath(): Promise<string | null> {
 }
 
 export type Appearance = "light" | "dark" | "system";
-export type Preferences = { appearance: Appearance };
+/** `units` is null until a choice has been saved. The UI resolves the region once and writes it. */
+export type Preferences = { appearance: Appearance; units: LengthUnit | null };
 
 export async function getPreferences(): Promise<Preferences> {
   return invoke("get_preferences", {});
 }
 
-export async function setPreferences(appearance: Appearance): Promise<Preferences> {
-  return invoke("set_preferences", { appearance });
+/** Either field may be omitted. A save merges onto the file, so naming one does not drop the other. */
+export async function setPreferences(appearance?: Appearance, units?: LengthUnit): Promise<Preferences> {
+  return invoke("set_preferences", { appearance, units });
 }

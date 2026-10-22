@@ -94,6 +94,9 @@
   --warning: #9a5b00;
   --destructive: #c92324;
   --destructive-foreground: #ffffff;
+  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 clears about
+     3.4:1 on the light panel and 5.1:1 on the dark one, and still reads as off. */
+  --disabled-opacity: 0.55;
   /* #f472b6 is 1.79:1 on the light mat. This is that magenta at OKLCH L 0.55
      (same chroma and hue), 3.60:1 on #d4d4d4. */
   --guide: #b73a80;
@@ -166,6 +169,46 @@ body {
   outline: 2px solid transparent;
   outline-offset: 2px;
   box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
+}
+
+/* Tailwind's preflight sets `appearance: button` inside `@layer base`. Chromium
+   then paints ButtonText, and that used color stays the light foreground after
+   the page flips to dark — enabled labels render dark-on-dark while an explicit
+   `color` on a non-button updates. Unlayered so it wins over the preflight.
+   Checkboxes and radios keep their native appearance. `color` is left to the
+   utilities: an unlayered `color: inherit` would beat `text-foreground`. */
+button,
+input:where([type="button"], [type="reset"], [type="submit"]) {
+  appearance: none;
+}
+
+/* `color: inherit` on a button does not recompute when the theme class flips
+   `color-scheme`, so the used color stays the light foreground (`#012f36`)
+   even though `--foreground` on that button is already the dark one. A
+   variable on the control itself does recompute. `@layer base` so a utility
+   such as `text-primary-foreground` or `text-muted-foreground` still wins. */
+@layer base {
+  button,
+  input:where([type="button"], [type="reset"], [type="submit"]) {
+    color: var(--foreground);
+  }
+}
+
+/* One opacity for every disabled control that used to repeat `opacity: 0.35`.
+   Scoped to buttons and menu items so a disabled field does not fade with them. */
+button:disabled,
+[role="menuitem"][data-disabled],
+[role="menuitemradio"][data-disabled] {
+  opacity: var(--disabled-opacity);
+}
+
+/* Opening a menu with the pointer focuses the trigger and the popover, and
+   Chromium reports that programmatic focus as :focus-visible, so both painted
+   this ring. The ring is the keyboard cue on a control that is not already open. */
+[role="menu"]:focus-visible,
+:is(button, [role="button"])[data-state="open"]:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 
 .appearance-option:hover {

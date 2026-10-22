@@ -95,6 +95,14 @@ impl AppState {
         self.editor.redo()
     }
 
+    pub fn can_undo(&self) -> bool {
+        self.editor.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.editor.can_redo()
+    }
+
     /// Imports SVG paths under `parent`, committed as one undoable step. Returns the
     /// committed delta plus any elements the importer had to skip (unsupported nodes).
     pub fn import_svg(&mut self, bytes: Vec<u8>, parent: NodeId) -> Result<(Delta, Vec<String>), IoError> {

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { CSSProperties } from "react";
+import { Circle, ImageUp, MousePointer2, Square, SquaresExclude, SquaresIntersect, SquaresSubtract, SquaresUnite, Trash2, Type } from "lucide-react";
 import type { BoolOp } from "../App";
+import { Tip } from "../components/Tip";
+import { cn } from "../lib/cn";
 
 type Props = {
   tool: string;
@@ -9,57 +11,89 @@ type Props = {
   onAddRect: () => void;
   onAddEllipse: () => void;
   onAddText: () => void;
+  onTrace: () => void;
   onBoolean: (op: BoolOp) => void;
   onDelete: () => void;
 };
 
-const btn = (active: boolean): CSSProperties => ({
-  background: active ? "var(--accent)" : "var(--panel)",
-  color: "var(--text)",
-  border: "1px solid var(--border)",
-  padding: "6px 8px",
-  cursor: "pointer",
-  width: "100%",
-});
+const btn =
+  "flex w-14 flex-col items-center gap-0.5 rounded-md border border-transparent px-0.5 py-1.5 text-[11px] leading-tight tracking-tight text-muted-foreground hover:bg-subtle hover:text-foreground disabled:pointer-events-none";
 
-const BOOL_OPS: BoolOp[] = ["Union", "Subtract", "Intersect", "Exclude"];
+const BOOLS: { op: BoolOp; label: string; tip: string; kbd: string; Icon: typeof Square }[] = [
+  { op: "Union", label: "Union", tip: "Weld / Union", kbd: "⌘U", Icon: SquaresUnite },
+  { op: "Subtract", label: "Subtract", tip: "Subtract", kbd: "⌘⌥S", Icon: SquaresSubtract },
+  { op: "Intersect", label: "Intersect", tip: "Intersect", kbd: "⌘⌥I", Icon: SquaresIntersect },
+  { op: "Exclude", label: "Exclude", tip: "Exclude", kbd: "⌘⌥E", Icon: SquaresExclude },
+];
 
-export function ToolRail({ tool, selectionCount, onSelectTool, onAddRect, onAddEllipse, onAddText, onBoolean, onDelete }: Props) {
+export function ToolRail({
+  tool,
+  selectionCount,
+  onSelectTool,
+  onAddRect,
+  onAddEllipse,
+  onAddText,
+  onTrace,
+  onBoolean,
+  onDelete,
+}: Props) {
   const canBoolean = selectionCount >= 2;
+  const canDelete = selectionCount > 0;
+  const active = tool === "select";
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: 4,
-        padding: 6,
-        width: 96,
-        background: "var(--panel)",
-        borderRight: "1px solid var(--border)",
-      }}
-    >
-      <button aria-label="Select" style={btn(tool === "select")} onClick={() => onSelectTool("select")}>
-        Select
-      </button>
-      <button aria-label="Rectangle" style={btn(false)} onClick={onAddRect}>
-        Rectangle
-      </button>
-      <button aria-label="Ellipse" style={btn(false)} onClick={onAddEllipse}>
-        Ellipse
-      </button>
-      <button aria-label="Text" style={btn(false)} onClick={onAddText}>
-        Text
-      </button>
-      <div style={{ height: 1, background: "var(--border)", margin: "4px 0" }} />
-      {BOOL_OPS.map((op) => (
-        <button key={op} aria-label={op} disabled={!canBoolean} style={btn(false)} onClick={() => onBoolean(op)}>
-          {op}
+    <nav className="flex w-16 shrink-0 flex-col items-center gap-1 border-r border-border bg-panel py-2" aria-label="Tools">
+      <Tip label="Select" kbd="V" side="right">
+        <button
+          type="button"
+          aria-label="Select"
+          aria-pressed={active}
+          onClick={() => onSelectTool("select")}
+          className={cn(btn, "cursor-pointer", active && "border-brand bg-tint/25 text-accent-ink dark:bg-tint/10")}
+        >
+          <MousePointer2 className="size-4" aria-hidden />
+          Select
         </button>
+      </Tip>
+      <Tip label="Rectangle" kbd="R" side="right">
+        <button type="button" aria-label="Rectangle" onClick={onAddRect} className={cn(btn, "cursor-pointer")}>
+          <Square className="size-4" aria-hidden />
+          Rectangle
+        </button>
+      </Tip>
+      <Tip label="Ellipse" kbd="E" side="right">
+        <button type="button" aria-label="Ellipse" onClick={onAddEllipse} className={cn(btn, "cursor-pointer")}>
+          <Circle className="size-4" aria-hidden />
+          Ellipse
+        </button>
+      </Tip>
+      <Tip label="Text" kbd="T" side="right">
+        <button type="button" aria-label="Text" onClick={onAddText} className={cn(btn, "cursor-pointer")}>
+          <Type className="size-4" aria-hidden />
+          Text
+        </button>
+      </Tip>
+      <Tip label="Trace image" kbd="⇧T" side="right">
+        <button type="button" aria-label="Trace" onClick={onTrace} className={cn(btn, "cursor-pointer")}>
+          <ImageUp className="size-4" aria-hidden />
+          Trace
+        </button>
+      </Tip>
+      <div className="my-1 h-px w-10 bg-border" />
+      {BOOLS.map(({ op, label, tip, kbd, Icon }) => (
+        <Tip key={op} label={canBoolean ? tip : "Select 2 or more shapes"} kbd={kbd} side="right" disabled={!canBoolean}>
+          <button type="button" aria-label={label} disabled={!canBoolean} onClick={() => onBoolean(op)} className={btn}>
+            <Icon className="size-4" aria-hidden />
+            {label}
+          </button>
+        </Tip>
       ))}
-      <div style={{ height: 1, background: "var(--border)", margin: "4px 0" }} />
-      <button aria-label="Delete" disabled={selectionCount === 0} style={btn(false)} onClick={onDelete}>
-        Delete
-      </button>
-    </div>
+      <div className="mt-auto mb-1 h-px w-10 bg-border" />
+      <Tip label="Delete" kbd="Del" side="right" disabled={!canDelete}>
+        <button type="button" aria-label="Delete" disabled={!canDelete} onClick={onDelete} className={btn}>
+          <Trash2 className="size-4" aria-hidden />
+          Delete
+        </button>
+      </Tip>
+    </nav>
   );
 }

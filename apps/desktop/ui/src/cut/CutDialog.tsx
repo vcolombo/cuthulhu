@@ -78,7 +78,13 @@ type Props = {
   docMachineId: string | null;
   status: ipc.CutStatus;
   refreshDeviceState: () => Promise<void>;
-  onConvertMachine: (machineId: string) => void;
+  onConvertMachine: (machineId: string) => boolean | Promise<boolean>;
+  /** The connected cutter, from the one store the pill and the status bar read. */
+  connected: ipc.DeviceInfo | null;
+  /** Resolves true when the document was retargeted to this cutter, which stales an open plan. */
+  onConnect: (info: ipc.DeviceInfo) => Promise<boolean>;
+  onDisconnect: () => Promise<unknown>;
+  onReconnect: () => Promise<unknown>;
   onError: (msg: string) => void;
   onClose: () => void;
   /** The weed controls as last left, kept by App for the session; null until first changed, when
@@ -125,6 +131,11 @@ const TONE_COLOR: Record<ReturnType<typeof deviceBadge>["tone"], string> = {
   gone: "var(--muted-foreground)",
 };
 
+function cutterKey(info: ipc.DeviceInfo | null): string {
+  if (!info) return "";
+  return `${info.host ?? ""}:${info.instance_id}`;
+}
+
 const btn: CSSProperties = {
   background: "var(--panel)",
   color: "var(--text)",
@@ -140,6 +151,10 @@ export function CutDialog({
   status,
   refreshDeviceState,
   onConvertMachine,
+  connected,
+  onConnect,
+  onDisconnect,
+  onReconnect,
   onError,
   onClose,
   weed,
@@ -153,7 +168,6 @@ export function CutDialog({
   const [pairing, setPairing] = useState(false);
   /** The host whose forget was refused because nothing could confirm it is idle, if any. */
   const [forceHost, setForceHost] = useState<string | null>(null);
-  const [connected, setConnected] = useState<ipc.DeviceInfo | null>(null);
   // The machine id rides along with the caps: `connected` can change before an
   // in-flight fetch resolves, and showing one machine's capability against another
   // is the exact defect this fetch was added to remove.
@@ -237,29 +251,12 @@ export function CutDialog({
       .settingsRanges()
       .then(setRanges)
       .catch((e) => setRangesError(ipc.ipcErrorMessage(e)));
-    // Reopening the dialog after a connect earlier in the session lost the local
-    // `connected` state (it lives only in this component) even though the backend
-    // is still connected — seed it from the manager's own cache so Start Cut isn't
-    // stuck disabled. Presets load with it: they're otherwise only fetched in
-    // connect(), so a reopened dialog would show an empty preset dropdown.
-    ipc
-      .getConnectedDevice()
-      .then((info) => {
-        setConnected(info);
-        if (!info) return;
-        const aim = aimPresetsAt(info.machine_id);
-        // Separate chains on purpose: a corrupt presets file must not leave caps
-        // unfetched, and an unknown machine must not blank the preset dropdown.
-        ipc
-          .machineCaps(info.machine_id)
-          .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
-          .catch((e) => onError(ipc.ipcErrorMessage(e)));
-        return readPresets(aim, info.machine_id);
-      })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** The connected cutter this dialog has already aimed presets at, so a store update caused by
+   *  connect() does not load the list a second time. */
+  const handledKey = useRef<string | null>(null);
   /** Serial number of the newest travel-affecting request; see movePass and replan. */
   const travelSeq = useRef(0);
   /** Serial number of the newest Replan, so two in flight cannot install out of order. */
@@ -425,38 +422,43 @@ export function CutDialog({
   const connect = (info: ipc.DeviceInfo) => {
     // Marked before the request, not after it: the aim is already on its way to another cutter, and
     // an edit typed while it travels would be dropped by `aimPresetsAt` when it lands.
+    // The key is claimed first so the effect that follows `connected` does not load the same list
+    // again when the store publishes this cutter.
     setAiming(true);
-    ipc
-      .connectDevice(info)
-      .then(() => {
-        setConnected(info);
-        // A preset belongs to one machine, so nothing about the previous cutter's entry survives
-        // aiming at another — including a `list_presets` still owed to it. Reached only past
-        // `guardUnsaved`, which is what asks about an unsaved draft before it is dropped here.
+    const previous = handledKey.current;
+    handledKey.current = cutterKey(info);
+    onConnect(info)
+      .then((retargeted) => {
+        // set_machine rewrites the document the open plan was hashed against. Replan before
+        // Start Cut is reachable again (`aiming` holds it), or the first cut is refused stale.
+        if (retargeted) replan();
         const aim = aimPresetsAt(info.machine_id);
-        refreshDeviceState();
         ipc
           .machineCaps(info.machine_id)
           .then((c) => setCapsFor({ machineId: info.machine_id, caps: c as Caps }))
           .catch((e) => onError(ipc.ipcErrorMessage(e)));
         return readPresets(aim, info.machine_id);
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .catch((e) => {
+        handledKey.current = previous;
+        onError(ipc.ipcErrorMessage(e));
+      })
       .finally(() => setAiming(false));
   };
 
-  // Clears `connected` locally too: `disconnect_device` is what releases the local manager, and a
-  // row still labelled "connected" would offer no way back to the Connect that clears the state.
+  // The store drops the device. A row still labelled connected would offer no way back to Connect.
   const disconnect = () => {
     setAiming(true);
-    ipc
-      .disconnectDevice()
+    const previous = handledKey.current;
+    handledKey.current = "";
+    onDisconnect()
       .then(() => {
-        setConnected(null);
         aimPresetsAt(null);
-        refreshDeviceState();
       })
-      .catch((e) => onError(ipc.ipcErrorMessage(e)))
+      .catch((e) => {
+        handledKey.current = previous;
+        onError(ipc.ipcErrorMessage(e));
+      })
       .finally(() => setAiming(false));
   };
 
@@ -464,9 +466,8 @@ export function CutDialog({
   // desktop's, it has simply had its transport re-opened. The status refresh is the point —
   // `actions.cut` is what was withheld and what should come back.
   const reconnect = () => {
-    ipc
-      .reconnectDevice()
-      .then(refreshDeviceState)
+    onReconnect()
+      .then(() => undefined)
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
@@ -588,6 +589,29 @@ export function CutDialog({
         return null;
       },
     );
+
+  // The store is the source of the connected cutter, including one chosen from the pill while this
+  // dialog is open and one that drops out. connect() claims the key first so this does not run for
+  // the click that already loads caps and presets.
+  const connectedKey = cutterKey(connected);
+  useEffect(() => {
+    if (handledKey.current === connectedKey) return;
+    handledKey.current = connectedKey;
+    if (!connected) {
+      aimPresetsAt(null);
+      return;
+    }
+    const machineId = connected.machine_id;
+    const aim = aimPresetsAt(machineId);
+    // Separate chains on purpose: a corrupt presets file must not leave caps unfetched, and an
+    // unknown machine must not blank the preset dropdown.
+    ipc
+      .machineCaps(machineId)
+      .then((c) => setCapsFor({ machineId, caps: c as Caps }))
+      .catch((e) => onError(ipc.ipcErrorMessage(e)));
+    void readPresets(aim, machineId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connectedKey]);
 
   /** Marks the held list superseded, which every write does the moment it lands: the presets file
    *  no longer holds what this list says, and the read that will say what it does hold is out. The
@@ -1054,7 +1078,16 @@ export function CutDialog({
         {machineMismatch && connected ? (
           <div style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
             Document is set up for a different machine than the connected device.
-            <button style={btn} onClick={() => onConvertMachine(connected.machine_id)}>
+            <button
+              style={btn}
+              onClick={() => {
+                // The conversion is the document change. A refused set_machine leaves the open plan,
+                // which still matches the document (Bugbot on #313).
+                void Promise.resolve(onConvertMachine(connected.machine_id)).then((changed) => {
+                  if (changed) replan();
+                });
+              }}
+            >
               Convert to {connected.machine_id}
             </button>
           </div>

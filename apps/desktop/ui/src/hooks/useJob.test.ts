@@ -325,6 +325,38 @@ describe("useJob", () => {
     expect(api.current?.status).toEqual(idle);
   });
 
+  it("refetches when a same-host switch invalidates the poll already in flight", async () => {
+    const other = { ...REMOTE, instance_id: "usb:pi:D" } as DeviceInfo;
+    const idle = status({ phase: "Idle", actions: { cut: true, cancel: false, resume: false, confirm: false } });
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+
+    let releaseState: (next: CutStatus) => void = () => {};
+    let releaseHosts: (hosts: PairedHostView[]) => void = () => {};
+    ipc.getDeviceState.mockImplementation(() => new Promise((resolve) => { releaseState = resolve; }));
+    ipc.listHosts.mockImplementation(() => new Promise((resolve) => { releaseHosts = resolve; }));
+    const pending = api.current!.refreshDeviceState();
+
+    let releaseFresh: (next: CutStatus) => void = () => {};
+    ipc.getDeviceState.mockImplementation(() => new Promise((resolve) => { releaseFresh = resolve; }));
+    ipc.listHosts.mockResolvedValue([HOST]);
+    await act(async () => { api.current?.attach(other); });
+    await act(async () => {
+      releaseHosts([HOST]);
+      releaseState(SWAP);
+    });
+    expect(api.current?.status.phase).toBe("AwaitingColorSwap");
+
+    await act(async () => {
+      releaseFresh(idle);
+      await pending;
+    });
+    expect(api.current?.status).toEqual(idle);
+  });
+
   it("does not cancel a cut that finished while the host was unreachable", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

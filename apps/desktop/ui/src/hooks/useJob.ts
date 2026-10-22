@@ -136,7 +136,16 @@ export function useJob(onError: (message: string) => void) {
     const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
     if (!watching || id === null) {
       return ipc.getDeviceState().then((next) => {
-        if (acceptGenRef.current !== gen || aimGenRef.current !== aimGen) return;
+        if (acceptGenRef.current !== gen) return;
+        // `aim()` starts this read, then the effect's `attach` bumps the generation.
+        // Dropping it leaves the previous surface up: nothing else is polling.
+        if (aimGenRef.current !== aimGen) {
+          const nextGen = aimGenRef.current;
+          return ipc.getDeviceState().then((fresh) => {
+            if (acceptGenRef.current !== gen || aimGenRef.current !== nextGen) return;
+            ingest(fresh);
+          });
+        }
         ingest(next);
       }).catch((e) => {
         onErrorRef.current(ipc.ipcErrorMessage(e));
@@ -159,7 +168,16 @@ export function useJob(onError: (message: string) => void) {
         });
       }
       // Same host, different cutter. This read was started for the previous one.
-      if (aimGenRef.current !== aimGen) return;
+      // Read again for the cutter now aimed, or the switch keeps the old surface.
+      if (aimGenRef.current !== aimGen) {
+        const nextGen = aimGenRef.current;
+        return ipc.getDeviceState().then((fresh) => {
+          if (acceptGenRef.current !== gen || aimGenRef.current !== nextGen) return;
+          ingest(fresh);
+        }).catch((e) => {
+          onErrorRef.current(ipc.ipcErrorMessage(e));
+        });
+      }
       const host = hostsResult.status === "fulfilled" ? hostsResult.value.find((item) => item.id === id) ?? null : null;
       if (host !== null) knownHostRef.current = host;
       const unreachable = hostsResult.status === "fulfilled" && (host === null || host.unreachable !== null);

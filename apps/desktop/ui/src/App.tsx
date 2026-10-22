@@ -29,7 +29,7 @@ import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/Canv
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
-import { CutDialog } from "./cut/CutDialog";
+import { SendSheet } from "./cut/send/SendSheet";
 import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
 import { TextDialog } from "./text/TextDialog";
@@ -727,7 +727,7 @@ export function App() {
       </div>
     </div>
       {cutOpen && doc ? (
-        <CutDialog
+        <SendSheet
           scene={scene}
           artboard={doc.artboard}
           docMachineId={doc.machine?.id ?? null}

@@ -68,7 +68,7 @@ impl std::error::Error for PreflightError {}
 
 impl PreflightError {
     /// Stable identifier for a caller that must branch on the *kind* of refusal rather
-    /// than show its text — the desktop sends it as `IpcError::code`, and `CutDialog.tsx`
+    /// than show its text — the desktop sends it as `IpcError::code`, and `useCutDispatch.ts`
     /// keys off `stale_plan` instead of matching a sentence across a language boundary.
     pub fn code(&self) -> &'static str {
         match self {

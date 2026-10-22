@@ -1331,7 +1331,7 @@ impl DeviceManagerHandle {
 }
 
 /// Every way `plan_cut` can refuse, as an IPC code the UI can branch on.
-/// `stale_plan` is the one the frontend actually keys off (CutDialog.tsx).
+/// `stale_plan` is the one the frontend actually keys off (`useCutDispatch.ts`).
 /// The message is `cutplan`'s — this used to restate all ten here, and the CLI
 /// restated them again, differently.
 fn map_cut_error(e: CutError) -> IpcError {

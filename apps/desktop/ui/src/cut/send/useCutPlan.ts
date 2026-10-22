@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as ipc from "../../ipc";
 import {
   carryRows,
@@ -76,19 +76,23 @@ export function useCutPlan({
   const travelSeq = useRef(0);
   /** Serial number of the newest Replan, so two in flight cannot install out of order. */
   const planSeq = useRef(0);
-  /** The plan as last rendered, for a reply that lands after the rows were rearranged since its
-   *  request went out: what it carries over must be the arrangement on screen now. */
+  /** The plan as last committed, for a reply that lands after the rows were rearranged since its
+   *  request went out: what it carries over must be the arrangement on screen now. Grouping and
+   *  weed sit with it. Connect and Convert await before they replan, and the grouping select stays
+   *  usable in that window — a function closed over the click would plan the mode the operator has
+   *  since left. Written after commit, because a render React discards must not publish a grouping
+   *  or a plan the operator never saw. A change made in the same event passes its new value into
+   *  `replan` directly. */
   const planRef = useRef(plan);
-  planRef.current = plan;
-  /** Connect and Convert await before they replan, and the grouping select stays usable in that
-   *  window. A function closed over the click would plan the mode the operator has since left, and
-   *  a failure would put the picker back on that click's plan. */
   const groupingRef = useRef(grouping);
-  groupingRef.current = grouping;
   const weedReadRef = useRef(weedRead);
-  weedReadRef.current = weedRead;
   const weedDraftRef = useRef(weedDraft);
-  weedDraftRef.current = weedDraft;
+  useLayoutEffect(() => {
+    planRef.current = plan;
+    groupingRef.current = grouping;
+    weedReadRef.current = weedRead;
+    weedDraftRef.current = weedDraft;
+  }, [plan, grouping, weedRead, weedDraft]);
   /** Counts weed edits, so a refused replan puts the controls back only if nothing was typed since
    *  it went out: typing that plans nothing (a cleared field) does not move `planSeq`. */
   const weedEdits = useRef(0);

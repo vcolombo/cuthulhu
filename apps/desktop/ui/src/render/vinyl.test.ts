@@ -166,6 +166,12 @@ describe("colour-mode vinyl", () => {
     expect(selectionHasFaintVinyl(nodes, [2])).toBe(true);
     expect(selectionHasFaintVinyl({ 2: { ...nodes[2], style: { stroke: 0xff0000ff, fill: null } } }, [2])).toBe(false);
   });
+
+  it("does not warn about a faint shape that is not cut", () => {
+    const faint = { kind: { Shape: { Rect: { w: 1, h: 1 } } }, style: { stroke: 0xff000001, fill: null }, children: [] };
+    expect(selectionHasFaintVinyl({ 2: { ...faint, cut_line_type: "NoCut" } }, [2])).toBe(false);
+    expect(selectionHasFaintVinyl({ 2: { ...faint, cut_line_type: "Cut" } }, [2])).toBe(true);
+  });
 });
 
 function converterRgb(hex: string): { r: number; g: number; b: number } {

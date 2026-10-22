@@ -93,6 +93,17 @@ describe("viewport", () => {
     expect((tl.y + br.y) / 2).toBeCloseTo((free.top + free.bottom) / 2, 6);
   });
 
+  it("caps a few-millimetre target at the zoom ceiling and still centres it", () => {
+    const target = { x: 0, y: 0, w: 0.01, h: 0.01 };
+    const frame = { w: 2000, h: 2000 };
+    const v = fitView(target, frame);
+    expect(v.scale).toBe(MAX_SCALE);
+    const tl = worldToScreen(v, { x: 0, y: 0 });
+    const br = worldToScreen(v, { x: target.w, y: target.h });
+    expect((tl.x + br.x) / 2).toBeCloseTo(frame.w / 2, 6);
+    expect((tl.y + br.y) / 2).toBeCloseTo(frame.h / 2, 6);
+  });
+
   it("gives Fit content more air than the mat fit", () => {
     const artwork = { x: 0, y: 0, w: 40, h: 20 };
     expect(fitView(artwork, size, CONTENT_FIT_MARGIN_PX).scale).toBeLessThan(fitView(artwork, size).scale);

@@ -283,23 +283,39 @@ function drawGrid(
   const top = Math.max(mat.y, (0 - ty) / scale);
   const bottom = Math.min(mat.y + mat.h, (cssH - ty) / scale);
   if (right <= left || bottom <= top) return;
+  // Each axis on its own: a long roll is tall and a wide machine is not, and one step
+  // for both would coarsen the short side.
+  const xStep = gridStep(minor, major, scale, right - left);
+  const yStep = gridStep(minor, major, scale, bottom - top);
 
   const minorSegs: Segment[] = [];
   const majorSegs: Segment[] = [];
   const sy1 = top * scale + ty;
   const sy2 = bottom * scale + ty;
-  for (const x of steps(mat.x, minor, left, right)) {
+  for (const x of steps(mat.x, xStep, left, right)) {
     const sx = x * scale + tx;
     (onMajor(x, mat.x, major) ? majorSegs : minorSegs).push({ x1: sx, y1: sy1, x2: sx, y2: sy2 });
   }
   const sx1 = left * scale + tx;
   const sx2 = right * scale + tx;
-  for (const y of steps(mat.y, minor, top, bottom)) {
+  for (const y of steps(mat.y, yStep, top, bottom)) {
     const sy = y * scale + ty;
     (onMajor(y, mat.y, major) ? majorSegs : minorSegs).push({ x1: sx1, y1: sy, x2: sx2, y2: sy });
   }
   strokeSegments(ctx, color, 0.5, minorSegs);
   strokeSegments(ctx, color, 1, majorSegs);
+}
+
+/**
+ * Minor lines while they stay at least 4 CSS px apart. Otherwise the major step, and a
+ * multiple of that when the visible span would still pass the 500-coordinate cap in
+ * `steps`. A long roll at the zoom floor is denser than an inch even on the major step,
+ * and the cap used to stop drawing and leave the rest of the mat blank.
+ */
+export function gridStep(minor: number, major: number, scale: number, span: number): number {
+  const base = minor * scale >= 4 ? minor : major;
+  if (span <= base * 499) return base;
+  return major * Math.ceil(span / (499 * major));
 }
 
 function steps(origin: number, step: number, min: number, max: number): number[] {

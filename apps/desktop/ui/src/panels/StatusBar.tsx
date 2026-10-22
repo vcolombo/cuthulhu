@@ -3,9 +3,9 @@ import { useEffect, useState } from "react";
 import { Crosshair, Maximize2, ZoomIn } from "lucide-react";
 import type { MachineProfile } from "../App";
 import type { LengthUnit } from "../length";
-import { formatLength, unitToMm } from "../length";
+import { formatLength } from "../length";
 import type { CutStatus, DeviceInfo, PairedHostView, Phase } from "../ipc";
-import { matKindLabel, type MatKind } from "../render/mat";
+import { committedRollLength, matKindLabel, type MatKind } from "../render/mat";
 
 type MatControl = {
   kind: MatKind;
@@ -42,12 +42,15 @@ function RollLength({ mm, unit, onCommit }: { mm: number; unit: LengthUnit; onCo
   const [text, setText] = useState(() => formatLength(mm, unit));
   useEffect(() => setText(formatLength(mm, unit)), [mm, unit]);
   const commit = () => {
-    const n = Number(text);
-    if (!Number.isFinite(n)) {
+    const next = committedRollLength(text, unit);
+    if (next === null) {
       setText(formatLength(mm, unit));
       return;
     }
-    onCommit(unitToMm(n, unit));
+    // Write the clamped length back before the parent hears it. A value already at the
+    // minimum does not change `mm`, so the effect would leave a typed "2" showing a 6 in roll.
+    setText(formatLength(next, unit));
+    onCommit(next);
   };
   return (
     <input

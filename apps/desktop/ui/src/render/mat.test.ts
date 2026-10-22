@@ -5,6 +5,7 @@ import {
   ROLL_DEFAULT_MM,
   ROLL_MIN_MM,
   clampRollLength,
+  committedRollLength,
   defaultMatKind,
   matBounds,
   matKindLabel,
@@ -34,6 +35,15 @@ describe("mat presets", () => {
     expect(matBounds("roll", 600, ROLL_DEFAULT_MM)).toEqual({ x: 0, y: 0, w: 600, h: 36 * MM_PER_IN });
     expect(matBounds("roll", 600, 10).h).toBe(ROLL_MIN_MM);
     expect(clampRollLength(Number.NaN)).toBe(ROLL_DEFAULT_MM);
+  });
+
+  it("treats a blank roll field as a revert and a short one as the minimum", () => {
+    expect(committedRollLength("", "in")).toBeNull();
+    expect(committedRollLength("   ", "mm")).toBeNull();
+    expect(committedRollLength("nope", "in")).toBeNull();
+    expect(committedRollLength("2", "in")).toBe(ROLL_MIN_MM);
+    expect(committedRollLength("0", "mm")).toBe(ROLL_MIN_MM);
+    expect(committedRollLength("48", "in")).toBe(48 * MM_PER_IN);
   });
 
   it("names presets by the sheet, with whole millimetres in brackets", () => {

@@ -40,7 +40,9 @@ export function fitView(target: Bounds, size: Size, margin = FIT_MARGIN_PX, inse
   }
   const availW = Math.max(size.w - 2 * margin - inset.left - inset.right, 1);
   const availH = Math.max(size.h - 2 * margin - inset.top - inset.bottom, 1);
-  const scale = Math.min(availW / target.w, availH / target.h);
+  // zoomAt already refuses past MAX_SCALE. A fit of a few millimetres on a large window
+  // used to store a scale above that, so the next zoom snapped and the status read past 6400%.
+  const scale = Math.min(availW / target.w, availH / target.h, MAX_SCALE);
   // With a zero inset this is `(size - target * scale) / 2`, the centring the older call had.
   const x0 = inset.left + margin + (availW - target.w * scale) / 2;
   const y0 = inset.top + margin + (availH - target.h * scale) / 2;

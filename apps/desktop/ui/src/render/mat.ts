@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import type { Bounds } from "./hittest";
-import { MM_PER_IN, formatLength, type LengthUnit } from "../length";
+import { MM_PER_IN, formatLength, unitToMm, type LengthUnit } from "../length";
 
 export type MatKind = "12x12" | "12x24" | "roll";
 
@@ -35,6 +35,18 @@ export function offeredKind(chosen: MatKind, machineId: string | null): MatKind 
 export function clampRollLength(mm: number): number {
   if (!Number.isFinite(mm)) return ROLL_DEFAULT_MM;
   return Math.max(ROLL_MIN_MM, mm);
+}
+
+/**
+ * The length a roll field should store. Blank is not zero: `Number("")` is 0, which the
+ * clamp would turn into the six-inch minimum and shorten the mat. Non-numeric is a revert.
+ */
+export function committedRollLength(text: string, unit: LengthUnit): number | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n)) return null;
+  return clampRollLength(unitToMm(n, unit));
 }
 
 /**

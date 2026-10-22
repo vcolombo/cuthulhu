@@ -52,7 +52,7 @@ export function nearlyInvisible(rgba: number): boolean {
   return alpha > 0 && alpha < 26;
 }
 
-type WalkNode = { kind: unknown; style?: VinylStyle; children: number[] };
+type WalkNode = { kind: unknown; style?: VinylStyle; cut_line_type?: string; children: number[] };
 
 /** True when any selected shape's colour-mode vinyl is nearly invisible in the file. */
 export function selectionHasFaintVinyl(nodes: Record<string, WalkNode>, selected: number[]): boolean {
@@ -65,6 +65,8 @@ export function selectionHasFaintVinyl(nodes: Record<string, WalkNode>, selected
     const node = nodes[String(id)];
     if (!node) continue;
     if (node.kind !== null && typeof node.kind === "object" && "Shape" in node.kind) {
+      // The note says the shape still cuts. A NoCut shape does not, so a faint one is not the warning.
+      if (node.cut_line_type === "NoCut") continue;
       const vinyl = colorModeVinyl(node.style);
       if (vinyl !== null && nearlyInvisible(vinyl)) return true;
     } else {

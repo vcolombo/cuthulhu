@@ -2,7 +2,7 @@
 import { useEffect, useRef } from "react";
 import type { Scene } from "../render/hittest";
 import { vinylDisplay } from "../render/vinyl";
-import { useTheme } from "../useTheme";
+import type { ResolvedTheme } from "../theme";
 import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds } from "./viewmodel";
 import type { PassKey } from "../ipc";
 
@@ -34,6 +34,7 @@ type Props = {
   artboard: { x: number; y: number; w: number; h: number };
   passes: PreviewPass[];
   travel: [number, number, number, number][];
+  theme: ResolvedTheme;
 };
 
 /** Cut-plan preview: artboard outline + pass-colored paths + order badges + dashed travel
@@ -41,9 +42,8 @@ type Props = {
  *  plan is empty) — a fixed 1px=1mm mapping left a typical small document a few dozen
  *  pixels in the corner of a 330×3000mm artboard. Badges and dashes are screen-space so
  *  they stay legible at any fitted scale. */
-export function CutPreview({ scene, artboard, passes, travel }: Props) {
+export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const theme = useTheme();
 
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");
@@ -84,7 +84,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
       // A pass with no colour to draw in — the colourless pass, the single pass, or a
       // preset-keyed one — keeps the text colour it always had.
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme.resolved).stroke : text;
+      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme).stroke : text;
       for (const nodeId of pass.nodeIds) {
         const node = nodesById.get(nodeId);
         if (!node) continue;
@@ -142,7 +142,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
       // A pass with no colour to draw in — the colourless pass, the single pass, or a
       // preset-keyed one — keeps the text colour it always had.
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme.resolved).stroke : text;
+      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme).stroke : text;
       pass.nodeIds.forEach((nodeId, shapeIndex) => {
         const node = nodesById.get(nodeId);
         if (!node) return;
@@ -183,7 +183,7 @@ export function CutPreview({ scene, artboard, passes, travel }: Props) {
     if (clipped.top) edge(0, 0.5, size.w, 0.5);
     if (clipped.bottom) edge(0, size.h - 0.5, size.w, size.h - 0.5);
     ctx.setLineDash([]);
-  }, [scene, artboard, passes, travel, theme.resolved]);
+  }, [scene, artboard, passes, travel, theme]);
 
   // A canvas has no accessible name of its own, and this one carries the answer to "what is about
   // to be cut" — so it says what it drew: the passes that will run and the moves between them.

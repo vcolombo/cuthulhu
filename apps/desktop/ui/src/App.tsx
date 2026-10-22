@@ -742,6 +742,7 @@ export function App() {
           onClose={() => setCutOpen(false)}
           weed={cutWeed}
           onWeedChange={setCutWeed}
+          theme={theme.resolved}
         />
       ) : null}
       {tracePath !== null ? (

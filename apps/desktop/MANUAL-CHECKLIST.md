@@ -1,5 +1,5 @@
 # Manual checklist (per release)
-- [ ] Switch machine Cameo 5 ⇄ Puma IV — artboard resizes on the canvas and in the status bar.
+- [ ] Switch machine Cameo 5 ⇄ Puma IV — the mat selector offers 12×12, 12×24, and roll for the Cameo and roll only for the Puma, and the canvas refits to that mat.
 - [ ] Import a complex SVG via the TopBar Import button — paths render as real geometry; stays responsive (pan/zoom deferred — SP4 candidate).
 - [ ] Drag/scale — drag via the canvas, scale via the properties panel W/H fields; one undo reverts the whole gesture. Rotate + on-canvas handles (deferred).
 - [ ] Boolean union/subtract/intersect/exclude on two overlapping shapes — correct result rendered as a real path.
@@ -113,7 +113,7 @@ real network can confirm the swap end to end.
 
 ## Viewport and handles (spec 2026-10-06, unverified)
 
-- [ ] Launch on a Retina Mac — strokes and handles are crisp, not blurred; the artboard fits the window.
+- [ ] Launch on a Retina Mac — strokes and handles are crisp, not blurred; the mat fits the window, inset from the rulers and clear of the zoom bar.
 - [ ] Trackpad: pinch zooms about the fingers; two-finger scroll pans; ⌘0 refits; ⌘1 is CSS reference
       size — record how far a 100 mm rect is from 100 mm on a ruler, with the display and its OS
       scaling (it is exact only at the reference density; per-monitor calibration is a ponytail).

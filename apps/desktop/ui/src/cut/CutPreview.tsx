@@ -9,6 +9,7 @@ import type { PassKey } from "../ipc";
 const FALLBACK_BORDER = "#2E2E34";
 const FALLBACK_PANEL = "#1F1F23";
 const FALLBACK_TEXT = "#E7E7EA";
+const FALLBACK_MAT = "#484848";
 
 /** Converts a packed 0xRRGGBBAA paint color (see document::Style) to a CSS rgba() string. */
 export function cssColor(rgba: number): string {
@@ -56,6 +57,7 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     const border = style.getPropertyValue("--border").trim() || FALLBACK_BORDER;
     const panel = style.getPropertyValue("--panel").trim() || FALLBACK_PANEL;
     const text = style.getPropertyValue("--text").trim() || FALLBACK_TEXT;
+    const mat = style.getPropertyValue("--mat").trim() || FALLBACK_MAT;
 
     const nodesById = new Map(scene.nodes.map((n) => [n.id, n]));
     const drawn = passes.flatMap((p) => p.nodeIds)
@@ -67,7 +69,7 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     const vp = fitViewport(contentBounds([...drawn, ...weedBoxes], travel), artboard, size, 16);
 
     ctx.setTransform(vp.scale, 0, 0, vp.scale, vp.tx, vp.ty);
-    ctx.fillStyle = panel;
+    ctx.fillStyle = mat;
     ctx.fillRect(artboard.x, artboard.y, artboard.w, artboard.h);
     ctx.strokeStyle = border;
     ctx.lineWidth = 1 / vp.scale;
@@ -202,7 +204,7 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
       aria-label={label}
       width={400}
       height={300}
-      style={{ background: "var(--workspace)" }}
+      style={{ background: "var(--mat)", width: "100%", height: "auto" }}
     />
   );
 }

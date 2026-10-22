@@ -20,6 +20,101 @@ async function fileAction(page: Page, name: string) {
   await page.getByRole("menuitem", { name, exact: true }).click();
 }
 
+const SEND_STEPS = ["Machine", "Material & passes", "Preview & cut"] as const;
+
+/** Blank speed and force on a pass that names no preset. An unread or unknown preset is left
+ *  alone: the backend resolves it, and filling it would hide the case a test is proving. */
+async function fillSendLevels(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  const speeds = dialog.getByLabel(/Speed for pass /);
+  const n = await speeds.count();
+  for (let i = 0; i < n; i++) {
+    const speed = speeds.nth(i);
+    if (!(await speed.isVisible()) || !(await speed.isEnabled())) continue;
+    if ((await speed.inputValue()) !== "") continue;
+    const preset = dialog.getByLabel(`Preset for pass ${i + 1}`);
+    if ((await preset.inputValue()) !== "no-preset") continue;
+    await speed.fill("10");
+    const force = dialog.getByLabel(`Force for pass ${i + 1}`);
+    if ((await force.isEnabled()) && (await force.inputValue()) === "") await force.fill("10");
+  }
+}
+
+/** Step 1 is the machine list, step 2 the passes, step 3 the preview and Start cut.
+ *  Leaving step 2 fills the blanks a no-preset pass would otherwise refuse. A step already
+ *  opened stays on the stepper when Next is gated, which is how a dropped aim is still readable. */
+async function goToSendStep(page: Page, step: 1 | 2 | 3) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  for (let i = 0; i < 4; i++) {
+    const current = Number(await dialog.getAttribute("data-send-step"));
+    if (current === step) return;
+    if (current === 2 && step > current) await fillSendLevels(page);
+    if (current < step) {
+      const next = dialog.getByRole("button", { name: "Next", exact: true });
+      if (await next.isEnabled()) {
+        await next.click();
+        continue;
+      }
+      const via = dialog.getByRole("button", { name: SEND_STEPS[step - 1] });
+      if (await via.isEnabled()) {
+        await via.click();
+        continue;
+      }
+      await next.click();
+    } else {
+      await dialog.getByRole("button", { name: "Back", exact: true }).click();
+    }
+  }
+  throw new Error(`send sheet did not reach step ${step}`);
+}
+
+/** Pass rows, grouping and weeding live on step 2, which needs a cutter that can cut. */
+async function showPasses(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog).toBeVisible();
+  if (Number(await dialog.getAttribute("data-send-step")) !== 2) {
+    const next = dialog.getByRole("button", { name: "Next", exact: true });
+    if (await next.isDisabled()) {
+      await dialog.getByRole("button", { name: "Connect", exact: true }).first().click();
+    }
+    await goToSendStep(page, 2);
+  }
+}
+
+/** The grip replaces Up and Down. Alt+Arrow is the keyboard half of the same move. */
+async function reorderPass(page: Page, index: number, dir: -1 | 1) {
+  await page.getByRole("button", { name: `Reorder pass ${index + 1}` }).press(dir < 0 ? "Alt+ArrowUp" : "Alt+ArrowDown");
+}
+
+/** Start cut exists only on step 3. Calling this from an earlier step is the walk there. */
+async function startCut(page: Page) {
+  await goToSendStep(page, 3);
+  await page.getByRole("button", { name: "Start Cut" }).click();
+}
+
+/** The preview is step 3. Next waits out a replan, so the name is the plan that landed. */
+async function showPreview(page: Page) {
+  await goToSendStep(page, 3);
+  return page.getByRole("img", { name: /Cut preview/ });
+}
+
+/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again. */
+async function expectStartOffered(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  const back = Number(await dialog.getAttribute("data-send-step")) < 3;
+  await goToSendStep(page, 3);
+  await expect(dialog.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  if (back) await goToSendStep(page, 2);
+}
+
+/** The preset editor is closed until asked, and a reopened sheet starts on the machine step. */
+async function showPresetEditor(page: Page) {
+  await showPasses(page);
+  const manage = page.getByLabel("Preset to manage");
+  if (!(await manage.isVisible())) await page.getByRole("button", { name: "Edit presets…" }).click();
+  await expect(manage).toBeVisible();
+}
+
 // Minimal in-memory fake Tauri backend. Runs inside the page (via addInitScript, so it
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
@@ -574,6 +669,9 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
   let inFlightEdits = 0;
   let holdingSnapshots = false;
   const heldSnapshots: (() => void)[] = [];
+  // See `__holdPass` below: the advance out of Sending, parked until a test releases it.
+  let holdPass = false;
+  let heldPass: (() => void) | null = null;
   Object.assign(window, {
     __holdSnapshots: () => { holdingSnapshots = true; },
     __holdEdits: () => { holdingEdits = true; },
@@ -594,6 +692,15 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
     __releaseRanges: () => release(heldRanges),
     __failRanges: () => { rangesFail = true; },
     __releaseTravel: () => release(heldTravel),
+    // The scripted pass leaves Sending after 50ms. Step 1 is where the badge is, and getting
+    // there takes longer than that, so a test that wants the transmitting tone holds the advance.
+    __holdPass: () => { holdPass = true; },
+    __releasePass: () => {
+      holdPass = false;
+      const advance = heldPass;
+      heldPass = null;
+      advance?.();
+    },
   });
 
   // Mirrors crates/document/src/commands.rs transform_nodes_in, which transform_nodes and
@@ -851,7 +958,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
       statusOf("Sending", { cancel: true }, { pass: { index: passIndex, total: enabledIndices.length }, sent: { sent, total } });
     status = sending(0);
     emit("StateChanged");
-    setTimeout(() => {
+    const advance = () => {
       status = sending(total);
       emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
       emit({ PassComplete: passIndex });
@@ -880,7 +987,11 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
         );
         emit("StateChanged");
       }
-    }, 50);
+    };
+    // Held before the timer: Sending is only on screen for 50ms, and the badge that has to
+    // show it lives on step 1, a navigation away.
+    if (holdPass) heldPass = advance;
+    else setTimeout(advance, 50);
   }
 
   Object.assign(commands, {
@@ -1541,9 +1652,10 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   await page.getByRole("button", { name: "Resume" }).click();
@@ -1560,11 +1672,12 @@ test("changing the grouping replans and renames the passes", async ({ page }) =>
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByLabel("Group passes by").selectOption("Single");
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-  await expect(page.getByText("Every cut shape")).toBeVisible();
+  await expect(page.getByTestId("cut-pass-row").getByText("Every cut shape")).toBeVisible();
 
   // And back again: switching modes replans each time rather than keeping the first answer.
   await page.getByLabel("Group passes by").selectOption("Stroke");
@@ -1580,18 +1693,25 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
 
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
   await page.getByLabel("Group passes by").selectOption("Single");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  await expect(next).toBeDisabled();
   // Still showing the old mode's rows, which is exactly why Cut is unavailable.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // The new plan's pass is a new row, so its speed and force start blank and have to be set.
+  await fillSendLevels(page);
+  await expect(next).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("a weed border and lines replan into the preview, and the cut carries the options", async ({ page }) => {
@@ -1599,22 +1719,27 @@ test("a weed border and lines replan into the preview, and the cut carries the o
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  const preview = page.getByRole("img", { name: /Cut preview/ });
-  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await showPasses(page);
   // Lines wait for a border: without one their ends would stop in the open sheet.
   await expect(page.getByLabel("Weed lines")).toBeDisabled();
   await expect(page.getByLabel("Weed margin")).toBeDisabled();
+  let preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
 
   await page.getByLabel("Weed border").check();
   // One border per pass, each its own sheet, and the blade travels to each after its shapes.
-  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
   await expect(page.getByLabel("Weed lines")).toBeEnabled();
   await expect(page.getByLabel("Weed spacing")).toBeDisabled();
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await goToSendStep(page, 2);
 
   await page.getByLabel("Weed lines").selectOption("Horizontal");
   await page.getByLabel("Weed spacing").fill("5");
   // Each 10 mm rect's border runs -3..13 on y; lines at y = 2 and 7 cross the rect and are cut off
   // within the clearance, leaving stubs under 2 mm, so only y = 12 survives: one line per pass.
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 5 travel moves, 4 weed paths");
 
   await page.getByRole("button", { name: "Start Cut" }).click();
@@ -1628,21 +1753,24 @@ test("a weed field out of range disables Cut and says why", async ({ page }) => 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
+  await fillSendLevels(page);
   await page.getByLabel("Weed border").check();
-  const start = page.getByRole("button", { name: "Start Cut" });
-  await expect(start).toBeEnabled();
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
 
   await page.getByLabel("Weed margin").fill("60");
   await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.5–50 mm" })).toBeVisible();
-  await expect(start).toBeDisabled();
+  await expect(next).toBeDisabled();
   // Not cut without its border: the last plan still holds the old margin, so Cut waits.
   await page.getByLabel("Weed margin").fill("4");
-  await expect(start).toBeEnabled();
+  await expect(next).toBeEnabled();
 
   await page.getByLabel("Weed lines").selectOption("Both");
   await page.getByLabel("Weed clearance").fill("4");
   await expect(page.getByRole("alert").filter({ hasText: "Clearance must be less than the margin" })).toBeVisible();
-  await expect(start).toBeDisabled();
+  await expect(next).toBeDisabled();
 });
 
 // What a replan for a weed edit does to the rows: the operator's arrangement (which passes are cut,
@@ -1652,18 +1780,21 @@ test("a weed edit keeps the passes as the operator arranged them, and their trav
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   const rows = page.getByTestId("cut-pass-row");
   await expect(rows).toHaveCount(2);
-  await rows.nth(1).getByRole("button", { name: "Up" }).click(); // green first
+  await reorderPass(page, 1, -1); // green first
   await rows.nth(1).getByRole("checkbox").uncheck(); // and red not cut
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+  await goToSendStep(page, 2);
 
   await page.getByLabel("Weed border").check();
   await expect(rows.nth(0).locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
   await expect(rows.nth(1).getByRole("checkbox")).not.toBeChecked();
   // Travel for the list as arranged: only green is cut, so one move, to its border. The plan's
   // own travel (both passes, in planned order) would read 3.
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
 });
 
@@ -1673,11 +1804,14 @@ test("reordering passes keeps the weed in the replanned travel", async ({ page }
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await page.getByLabel("Weed border").check();
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
-  await page.getByTestId("cut-pass-row").nth(1).getByRole("button", { name: "Up" }).click();
+  await goToSendStep(page, 2);
+  await reorderPass(page, 1, -1);
   await expect(page.getByTestId("cut-pass-row").first().locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
 });
 
@@ -1686,13 +1820,17 @@ test("Cut waits while a weed replan is out, so a border nobody has previewed can
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  const start = page.getByRole("button", { name: "Start Cut" });
-  await expect(start).toBeEnabled();
+  await showPasses(page);
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
   await page.getByLabel("Weed border").check();
-  await expect(start).toBeDisabled();
+  await expect(next).toBeDisabled();
   await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
-  await expect(start).toBeEnabled();
+  await expect(next).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("a refused weed replan puts the controls back to the plan still installed", async ({ page }) => {
@@ -1700,16 +1838,19 @@ test("a refused weed replan puts the controls back to the plan still installed",
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await page.getByLabel("Weed border").check();
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await goToSendStep(page, 2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
   await page.getByLabel("Weed lines").selectOption("Both");
   // The controls say what the installed plan holds, so Cut is offered for what the preview shows.
   await expect(page.getByLabel("Weed lines")).toHaveValue("None");
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // A refusal arriving after the operator has typed on must not put back over what they typed.
@@ -1717,8 +1858,11 @@ test("a refused weed replan does not overwrite what was typed after it", async (
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await page.getByLabel("Weed border").check();
-  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName(/2 weed paths/);
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName(/2 weed paths/);
+  await goToSendStep(page, 2);
   await page.evaluate(() => {
     const w = window as unknown as { __armHold: () => void; __refuseHeldPlans: () => void };
     w.__armHold();
@@ -1734,10 +1878,12 @@ test("changing the grouping keeps the weed", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await page.getByLabel("Weed border").check();
   await page.getByLabel("Group passes by").selectOption("Single");
   // One pass over both rects, so one border around both.
-  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
 });
 
 test("Border waits for the weed defaults, and says why while it waits or when they fail", async ({ page }) => {
@@ -1745,6 +1891,7 @@ test("Border waits for the weed defaults, and says why while it waits or when th
   await page.goto("/");
   await page.evaluate(() => (window as unknown as { __holdRanges: () => void }).__holdRanges());
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   const border = page.getByLabel("Weed border");
   // Ticked now it would start from an empty margin.
   await expect(border).toBeDisabled();
@@ -1758,6 +1905,7 @@ test("Border waits for the weed defaults, and says why while it waits or when th
   await page.reload();
   await page.evaluate(() => (window as unknown as { __failRanges: () => void }).__failRanges());
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByLabel("Weed border")).toBeDisabled();
   await expect(page.getByLabel("Weed border")).toHaveAttribute("title", /Weeding is unavailable: settings ranges could not be read/);
 });
@@ -1766,15 +1914,18 @@ test("reopening the cut dialog keeps the weed controls as they were left", async
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await page.getByLabel("Weed border").check();
   await page.getByLabel("Weed margin").fill("4");
   await page.getByRole("button", { name: "Close" }).click();
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByLabel("Weed border")).toBeChecked();
   await expect(page.getByLabel("Weed margin")).toHaveValue("4");
   // And the first plan of the reopened dialog is made with them.
-  await expect(page.getByRole("img", { name: /Cut preview/ })).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
 });
 
 // Greptile's P1 on this PR, with its own Playwright repro: a replan that fails leaves the previous
@@ -1787,10 +1938,12 @@ test("a rejected replan keeps the travel it was showing", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   // Two passes means one move between them - the travel this test is about.
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
   await page.getByLabel("Group passes by").selectOption("Single");
@@ -1798,7 +1951,8 @@ test("a rejected replan keeps the travel it was showing", async ({ page }) => {
   // The plan failed, so the previous one is still in force: same rows, same mode, still cuttable.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  preview = await showPreview(page);
+  await expectStartOffered(page);
   // ...and the preview still describes the arrangement that cut would use.
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
@@ -1818,8 +1972,9 @@ test("a replan failing while another is parked keeps the installed plan's travel
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 
   // Stale the plan so the banner - and its Replan - are on screen.
@@ -1830,7 +1985,7 @@ test("a replan failing while another is parked keeps the installed plan's travel
     ),
   );
   await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await expect(page.getByText("Your design changed.")).toBeVisible();
 
   // First Replan is parked in flight: the window in which travel used to be cleared.
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
@@ -1844,12 +1999,16 @@ test("a replan failing while another is parked keeps the installed plan's travel
 
   // Nothing was ever replaced, so the original plan is still the installed one - and the preview
   // must still describe it rather than showing a cut with no travel at all.
+  await goToSendStep(page, 2);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 
   // The parked reply lands last and is superseded, so it changes nothing either.
+  await goToSendStep(page, 2);
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
 
@@ -1864,15 +2023,19 @@ test("a travel reply owed to a row edit still lands when a replan fails", async 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
 
   // Disable a pass and park the travel reply it asks for: one pass left to cut means no travel
   // between passes, which is the answer this plan is owed.
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move");
+  await goToSendStep(page, 2);
 
   // Now a replan fails. The edited rows stay installed - so the parked reply is still the right
   // answer for them, and discarding it would leave the count above standing for good.
@@ -1882,6 +2045,7 @@ test("a travel reply owed to a row edit still lands when a replan fails", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __releaseTravel: () => void }).__releaseTravel());
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
 });
 
@@ -1910,6 +2074,7 @@ test("a pass whose assigned preset was deleted is refused, not cut", async ({ pa
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPresetEditor(page);
   await page.getByLabel("Group passes by").selectOption("Preset");
   // One pass for the assigned material, one for everything that resolves to none.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
@@ -1919,7 +2084,7 @@ test("a pass whose assigned preset was deleted is refused, not cut", async ({ pa
   await page.getByLabel("Delete preset").click();
   await expect(page.getByTestId("cut-pass-row").first()).toContainText("card-stock (unknown preset)");
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText(/not available for this machine/)).toBeVisible();
 });
 
@@ -1935,6 +2100,7 @@ test("an empty preset id is still named and refused", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await page.getByLabel("Group passes by").selectOption("Preset");
 
   // Copilot on PR #272: the picker keys its options in the pass-key grammar, so the pass keyed on a
@@ -1942,7 +2108,7 @@ test("an empty preset id is still named and refused", async ({ page }) => {
   // not express, since it had to spend the empty string on the absence.
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:");
   await expect(page.getByTestId("cut-pass-row").first()).toContainText("(unknown preset)");
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText(/material preset ``.*not available for this machine/)).toBeVisible();
 });
 
@@ -2054,7 +2220,7 @@ const callFake = (page: Page, cmd: string) =>
 const openDialogOnCameo = async (page: Page) => {
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByLabel("Preset to manage")).toBeVisible();
+  await showPresetEditor(page);
 };
 
 test("a preset created in the cut dialog is offered to a pass and cut by its id", async ({ page }) => {
@@ -2076,7 +2242,7 @@ test("a preset created in the cut dialog is offered to a pass and cut by its id"
   // And a pass can now be cut with it, which is the whole point of managing them here.
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
   await page.getByLabel("Preset for pass 1").selectOption("preset:thick-card");
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   // Which pass carries it, not merely that some pass does: the dialog attaching the preset to the
@@ -2175,6 +2341,7 @@ test("a write that landed is not reported as refused when the re-read after it f
   // And 18 is in the file: a fresh dialog reads the list again — no Connect, the cutter is still
   // connected — and the failure the section was showing is answered by that read.
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("force 18");
 
@@ -2187,6 +2354,7 @@ test("a write that landed is not reported as refused when the re-read after it f
   await expect(page.getByRole("dialog")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("force 19");
 });
@@ -2285,6 +2453,7 @@ test("an unsaved preset edit has to be decided before the dialog closes", async 
   // this time: the cutter is still connected, and the dialog seeds itself from the manager's cache
   // — pressing the first Connect on screen would aim at the *other* local cutter.
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 9");
 });
@@ -2325,14 +2494,18 @@ test("a preset belongs to one cutter: aiming at another shows that machine's ent
   // Connect while it holds a transport, so the dialog's Disconnect is the way across. The Puma's
   // list is its own — an id is the operator's own string, so one machine's entry must not appear,
   // or be editable, under another (#153).
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await goToSendStep(page, 2);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
 
   // And the Cameo's entry is untouched by the trip, settings and all.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 7");
 });
@@ -2363,8 +2536,10 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await page.getByLabel("Delete preset").click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await goToSendStep(page, 2);
   await callFake(page, "__test_release_presets");
 
   // The Cameo's reply is inert: no draft of its material, and none of its entries in the picker.
@@ -2374,8 +2549,10 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
 
   // And the delete that was in flight did reach the Cameo's file, where it belonged.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
 });
@@ -2402,8 +2579,10 @@ test("a preset list owed to a previous connection to the same cutter is not take
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Preset speed").fill("16");
   await page.getByLabel("Save preset", { exact: true }).click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await goToSendStep(page, 2);
 
   // This aim has read nothing yet: the editor is withheld, whatever the previous connection left
   // behind. Rendered from that cached list, New would mint an id against entries nobody re-read.
@@ -2442,8 +2621,10 @@ test("a save's continuation is dropped when the cutter changed before it could r
   await page.getByLabel("Preset to manage").selectOption("vinyl");
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Save preset and continue").click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await goToSendStep(page, 2);
   await callFake(page, "__test_release_presets");
 
   // Nothing of the Cameo's arrives on the Puma: no draft, and no Cameo entry in its picker. The
@@ -2454,8 +2635,10 @@ test("a save's continuation is dropped when the cutter changed before it could r
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Vinyl" })).toHaveCount(0);
 
   // And the save that carried the continuation did land on the Cameo, where it was aimed.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 13");
 });
@@ -2488,8 +2671,10 @@ test("an unsaved edit withholds the actions that would discard it, and an unread
   // With every list reply parked, aiming at the Puma leaves nothing to create against: no picker,
   // no New, and a line saying why.
   await callFake(page, "__test_hold_presets");
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
   await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await goToSendStep(page, 2);
   await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
   await expect(page.getByLabel("New preset")).toHaveCount(0);
 
@@ -2521,6 +2706,7 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await callFake(page, "__test_hold_presets");
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
   await page.getByLabel("Group passes by").selectOption("Preset");
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
@@ -2534,7 +2720,7 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
   // Cutting stays available throughout: the backend resolves the material from the presets file,
   // and refuses by name when it cannot, so nothing here is a gate.
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 
   // The name and its settings arrive together, under the aim that asked for them.
   await callFake(page, "__test_release_presets");
@@ -2546,7 +2732,9 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   // machine-scoped, so from here nothing can resolve the name — not "reading", which is why the
   // marker does not say so. What must not come back is `(unknown preset)`: the material is not gone,
   // and the file the backend would resolve it from is untouched by a disconnect.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
+  await goToSendStep(page, 2);
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("unknown preset");
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
@@ -2593,7 +2781,7 @@ test("a written preset's previous name and settings leave the pass row when the 
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
   // Cutting stays available throughout: the backend resolves the material from the presets file,
   // and refuses by name when it cannot, so nothing here is a gate.
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   // And the editor above the rows does not go with them. It is withheld only until *some* list for
   // this aim has arrived, because what is stored is what a new entry's id and name must avoid —
   // withholding it here would take it off screen on every save.
@@ -2612,7 +2800,7 @@ test("a written preset's previous name and settings leave the pass row when the 
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Heavy Card");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // The delete half of the same window, which is its own branch of the dialog and can regress on its
@@ -2648,7 +2836,7 @@ test("a deleted preset's name and settings leave the pass row when the delete la
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Card Stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   // The editor stays, for the same reason it stays across a save: it is what the held entries are
   // kept for.
   await expect(page.getByLabel("Preset to manage")).toBeVisible();
@@ -2677,7 +2865,7 @@ test("a deleted preset's name and settings leave the pass row when the delete la
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Card Stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {
@@ -2711,6 +2899,7 @@ test("a grouping whose plan fails does not stay on the picker", async ({ page })
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
 
@@ -2732,6 +2921,7 @@ test("row controls are unavailable while a replacement plan is in flight", async
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
 
@@ -2745,7 +2935,7 @@ test("row controls are unavailable while a replacement plan is in flight", async
   await expect(page.getByLabel("Repeat count for pass 1")).toBeDisabled();
   await expect(page.getByLabel("Preset for pass 1")).toBeDisabled();
   await expect(page.getByRole("checkbox", { name: "Enabled" }).first()).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Down" }).first()).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeDisabled();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
@@ -2771,6 +2961,7 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
   await cuttable.uncheck();
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByText("Not cut: 1 shape marked No Cut")).toBeVisible();
 
@@ -2780,6 +2971,7 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
   await showTab(page, "Properties");
   await cuttable.check();
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
 
@@ -2796,6 +2988,7 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
 
   await cuttable.click();
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
 });
@@ -2809,6 +3002,7 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Reaches past the UI on purpose: the canvas drag that would edit the document (through
@@ -2821,11 +3015,14 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
     ),
   );
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByText("Your design changed.")).toBeVisible();
 
   await page.getByRole("button", { name: "Replan" }).click();
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  // A replan starts the rows again, so the blanks a no-preset pass refuses have to be filled once more.
+  await goToSendStep(page, 2);
+  await fillSendLevels(page);
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 });
 
@@ -2833,13 +3030,14 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Seeded first-seen order is red (0xff0000ff) then green (0x00ff00ff).
   const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
   await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
 
-  await page.getByRole("button", { name: "Down" }).first().click();
+  await reorderPass(page, 0, 1);
   await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
 
   // The wire is the contract under test: the replan request names the swapped order.
@@ -2858,6 +3056,7 @@ test("disabling a pass replans travel without it", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
@@ -2877,6 +3076,7 @@ test("reordering after a doc edit surfaces the stale plan instead of stale trave
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Same off-screen edit as the stale-cut test above: the dialog covers the canvas.
@@ -2887,8 +3087,8 @@ test("reordering after a doc edit surfaces the stale plan instead of stale trave
     ),
   );
 
-  await page.getByRole("button", { name: "Down" }).first().click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await reorderPass(page, 0, 1);
+  await expect(page.getByText("Your design changed.")).toBeVisible();
 });
 
 // The order these two settle in is the whole defect: a reorder issued before Replan carries
@@ -2900,6 +3100,7 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() =>
@@ -2908,16 +3109,17 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
       { ids: [2], m: [1, 0, 0, 1, 5, 0] },
     ),
   );
-  const banner = page.getByText("Document changed since this plan was made.");
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  const banner = page.getByText("Your design changed.");
+  await startCut(page);
   await expect(banner).toBeVisible();
+  await goToSendStep(page, 2);
 
   // The interleaving, without editing a row during a replan — which the dialog now refuses,
   // because rows belonging to a plan being replaced must not accept edits the arriving plan
   // discards. The reorder goes out *first* and is held, which is what the defect's own story
   // says anyway: "a reorder issued before Replan carries the old revision".
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
-  await page.getByRole("button", { name: "Down" }).first().click();
+  await reorderPass(page, 0, 1);
   await page.getByRole("button", { name: "Replan" }).click();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<unknown> }).__releasePlans());
@@ -3057,10 +3259,11 @@ test("a stuck cutter on a Cut Host offers Reconnect, and reconnecting makes it c
 
   // The cancel nobody could confirm: the badge asks for a person, and Start Cut is withheld.
   // Scoped to the dialog: the pill and the status bar name the same host.
-  const dialog = page.getByRole("dialog", { name: "Cut" });
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
   await expect(dialog.getByText("Bench Pi")).toBeVisible();
   await expect(page.getByText(/Cancelled — stop not confirmed/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
 
   // Reconnect, not Disconnect: this desktop never opened that transport, and dropping the aim
   // would leave the cutter exactly as stuck.
@@ -3068,7 +3271,7 @@ test("a stuck cutter on a Cut Host offers Reconnect, and reconnecting makes it c
   await page.getByRole("button", { name: "Reconnect usb:pi:C" }).click();
 
   await expect(page.getByText("Ready", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // The teardown is the deliverable, not the interval. A leaked interval keeps a Cut Host
@@ -3148,14 +3351,15 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("a cut that runs to the end reports completion, not a cancellation", async ({ page }) => {
@@ -3163,9 +3367,10 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
 
@@ -3173,7 +3378,7 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   // is the case the mock could not express while a finished cut only rested on `Idle`.
   await expect(page.getByText("Job complete")).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("transmitting shows a Cancel button and progress so the GUI can cancel mid-cut", async ({ page }) => {
@@ -3181,11 +3386,16 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  // Sending lasts 50ms unless held, and the badge is on step 1. Without the hold the
+  // pass has already parked for a colour swap, whose badge asks for a person.
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
   await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+  await goToSendStep(page, 1);
 
   // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
   // has polled. `deviceBadge`'s unit tests assert on `tone` alone; this is what makes them
@@ -3200,9 +3410,10 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText(/complete/i)).toBeVisible();
@@ -3220,7 +3431,7 @@ test("reopening the dialog after connect recovers the connected device", async (
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   // The pill's "no cutter connected" contains the same substring once a design has a machine.
-  const cut = page.getByRole("dialog", { name: "Cut" });
+  const cut = page.getByRole("dialog", { name: "Send to cutter" });
   await expect(cut.getByText("connected")).toBeVisible();
 
   await page.getByRole("button", { name: "Close" }).click();
@@ -3229,8 +3440,8 @@ test("reopening the dialog after connect recovers the connected device", async (
   // Without get_connected_device seeding this on mount, the reopened dialog's local
   // `connected` state comes back null even though the backend is still connected,
   // leaving Start Cut stuck disabled and the device row stuck on "Connect".
-  await expect(page.getByRole("dialog", { name: "Cut" }).getByText("connected")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" }).getByText("connected")).toBeVisible();
+  await expectStartOffered(page);
 });
 
 // The exit from a cancel whose stop nothing confirmed. `driver-core` refuses both a cut and a
@@ -3242,7 +3453,7 @@ test("a connected cutter offers a disconnect, and the row goes back to offering 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  const cut = page.getByRole("dialog", { name: "Cut" });
+  const cut = page.getByRole("dialog", { name: "Send to cutter" });
   await expect(cut.getByText("connected")).toBeVisible();
 
   await page.getByRole("button", { name: "Disconnect", exact: false }).first().click();
@@ -3261,9 +3472,10 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
@@ -3279,9 +3491,10 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   // Arm a one-shot async resume failure, then resume: the Failed phase must show
@@ -3297,8 +3510,9 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // comes back only because the reconnect's Idle status was accepted.
   // The first connect aimed the document at the Cameo, so this one asks before switching.
   page.once("dialog", (dialog) => dialog.accept());
+  await goToSendStep(page, 1);
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // A fault whose mid-flight status never reaches a render: a banner that waits to be
@@ -3308,10 +3522,11 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Cut failed")).toBeVisible();
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
@@ -3325,9 +3540,10 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
   await expect(page.getByText("Job complete")).toBeVisible();
@@ -3335,8 +3551,9 @@ test("a reconnect clears the completed banner from the previous connection", asy
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
+  await goToSendStep(page, 1);
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
@@ -3348,9 +3565,10 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText("Waiting for color swap")).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
@@ -3358,9 +3576,64 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
+  await goToSendStep(page, 1);
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("the send sheet walks machine, passes and preview, and withholds a blank level", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+
+  const shots = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.SEND_SHEET_SHOTS === "1";
+  const shot = async (name: string) => {
+    if (!shots) return;
+    await page.getByRole("dialog", { name: "Send to cutter" }).screenshot({ path: `/opt/cursor/artifacts/${name}.png` });
+  };
+  const nudge = (dx: number) =>
+    page.evaluate((x) =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "commit_transform",
+        { ids: [2], m: [1, 0, 0, 1, x, 0] },
+      ), dx);
+
+  const walk = async (theme: "light" | "dark", dx: number) => {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+    await expect(dialog).toHaveAttribute("data-send-step", "1");
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+    await shot(`send-step1-${theme}`);
+
+    await showPasses(page);
+    await expect(dialog.getByTestId("cut-pass-row")).toHaveCount(2);
+    await expect(dialog.getByLabel("Speed for pass 1")).toHaveAttribute("aria-invalid", "true");
+    await expect(dialog.getByText("Use 1–30").first()).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+    await shot(`send-step2-${theme}-invalid`);
+
+    await fillSendLevels(page);
+    await goToSendStep(page, 3);
+    await expect(dialog.getByRole("img", { name: /Cut preview/ })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+    await shot(`send-step3-${theme}`);
+
+    await nudge(dx);
+    await dialog.getByRole("button", { name: "Start Cut" }).click();
+    await expect(dialog.getByText("Your design changed.")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Replan" })).toBeEnabled();
+    await shot(`send-stale-replan-${theme}`);
+    await dialog.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  };
+
+  await walk("light", 5);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await walk("dark", 12);
 });
 
 test("trace dialog: preview appears and insert adds paths", async ({ page }) => {
@@ -5503,7 +5776,9 @@ test("a refused machine change does not rebuild the open plan", async ({ page })
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failSetMachine: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await expect(page.getByTestId("cut-pass-row").first()).toBeVisible();
+  // The passes are the second step, and that step asks for a cutter first. The plan itself is
+  // requested as the sheet opens, which is the signal this test used the rows for.
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0)).toBeGreaterThan(0);
   const before = await page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0);
   await page.getByRole("button", { name: "Connect", exact: true }).first().click();
   await expect(page.getByText("could not set the machine")).toBeVisible();

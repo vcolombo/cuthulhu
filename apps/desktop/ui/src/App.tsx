@@ -743,6 +743,7 @@ export function App() {
           weed={cutWeed}
           onWeedChange={setCutWeed}
           theme={theme.resolved}
+          unit={unit}
         />
       ) : null}
       {tracePath !== null ? (

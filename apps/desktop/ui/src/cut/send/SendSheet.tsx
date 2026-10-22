@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, ArrowRight, Check, Scissors, X } from "lucide-react";
 import * as ipc from "../../ipc";
+import type { LengthUnit } from "../../length";
 import type { Scene } from "../../render/hittest";
 import type { ResolvedTheme } from "../../theme";
+import { Button } from "../../components/ui/button";
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "../../components/ui/sheet";
+import { cn } from "../../lib/cn";
 import type { WeedDraft } from "../viewmodel";
-import { btn, dialogStyle, panelStyle } from "./chrome";
+import { collectPassIssues } from "./passFields";
 import { AlreadyAcceptedNote, StepPreview } from "./StepPreview";
 import { HostPairing, StepMachine, useDeviceList } from "./StepMachine";
 import { StepPasses } from "./StepPasses";
@@ -12,24 +17,8 @@ import { useCutDispatch } from "./useCutDispatch";
 import { useCutPlan } from "./useCutPlan";
 import { usePresetsForAim } from "./usePresetsForAim";
 
-/** Phase 4b's stepper writes this. Until then every section stays on screen. */
+const STEPS = ["Machine", "Material & passes", "Preview & cut"] as const;
 export type SendStep = 1 | 2 | 3;
-
-function shownSections(step: SendStep): { machine: boolean; passes: boolean; preview: boolean } {
-  switch (step) {
-    case 1:
-    case 2:
-    case 3:
-      // ponytail: one scroll until phase 4b's stepper. The step is already the shell's, so that
-      // stepper is a writer rather than a new home for the state. Upgrade: return false for the
-      // sections a step does not show.
-      return { machine: true, passes: true, preview: true };
-    default: {
-      const unreachable: never = step;
-      return unreachable;
-    }
-  }
-}
 
 type Props = {
   scene: Scene;
@@ -53,6 +42,7 @@ type Props = {
   /** App's resolved theme. A second `useTheme()` keeps its own state, so a keyboard
    *  appearance change while this dialog is open would leave the swatches on the old theme. */
   theme: ResolvedTheme;
+  unit: LengthUnit;
 };
 
 export function SendSheet({
@@ -71,9 +61,16 @@ export function SendSheet({
   weed,
   onWeedChange,
   theme,
+  unit,
 }: Props) {
-  const [step] = useState<SendStep>(1);
-  const shown = shownSections(step);
+  const [step, setStep] = useState<SendStep>(1);
+  // The first visit to a step is Next, which is what requires a cutter. Going back to the machine
+  // list to disconnect must not trap the passes there: the row is where a dropped aim shows that
+  // a material's name is unread, and Next will not leave step 1 without a cutter that can cut.
+  const [reached, setReached] = useState<SendStep>(1);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const opened = useRef(true);
   const device = useDeviceList({ refreshDeviceState, onError, onReconnect });
 
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
@@ -82,8 +79,6 @@ export function SendSheet({
   const [ranges, setRanges] = useState<ipc.SettingsRanges | null>(null);
   const [rangesError, setRangesError] = useState<string | null>(null);
   useEffect(() => {
-    // Its own chain, and its failure is kept rather than raised: it withholds the preset editor
-    // (see below) instead of taking the dialog's other sections down with it.
     ipc
       .settingsRanges()
       .then(setRanges)
@@ -107,15 +102,29 @@ export function SendSheet({
     clearPending: () => setPendingAfterDecision(null),
   });
 
+  const rows = plan.plan?.rows ?? [];
+  const issues = collectPassIssues(rows, presets.presetLookup, presets.caps, ranges);
   const dispatch = useCutDispatch({
     connected,
     plan: plan.plan,
     replanning: plan.replanning,
     weedSettled: plan.weedSettled,
+    // Blank speed and force, and a plan the document has since left, never leave the sheet.
+    // The button is disabled for the same reason; this still holds if the click arrives.
+    canSend: () => !plan.stalePlan && collectPassIssues(plan.plan?.rows ?? [], presets.presetLookup, presets.caps, ranges).length === 0,
     onStalePlan: () => plan.setStalePlan(true),
     onError,
     refreshDeviceState,
   });
+
+  // Moving between steps, not the open itself: the dialog's own focus lands on the first control.
+  useEffect(() => {
+    if (opened.current) {
+      opened.current = false;
+      return;
+    }
+    headingRef.current?.focus();
+  }, [step]);
 
   /** Every action that replaces or drops the draft goes through here: selecting another preset,
    *  aiming at another cutter, and closing the dialog. An operator who typed a force and pressed
@@ -139,194 +148,256 @@ export function SendSheet({
   };
 
   const machineMismatch = docMachineId !== null && connected !== null && docMachineId !== connected.machine_id;
+  // A preset list still in flight does not hold the steps. `aiming` covers that read, and the
+  // rows are what say the name is unread while it is out; Start waits on `replanning` instead,
+  // which is the window a retarget's new plan has not installed yet.
+  const readyCutter = connected !== null && status.actions.cut;
+  const passesReady = plan.plan !== null && rows.length > 0 && !plan.replanning && plan.weedSettled
+    && issues.length === 0 && !machineMismatch && readyCutter && !dispatch.cutInFlight;
+  // The first Start is what discovers a stale plan. Only the ones after the refusal wait.
+  const startReady = passesReady && !plan.stalePlan;
+
+  const go = (next: SendStep) => {
+    setStep(next);
+    setReached((prev) => (next > prev ? next : prev));
+  };
 
   return (
     <>
-    <div style={panelStyle}>
-      <div role="dialog" aria-modal="true" aria-label="Cut" data-send-step={step} style={dialogStyle}>
-        <div style={{ display: "flex", alignItems: "center" }}>
-          <strong>Cut</strong>
-          <div style={{ flex: 1 }} />
-          <button aria-label="Close" style={btn} onClick={() => guardUnsaved(onClose)}>
-            Close
-          </button>
-        </div>
+      <Sheet open onOpenChange={(next) => { if (!next) guardUnsaved(onClose); }}>
+        <SheetContent
+          data-send-step={step}
+          className="gap-0 p-0 sm:max-w-none"
+          onInteractOutside={(event) => event.preventDefault()}
+          onPointerDownOutside={(event) => event.preventDefault()}
+        >
+          <div className="border-b border-border px-6 pb-4 pt-5">
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <SheetTitle className="text-xl font-semibold">Send to cutter</SheetTitle>
+                <SheetDescription className="mt-1 text-sm text-muted-foreground">
+                  Three quick steps. Nothing is cut until you press Start cut.
+                </SheetDescription>
+              </div>
+              <button type="button" aria-label="Close" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => guardUnsaved(onClose)}>
+                <X className="size-4" aria-hidden />
+              </button>
+            </div>
+            <ol className="mt-4 flex items-center gap-2" aria-label="Steps">
+              {STEPS.map((title, index) => {
+                const number = (index + 1) as SendStep;
+                const current = number === step;
+                const done = number < step;
+                const opened = number <= reached;
+                const badge = (
+                  <span className={cn(
+                    "grid size-6 place-items-center rounded-full border text-xs font-semibold",
+                    current && "border-accent-ink text-accent-ink",
+                    done && "border-success bg-success/15 text-success",
+                    !current && !done && "border-border text-muted-foreground",
+                  )}>
+                    {done ? <Check className="size-3.5" aria-hidden /> : number}
+                  </span>
+                );
+                return (
+                  <li key={title} className="flex flex-1 items-center gap-2">
+                    {current ? (
+                      <h2 ref={headingRef} tabIndex={-1} aria-current="step" className="flex items-center gap-2 text-sm font-medium outline-none">
+                        {badge}
+                        {title}
+                      </h2>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!opened}
+                        onClick={() => go(number)}
+                        className={cn("flex items-center gap-2 text-sm", opened ? "text-foreground/80 hover:text-foreground" : "text-muted-foreground")}
+                      >
+                        {badge}
+                        {title}
+                      </button>
+                    )}
+                    {index < STEPS.length - 1 ? <span className="h-px flex-1 bg-border" /> : null}
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
 
-        {shown.machine ? (
-          <StepMachine
-            devices={device.devices}
-            hosts={device.hosts}
-            shown={device.shown}
-            forceHost={device.forceHost}
-            setForceHost={device.setForceHost}
-            connected={connected}
-            status={status}
-            aiming={presets.aiming}
-            guardUnsaved={guardUnsaved}
-            onConnect={presets.connect}
-            onDisconnect={presets.disconnect}
-            onReconnect={device.reconnect}
-            onForget={device.forget}
-            onAddHost={() => device.setPairing(true)}
-          />
-        ) : null}
+          <div className="flex-1 space-y-4 overflow-auto px-6 py-5">
+            {pendingAfterDecision !== null ? (
+              <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+                <span>Unsaved changes to the preset “{presets.draft?.name}”.</span>
+                <Button variant="secondary" size="sm" aria-label="Save preset and continue" disabled={presets.presetBusy || presets.presetFault !== null} onClick={saveThenContinue}>
+                  Save and continue
+                </Button>
+                <Button variant="secondary" size="sm" aria-label="Discard preset changes and continue" disabled={presets.presetBusy} onClick={discardThenContinue}>
+                  Discard changes
+                </Button>
+                <Button variant="ghost" size="sm" aria-label="Keep editing the preset" onClick={() => setPendingAfterDecision(null)}>
+                  Keep editing
+                </Button>
+              </div>
+            ) : null}
 
-        {shown.passes ? (
-          <StepPasses
-            mid={
-              <>
-                {/* The decision is the operator's, and nothing moves until they make it: Save writes and
-                    then does what they asked for, Discard drops the edit and does it, Keep editing leaves
-                    them where they were. Save is withheld while the draft is refused, with the reason
-                    already on screen in the editor above. */}
-                {pendingAfterDecision !== null ? (
-                  <div role="alert" style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                    <span>Unsaved changes to the preset “{presets.draft?.name}”.</span>
-                    <button
-                      aria-label="Save preset and continue"
-                      style={btn}
-                      disabled={presets.presetBusy || presets.presetFault !== null}
-                      onClick={saveThenContinue}
-                    >
-                      Save and continue
-                    </button>
-                    <button aria-label="Discard preset changes and continue" style={btn} disabled={presets.presetBusy} onClick={discardThenContinue}>
-                      Discard changes
-                    </button>
-                    <button aria-label="Keep editing the preset" style={btn} onClick={() => setPendingAfterDecision(null)}>
-                      Keep editing
-                    </button>
-                  </div>
-                ) : null}
+            {machineMismatch && connected ? (
+              <div className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+                Document is set up for a different machine than the connected device.
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    // The conversion is the document change. A refused set_machine leaves the open plan,
+                    // which still matches the document (Bugbot on #313).
+                    void Promise.resolve(onConvertMachine(connected.machine_id)).then((changed) => {
+                      if (changed) plan.replan();
+                    });
+                  }}
+                >
+                  Convert to {connected.machine_id}
+                </Button>
+              </div>
+            ) : null}
 
-                {machineMismatch && connected ? (
-                  <div style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                    Document is set up for a different machine than the connected device.
-                    <button
-                      style={btn}
-                      onClick={() => {
-                        // The conversion is the document change. A refused set_machine leaves the open plan,
-                        // which still matches the document (Bugbot on #313).
-                        void Promise.resolve(onConvertMachine(connected.machine_id)).then((changed) => {
-                          if (changed) plan.replan();
-                        });
-                      }}
-                    >
-                      Convert to {connected.machine_id}
-                    </button>
-                  </div>
-                ) : null}
+            <AlreadyAcceptedNote show={dispatch.alreadyAccepted} />
 
-                <AlreadyAcceptedNote show={dispatch.alreadyAccepted} />
+            {plan.stalePlan ? (
+              <div className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+                Your design changed.
+                <Button variant="secondary" size="sm" onClick={() => plan.replan()}>Replan</Button>
+              </div>
+            ) : null}
 
-                {plan.stalePlan ? (
-                  <div style={{ color: "var(--cut)", fontSize: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                    Document changed since this plan was made.
-                    <button style={btn} onClick={() => plan.replan()}>
-                      Replan
-                    </button>
-                  </div>
-                ) : null}
-              </>
-            }
-            connected={connected}
-            ranges={ranges}
-            rangesError={rangesError}
-            weed={weed}
-            theme={theme}
-            presets={presets.presets}
-            presetsLoaded={presets.presetsLoaded}
-            presetListError={presets.presetListError}
-            caps={presets.caps}
-            draft={presets.draft}
-            presetMode={presets.presetMode}
-            presetDirty={presets.presetDirty}
-            presetFault={presets.presetFault}
-            presetError={presets.presetError}
-            presetBusy={presets.presetBusy}
-            aiming={presets.aiming}
-            guardUnsaved={guardUnsaved}
-            onSelectPreset={presets.editPreset}
-            onNewPreset={presets.newPreset}
-            onCopyPreset={presets.copyPreset}
-            onChangeDraft={(patch) => presets.setDraft((prev) => (prev === null ? prev : { ...prev, ...patch }))}
-            onSavePreset={() => presets.savePresetDraft()}
-            onDiscardPreset={presets.discardDraft}
-            onDeletePreset={presets.deletePresetDraft}
-            grouping={plan.grouping}
-            setGrouping={plan.setGrouping}
-            replanning={plan.replanning}
-            replan={plan.replan}
-            weedDraft={plan.weedDraft}
-            weedRead={plan.weedRead}
-            changeWeed={plan.changeWeed}
-            planRows={plan.plan?.rows ?? null}
-            planGrouping={plan.plan?.grouping ?? null}
-            skippedNotCut={plan.plan?.skippedNotCut ?? null}
-            presetLookup={presets.presetLookup}
-            updateRow={plan.updateRow}
-            setPassEnabled={plan.setPassEnabled}
-            movePass={plan.movePass}
-          />
-        ) : null}
+            {step === 1 ? (
+              <StepMachine
+                devices={device.devices}
+                hosts={device.hosts}
+                shown={device.shown}
+                forceHost={device.forceHost}
+                setForceHost={device.setForceHost}
+                connected={connected}
+                status={status}
+                aiming={presets.aiming}
+                guardUnsaved={guardUnsaved}
+                onConnect={presets.connect}
+                onDisconnect={presets.disconnect}
+                onReconnect={device.reconnect}
+                onForget={device.forget}
+                onAddHost={() => device.setPairing(true)}
+                onRetry={() => void device.refreshList()}
+              />
+            ) : null}
 
-        {shown.preview ? (
-          <StepPreview
-            scene={scene}
-            artboard={artboard}
-            passes={plan.plan?.rows ?? []}
-            travel={plan.plan?.travel ?? []}
-            theme={theme}
-          />
-        ) : null}
+            {step === 2 ? (
+              <StepPasses
+                connected={connected}
+                ranges={ranges}
+                rangesError={rangesError}
+                weed={weed}
+                unit={unit}
+                theme={theme}
+                scene={scene}
+                artboard={artboard}
+                presets={presets.presets}
+                presetsLoaded={presets.presetsLoaded}
+                presetListError={presets.presetListError}
+                caps={presets.caps}
+                draft={presets.draft}
+                presetMode={presets.presetMode}
+                presetDirty={presets.presetDirty}
+                presetFault={presets.presetFault}
+                presetError={presets.presetError}
+                presetBusy={presets.presetBusy}
+                aiming={presets.aiming}
+                editorOpen={editorOpen}
+                onToggleEditor={() => setEditorOpen((open) => !open)}
+                guardUnsaved={guardUnsaved}
+                onSelectPreset={presets.editPreset}
+                onNewPreset={presets.newPreset}
+                onCopyPreset={presets.copyPreset}
+                onChangeDraft={(patch) => presets.setDraft((prev) => (prev === null ? prev : { ...prev, ...patch }))}
+                onSavePreset={() => presets.savePresetDraft()}
+                onDiscardPreset={presets.discardDraft}
+                onDeletePreset={presets.deletePresetDraft}
+                grouping={plan.grouping}
+                setGrouping={plan.setGrouping}
+                replanning={plan.replanning}
+                replan={plan.replan}
+                weedDraft={plan.weedDraft}
+                weedRead={plan.weedRead}
+                changeWeed={plan.changeWeed}
+                planRows={plan.plan?.rows ?? null}
+                planGrouping={plan.plan?.grouping ?? null}
+                skippedNotCut={plan.plan?.skippedNotCut ?? null}
+                presetLookup={presets.presetLookup}
+                issues={issues}
+                updateRow={plan.updateRow}
+                setPassEnabled={plan.setPassEnabled}
+                movePass={plan.movePass}
+                movePassTo={plan.movePassTo}
+                onApplyMaterial={plan.applyMaterial}
+              />
+            ) : null}
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
-          {status.phase === "Sending" && status.sent ? (
-            <span>
-              sending {status.sent.sent} / {status.sent.total} bytes
-            </span>
-          ) : null}
-          {status.phase === "Cancelling" ? <span>cancelling</span> : null}
-          {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
-          {/* How the last job ended comes from the backend, so the dialog remembers
-              nothing: no latch, no reading `actions.cancel` as a liveness bit. */}
-          {status.ended === "Cancelled" ? <span style={{ color: "var(--muted-foreground)" }}>Cancelled</span> : null}
-          {status.ended === "Completed" ? <span>Job complete</span> : null}
-          {status.phase === "Failed" ? <span style={{ color: "var(--cut)" }}>Cut failed</span> : null}
+            {step === 3 ? (
+              <StepPreview
+                scene={scene}
+                artboard={artboard}
+                passes={rows}
+                travel={plan.plan?.travel ?? []}
+                theme={theme}
+                connected={connected}
+                hosts={device.hosts}
+                presetLookup={presets.presetLookup}
+                grouping={plan.plan?.grouping ?? plan.grouping}
+                weedOn={plan.weedDraft.border}
+              />
+            ) : null}
+          </div>
 
-          <div style={{ flex: 1 }} />
-
-          {status.actions.resume ? (
-            <button aria-label="Resume" style={btn} onClick={dispatch.resume}>
-              Resume
-            </button>
-          ) : null}
-          {status.actions.confirm ? (
-            <button aria-label="Confirm pass done" style={btn} onClick={dispatch.confirmPassDone}>
-              Confirm pass done
-            </button>
-          ) : null}
-          {status.actions.cancel ? (
-            <button aria-label="Cancel" style={btn} onClick={dispatch.cancel}>
-              Cancel
-            </button>
-          ) : null}
-          {/* The only enablement checks left are the ones the backend cannot know:
-              whether this dialog has a device, a matching machine and rows to cut. */}
-          <button
-            aria-label="Start Cut"
-            style={btn}
-            disabled={!status.actions.cut || !connected || machineMismatch || plan.plan === null
-              || plan.plan.rows.length === 0 || plan.replanning || dispatch.cutInFlight || !plan.weedSettled}
-            onClick={dispatch.startCut}
-          >
-            Start Cut
-          </button>
-        </div>
-      </div>
-    </div>
-    <HostPairing open={device.pairing} onPaired={device.paired} onClose={() => device.setPairing(false)} />
+          <div className="flex items-center gap-2 border-t border-border px-6 py-3">
+            {step === 1 ? (
+              status.actions.cancel ? <span /> : (
+                <Button variant="ghost" onClick={() => guardUnsaved(onClose)}>Cancel</Button>
+              )
+            ) : (
+              <Button variant="ghost" onClick={() => go((step - 1) as SendStep)}>
+                <ArrowLeft aria-hidden /> Back
+              </Button>
+            )}
+            <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
+              {status.phase === "Sending" && status.sent ? (
+                <span>sending {status.sent.sent} / {status.sent.total} bytes</span>
+              ) : null}
+              {status.phase === "Cancelling" ? <span>cancelling</span> : null}
+              {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
+              {status.ended === "Cancelled" ? <span>Cancelled</span> : null}
+              {status.ended === "Completed" ? <span>Job complete</span> : null}
+              {status.phase === "Failed" ? <span className="text-destructive">Cut failed</span> : null}
+              {step === 1 && !readyCutter ? <span>Pick a cutter that's ready.</span> : null}
+              {step === 2 && issues.length > 0 ? (
+                <span role="alert" className="text-destructive">
+                  Fix {issues.length} highlighted {issues.length === 1 ? "setting" : "settings"} to continue.
+                </span>
+              ) : null}
+            </div>
+            {status.actions.resume ? <Button variant="secondary" size="sm" aria-label="Resume" onClick={dispatch.resume}>Resume</Button> : null}
+            {status.actions.confirm ? <Button variant="secondary" size="sm" aria-label="Confirm pass done" onClick={dispatch.confirmPassDone}>Confirm pass done</Button> : null}
+            {status.actions.cancel ? <Button variant="secondary" size="sm" aria-label="Cancel" onClick={dispatch.cancel}>Cancel</Button> : null}
+            {step < 3 ? (
+              <Button disabled={step === 1 ? !readyCutter : !passesReady} onClick={() => go((step + 1) as SendStep)}>
+                Next <ArrowRight aria-hidden />
+              </Button>
+            ) : (
+              <Button disabled={!startReady} onClick={dispatch.startCut}>
+                <Scissors aria-hidden /> Start cut
+              </Button>
+            )}
+          </div>
+          <HostPairing open={device.pairing} onPaired={device.paired} onClose={() => device.setPairing(false)} />
+        </SheetContent>
+      </Sheet>
     </>
   );
 }

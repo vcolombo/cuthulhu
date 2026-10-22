@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useState } from "react";
 import * as ipc from "../../ipc";
+import { Laptop, Router } from "lucide-react";
+import { Button } from "../../components/ui/button";
+import { cn } from "../../lib/cn";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../../hosts/deviceList";
 import { PairHostDialog } from "../../hosts/PairHostDialog";
-import { btn, TONE_COLOR } from "./chrome";
+import { TONE_COLOR } from "./chrome";
 
 /** The device list and the poll that keeps a Cut Host's rows moving. Called from the sheet so its
  *  mount effect stays ahead of the plan: the list and the ranges used to start in one effect. */
@@ -120,7 +123,7 @@ export function useDeviceList({
   const sections = groupDevices(devices, hosts);
   const shown = listError === null ? sections : sections.map((s) => staleSection(s, listError));
 
-  return { devices, hosts, shown, forceHost, setForceHost, pairing, setPairing, forget, paired, reconnect };
+  return { devices, hosts, shown, forceHost, setForceHost, pairing, setPairing, forget, paired, reconnect, refreshList };
 }
 
 export function HostPairing({
@@ -151,6 +154,7 @@ export function StepMachine({
   onReconnect,
   onForget,
   onAddHost,
+  onRetry,
 }: {
   devices: ipc.DeviceInfo[];
   hosts: ipc.PairedHostView[];
@@ -166,19 +170,19 @@ export function StepMachine({
   onReconnect: () => void;
   onForget: (id: string, force?: boolean) => void;
   onAddHost: () => void;
+  onRetry: () => void;
 }) {
   return (
-    <div>
-      <div style={{ fontSize: 12, color: "var(--muted-foreground)", marginBottom: 4 }}>Device</div>
+    <div className="space-y-4">
       {/* Only when there is nothing at all. A paired host with no cutters attached is a
           different fact, and it has its own section saying so. */}
       {devices.length === 0 && hosts.length === 0 ? (
-        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
+        <div className="text-sm text-muted-foreground">
           No devices found — connect a cutter and reopen this dialog.
         </div>
       ) : null}
       {shown.map((section) => (
-        <div key={section.hostId ?? "local"} style={{ marginBottom: 6 }}>
+        <div key={section.hostId ?? "local"} className="space-y-2">
           {/* The local section's header is suppressed when it is the only one, so a user with
               no Cut Host sees the flat list this dialog has always shown — but not when the
               read failed. The "last known" marker lives in this header, so suppressing it
@@ -187,25 +191,24 @@ export function StepMachine({
               moving. A failure the user cannot place is worse than a heading they did not
               need. */}
           {section.hostId === null && hosts.length === 0 && !section.stale ? null : (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+            <div className="flex items-center gap-2 text-sm">
               <strong>{section.title}</strong>
-              {section.address ? <span style={{ color: "var(--muted-foreground)" }}>{section.address}</span> : null}
-              {section.stale ? <span style={{ color: "var(--muted-foreground)" }}>last known</span> : null}
-              <div style={{ flex: 1 }} />
+              {section.address ? <span className="text-muted-foreground">{section.address}</span> : null}
+              {section.stale ? <span className="text-muted-foreground">last known</span> : null}
+              <div className="flex-1" />
+              {section.unreachable ? (
+                <Button variant="ghost" size="sm" aria-label={`Retry ${section.title}`} onClick={onRetry}>Retry</Button>
+              ) : null}
               {hosts.some((h) => h.id === section.hostId) ? (
-                <button
-                  aria-label={`Forget ${section.title}`}
-                  style={btn}
-                  onClick={() => onForget(section.hostId!)}
-                >
+                <Button variant="ghost" size="sm" aria-label={`Forget ${section.title}`} onClick={() => onForget(section.hostId!)}>
                   Forget
-                </button>
+                </Button>
               ) : null}
             </div>
           )}
           {/* An unreachable host keeps its cutters listed below this, not hidden (#42). */}
           {section.unreachable ? (
-            <div style={{ fontSize: 12, color: "var(--cut)" }}>{section.unreachable}</div>
+            <div className="text-sm text-destructive">{section.unreachable}</div>
           ) : null}
           {/* Says what is being accepted rather than asking "are you sure": the risk is not
               that the host is gone, it is that it is still cutting and this is the only
@@ -215,7 +218,7 @@ export function StepMachine({
               paired a host carried this warning over its local cutters, and that
               `Discard anyway` called `forget_host` for no host (#265). */}
           {forceHost !== null && forceHost === section.hostId ? (
-            <div style={{ fontSize: 12, color: "var(--cut)", display: "flex", alignItems: "center", gap: 8 }}>
+            <div className="flex items-center gap-2 text-sm text-destructive">
               <span>
                 A cut may still be running on this Cut Host. Forgetting it discards the
                 credentials this desktop needs to cancel, resume or confirm that cut — it will
@@ -223,76 +226,112 @@ export function StepMachine({
               </span>
               {/* Not "Forget <name> anyway": that name contains this section's own Forget
                   button's, and a selector for one would match both. */}
-              <button
-                aria-label={`Discard ${section.title} anyway`}
-                style={btn}
-                onClick={() => onForget(section.hostId!, true)}
-              >
+              <Button variant="secondary" size="sm" aria-label={`Discard ${section.title} anyway`} onClick={() => onForget(section.hostId!, true)}>
                 Discard anyway
-              </button>
-              <button aria-label={`Keep ${section.title}`} style={btn} onClick={() => setForceHost(null)}>
+              </Button>
+              <Button variant="ghost" size="sm" aria-label={`Keep ${section.title}`} onClick={() => setForceHost(null)}>
                 Keep it
-              </button>
+              </Button>
             </div>
           ) : null}
-          {section.devices.map((d) => {
-            // Only the aimed-at cutter has a status; the rest have not been asked, and
-            // `null` is what says so rather than something that reads as ready. Matched on the
-            // id *and* the host: two hosts wired alike hand out the same fallback id, and
-            // giving one host's status to the other's row hands Cancel to the wrong machine.
-            const isAimed = sameCutter(connected, d);
-            const aimed = isAimed ? status : null;
-            const badge = deviceBadge(aimed);
-            const control = connectedControl(aimed, d.host !== null);
-            return (
-            <div key={`${d.host ?? "local"}:${d.instance_id}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-              <span>
-                {d.machine_id}
-                {d.candidate ? " (unverified serial device)" : ""}
-              </span>
-              <span data-testid="device-badge" data-tone={badge.tone} style={{ color: TONE_COLOR[badge.tone] }}>
-                {badge.label}
-              </span>
-              {isAimed ? (
-                <>
-                  <span style={{ color: "var(--ready)" }}>connected</span>
-                  {/* The only way back from a stop nothing confirmed: `driver-core` refuses
-                      both a cut and a connect from that state, so without this the operator's
-                      exit is restarting the app. Withheld mid-Job — see `connectedControl`. */}
-                  {control ? (
-                    <button
-                      aria-label={`${control.label} ${d.instance_id}`}
-                      style={btn}
-                      // One aim change at a time. Two in flight would have their replies install
-                      // in whatever order they land, and the first to finish would clear
-                      // `aiming` while the other was still moving the aim (CodeRabbit on
-                      // PR #264) — which is also what `DeviceManager` refuses as Busy.
-                      disabled={aiming}
-                      // Only the disconnect is guarded: a reconnect re-opens the same cutter's
-                      // transport, so the draft it is editing is still that machine's.
-                      onClick={() =>
-                        control.verb === "reconnect" ? onReconnect() : guardUnsaved(onDisconnect)
-                      }
-                    >
-                      {control.label}
-                    </button>
-                  ) : null}
-                </>
-              ) : (
-                <button style={btn} disabled={aiming} onClick={() => guardUnsaved(() => onConnect(d))}>
-                  Connect
-                </button>
-              )}
-            </div>
-            );
-          })}
+          <div role="radiogroup" aria-label={section.title} className="space-y-2">
+            {section.devices.map((d) => {
+              // Only the aimed-at cutter has a status; the rest have not been asked, and
+              // `null` is what says so rather than something that reads as ready. Matched on the
+              // id *and* the host: two hosts wired alike hand out the same fallback id, and
+              // giving one host's status to the other's row hands Cancel to the wrong machine.
+              const isAimed = sameCutter(connected, d);
+              const aimed = isAimed ? status : null;
+              const badge = deviceBadge(aimed);
+              const control = connectedControl(aimed, d.host !== null);
+              // A busy cutter cannot be chosen until a queue exists, and an unreachable host's
+              // cutters stay listed but cannot be aimed at. The aimed cutter stays selectable:
+              // Reconnect is the way back from a stop nothing confirmed.
+              const blocked = section.unreachable !== null || (!isAimed && badge.tone === "busy");
+              const reason = badge.tone === "busy" ? "This cutter is in the middle of a job." : null;
+              const Icon = d.host === null ? Laptop : Router;
+              return (
+                <div
+                  key={`${d.host ?? "local"}:${d.instance_id}`}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-lg border bg-card p-3 text-left",
+                    isAimed && !blocked ? "border-accent-ink ring-1 ring-accent-ink" : "border-border",
+                    blocked && "opacity-70",
+                  )}
+                >
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={isAimed}
+                    aria-label={d.machine_id}
+                    disabled={aiming || (blocked && !isAimed)}
+                    onClick={() => {
+                      if (isAimed || blocked) return;
+                      guardUnsaved(() => onConnect(d));
+                    }}
+                    className={cn(
+                      "grid size-4 shrink-0 place-items-center rounded-full border",
+                      isAimed && !blocked ? "border-accent-ink" : "border-input",
+                    )}
+                  >
+                    {isAimed && !blocked ? <span className="size-2 rounded-full bg-primary" /> : null}
+                  </button>
+                  <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">
+                      {d.machine_id}
+                      {d.candidate ? " (unverified serial device)" : ""}
+                    </span>
+                    {/* A Cut Host is already named, once, in the section header above — including
+                        its address. Repeating the title on the card makes that name match twice. */}
+                    {d.host === null ? (
+                      <span className="block text-xs text-muted-foreground">USB on this computer</span>
+                    ) : null}
+                    {reason ? <span className="mt-1 block text-xs text-muted-foreground">{reason}</span> : null}
+                  </span>
+                  <span data-testid="device-badge" data-tone={badge.tone} className="text-xs font-medium" style={{ color: TONE_COLOR[badge.tone] }}>
+                    {badge.label}
+                  </span>
+                  {isAimed ? (
+                    <>
+                      <span className="text-xs text-success">connected</span>
+                      {/* The only way back from a stop nothing confirmed: `driver-core` refuses
+                          both a cut and a connect from that state, so without this the operator's
+                          exit is restarting the app. Withheld mid-Job — see `connectedControl`. */}
+                      {control ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          aria-label={`${control.label} ${d.instance_id}`}
+                          // One aim change at a time. Two in flight would have their replies install
+                          // in whatever order they land, and the first to finish would clear
+                          // `aiming` while the other was still moving the aim (CodeRabbit on
+                          // PR #264) — which is also what `DeviceManager` refuses as Busy.
+                          disabled={aiming}
+                          // Only the disconnect is guarded: a reconnect re-opens the same cutter's
+                          // transport, so the draft it is editing is still that machine's.
+                          onClick={() =>
+                            control.verb === "reconnect" ? onReconnect() : guardUnsaved(onDisconnect)
+                          }
+                        >
+                          {control.label}
+                        </Button>
+                      ) : null}
+                    </>
+                  ) : (
+                    <Button variant="secondary" size="sm" disabled={aiming || blocked} onClick={() => guardUnsaved(() => onConnect(d))}>
+                      Connect
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       ))}
       {/* Pairing lives in the device list on purpose: someone hunting for their Pi looks
           here, and finds nothing if it lives in a settings screen. */}
-      <button style={btn} onClick={onAddHost}>
-        Add a Cut Host…
-      </button>
+      <Button variant="secondary" onClick={onAddHost}>Add a Cut Host…</Button>
     </div>
   );
 }

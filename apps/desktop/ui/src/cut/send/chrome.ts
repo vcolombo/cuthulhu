@@ -1,29 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { CSSProperties } from "react";
 import { deviceBadge } from "../../hosts/deviceList";
-
-export const panelStyle: CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  background: "rgba(0,0,0,0.5)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  zIndex: 100,
-};
-
-export const dialogStyle: CSSProperties = {
-  background: "var(--panel)",
-  border: "1px solid var(--border)",
-  color: "var(--text)",
-  padding: 16,
-  width: 640,
-  maxHeight: "85vh",
-  overflow: "auto",
-  display: "flex",
-  flexDirection: "column",
-  gap: 10,
-};
 
 // `deviceBadge` decides the tone; the palette is this file's, since a pure module has no
 // business knowing the tokens. Without this the label rendered in one flat grey, so "Cutting",
@@ -38,12 +14,4 @@ export const TONE_COLOR: Record<ReturnType<typeof deviceBadge>["tone"], string> 
   attention: "var(--cut)",
   unknown: "var(--muted-foreground)",
   gone: "var(--muted-foreground)",
-};
-
-export const btn: CSSProperties = {
-  background: "var(--panel)",
-  color: "var(--text)",
-  border: "1px solid var(--border)",
-  padding: "4px 10px",
-  cursor: "pointer",
 };

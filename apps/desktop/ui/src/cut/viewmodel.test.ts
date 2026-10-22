@@ -106,6 +106,7 @@ describe("clippedEdges", () => {
 import {
   reorderPass,
   reorderForReplan,
+  reorderTo,
   toTravelPasses,
   effectiveSettings,
   fieldDisabled,
@@ -239,6 +240,21 @@ describe("reorderForReplan", () => {
     expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.key)).toEqual([
       "color:00ff00ff", "color:ff0000ff", "no-color",
     ]);
+  });
+});
+
+describe("reorderTo", () => {
+  const rows = ["red", "green", "gold"];
+
+  it("moves a row onto another index", () => {
+    expect(reorderTo(rows, 2, 0)).toEqual(["gold", "red", "green"]);
+    expect(reorderTo(rows, 0, 2)).toEqual(["green", "gold", "red"]);
+  });
+
+  it("is null when the row does not move", () => {
+    expect(reorderTo(rows, 1, 1)).toBeNull();
+    expect(reorderTo(rows, -1, 0)).toBeNull();
+    expect(reorderTo(rows, 0, 3)).toBeNull();
   });
 });
 

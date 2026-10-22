@@ -160,6 +160,16 @@ export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] 
   return next === rows ? null : next;
 }
 
+/** Drag a row from `from` to `to`. Null when nothing moves, so a drop on the same row
+ *  does not ask the planner for travel it already has. */
+export function reorderTo<T>(rows: T[], from: number, to: number): T[] | null {
+  if (from === to || from < 0 || to < 0 || from >= rows.length || to >= rows.length) return null;
+  const next = rows.slice();
+  const [row] = next.splice(from, 1);
+  next.splice(to, 0, row);
+  return next;
+}
+
 /** What a `PassKey` says, for the two things the UI needs from inside one: a swatch needs the
  *  RGBA, a row label and a row's settings need the preset id. The mirror of
  *  `cutplan::PassKey::from_str`; the example table in `viewmodel.test.ts` keeps the two agreed. */

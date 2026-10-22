@@ -202,6 +202,15 @@ button:disabled,
   opacity: var(--disabled-opacity);
 }
 
+/* Dark active tab. `--card` plus `--accent-ink` is teal on a dark pill; the light
+   pairing is a white pill and the dark teal, which is what the light theme already
+   shows and what stays above 4.5:1. Unlayered so it wins over the utility and over
+   a hover or focus that would put the teal back on the dark fill. */
+.dark [role="tab"][data-state="active"] {
+  background: var(--primary-foreground);
+  color: var(--primary);
+}
+
 /* Opening a menu with the pointer focuses the trigger and the popover, and
    Chromium reports that programmatic focus as :focus-visible, so both painted
    this ring. The ring is the keyboard cue on a control that is not already open. */

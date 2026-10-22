@@ -3456,10 +3456,11 @@ async function toPage(page: Page, v: CanvasView, mm: { x: number; y: number }) {
   return { x: box.x + mm.x * v.scale + v.tx, y: box.y + mm.y * v.scale + v.ty };
 }
 
-/** The Cameo bed these wheel deltas were written against. Fit used to show that bed (~0.2 px/mm);
- *  it now shows the mat (~2 px/mm), and the same notch count walks the shapes off the canvas. */
+/** The Cameo bed these wheel deltas were written against. Fit used to show that bed (~0.2 px/mm)
+ *  with a 24 px margin and no rulers; it now shows the mat, and the same notch count walks the
+ *  shapes off the canvas. 24 is that old margin, not the mat fit's padding. */
 const CAMEO_BED_MM = { w: 330, h: 3000 };
-const FIT_MARGIN_PX = 24;
+const BED_FIT_MARGIN_PX = 24;
 
 /** Ctrl-wheel at (the whole pixel nearest) a document point; returns the view once the zoom has
  *  landed. Whole pixels because Chromium reports a wheel's position as integers: a fractional
@@ -3470,8 +3471,8 @@ async function zoomInAt(page: Page, mm: { x: number; y: number }, deltaY: number
   const before = await fittedView(page);
   const box = await page.getByTestId("design-canvas").boundingBox();
   if (!box) throw new Error("design canvas has no layout box");
-  const availW = Math.max(box.width - 2 * FIT_MARGIN_PX, 1);
-  const availH = Math.max(box.height - 2 * FIT_MARGIN_PX, 1);
+  const availW = Math.max(box.width - 2 * BED_FIT_MARGIN_PX, 1);
+  const availH = Math.max(box.height - 2 * BED_FIT_MARGIN_PX, 1);
   const bedFit = Math.min(availW / CAMEO_BED_MM.w, availH / CAMEO_BED_MM.h);
   const target = bedFit * Math.exp(-deltaY * 0.01);
   // Already at least as close as this delta used to get (the mat fit is past a shallow zoom).
@@ -3676,14 +3677,16 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await showTab(page, "Properties");
   await page.getByLabel("Design for").selectOption("puma");
   const box = (await page.getByTestId("design-canvas").boundingBox())!;
-  // Puma is roll-only. The default roll is the machine width by 36 in, and rulers take 24 px off
-  // the left and top of the fit, so the scale is not the 600 × 5000 mm bed.
-  const margin = 24;
+  // Puma is roll-only. The default roll is the machine width by 36 in. Rulers take 24 px off the
+  // left and top, the zoom bar takes 54 px off the bottom, and the mat fit pads 32 px, so the
+  // scale is not the 600 × 5000 mm bed.
+  const margin = 32;
   const ruler = 24;
+  const zoomBar = 54;
   const rollW = 600;
   const rollH = 36 * 25.4;
   const availW = box.width - 2 * margin - ruler;
-  const availH = box.height - 2 * margin - ruler;
+  const availH = box.height - 2 * margin - ruler - zoomBar;
   await expect.poll(async () => (await readView(page)).scale).toBeCloseTo(Math.min(availW / rollW, availH / rollH), 3);
 });
 
@@ -3820,7 +3823,24 @@ test("vinyl colours stay distinct on the mat in both themes, including a gold ou
       }
     }
     await page.screenshot({ path: `/opt/cursor/artifacts/editor-${theme.toLowerCase()}.png` }).catch(() => undefined);
+    if (theme === "Dark") {
+      await page.getByRole("tablist").screenshot({ path: "/opt/cursor/artifacts/tabs-dark.png" }).catch(() => undefined);
+    }
   }
+
+  const box = (await page.getByTestId("design-canvas").boundingBox())!;
+  const v = await readView(page);
+  const mat = 12 * 25.4;
+  const matBottom = box.y + v.ty + mat * v.scale;
+  const matLeft = box.x + v.tx;
+  const matRight = matLeft + mat * v.scale;
+  const bar = (await page.getByTestId("zoom-controls").boundingBox())!;
+  expect(matLeft - box.x).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(box.y + v.ty - box.y).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(matBottom).toBeLessThanOrEqual(bar.y + 1);
+  expect(matRight).toBeLessThanOrEqual(box.x + box.width - 32 + 1);
+  const rulers = page.getByRole("button", { name: "Rulers" });
+  await expect(rulers).toHaveAttribute("aria-pressed", "true");
 });
 
 async function documentDark(page: Page): Promise<boolean> {
@@ -5297,6 +5317,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
   const fileButton = page.getByRole("button", { name: "File", exact: true });
   const undo = page.getByRole("button", { name: "Undo", exact: true });
   const redo = page.getByRole("button", { name: "Redo", exact: true });
+  const layers = page.getByRole("tab", { name: "Layers", exact: true });
   const properties = page.getByRole("tab", { name: "Properties", exact: true });
   const devices = page.getByRole("tab", { name: "Devices", exact: true });
   await expect(importButton).toBeEnabled();
@@ -5308,6 +5329,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
     file: await paintContrast(page, fileButton),
     undo: await paintContrast(page, undo),
     redo: await paintContrast(page, redo),
+    layers: await paintContrast(page, layers),
     properties: await paintContrast(page, properties),
     devices: await paintContrast(page, devices),
   });
@@ -5321,6 +5343,13 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
   // flips. The settled button color is the dark token.
   await expect.poll(() => importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(230, 240, 240)");
   await expect.poll(() => properties.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(157, 184, 185)");
+  // Active tab: the light theme's dark teal on a white pill, in both themes.
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.hover();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.focus();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
   const dark = await measure();
 
   for (const [theme, sample] of [
@@ -5333,6 +5362,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
       file: sample.file.ratio.toFixed(2),
       undo: sample.undo.ratio.toFixed(2),
       redo: sample.redo.ratio.toFixed(2),
+      layers: sample.layers.ratio.toFixed(2),
       properties: sample.properties.ratio.toFixed(2),
       devices: sample.devices.ratio.toFixed(2),
       importInk: sample.import.ink.join(","),
@@ -5345,6 +5375,7 @@ test("top-bar labels stay readable in both themes, including after a light-to-da
     expect(sample.file.ratio, `${theme} File`).toBeGreaterThanOrEqual(4.5);
     expect(sample.undo.ratio, `${theme} Undo`).toBeGreaterThanOrEqual(3);
     expect(sample.redo.ratio, `${theme} Redo`).toBeGreaterThanOrEqual(3);
+    expect(sample.layers.ratio, `${theme} Layers`).toBeGreaterThanOrEqual(4.5);
     expect(sample.properties.ratio, `${theme} Properties`).toBeGreaterThanOrEqual(4.5);
     expect(sample.devices.ratio, `${theme} Devices`).toBeGreaterThanOrEqual(4.5);
   }

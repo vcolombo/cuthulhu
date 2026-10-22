@@ -36,10 +36,12 @@ describe("mat presets", () => {
     expect(clampRollLength(Number.NaN)).toBe(ROLL_DEFAULT_MM);
   });
 
-  it("names sheets in the unit the status bar is using", () => {
+  it("names presets by the sheet, with whole millimetres in brackets", () => {
     expect(matKindLabel("12x12", "in")).toBe("12 × 12 in");
     expect(matKindLabel("12x24", "in")).toBe("12 × 24 in");
-    expect(matKindLabel("12x12", "mm")).toBe("304.8 × 304.8 mm");
+    expect(matKindLabel("12x12", "mm")).toBe("12 × 12 in (305 × 305 mm)");
+    expect(matKindLabel("12x24", "mm")).toBe("12 × 24 in (305 × 610 mm)");
     expect(matKindLabel("roll", "mm")).toBe("Roll");
+    expect(matKindLabel("roll", "in")).toBe("Roll");
   });
 });

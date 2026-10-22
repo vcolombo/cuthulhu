@@ -49,7 +49,9 @@ export function matBounds(kind: MatKind, machineWidthMm: number, rollLengthMm: n
 
 export function matKindLabel(kind: MatKind, unit: LengthUnit): string {
   if (kind === "roll") return "Roll";
-  if (unit === "in") return kind === "12x12" ? "12 × 12 in" : "12 × 24 in";
+  const name = kind === "12x12" ? "12 × 12 in" : "12 × 24 in";
+  if (unit === "in") return name;
   const height = kind === "12x12" ? IN_12 : IN_24;
-  return `${formatLength(IN_12, "mm")} × ${formatLength(height, "mm")} mm`;
+  // Whole millimetres: 12 in is 304.8, and the preset name is the inch size.
+  return `${name} (${formatLength(IN_12, "mm", 0)} × ${formatLength(height, "mm", 0)} mm)`;
 }

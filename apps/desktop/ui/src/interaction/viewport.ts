@@ -14,8 +14,9 @@ export type Size = { w: number; h: number };
  *  Upgrade: a one-time "hold a card to the screen" calibration stored per display. */
 export const CSS_PX_PER_MM = 96 / 25.4;
 export const MAX_SCALE = 64 * CSS_PX_PER_MM; // 6400%
-export const FIT_MARGIN_PX = 24;
-/** Air around the artwork for Fit content. The mat fit keeps FIT_MARGIN_PX. */
+/** Air around a fitted mat, inside whatever the caller insets (rulers, the zoom bar). */
+export const FIT_MARGIN_PX = 32;
+/** Air around the artwork for Fit content. Wider than the mat fit on purpose. */
 export const CONTENT_FIT_MARGIN_PX = 80;
 export const ZOOM_STEP = 1.25;
 

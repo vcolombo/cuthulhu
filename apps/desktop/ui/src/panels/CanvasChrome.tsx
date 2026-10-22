@@ -6,6 +6,9 @@ import type { Size, View } from "../interaction/viewport";
 
 /** Lovable's ruler thickness. Fit insets by this on the left and top while rulers are on. */
 export const RULER_PX = 24;
+/** Canvas px from the bottom edge up to the top of the zoom bar: `bottom-3` (12), the border
+ *  (2), the padding (8) and the 32 px controls. Fit insets by this so the mat stays above the bar. */
+export const ZOOM_BAR_CLEAR_PX = 12 + 2 + 8 + 32;
 
 type RulerProps = {
   view: View;
@@ -101,7 +104,7 @@ type ZoomProps = {
 
 export function ZoomControls({ zoomPercent, rulers, onZoomOut, onZoomIn, onFitMat, onFitContent, onToggleRulers }: ZoomProps) {
   return (
-    <div className="absolute bottom-3 right-3 z-[2] flex items-center gap-0.5 rounded-md border border-border bg-panel p-1 shadow-sm">
+    <div data-testid="zoom-controls" className="absolute bottom-3 right-3 z-[2] flex items-center gap-0.5 rounded-md border border-border bg-panel p-1 shadow-sm">
       <Button variant="ghost" size="icon" aria-label="Zoom out" onClick={onZoomOut}>
         −
       </Button>
@@ -115,7 +118,13 @@ export function ZoomControls({ zoomPercent, rulers, onZoomOut, onZoomIn, onFitMa
       <Button variant="ghost" size="sm" onClick={onFitContent}>
         Fit content
       </Button>
-      <Button variant="ghost" size="sm" aria-pressed={rulers} onClick={onToggleRulers}>
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-pressed={rulers}
+        onClick={onToggleRulers}
+        className={rulers ? "bg-subtle text-foreground" : undefined}
+      >
         Rulers
       </Button>
     </div>

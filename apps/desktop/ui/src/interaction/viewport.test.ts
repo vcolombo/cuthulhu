@@ -72,6 +72,27 @@ describe("viewport", () => {
     expect(inset.scale).toBeLessThan(plain.scale);
   });
 
+  it("centres the mat in the area the zoom bar does not cover", () => {
+    const mat = { x: 0, y: 0, w: 304.8, h: 304.8 };
+    const frame = { w: 900, h: 640 };
+    const inset = { left: 24, top: 24, right: 0, bottom: 54 };
+    const v = fitView(mat, frame, FIT_MARGIN_PX, inset);
+    const tl = worldToScreen(v, { x: 0, y: 0 });
+    const br = worldToScreen(v, { x: mat.w, y: mat.h });
+    const free = {
+      left: inset.left + FIT_MARGIN_PX,
+      top: inset.top + FIT_MARGIN_PX,
+      right: frame.w - inset.right - FIT_MARGIN_PX,
+      bottom: frame.h - inset.bottom - FIT_MARGIN_PX,
+    };
+    expect(tl.x).toBeGreaterThanOrEqual(free.left - 1e-6);
+    expect(tl.y).toBeGreaterThanOrEqual(free.top - 1e-6);
+    expect(br.x).toBeLessThanOrEqual(free.right + 1e-6);
+    expect(br.y).toBeLessThanOrEqual(free.bottom + 1e-6);
+    expect((tl.x + br.x) / 2).toBeCloseTo((free.left + free.right) / 2, 6);
+    expect((tl.y + br.y) / 2).toBeCloseTo((free.top + free.bottom) / 2, 6);
+  });
+
   it("gives Fit content more air than the mat fit", () => {
     const artwork = { x: 0, y: 0, w: 40, h: 20 };
     expect(fitView(artwork, size, CONTENT_FIT_MARGIN_PX).scale).toBeLessThan(fitView(artwork, size).scale);

@@ -25,7 +25,7 @@ import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
 import { PropertiesPanel } from "./panels/PropertiesPanel";
-import { RULER_PX, Rulers, ZoomControls } from "./panels/CanvasChrome";
+import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/CanvasChrome";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
@@ -204,7 +204,13 @@ export function App() {
     [scene],
   );
   const inset = useMemo<Inset>(
-    () => (rulers ? { left: RULER_PX, top: RULER_PX, right: 0, bottom: 0 } : { left: 0, top: 0, right: 0, bottom: 0 }),
+    () => ({
+      left: rulers ? RULER_PX : 0,
+      top: rulers ? RULER_PX : 0,
+      right: 0,
+      // The bar sits on the canvas, so the mat is fitted to the area above it.
+      bottom: ZOOM_BAR_CLEAR_PX,
+    }),
     [rulers],
   );
   const { status, refreshDeviceState } = useJob(setError);

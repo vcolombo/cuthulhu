@@ -84,7 +84,7 @@ export function StepPreview({
             );
           })}
         </div>
-        <p className={host ? "rounded-md bg-success/10 p-2 text-xs" : "rounded-md bg-warning/10 p-2 text-xs"}>
+        <p className={host ? "break-words rounded-md bg-success/10 p-2 text-xs" : "break-words rounded-md bg-warning/10 p-2 text-xs"}>
           {host
             ? `Runs on ${host.name}. You can close this computer once the cut has started.`
             : "Runs from this computer — keep Cuthulhu open until the cut finishes."}
@@ -94,11 +94,13 @@ export function StepPreview({
   );
 }
 
+/** The value wraps inside the column. One token wider than the column was the column's
+ *  min-content, and the sheet scrolled sideways to show it. */
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex justify-between gap-3">
-      <dt className="text-muted-foreground">{label}</dt>
-      <dd className="text-right">{value}</dd>
+      <dt className="shrink-0 text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 break-words text-right">{value}</dd>
     </div>
   );
 }

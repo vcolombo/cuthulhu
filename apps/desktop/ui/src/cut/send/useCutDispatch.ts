@@ -11,6 +11,7 @@ export function useCutDispatch({
   plan,
   replanning,
   weedSettled,
+  canSend,
   onStalePlan,
   onError,
   refreshDeviceState,
@@ -19,6 +20,9 @@ export function useCutDispatch({
   plan: InstalledPlan | null;
   replanning: boolean;
   weedSettled: boolean;
+  /** Blank or out-of-range speed and force never leave the sheet. The button is disabled
+   *  for the same reason; this is the check that still holds if the click arrives anyway. */
+  canSend: () => boolean;
   onStalePlan: () => void;
   onError: (msg: string) => void;
   refreshDeviceState: () => Promise<void>;
@@ -35,7 +39,7 @@ export function useCutDispatch({
     // `replanning` guards the window a mode change opens: the rows on screen still belong to
     // the previous grouping until the new plan installs, and sending them under the new one
     // would cut whatever that mode happens to key the same way.
-    if (!connected || plan === null || replanning || !weedSettled) return;
+    if (!connected || plan === null || replanning || !weedSettled || !canSend()) return;
     const request = toCutRequest(connected.instance_id, plan.revision, plan.grouping, plan.weed, plan.rows);
     setAlreadyAccepted(false);
     setCutInFlight(true);
@@ -46,8 +50,12 @@ export function useCutDispatch({
       // same either way and only the host knows which happened.
       .then((started) => setAlreadyAccepted(started.duplicate))
       .catch((e) => {
-        const code = ipc.ipcErrorCode(e);
-        if (code === "stale_plan") onStalePlan();
+        // The open sheet already says the design changed and offers Replan. Toasting the same
+        // refusal repeats that banner and covers the summary beside it.
+        if (ipc.ipcErrorCode(e) === "stale_plan") {
+          onStalePlan();
+          return;
+        }
         onError(ipc.ipcErrorMessage(e));
       })
       .finally(() => setCutInFlight(false));

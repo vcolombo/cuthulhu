@@ -6,6 +6,7 @@ import {
   presetIdForKey,
   readWeedDraft,
   reorderForReplan,
+  reorderTo,
   toTravelPasses,
   weedDraftFrom,
   type PassVm,
@@ -232,6 +233,24 @@ export function useCutPlan({
     refreshTravel(next);
   };
 
+  // A drag lands on an index, not a direction. The same travel request as a one-step move.
+  const movePassTo = (from: number, to: number) => {
+    if (plan === null) return;
+    const next = reorderTo(plan.rows, from, to);
+    if (!next) return;
+    setPlan({ ...plan, rows: next });
+    refreshTravel(next);
+  };
+
+  /** One material for every pass: the preset's own speed and force show, and a typed
+   *  override would hide them. Clearing the choice puts the blanks back. */
+  const applyMaterial = (presetId: string | null) => {
+    setPlan((prev) => (prev === null ? prev : {
+      ...prev,
+      rows: prev.rows.map((r) => ({ ...r, presetId, speed: null, force: null, repeatCount: null })),
+    }));
+  };
+
   // The head never travels to a pass that will not be cut, so enabling is as much a
   // travel edit as reordering is.
   const setPassEnabled = (i: number, enabled: boolean) => {
@@ -255,6 +274,8 @@ export function useCutPlan({
     changeWeed,
     updateRow,
     movePass,
+    movePassTo,
+    applyMaterial,
     setPassEnabled,
   };
 }

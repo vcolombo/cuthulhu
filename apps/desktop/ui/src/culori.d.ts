@@ -23,4 +23,5 @@ declare module "culori" {
   export function clampChroma(color: Oklch, mode?: string, rgbGamut?: string): Oklch | undefined;
   export function wcagContrast(a: Color | string, b: Color | string): number;
   export function interpolate(colors: Array<Color | string>, mode?: string): (t: number) => Color;
+  export function differenceCiede2000(kL?: number, kC?: number, kH?: number): (a: Color | string, b: Color | string) => number;
 }

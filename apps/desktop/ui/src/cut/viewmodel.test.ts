@@ -106,6 +106,8 @@ describe("clippedEdges", () => {
 import {
   reorderPass,
   reorderForReplan,
+  droppedPassIndex,
+  reorderTo,
   toTravelPasses,
   effectiveSettings,
   fieldDisabled,
@@ -239,6 +241,36 @@ describe("reorderForReplan", () => {
     expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.key)).toEqual([
       "color:00ff00ff", "color:ff0000ff", "no-color",
     ]);
+  });
+});
+
+describe("droppedPassIndex", () => {
+  it("accepts the index a grip writes and nothing Number would coerce", () => {
+    expect(droppedPassIndex("0")).toBe(0);
+    expect(droppedPassIndex("2")).toBe(2);
+    expect(droppedPassIndex("1.")).toBeNull();
+    expect(droppedPassIndex("")).toBeNull();
+    expect(droppedPassIndex(" ")).toBeNull();
+    expect(droppedPassIndex("foo")).toBeNull();
+    expect(droppedPassIndex("1.5")).toBeNull();
+    expect(droppedPassIndex("01")).toBeNull();
+  });
+});
+
+describe("reorderTo", () => {
+  const rows = ["red", "green", "gold"];
+
+  it("moves a row onto another index", () => {
+    expect(reorderTo(rows, 2, 0)).toEqual(["gold", "red", "green"]);
+    expect(reorderTo(rows, 0, 2)).toEqual(["green", "gold", "red"]);
+  });
+
+  it("is null when the row does not move", () => {
+    expect(reorderTo(rows, 1, 1)).toBeNull();
+    expect(reorderTo(rows, -1, 0)).toBeNull();
+    expect(reorderTo(rows, 0, 3)).toBeNull();
+    expect(reorderTo(rows, Number.NaN, 1)).toBeNull();
+    expect(reorderTo(rows, 1.5, 0)).toBeNull();
   });
 });
 
@@ -576,8 +608,9 @@ describe("passRowLabel", () => {
   const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
                      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
 
-  it("names a colour pass by its swatch, not by words", () => {
-    expect(passRowLabel("color:ff0000ff", read(presets), "Color")).toEqual({ swatch: "#ff0000", text: null });
+  it("names a colour pass by its swatch and the nearest vinyl", () => {
+    expect(passRowLabel("color:ff0000ff", read(presets), "Color")).toEqual({ swatch: "#ff0000", text: "Red vinyl" });
+    expect(passRowLabel("color:00ff00ff", read(presets), "Color")).toEqual({ swatch: "#00ff00", text: "#00ff00" });
   });
 
   // Grouping-aware, because `no-color` means something different in each colour mode: under

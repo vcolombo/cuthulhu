@@ -216,7 +216,7 @@ describe("deviceBadge", () => {
 
   it("shows a running job as busy when only cancel is legal", () => {
     const status: CutStatus = { ...aStatus(), phase: "Sending", actions: { ...aStatus().actions, cancel: true } };
-    expect(deviceBadge(status).tone).toBe("busy");
+    expect(deviceBadge(status)).toEqual({ label: "Cutting", tone: "busy" });
   });
 
   // Both rest on "Idle" and both report a cancelled ending, so only `actions.cut` separates a

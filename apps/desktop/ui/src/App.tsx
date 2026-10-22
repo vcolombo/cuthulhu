@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Cpu, Layers, SlidersHorizontal } from "lucide-react";
 import * as ipc from "./ipc";
@@ -731,6 +731,7 @@ export function App() {
           scene={scene}
           artboard={doc.artboard}
           docMachineId={doc.machine?.id ?? null}
+          machines={machines}
           status={status}
           refreshDeviceState={refreshDeviceState}
           connected={cutter.device}
@@ -743,6 +744,7 @@ export function App() {
           weed={cutWeed}
           onWeedChange={setCutWeed}
           theme={theme.resolved}
+          unit={unit}
         />
       ) : null}
       {tracePath !== null ? (
@@ -761,7 +763,15 @@ export function App() {
           onClose={() => setTextOpen(false)}
         />
       ) : null}
-    <Toaster position="bottom-center" theme={theme.resolved} offset={{ bottom: "40px" }} />
+    {/* Top-right, and no wider than the viewport. A bottom-centred toast sits on the
+        sheet footer and, wider than the window, is cut off at the left edge. */}
+    <Toaster
+      position="top-right"
+      theme={theme.resolved}
+      offset={{ top: "148px", right: "16px" }}
+      mobileOffset={{ top: "16px", right: "16px" }}
+      style={{ "--width": "min(356px, calc(100vw - 32px))" } as CSSProperties}
+    />
     </TooltipProvider>
   );
 }

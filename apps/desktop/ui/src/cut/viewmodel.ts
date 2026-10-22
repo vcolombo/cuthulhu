@@ -2,6 +2,7 @@
 // One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
 // callers keep their import path without a second structurally-identical type drifting.
 import type { Bounds } from "../render/hittest";
+import { vinylName } from "../render/vinyl";
 import type { Grouping, PassKey, WeedLines, WeedOptions, WeedRanges } from "../ipc";
 export type { Bounds };
 
@@ -160,6 +161,27 @@ export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] 
   return next === rows ? null : next;
 }
 
+/** The drag payload is text. `Number("1.")` is 1 and `Number("")` is 0, and both are integers,
+ *  so an inch someone was typing would reorder a pass if it were dropped on a row. */
+export function droppedPassIndex(payload: string): number | null {
+  if (!/^(0|[1-9]\d*)$/.test(payload)) return null;
+  const index = Number(payload);
+  return Number.isInteger(index) ? index : null;
+}
+
+/** Drag a row from `from` to `to`. Null when nothing moves, so a drop on the same row
+ *  does not ask the planner for travel it already has. */
+export function reorderTo<T>(rows: T[], from: number, to: number): T[] | null {
+  // `NaN` fails every one of the comparisons below, and `splice` then treats it as 0,
+  // so a drop that is not an index would move the first pass.
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return null;
+  if (from === to || from < 0 || to < 0 || from >= rows.length || to >= rows.length) return null;
+  const next = rows.slice();
+  const [row] = next.splice(from, 1);
+  next.splice(to, 0, row);
+  return next;
+}
+
 /** What a `PassKey` says, for the two things the UI needs from inside one: a swatch needs the
  *  RGBA, a row label and a row's settings need the preset id. The mirror of
  *  `cutplan::PassKey::from_str`; the example table in `viewmodel.test.ts` keeps the two agreed. */
@@ -263,9 +285,10 @@ export function presetPicker(
   return { selected: key(presetId), options };
 }
 
-/** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
- *  Grouping-aware because `no-color` means something different per mode — under Stroke it can
- *  hold brightly filled shapes, so calling it "no visible paint" would be false. */
+/** How a pass row identifies itself. A colour pass is a swatch plus a name ("Red vinyl",
+ *  or the hex when no built-in swatch is that close). Grouping-aware because `no-color`
+ *  means something different per mode — under Stroke it can hold brightly filled shapes,
+ *  so calling it "no visible paint" would be false. */
 export function passRowLabel(
   key: PassKey,
   lookup: PresetLookup,
@@ -276,7 +299,8 @@ export function passRowLabel(
     case "color":
       if (parsed.color !== null) {
         // Drop the alpha byte: a swatch is a colour, and 0-alpha keys never reach here.
-        return { swatch: `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`, text: null };
+        const swatch = `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`;
+        return { swatch, text: vinylName(swatch) };
       }
       return {
         swatch: null,

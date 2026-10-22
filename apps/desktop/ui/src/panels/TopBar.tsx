@@ -176,6 +176,7 @@ export function TopBar(props: Props) {
             key={unit}
             type="button"
             aria-pressed={props.unit === unit}
+            data-ink="muted"
             onClick={() => props.onUnit(unit)}
             className={cn(
               "h-6 cursor-pointer rounded-sm px-2.5 text-xs",

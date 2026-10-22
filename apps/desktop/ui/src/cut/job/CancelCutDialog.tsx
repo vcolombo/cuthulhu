@@ -39,7 +39,7 @@ export function CancelCutDialog({
             <Button variant="ghost">Keep cutting</Button>
           </AlertDialogCancel>
           <AlertDialogAction asChild>
-            <Button variant="ghost" className="border border-destructive text-destructive" onClick={onConfirm}>
+            <Button variant="ghost" data-ink="destructive" className="border border-destructive text-destructive" onClick={onConfirm}>
               Cancel the cut
             </Button>
           </AlertDialogAction>

@@ -179,66 +179,48 @@ body {
 button,
 input:where([type="button"], [type="reset"], [type="submit"]) {
   appearance: none;
+  --btn-ink: var(--foreground);
+  --btn-ink-hover: var(--btn-ink);
+  color: var(--btn-ink, var(--foreground));
 }
-/* Ghost and text buttons only. The same selector matches in both themes, so a
-   flip is not waiting on `.dark`. Filled, secondary, and pressed controls are
-   excluded: painting every button with the body ink put light text on a fill
-   that was still the light pill. */
-button:not(
-  .bg-primary,
-  .bg-secondary,
-  .text-primary,
-  .text-primary-foreground,
-  .text-muted-foreground,
-  .text-destructive,
-  .text-accent-ink,
-  .text-warning,
-  .text-success,
-  [aria-pressed="true"],
-  [data-state="active"]
-),
-input:where([type="button"], [type="reset"], [type="submit"]) {
-  color: var(--foreground);
+button:hover,
+input:where([type="button"], [type="reset"], [type="submit"]):hover {
+  color: var(--btn-ink-hover, var(--btn-ink, var(--foreground)));
 }
-button.bg-secondary {
-  color: var(--foreground);
+/* One channel per variant. A selector on a Tailwind class string is the previous
+   theme's ink, because the utility that set it lives in a layer and loses. */
+button[data-ink="fill"] {
+  --btn-ink: var(--primary-foreground);
+  --btn-ink-hover: var(--primary-foreground);
 }
-button.bg-primary,
-button.text-primary-foreground {
-  color: var(--primary-foreground);
+button[data-ink="muted"] {
+  --btn-ink: var(--muted-foreground);
+  --btn-ink-hover: var(--foreground);
 }
-button.text-muted-foreground:not([data-state="active"]) {
-  color: var(--muted-foreground);
+button[data-ink="faded"] {
+  --btn-ink: color-mix(in oklab, var(--foreground) 80%, transparent);
+  --btn-ink-hover: var(--foreground);
 }
-/* Hover utilities live in a layer, so they lose to the rules above. Restated
-   here, still unlayered, and only for a button that asked for the hover: a
-   layered color is what left the previous theme's ink on the flip frame. */
-button.text-muted-foreground.hover\:text-foreground:not([data-state="active"]):hover {
-  color: var(--foreground);
+button[data-ink="destructive"] {
+  --btn-ink: var(--destructive);
+  --btn-ink-hover: var(--destructive);
 }
-button.text-foreground\/80 {
-  color: var(--foreground);
-  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+button[data-ink="accent"] {
+  --btn-ink: var(--accent-ink);
+  --btn-ink-hover: var(--accent-ink);
 }
-button.text-foreground\/80.hover\:text-foreground:hover {
-  color: var(--foreground);
+button[data-ink="warning"] {
+  --btn-ink: var(--warning);
+  --btn-ink-hover: var(--warning);
 }
-button.text-destructive {
-  color: var(--destructive);
-}
-button.text-accent-ink {
-  color: var(--accent-ink);
-}
-button.text-warning {
-  color: var(--warning);
-}
-button.text-success {
-  color: var(--success);
+button[data-ink="success"] {
+  --btn-ink: var(--success);
+  --btn-ink-hover: var(--success);
 }
 /* Pressed tab and toggle: white pill, primary ink, in both themes. #106c72 on
    white is 6.16:1, and neither side changes when the theme does, so the flip
    frame cannot catch the previous pairing. The tool rail names accent ink. */
-button[aria-pressed="true"]:not(.text-accent-ink),
+button[aria-pressed="true"]:not([data-ink="accent"]),
 button[role="tab"][data-state="active"] {
   background: var(--primary-foreground);
   color: var(--primary);

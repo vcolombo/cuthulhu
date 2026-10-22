@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from "vitest";
 import { unitToMm } from "../../length";
-import { inchReady, lengthFromDraft, lengthToDraft, weedMessage } from "./StepPasses";
+import { inchCommit, inchReady, lengthFromDraft, lengthToDraft, weedMessage } from "./StepPasses";
 
 describe("inch weed fields", () => {
   it("shows the millimetre draft in inches, and writes inches back as millimetres", () => {
@@ -22,6 +22,21 @@ describe("inch weed fields", () => {
     expect(lengthToDraft("1.")).toBe("1.");
     expect(inchReady("1")).toBe(true);
     expect(inchReady("")).toBe(true);
+  });
+
+  it("shows a stored millimetre as an inch the same range still accepts", () => {
+    const margin = { min: 0.5, max: 50 };
+    const spacing = { min: 5, max: 500 };
+    expect(lengthFromDraft("3", margin)).toBe("0.12");
+    expect(lengthFromDraft("50")).toBe("1.97");
+    expect(lengthFromDraft("50", margin)).toBe("1.96");
+    expect(lengthFromDraft("500", spacing)).toBe("19.68");
+    expect(lengthFromDraft("20", { min: 0.2, max: 20 })).toBe("0.78");
+    expect(inchCommit("50", "1.96", margin)).toBeNull();
+    expect(inchCommit("50", "1.97", margin)).toBe(String(unitToMm(1.97, "in")));
+    expect(inchCommit("50", "1.", margin)).toBeNull();
+    expect(inchCommit("3", "1", margin)).toBe("25.4");
+    expect(inchCommit("3", "", margin)).toBe("");
   });
 
   it("quotes a weed bound in the unit the field is showing", () => {

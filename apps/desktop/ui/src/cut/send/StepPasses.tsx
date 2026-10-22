@@ -11,6 +11,7 @@ import { cn } from "../../lib/cn";
 import { PresetEditor } from "../PresetEditor";
 import { type EditorMode, type PresetDraft } from "../presetDraft";
 import {
+  droppedPassIndex,
   effectiveSettings,
   passRowLabel,
   presetIdForKey,
@@ -129,6 +130,9 @@ export function StepPasses({
   // Open, so the weed controls are on the step the moment it is. Collapsing is a look, not a gate.
   const [weedOpen, setWeedOpen] = useState(true);
   const [highlight, setHighlight] = useState<number | null>(null);
+  // The last payload a row received, including one that is not an index. An untouched order
+  // is also what a drop that never arrived looks like, so the row has to show which it was.
+  const [dropped, setDropped] = useState<{ index: number; payload: string } | null>(null);
   // Inch text that has not been committed. A number input never reports `1.` — Chromium
   // turns both the `1` and the `.` into `"1"` — so the field is text, and the millimetre
   // draft is written only once the text is a finished amount. Writing `1` on the keystroke
@@ -137,9 +141,11 @@ export function StepPasses({
   const inchPendingRef = useRef(inchPending);
   const weedDraftRef = useRef(weedDraft);
   const changeWeedRef = useRef(changeWeed);
+  const rangesRef = useRef(ranges);
   inchPendingRef.current = inchPending;
   weedDraftRef.current = weedDraft;
   changeWeedRef.current = changeWeed;
+  rangesRef.current = ranges;
   useEffect(() => {
     inchPendingRef.current = {};
     setInchPending({});
@@ -153,8 +159,10 @@ export function StepPasses({
       let commit = false;
       for (const field of Object.keys(pending) as WeedField[]) {
         const typed = pending[field];
-        if (typed === undefined || !inchReady(typed)) continue;
-        draft[field] = lengthToDraft(typed);
+        if (typed === undefined) continue;
+        const next = inchCommit(draft[field], typed, rangeFor(field, rangesRef.current));
+        if (next === null) continue;
+        draft[field] = next;
         commit = true;
       }
       inchPendingRef.current = {};
@@ -178,11 +186,14 @@ export function StepPasses({
   };
 
   const commitInch = (field: WeedField, typed: string) => {
+    // A fragment stays on screen. Clearing it would show the previous length and let Next through.
     if (!inchReady(typed)) return;
     const rest = { ...inchPendingRef.current };
     delete rest[field];
+    const next = inchCommit(weedDraftRef.current[field], typed, rangeFor(field, ranges));
     setPending(rest);
-    changeWeed({ ...weedDraftRef.current, [field]: lengthToDraft(typed) });
+    if (next === null) return;
+    changeWeed({ ...weedDraftRef.current, [field]: next });
   };
 
   const weedInput = (field: WeedField, name: string, off: boolean) => {
@@ -201,7 +212,7 @@ export function StepPasses({
           type="text"
           inputMode="decimal"
           autoComplete="off"
-          value={pending !== undefined ? pending : unit === "mm" ? weedDraft[field] : lengthFromDraft(weedDraft[field])}
+          value={pending !== undefined ? pending : unit === "mm" ? weedDraft[field] : lengthFromDraft(weedDraft[field], rangeFor(field, ranges))}
           disabled={off}
           aria-invalid={showError}
           onChange={(event) => {
@@ -343,6 +354,7 @@ export function StepPasses({
               <div
                 key={row.key}
                 data-testid="cut-pass-row"
+                data-drop-payload={dropped?.index === i ? dropped.payload : undefined}
                 onMouseEnter={() => setHighlight(i)}
                 onFocusCapture={() => setHighlight(i)}
                 onDragOver={(event) => {
@@ -353,9 +365,11 @@ export function StepPasses({
                   event.preventDefault();
                 }}
                 onDrop={(event) => {
+                  const payload = event.dataTransfer.getData("text/plain");
+                  setDropped({ index: i, payload });
                   if (replanning) return;
-                  const from = Number(event.dataTransfer.getData("text/plain"));
-                  if (!Number.isInteger(from)) return;
+                  const from = droppedPassIndex(payload);
+                  if (from === null) return;
                   movePassTo(from, i);
                 }}
                 className={cn(
@@ -554,11 +568,48 @@ export function inchReady(typed: string): boolean {
   return typed.trim() === "" || settledInch(typed) !== null;
 }
 
-/** Inches are a view of the millimetre draft. A fragment that is not a number yet is left as typed. */
-export function lengthFromDraft(stored: string): string {
+/** Inches are a view of the millimetre draft. A fragment that is not a number yet is left as typed.
+ *  When the ordinary hundredth would fall outside `range`, the next hundredth inward is shown:
+ *  50 mm is 1.97 in, and 1.97 in is past 50 mm. */
+export function lengthFromDraft(stored: string, range?: { min: number; max: number } | null): string {
   if (stored.trim() === "") return "";
-  const value = settledInch(stored);
-  return value === null ? stored : formatLength(value, "in");
+  const mm = settledInch(stored);
+  if (mm === null) return stored;
+  const shown = formatLength(mm, "in");
+  if (!range || mm < range.min || mm > range.max) return shown;
+  return inchInside(shown, range);
+}
+
+/** What blur writes. `null` keeps the stored draft: a fragment is not a length, and committing
+ *  the inches already on screen must not walk a legal millimetre onto a different hundredth. */
+export function inchCommit(stored: string, typed: string, range: { min: number; max: number } | null): string | null {
+  if (!inchReady(typed)) return null;
+  if (typed.trim() === "") return "";
+  const storedMm = settledInch(stored);
+  const shown = lengthFromDraft(stored, range);
+  const storedOk = storedMm !== null && (range === null || (storedMm >= range.min && storedMm <= range.max));
+  if (storedOk && shown !== "" && Number(typed) === Number(shown)) return null;
+  return lengthToDraft(typed);
+}
+
+function rangeFor(field: WeedField, ranges: ipc.SettingsRanges | null): { min: number; max: number } | null {
+  if (!ranges) return null;
+  if (field === "margin") return ranges.weed.margin_mm;
+  if (field === "spacing") return ranges.weed.spacing_mm;
+  return ranges.weed.clearance_mm;
+}
+
+function inchInside(shown: string, range: { min: number; max: number }): string {
+  const back = unitToMm(Number(shown), "in");
+  if (back >= range.min && back <= range.max) return shown;
+  const hundredths = Math.round(Number(shown) * 100);
+  const step = back > range.max ? -1 : 1;
+  for (let h = hundredths + step; h >= 0 && h <= 10000; h += step) {
+    const next = (h / 100).toFixed(2);
+    const mmBack = unitToMm(Number(next), "in");
+    if (mmBack >= range.min && mmBack <= range.max) return next;
+  }
+  return shown;
 }
 
 export function lengthToDraft(typed: string): string {

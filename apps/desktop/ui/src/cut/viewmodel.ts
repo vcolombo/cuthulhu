@@ -160,6 +160,14 @@ export function reorderForReplan<T>(rows: T[], index: number, dir: -1 | 1): T[] 
   return next === rows ? null : next;
 }
 
+/** The drag payload is text. `Number("1.")` is 1 and `Number("")` is 0, and both are integers,
+ *  so an inch someone was typing would reorder a pass if it were dropped on a row. */
+export function droppedPassIndex(payload: string): number | null {
+  if (!/^(0|[1-9]\d*)$/.test(payload)) return null;
+  const index = Number(payload);
+  return Number.isInteger(index) ? index : null;
+}
+
 /** Drag a row from `from` to `to`. Null when nothing moves, so a drop on the same row
  *  does not ask the planner for travel it already has. */
 export function reorderTo<T>(rows: T[], from: number, to: number): T[] | null {

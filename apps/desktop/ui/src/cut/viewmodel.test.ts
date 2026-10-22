@@ -106,6 +106,7 @@ describe("clippedEdges", () => {
 import {
   reorderPass,
   reorderForReplan,
+  droppedPassIndex,
   reorderTo,
   toTravelPasses,
   effectiveSettings,
@@ -240,6 +241,18 @@ describe("reorderForReplan", () => {
     expect(toTravelPasses(reorderForReplan(rows, 0, 1)!).map((p) => p.key)).toEqual([
       "color:00ff00ff", "color:ff0000ff", "no-color",
     ]);
+  });
+});
+
+describe("droppedPassIndex", () => {
+  it("accepts the index a grip writes and nothing Number would coerce", () => {
+    expect(droppedPassIndex("0")).toBe(0);
+    expect(droppedPassIndex("2")).toBe(2);
+    expect(droppedPassIndex("1.")).toBeNull();
+    expect(droppedPassIndex("")).toBeNull();
+    expect(droppedPassIndex("foo")).toBeNull();
+    expect(droppedPassIndex("1.5")).toBeNull();
+    expect(droppedPassIndex("01")).toBeNull();
   });
 });
 

@@ -3102,15 +3102,19 @@ test("a drop that is not a pass index leaves the order alone", async ({ page }) 
   await showPasses(page);
   const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
   await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  const row = page.getByTestId("cut-pass-row").nth(1);
 
-  await page.getByTestId("cut-pass-row").nth(1).evaluate((row) => {
-    const data = new DataTransfer();
-    data.setData("text/plain", "foo");
-    row.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
-    row.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
-  });
+  for (const payload of ["foo", "1.", ""]) {
+    await row.evaluate((target, text) => {
+      const data = new DataTransfer();
+      data.setData("text/plain", text);
+      target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
+      target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
+    }, payload);
+    await expect(row).toHaveAttribute("data-drop-payload", payload);
+    await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  }
 
-  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
   const requests = await page.evaluate(
     () => (window as unknown as { __travelRequests?: unknown[] }).__travelRequests,
   );
@@ -3184,6 +3188,64 @@ test("an inch weed margin is a view of the millimetre draft", async ({ page }) =
   await startCut(page);
   const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };
   expect(request.weed.margin_mm).toBe(25.4);
+});
+
+test("escape commits a finished inch and drops a half-typed one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
+  await page.getByLabel("Weed border").check();
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("0.12");
+
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.");
+  await expect(margin).toHaveValue("1.");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByLabel("Weed margin")).toHaveValue("0.12");
+
+  await page.getByLabel("Weed margin").fill("1");
+  await expect(page.getByLabel("Weed margin")).toHaveValue("1");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByLabel("Weed margin")).toHaveValue("1.00");
+  await fillSendLevels(page);
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeEnabled();
+});
+
+test("a margin at the millimetre maximum is shown as an inch that margin still allows", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await showPasses(page);
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Weed margin").fill("50");
+  await page.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("1.96");
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.96");
+  await margin.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be" })).toHaveCount(0);
+  await fillSendLevels(page);
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };
+  expect(request.weed.margin_mm).toBe(50);
 });
 
 // The head does not travel to a pass that will not be cut, so switching one off is a travel

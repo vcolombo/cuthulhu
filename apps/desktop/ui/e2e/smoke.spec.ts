@@ -95,8 +95,12 @@ async function reorderPass(page: Page, index: number, dir: -1 | 1) {
   await page.getByRole("button", { name: `Reorder pass ${index + 1}` }).press(dir < 0 ? "Alt+ArrowUp" : "Alt+ArrowDown");
 }
 
-/** Start cut exists only on step 3. Calling this from an earlier step is the walk there. */
+/** Start cut exists only on step 3. Calling this from an earlier step is the walk there.
+ *  A closed sheet is the job panel's doing: Start cut closes it, and a later cut opens a fresh one. */
 async function startCut(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
   await goToSendStep(page, 3);
   await page.getByRole("button", { name: "Start Cut" }).click();
 }
@@ -107,8 +111,12 @@ async function showPreview(page: Page) {
   return page.getByRole("img", { name: /Cut preview/ });
 }
 
-/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again. */
+/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again.
+ *  The sheet closes when a cut starts, so a check after a job opens it again. */
 async function expectStartOffered(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
   const dialog = page.getByRole("dialog", { name: "Send to cutter" });
   const back = Number(await dialog.getAttribute("data-send-step")) < 3;
   await goToSendStep(page, 3);
@@ -128,7 +136,7 @@ async function showPresetEditor(page: Page) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -207,6 +215,31 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
       material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, greenId);
+  }
+
+  // Screenshot seed only. Green is not a named swatch; gold is, so the swap bar can say "Gold vinyl".
+  if (opts?.seedRedGold) {
+    const redId = nextId++;
+    doc.nodes[redId] = {
+      id: redId,
+      kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 0, 0],
+      style: { stroke: 0xff0000ff, fill: null },
+      children: [],
+      cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
+    };
+    const goldId = nextId++;
+    doc.nodes[goldId] = {
+      id: goldId,
+      kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 0, 0],
+      style: { stroke: 0xd39900ff, fill: null },
+      children: [],
+      cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
+    };
+    doc.nodes[doc.root].children.push(redId, goldId);
   }
 
   // Seven vinyl colours on a Cameo 12×12. Gold is before red so the red fill covers the gold fill
@@ -570,7 +603,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
     instance_id: "usb:pi:C", machine_id: "cameo5",
     transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
   };
-  if (opts?.seedRemoteConnected) {
+  if (opts?.seedRemoteConnected || opts?.seedRemoteIdle) {
     hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
     devices.push(REMOTE_CUTTER);
   }
@@ -1269,6 +1302,24 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?:
       emit("StateChanged");
       return null;
     },
+    // Test hooks (no production counterpart): drive the job panel without waiting out a scripted pass.
+    __test_set_progress: (a) => {
+      const sent = Number(a.sent);
+      const total = status.sent?.total ?? Number(a.total ?? 100);
+      status = { ...status, sent: { sent, total } };
+      emit("StateChanged");
+      return null;
+    },
+    __test_set_status: (a) => {
+      status = statusOf(String(a.phase), (a.actions ?? {}) as Partial<Actions>, (a.rest ?? {}) as Partial<CutStatus>);
+      emit("StateChanged");
+      return null;
+    },
+    __test_host_unreachable: (a) => {
+      const id = String(a.id);
+      hosts = hosts.map((h) => (h.id === id ? { ...h, unreachable: a.unreachable == null ? null : String(a.unreachable) } : h));
+      return null;
+    },
     // Mirrors `desktop::device::list_presets`: this machine's builtins, minus any the operator's
     // own entries shadow by pair, plus those entries. The cut handler resolves against this same
     // list so a preset the dialog just saved can be cut.
@@ -1669,12 +1720,19 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // Start cut closes the sheet. The job stays, including across a reopen (C2).
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await expect(swap.getByText("Load #00ff00, then press Resume")).toBeVisible();
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).not.toContainText("then press Resume");
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(swap).toBeVisible();
 
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
@@ -1764,7 +1822,7 @@ test("a weed border and lines replan into the preview, and the cut carries the o
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 5 travel moves, 4 weed paths");
 
   await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   const request = await callFake(page, "__test_last_cut_request") as { weed: unknown };
   expect(request.weed).toEqual({ margin_mm: 3, lines: "Horizontal", spacing_mm: 5, clearance_mm: 1.5 });
 });
@@ -2247,6 +2305,14 @@ const callFake = (page: Page, cmd: string) =>
     return internals.__TAURI_INTERNALS__.invoke(name);
   }, cmd);
 
+const callFakeWith = (page: Page, cmd: string, args: Record<string, unknown>) =>
+  page.evaluate(({ name, payload }) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke(name, payload);
+  }, { name: cmd, payload: args });
+
 /** Opens the Cut dialog on the local Cameo, which is the machine the presets below belong to. */
 const openDialogOnCameo = async (page: Page) => {
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
@@ -2274,7 +2340,7 @@ test("a preset created in the cut dialog is offered to a pass and cut by its id"
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
   await page.getByLabel("Preset for pass 1").selectOption("preset:thick-card");
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Which pass carries it, not merely that some pass does: the dialog attaching the preset to the
   // wrong row is the regression this is here for, and the untouched row must still name none.
@@ -3070,7 +3136,7 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await goToSendStep(page, 2);
   await fillSendLevels(page);
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 });
 
 test("reordering passes asks the backend for travel in the new order", async ({ page }) => {
@@ -3646,10 +3712,11 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Cancel job", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
   await expectStartOffered(page);
 });
 
@@ -3662,12 +3729,12 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
 
   // The backend says which ending it was, so the two endings cannot be confused: this
   // is the case the mock could not express while a finished cut only rested on `Idle`.
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
   await expectStartOffered(page);
 });
@@ -3684,9 +3751,10 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   // pass has already parked for a colour swap, whose badge asks for a person.
   await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
   await startCut(page);
-  await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
-  await goToSendStep(page, 1);
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
   // has polled. `deviceBadge`'s unit tests assert on `tone` alone; this is what makes them
@@ -3706,14 +3774,14 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
-  // Second cut in the same session: the dialog must take the new job's statuses as
-  // they arrive, with no per-job bookkeeping left over from the finished first cut.
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // Second cut in the same session: the sheet opens on step 1 again, and the new job's
+  // statuses replace the finished one. Nothing is remembered per job id.
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
 });
 
@@ -3758,13 +3826,10 @@ test("a connected cutter offers a disconnect, and choosing it clears the aim", a
   await expect(cut.getByRole("button", { name: /^Disconnect/ })).toHaveCount(0);
 });
 
-// Inverted deliberately. While the dialog latched its own outcome, "did the last cut
-// finish?" was answered by how long the dialog had been mounted, so a reopened dialog
-// had to show nothing — and this test asserted that. The outcome now comes from the
-// device, so a reopened dialog reports what the device actually last did, for the same
-// reason a freshly opened one does. The guard against a *false* completion is
-// "disconnecting mid-pause" below: there the job never ended, and no banner appears.
-test("a reopened dialog reports the ending the device actually last had", async ({ page }) => {
+// The ending lives on the job panel, which is what the device last did. Reopening the
+// sheet must not repeat it and must not clear it. The guard against a false completion
+// is "disconnecting mid-pause" below: there the job never ended, and no banner appears.
+test("a reopened sheet leaves the ending on the job panel", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
@@ -3773,13 +3838,18 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Close" }).click();
+  // The ending stays on the panel. Reopening the sheet must not repeat it, and must not clear it.
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog.getByText("Completed", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Job complete")).toHaveCount(0);
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
 });
 
@@ -3792,14 +3862,15 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Arm a one-shot async resume failure, then resume: the Failed phase must show
-  // "Cut failed" — never "Job complete", which a banner derived from "a job ended
+  // "Cut failed" — never a completion, which a banner derived from "a job ended
   // and the device is Idle" produced for a failed job whose state cache lagged.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 
   // Recover by reconnecting (the other listed device). The connect lifecycle events
@@ -3808,7 +3879,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // The first choice aimed the document at the Cameo, so this one asks before switching.
   // The aimed card is not a second connect: the Puma card is the other cutter.
   page.once("dialog", (dialog) => dialog.accept());
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
   await expectStartOffered(page);
 });
@@ -3825,7 +3896,8 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
   await startCut(page);
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
@@ -3842,16 +3914,17 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
   await expectStartOffered(page);
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
@@ -3867,17 +3940,171 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
   await expectStartOffered(page);
   await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("an unreachable host freezes the pass, then shows the real status", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  await expect(job.getByText(/Connection lost · last update \d+s ago/)).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 90 });
+
+  const ageOf = async () => {
+    const text = await job.getByText(/Connection lost · last update \d+s ago/).innerText();
+    return Number(text.match(/(\d+)s ago/)?.[1] ?? "0");
+  };
+  const before = await ageOf();
+  const started = Date.now();
+  if ((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1") {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-light.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+  const remaining = 5000 - (Date.now() - started);
+  if (remaining > 0) await page.waitForTimeout(remaining);
+
+  expect(await ageOf()).toBeGreaterThanOrEqual(before + 3);
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar")).toHaveAttribute("aria-valuenow", "40");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  await expect(job.getByText("bench.local:7878")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(job.getByTestId("pass-progress")).toHaveText("90% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+});
+
+test("resume is disabled while a colour swap's host is unreachable", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await startCut(page);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  const resume = swap.getByRole("button", { name: "Resume", exact: true });
+  await expect(resume).toBeDisabled();
+  await resume.locator("xpath=..").hover();
+  await expect(page.getByRole("tooltip")).toHaveText("Waiting for the host to reconnect");
+  await swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
+});
+
+function jobShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1";
+}
+
+async function shot(page: Page, name: string) {
+  if (!jobShots()) return;
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+test("the job panel, swap bar, confirm, cancel and failure states", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await shot(page, "panel-mid-pass");
+
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load Gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
+  await shot(page, "swap-waiting");
+
+  await swap.getByRole("button", { name: "Collapse", exact: true }).click();
+  await expect(swap).toHaveCount(0);
+  const chip = page.getByTestId("swap-chip");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("aria-label", "Show colour swap: Load Gold vinyl, then press Resume");
+  await shot(page, "swap-chip");
+  await chip.click();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+  await shot(page, "confirm-pass");
+
+  await job.getByRole("button", { name: "Cancel", exact: true }).click();
+  const alert = page.getByRole("alertdialog");
+  await expect(alert.getByRole("heading", { name: "Cancel this cut?" })).toBeVisible();
+  if (jobShots()) {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-light.png" });
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await job.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-dark.png" });
+    await page.getByRole("alertdialog").getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  } else {
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+  }
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "Failed",
+    rest: { error: "Timeout" },
+  });
+  await expect(job.getByText("Cut failed")).toBeVisible();
+  await expect(job.getByText("The cutter did not answer in time.")).toBeVisible();
+  await expect(job.getByRole("button", { name: "Start again", exact: true })).toBeVisible();
+  await shot(page, "failed");
+  await job.getByRole("button", { name: "Start again", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toBeVisible();
 });
 
 test("the send sheet walks machine, passes and preview, and withholds a blank level", async ({ page }) => {

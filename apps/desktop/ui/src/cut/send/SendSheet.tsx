@@ -14,6 +14,7 @@ import { collectPassIssues } from "./passFields";
 import { AlreadyAcceptedNote, StepPreview } from "./StepPreview";
 import { HostPairing, StepMachine, useDeviceList } from "./StepMachine";
 import { StepPasses } from "./StepPasses";
+import type { JobSnapshot } from "../job/model";
 import { useCutDispatch } from "./useCutDispatch";
 import { useCutPlan } from "./useCutPlan";
 import { usePresetsForAim } from "./usePresetsForAim";
@@ -37,6 +38,8 @@ type Props = {
   onReconnect: () => Promise<unknown>;
   onError: (msg: string) => void;
   onClose: () => void;
+  /** A cut the host accepted. The sheet closes; the passes stay with the job panel. */
+  onJobAccepted: (snapshot: JobSnapshot) => void;
   /** The weed controls as last left, kept by App for the session; null until first changed, when
    *  they start from the backend's defaults. */
   weed: WeedDraft | null;
@@ -61,6 +64,7 @@ export function SendSheet({
   onReconnect,
   onError,
   onClose,
+  onJobAccepted,
   weed,
   onWeedChange,
   theme,
@@ -120,7 +124,10 @@ export function SendSheet({
     canSend: () => !plan.stalePlan && collectPassIssues(plan.plan?.rows ?? [], presets.presetLookup, presets.caps, ranges).length === 0,
     onStalePlan: () => plan.setStalePlan(true),
     onError,
-    refreshDeviceState,
+    onAccepted: (snapshot) => {
+      onJobAccepted(snapshot);
+      onClose();
+    },
   });
 
   // Moving between steps, not the open itself: the dialog's own focus lands on the first control.
@@ -364,24 +371,13 @@ export function SendSheet({
 
           <div className="flex items-center gap-2 border-t border-border px-6 py-3">
             {step === 1 ? (
-              status.actions.cancel ? <span /> : (
-                <Button variant="ghost" onClick={() => guardUnsaved(onClose)}>Cancel</Button>
-              )
+              <Button variant="ghost" onClick={() => guardUnsaved(onClose)}>Cancel</Button>
             ) : (
               <Button variant="ghost" onClick={() => go((step - 1) as SendStep)}>
                 <ArrowLeft aria-hidden /> Back
               </Button>
             )}
             <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
-              {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
-              {status.phase === "Sending" && status.sent ? (
-                <span>sending {status.sent.sent} / {status.sent.total} bytes</span>
-              ) : null}
-              {status.phase === "Cancelling" ? <span>cancelling</span> : null}
-              {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
-              {status.ended === "Cancelled" ? <span>Cancelled</span> : null}
-              {status.ended === "Completed" ? <span>Job complete</span> : null}
-              {status.phase === "Failed" ? <span className="text-destructive">Cut failed</span> : null}
               {step === 1 && !readyCutter ? <span>Pick a cutter that's ready.</span> : null}
               {step === 2 && issues.length > 0 ? (
                 <span role="alert" className="text-destructive">
@@ -389,9 +385,6 @@ export function SendSheet({
                 </span>
               ) : null}
             </div>
-            {status.actions.resume ? <Button variant="secondary" size="sm" aria-label="Resume" onClick={dispatch.resume}>Resume</Button> : null}
-            {status.actions.confirm ? <Button variant="secondary" size="sm" aria-label="Confirm pass done" onClick={dispatch.confirmPassDone}>Confirm pass done</Button> : null}
-            {status.actions.cancel ? <Button variant="secondary" size="sm" aria-label="Cancel" onClick={dispatch.cancel}>Cancel</Button> : null}
             {step < 3 ? (
               <Button disabled={step === 1 ? !readyCutter : !passesReady} onClick={() => go((step + 1) as SendStep)}>
                 Next <ArrowRight aria-hidden />

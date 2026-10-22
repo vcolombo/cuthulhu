@@ -253,3 +253,23 @@ ul {
 ol {
   list-style: decimal;
 }
+
+/* Stripes on a pass that is still moving. Tokens only: primary and tint, never a literal.
+   Frozen progress drops the class, so a lost host does not look like the blade is advancing. */
+@keyframes progress-live {
+  to {
+    background-position: 16px 0;
+  }
+}
+
+.progress-live {
+  background-image: linear-gradient(90deg, var(--primary) 0 8px, var(--tint) 8px 16px);
+  background-size: 16px 100%;
+  animation: progress-live 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-live {
+    animation: none;
+  }
+}

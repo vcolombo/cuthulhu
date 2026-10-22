@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Crosshair, Maximize2, ZoomIn } from "lucide-react";
 import type { MachineProfile } from "../App";
 import type { LengthUnit } from "../length";
@@ -30,6 +30,10 @@ type Props = {
   /** Selection bounds in document millimetres, or null when nothing is selected. */
   selection: { w: number; h: number } | null;
   unit: LengthUnit;
+  /** The folded colour-swap chip. It replaces the mini progress, which would say the same thing twice. */
+  trailing?: ReactNode;
+  /** The job panel or the swap bar already shows this job. */
+  hideJobEcho?: boolean;
 };
 
 function phaseDot(phase: Phase): string {
@@ -72,7 +76,7 @@ function cursorText(cursor: { x: number; y: number }, unit: LengthUnit): string 
   return `x ${formatLength(cursor.x, "in")}  y ${formatLength(cursor.y, "in")} in`;
 }
 
-export function StatusBar({ device, profile, machines, hosts, mat, status, zoomPercent, cursor, selection, unit }: Props) {
+export function StatusBar({ device, profile, machines, hosts, mat, status, zoomPercent, cursor, selection, unit, trailing = null, hideJobEcho = false }: Props) {
   const connectedName = device ? (machines.find((machine) => machine.id === device.machine_id)?.name ?? device.machine_id) : null;
   const where = device
     ? device.host === null
@@ -140,7 +144,8 @@ export function StatusBar({ device, profile, machines, hosts, mat, status, zoomP
         </span>
       ) : null}
       <div className="flex-1" />
-      {busy ? (
+      {trailing}
+      {trailing === null && busy && !hideJobEcho ? (
         <span className="flex items-center gap-2 text-foreground">
           <span>
             {status.pass ? `pass ${status.pass.index + 1}/${status.pass.total}` : status.phase}

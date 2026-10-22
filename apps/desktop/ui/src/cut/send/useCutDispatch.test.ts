@@ -25,7 +25,10 @@ const plan: InstalledPlan = {
   grouping: "Color",
   weed: null,
   revision: "1",
-  rows: [],
+  rows: [
+    { key: "color:ff0000ff", shapeCount: 2, enabled: true, presetId: null, speed: null, force: null, repeatCount: null, nodeIds: [], starts: [], weed: [] },
+    { key: "color:00ff00ff", shapeCount: 1, enabled: false, presetId: null, speed: null, force: null, repeatCount: null, nodeIds: [], starts: [], weed: [] },
+  ],
   skippedNotCut: 0,
   travel: [],
 };
@@ -34,10 +37,12 @@ function Host({
   api,
   onStalePlan,
   onError,
+  onAccepted,
 }: {
   api: { current: DispatchApi | null };
   onStalePlan: () => void;
   onError: (msg: string) => void;
+  onAccepted: (snapshot: { passes: { key: string }[] }) => void;
 }) {
   api.current = useCutDispatch({
     connected: { instance_id: "usb:mock" } as DeviceInfo,
@@ -47,7 +52,7 @@ function Host({
     canSend: () => true,
     onStalePlan,
     onError,
-    refreshDeviceState: () => Promise.resolve(),
+    onAccepted,
   });
   return null;
 }
@@ -57,6 +62,7 @@ describe("useCutDispatch", () => {
   let el: HTMLDivElement;
   const api = { current: null as DispatchApi | null };
   const errors: string[] = [];
+  const accepted: { passes: { key: string }[] }[] = [];
   let stale = 0;
 
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -66,6 +72,7 @@ describe("useCutDispatch", () => {
       api,
       onStalePlan: () => { stale += 1; },
       onError: (msg) => errors.push(msg),
+      onAccepted: (snapshot) => accepted.push(snapshot),
     });
   }
 
@@ -73,6 +80,7 @@ describe("useCutDispatch", () => {
     ipc.cut.mockReset();
     api.current = null;
     errors.length = 0;
+    accepted.length = 0;
     stale = 0;
     el = document.createElement("div");
     document.body.appendChild(el);
@@ -98,5 +106,20 @@ describe("useCutDispatch", () => {
     await act(async () => { api.current?.startCut(); });
     expect(stale).toBe(0);
     expect(errors).toEqual(["no fonts are installed"]);
+    expect(accepted).toEqual([]);
+  });
+
+  it("remembers only the enabled passes of a cut that started", async () => {
+    ipc.cut.mockResolvedValue({ duplicate: false });
+    await act(async () => { root.render(render()); });
+    await act(async () => { api.current?.startCut(); });
+    expect(accepted).toEqual([{ grouping: "Color", passes: [{ key: "color:ff0000ff", shapeCount: 2 }] }]);
+  });
+
+  it("keeps the sheet's passes when the host had already accepted the cut", async () => {
+    ipc.cut.mockResolvedValue({ duplicate: true });
+    await act(async () => { root.render(render()); });
+    await act(async () => { api.current?.startCut(); });
+    expect(accepted).toEqual([]);
   });
 });

@@ -55,7 +55,7 @@ export function StepPreview({
         <CutPreview scene={scene} artboard={artboard} passes={passes} travel={travel} theme={theme} />
         <p className="mt-2 text-xs text-muted-foreground">Numbers show the cut order. Each colour is a separate pass.</p>
       </div>
-      <div className="space-y-3 text-sm">
+      <div className="min-w-0 space-y-3 text-sm">
         <dl className="space-y-1.5 rounded-lg border border-border bg-card p-3 text-xs">
           <Row label="Cutter" value={connected ? (machines.find((machine) => machine.id === connected.machine_id)?.name ?? connected.machine_id) : "None"} />
           <Row label="Runs on" value={runsOn} />
@@ -72,8 +72,10 @@ export function StepPreview({
               <div key={pass.key} className="flex items-start gap-2 text-xs">
                 <span className="tabular text-muted-foreground">{index + 1}.</span>
                 {swatch !== null ? <span className="mt-0.5 inline-block size-3 shrink-0 rounded-sm" style={{ background: swatch }} /> : null}
-                <span>
-                  <span className="block">{label.text ?? "This pass"}</span>
+                {/* min-w-0 and break-words: a name with no space is wider than this column, and the
+                    column's min-content would otherwise widen the sheet until the name is clipped. */}
+                <span className="min-w-0">
+                  <span className="block break-words">{label.text ?? "This pass"}</span>
                   <span className="mt-0.5 block tabular text-muted-foreground">
                     Speed {shown(effective.speed)} · force {shown(effective.force)} · {shown(effective.repeatCount)}×
                   </span>

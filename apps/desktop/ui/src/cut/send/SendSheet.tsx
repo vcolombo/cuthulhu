@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, Scissors, X } from "lucide-react";
+import type { MachineProfile } from "../../App";
 import * as ipc from "../../ipc";
 import type { LengthUnit } from "../../length";
 import type { Scene } from "../../render/hittest";
@@ -24,6 +25,7 @@ type Props = {
   scene: Scene;
   artboard: { x: number; y: number; w: number; h: number };
   docMachineId: string | null;
+  machines: MachineProfile[];
   status: ipc.CutStatus;
   refreshDeviceState: () => Promise<void>;
   onConvertMachine: (machineId: string) => boolean | Promise<boolean>;
@@ -49,6 +51,7 @@ export function SendSheet({
   scene,
   artboard,
   docMachineId,
+  machines,
   status,
   refreshDeviceState,
   onConvertMachine,
@@ -273,6 +276,7 @@ export function SendSheet({
               <StepMachine
                 devices={device.devices}
                 hosts={device.hosts}
+                machines={machines}
                 shown={device.shown}
                 forceHost={device.forceHost}
                 setForceHost={device.setForceHost}
@@ -350,6 +354,7 @@ export function SendSheet({
                 theme={theme}
                 connected={connected}
                 hosts={device.hosts}
+                machines={machines}
                 presetLookup={presets.presetLookup}
                 grouping={plan.plan?.grouping ?? plan.grouping}
                 weedOn={plan.weedDraft.border}

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useCallback, useEffect, useState } from "react";
+import type { MachineProfile } from "../../App";
 import * as ipc from "../../ipc";
 import { Laptop, Router } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/cn";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../../hosts/deviceList";
 import { PairHostDialog } from "../../hosts/PairHostDialog";
-import { TONE_COLOR } from "./chrome";
+import { TONE_BADGE } from "./chrome";
 
 /** The device list and the poll that keeps a Cut Host's rows moving. Called from the sheet so its
  *  mount effect stays ahead of the plan: the list and the ranges used to start in one effect. */
@@ -142,6 +143,7 @@ export function HostPairing({
 export function StepMachine({
   devices,
   hosts,
+  machines,
   shown,
   forceHost,
   setForceHost,
@@ -158,6 +160,7 @@ export function StepMachine({
 }: {
   devices: ipc.DeviceInfo[];
   hosts: ipc.PairedHostView[];
+  machines: MachineProfile[];
   shown: ReturnType<typeof groupDevices>;
   forceHost: string | null;
   setForceHost: (id: string | null) => void;
@@ -250,6 +253,16 @@ export function StepMachine({
               const blocked = section.unreachable !== null || (!isAimed && badge.tone === "busy");
               const reason = badge.tone === "busy" ? "This cutter is in the middle of a job." : null;
               const Icon = d.host === null ? Laptop : Router;
+              const model = machines.find((machine) => machine.id === d.machine_id)?.name ?? d.machine_id;
+              // The section header already names a host. The card's second line is how this
+              // cutter is reached, which for a serial port that has not been confirmed is the
+              // caveat that used to sit in parentheses on the raw id.
+              const host = d.host === null ? null : hosts.find((item) => item.id === d.host) ?? null;
+              const where = d.host === null
+                ? (d.candidate ? "Unverified serial port on this computer" : "USB on this computer")
+                : host
+                  ? `${host.name} (${host.address})`
+                  : "Cut Host";
               return (
                 <div
                   key={`${d.host ?? "local"}:${d.instance_id}`}
@@ -259,70 +272,65 @@ export function StepMachine({
                     blocked && "opacity-70",
                   )}
                 >
+                  {/* The card is the choice. A second Connect button asked the same question
+                      and went through the same aim. Disconnect and Reconnect stay beside it:
+                      choosing the card again is not how a transport is dropped or reopened. */}
                   <button
                     type="button"
                     role="radio"
                     aria-checked={isAimed}
-                    aria-label={d.machine_id}
+                    aria-label={model}
                     disabled={aiming || (blocked && !isAimed)}
                     onClick={() => {
                       if (isAimed || blocked) return;
                       guardUnsaved(() => onConnect(d));
                     }}
-                    className={cn(
-                      "grid size-4 shrink-0 place-items-center rounded-full border",
-                      isAimed && !blocked ? "border-accent-ink" : "border-input",
-                    )}
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left disabled:cursor-not-allowed"
                   >
-                    {isAimed && !blocked ? <span className="size-2 rounded-full bg-primary" /> : null}
-                  </button>
-                  <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                  <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium">
-                      {d.machine_id}
-                      {d.candidate ? " (unverified serial device)" : ""}
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "grid size-4 shrink-0 place-items-center rounded-full border",
+                        isAimed && !blocked ? "border-accent-ink" : "border-input",
+                      )}
+                    >
+                      {isAimed && !blocked ? <span className="size-2 rounded-full bg-primary" /> : null}
                     </span>
-                    {/* A Cut Host is already named, once, in the section header above — including
-                        its address. Repeating the title on the card makes that name match twice. */}
-                    {d.host === null ? (
-                      <span className="block text-xs text-muted-foreground">USB on this computer</span>
-                    ) : null}
-                    {reason ? <span className="mt-1 block text-xs text-muted-foreground">{reason}</span> : null}
-                  </span>
-                  <span data-testid="device-badge" data-tone={badge.tone} className="text-xs font-medium" style={{ color: TONE_COLOR[badge.tone] }}>
+                    <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-medium">{model}</span>
+                      <span className="block text-xs text-muted-foreground">{where}</span>
+                      {reason ? <span className="mt-1 block text-xs text-muted-foreground">{reason}</span> : null}
+                    </span>
+                  </button>
+                  <span
+                    data-testid="device-badge"
+                    data-tone={badge.tone}
+                    className={cn("shrink-0 rounded-full border px-2 py-0.5 text-2xs font-medium", TONE_BADGE[badge.tone])}
+                  >
                     {badge.label}
                   </span>
-                  {isAimed ? (
-                    <>
-                      <span className="text-xs text-success">connected</span>
-                      {/* The only way back from a stop nothing confirmed: `driver-core` refuses
-                          both a cut and a connect from that state, so without this the operator's
-                          exit is restarting the app. Withheld mid-Job — see `connectedControl`. */}
-                      {control ? (
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          aria-label={`${control.label} ${d.instance_id}`}
-                          // One aim change at a time. Two in flight would have their replies install
-                          // in whatever order they land, and the first to finish would clear
-                          // `aiming` while the other was still moving the aim (CodeRabbit on
-                          // PR #264) — which is also what `DeviceManager` refuses as Busy.
-                          disabled={aiming}
-                          // Only the disconnect is guarded: a reconnect re-opens the same cutter's
-                          // transport, so the draft it is editing is still that machine's.
-                          onClick={() =>
-                            control.verb === "reconnect" ? onReconnect() : guardUnsaved(onDisconnect)
-                          }
-                        >
-                          {control.label}
-                        </Button>
-                      ) : null}
-                    </>
-                  ) : (
-                    <Button variant="secondary" size="sm" disabled={aiming || blocked} onClick={() => guardUnsaved(() => onConnect(d))}>
-                      Connect
+                  {isAimed && control ? (
+                    // The only way back from a stop nothing confirmed: `driver-core` refuses
+                    // both a cut and a connect from that state. Withheld mid-Job — `connectedControl`.
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      aria-label={`${control.label} ${d.instance_id}`}
+                      // One aim change at a time. Two in flight would have their replies install
+                      // in whatever order they land, and the first to finish would clear
+                      // `aiming` while the other was still moving the aim (CodeRabbit on
+                      // PR #264) — which is also what `DeviceManager` refuses as Busy.
+                      disabled={aiming}
+                      // Only the disconnect is guarded: a reconnect re-opens the same cutter's
+                      // transport, so the draft it is editing is still that machine's.
+                      onClick={() =>
+                        control.verb === "reconnect" ? onReconnect() : guardUnsaved(onDisconnect)
+                      }
+                    >
+                      {control.label}
                     </Button>
-                  )}
+                  ) : null}
                 </div>
               );
             })}

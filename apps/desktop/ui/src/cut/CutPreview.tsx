@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useEffect, useRef } from "react";
-import type { Scene } from "../render/hittest";
+import type { Scene, SceneNode } from "../render/hittest";
 import { vinylDisplay } from "../render/vinyl";
 import type { ResolvedTheme } from "../theme";
 import { clippedEdges, contentBounds, fitViewport, parsePassKey, polylineBounds } from "./viewmodel";
@@ -82,34 +82,45 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     // which is reachable today through the PropertiesPanel's W/H fields.
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     const vpM = new DOMMatrix([vp.scale, 0, 0, vp.scale, vp.tx, vp.ty]);
+    const screenOf = (node: SceneNode) => {
+      const screen = new Path2D();
+      if (node.shape && node.world) {
+        const [a, b, c, d, e, f] = node.world;
+        let local: Path2D;
+        if (node.shape.t === "path") local = new Path2D(node.shape.d);
+        else {
+          local = new Path2D();
+          if (node.shape.t === "rect") local.rect(0, 0, node.shape.w, node.shape.h);
+          else local.ellipse(node.shape.rx, node.shape.ry, node.shape.rx, node.shape.ry, 0, 0, Math.PI * 2);
+        }
+        screen.addPath(local, vpM.multiply(new DOMMatrix([a, b, c, d, e, f])));
+      } else {
+        const local = new Path2D();
+        local.rect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
+        screen.addPath(local, vpM);
+      }
+      return screen;
+    };
     passes.forEach((pass) => {
       // A pass with no colour to draw in — the colourless pass, the single pass, or a
-      // preset-keyed one — keeps the text colour it always had.
+      // preset-keyed one — keeps the text colour it always had. A colour pass is filled
+      // with the same vinyl the swatch uses, or a green outline is all a later pass leaves
+      // when it is drawn over an earlier one.
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme).stroke : text;
+      const display = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme) : null;
+      const color = display?.stroke ?? text;
       for (const nodeId of pass.nodeIds) {
         const node = nodesById.get(nodeId);
         if (!node) continue;
-
+        const screen = screenOf(node);
+        if (display) {
+          ctx.globalAlpha = (pass.enabled ? 1 : 0.35) * display.fillOpacity;
+          ctx.fillStyle = display.fill;
+          ctx.fill(screen);
+        }
         ctx.globalAlpha = pass.enabled ? 1 : 0.35;
         ctx.strokeStyle = color;
-        ctx.lineWidth = 1;
-        const screen = new Path2D();
-        if (node.shape && node.world) {
-          const [a, b, c, d, e, f] = node.world;
-          let local: Path2D;
-          if (node.shape.t === "path") local = new Path2D(node.shape.d);
-          else {
-            local = new Path2D();
-            if (node.shape.t === "rect") local.rect(0, 0, node.shape.w, node.shape.h);
-            else local.ellipse(node.shape.rx, node.shape.ry, node.shape.rx, node.shape.ry, 0, 0, Math.PI * 2);
-          }
-          screen.addPath(local, vpM.multiply(new DOMMatrix([a, b, c, d, e, f])));
-        } else {
-          const local = new Path2D();
-          local.rect(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h);
-          screen.addPath(local, vpM);
-        }
+        ctx.lineWidth = 2;
         ctx.stroke(screen);
       }
       // In the pass's colour because it is cut with the pass, at a lighter alpha so it reads as
@@ -140,30 +151,37 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
 
     // Badges and clip markers draw in screen space — a badge that scaled with the
     // fit is exactly the illegibility this viewport exists to remove.
-    passes.forEach((pass, passIndex) => {
-      // A pass with no colour to draw in — the colourless pass, the single pass, or a
-      // preset-keyed one — keeps the text colour it always had.
+    // One number per shape, in the order the blade meets them. The pass index repeated
+    // on every shape of a pass, so a pass drawn on top of another left a single "2".
+    let cutOrder = 0;
+    passes.forEach((pass) => {
       const parsed = parsePassKey(pass.key);
-      const color = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme).stroke : text;
+      const display = parsed.kind === "color" && parsed.color !== null ? vinylDisplay(parsed.color, theme) : null;
+      const color = display?.stroke ?? text;
       pass.nodeIds.forEach((nodeId, shapeIndex) => {
         const node = nodesById.get(nodeId);
         if (!node) return;
+        cutOrder += 1;
         // Order badge at the shape's first planned point — where the blade actually
         // lands (PR #141 wanted this; the plan now carries it). A shape whose outline
         // flattened to nothing falls back to the world-bounds corner, which is inside
-        // the fitted region by construction.
+        // the fitted region by construction. The disc is the panel, not the vinyl:
+        // a badge filled with the same colour as the shape disappears into the fill.
         const start = pass.starts[shapeIndex];
         const bx = (start ? start[0] : node.bounds.x) * vp.scale + vp.tx;
         const by = (start ? start[1] : node.bounds.y) * vp.scale + vp.ty;
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(bx, by, 6, 0, Math.PI * 2);
-        ctx.fill();
         ctx.fillStyle = panel;
+        ctx.beginPath();
+        ctx.arc(bx, by, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.fillStyle = text;
         ctx.font = "9px sans-serif";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(String(passIndex + 1), bx, by);
+        ctx.fillText(String(cutOrder), bx, by);
       });
     });
 

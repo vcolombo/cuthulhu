@@ -127,8 +127,9 @@ export function StepPasses({
   movePassTo: (from: number, to: number) => void;
   onApplyMaterial: (presetId: string | null) => void;
 }) {
-  // Open, so the weed controls are on the step the moment it is. Collapsing is a look, not a gate.
-  const [weedOpen, setWeedOpen] = useState(true);
+  // Closed until weeding is already on. The margin fields are the exception, not the first thing
+  // the step shows, and a sheet reopened with a border still drawn has to show the fields.
+  const [weedOpen, setWeedOpen] = useState(weedDraft.border);
   const [highlight, setHighlight] = useState<number | null>(null);
   // The last payload a row received, including one that is not an index. An untouched order
   // is also what a drop that never arrived looks like, so the row has to show which it was.
@@ -252,39 +253,14 @@ export function StepPasses({
         <div className="text-sm text-destructive">
           Material presets are unavailable: {rangesError ?? presetListError}
         </div>
-      ) : ranges !== null && presetsLoaded ? (
-        <div className="space-y-3">
-          <button type="button" className="text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
-            Edit presets…
-          </button>
-          {editorOpen ? (
-            <PresetEditor
-              presets={presets}
-              caps={caps}
-              ranges={ranges}
-              draft={draft}
-              mode={presetMode}
-              dirty={presetDirty}
-              fault={presetFault}
-              error={presetError}
-              busy={presetBusy || aiming}
-              onSelect={(id) => guardUnsaved(() => onSelectPreset(id))}
-              onNew={() => guardUnsaved(onNewPreset)}
-              onCopy={onCopyPreset}
-              onChange={onChangeDraft}
-              onSave={onSavePreset}
-              onDiscard={onDiscardPreset}
-              onDelete={onDeletePreset}
-            />
-          ) : null}
-        </div>
-      ) : (
+      ) : ranges !== null && presetsLoaded ? null : (
         <div className="text-sm text-muted-foreground">Reading this cutter's presets…</div>
       )}
 
       {/* ponytail: one preset for every pass, in the slot a per-colour material picker (#310)
           will take. Speed and force stay in the row until that picker can move them under Advanced. */}
-      <div>
+      <div className="flex items-end gap-3">
+        <div className="min-w-0 flex-1">
         <div className="mb-1 text-2xs text-muted-foreground">Material preset</div>
         <select
           aria-label="Material preset"
@@ -306,7 +282,33 @@ export function StepPasses({
             <option key={preset.id} value={`preset:${preset.id}`}>{preset.name}</option>
           ))}
         </select>
+        </div>
+        {ranges !== null && presetsLoaded ? (
+          <button type="button" className="mb-0.5 shrink-0 text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
+            Edit presets…
+          </button>
+        ) : null}
       </div>
+      {editorOpen && ranges !== null && presetsLoaded ? (
+        <PresetEditor
+          presets={presets}
+          caps={caps}
+          ranges={ranges}
+          draft={draft}
+          mode={presetMode}
+          dirty={presetDirty}
+          fault={presetFault}
+          error={presetError}
+          busy={presetBusy || aiming}
+          onSelect={(id) => guardUnsaved(() => onSelectPreset(id))}
+          onNew={() => guardUnsaved(onNewPreset)}
+          onCopy={onCopyPreset}
+          onChange={onChangeDraft}
+          onSave={onSavePreset}
+          onDiscard={onDiscardPreset}
+          onDelete={onDeletePreset}
+        />
+      ) : null}
 
       <label className="flex items-center gap-2 text-sm">
         Group passes by

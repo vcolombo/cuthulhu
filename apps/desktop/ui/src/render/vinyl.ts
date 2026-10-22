@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { clampChroma, converter, formatHex, interpolate, wcagContrast, type Oklch } from "culori";
+import { clampChroma, converter, differenceCiede2000, formatHex, interpolate, wcagContrast, type Oklch } from "culori";
 
 const toOklch = converter("oklch");
 const toRgb = converter("rgb");
@@ -74,6 +74,24 @@ export function selectionHasFaintVinyl(nodes: Record<string, WalkNode>, selected
     }
   }
   return false;
+}
+
+/** Past this, the nearest swatch is a different colour. Pure red is still Red (about 10);
+ *  pure green has no swatch and must not become White (about 33). */
+const VINYL_NAME_LIMIT = 12.5;
+const vinylDelta = differenceCiede2000();
+
+/** "Red vinyl", or a `#rrggbb` when no built-in swatch is that colour. */
+export function vinylName(rgba: number | string): string {
+  const css = (typeof rgba === "number" ? rgbaToHex(rgba) : rgba.trim()).toLowerCase();
+  let best: { name: string; delta: number } | null = null;
+  for (const swatch of VINYL_SWATCHES) {
+    const delta = vinylDelta(css, swatch.oklch);
+    if (!Number.isFinite(delta)) continue;
+    if (best === null || delta < best.delta) best = { name: swatch.name, delta };
+  }
+  if (best !== null && best.delta <= VINYL_NAME_LIMIT) return `${best.name} vinyl`;
+  return css.startsWith("#") ? css : `#${css}`;
 }
 
 function rgbaToHex(rgba: number): string {

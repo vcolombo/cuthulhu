@@ -608,8 +608,9 @@ describe("passRowLabel", () => {
   const presets = [{ id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
                      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true }];
 
-  it("names a colour pass by its swatch, not by words", () => {
-    expect(passRowLabel("color:ff0000ff", read(presets), "Color")).toEqual({ swatch: "#ff0000", text: null });
+  it("names a colour pass by its swatch and the nearest vinyl", () => {
+    expect(passRowLabel("color:ff0000ff", read(presets), "Color")).toEqual({ swatch: "#ff0000", text: "Red vinyl" });
+    expect(passRowLabel("color:00ff00ff", read(presets), "Color")).toEqual({ swatch: "#00ff00", text: "#00ff00" });
   });
 
   // Grouping-aware, because `no-color` means something different in each colour mode: under

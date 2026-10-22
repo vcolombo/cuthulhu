@@ -7,6 +7,7 @@ import {
   nearlyInvisible,
   selectionHasFaintVinyl,
   vinylDisplay,
+  vinylName,
 } from "./vinyl";
 
 const toOklch = converter("oklch");
@@ -34,6 +35,15 @@ function hueDelta(a: number, b: number): number {
   const d = Math.abs(a - b) % 360;
   return Math.min(d, 360 - d);
 }
+
+describe("vinylName", () => {
+  it("names a near swatch and leaves a colour with no swatch as hex", () => {
+    expect(vinylName("#ff0000")).toBe("Red vinyl");
+    expect(vinylName(0xff0000ff)).toBe("Red vinyl");
+    expect(vinylName("#00ff00")).toBe("#00ff00");
+    expect(vinylName("oklch(0.72 0.15 82)")).toBe("Gold vinyl");
+  });
+});
 
 describe("vinylDisplay", () => {
   it("matches the dark contrast table, and every rounded outline clears 3:1 on #484848", () => {

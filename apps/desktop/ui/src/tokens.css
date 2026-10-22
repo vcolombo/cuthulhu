@@ -233,6 +233,14 @@ textarea {
   border: 1px solid var(--border);
 }
 
+/* That reset is unlayered and sets the whole border, so `border-destructive` never
+   paints. The red border is the same fact `aria-invalid` already states. */
+input[aria-invalid="true"]:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
+select[aria-invalid="true"],
+textarea[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
 ul,
 ol {
   padding-left: 1.5em;

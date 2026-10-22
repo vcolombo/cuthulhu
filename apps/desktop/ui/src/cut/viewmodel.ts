@@ -2,6 +2,7 @@
 // One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
 // callers keep their import path without a second structurally-identical type drifting.
 import type { Bounds } from "../render/hittest";
+import { vinylName } from "../render/vinyl";
 import type { Grouping, PassKey, WeedLines, WeedOptions, WeedRanges } from "../ipc";
 export type { Bounds };
 
@@ -284,9 +285,10 @@ export function presetPicker(
   return { selected: key(presetId), options };
 }
 
-/** How a pass row identifies itself: a swatch when the key is a colour, words otherwise.
- *  Grouping-aware because `no-color` means something different per mode — under Stroke it can
- *  hold brightly filled shapes, so calling it "no visible paint" would be false. */
+/** How a pass row identifies itself. A colour pass is a swatch plus a name ("Red vinyl",
+ *  or the hex when no built-in swatch is that close). Grouping-aware because `no-color`
+ *  means something different per mode — under Stroke it can hold brightly filled shapes,
+ *  so calling it "no visible paint" would be false. */
 export function passRowLabel(
   key: PassKey,
   lookup: PresetLookup,
@@ -297,7 +299,8 @@ export function passRowLabel(
     case "color":
       if (parsed.color !== null) {
         // Drop the alpha byte: a swatch is a colour, and 0-alpha keys never reach here.
-        return { swatch: `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`, text: null };
+        const swatch = `#${(parsed.color >>> 8).toString(16).padStart(6, "0")}`;
+        return { swatch, text: vinylName(swatch) };
       }
       return {
         swatch: null,

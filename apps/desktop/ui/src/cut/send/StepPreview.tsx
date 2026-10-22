@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { Scene } from "../../render/hittest";
 import { vinylDisplay } from "../../render/vinyl";
 import type { ResolvedTheme } from "../../theme";
+import type { MachineProfile } from "../../App";
 import type { DeviceInfo, Grouping, PairedHostView } from "../../ipc";
 import { CutPreview } from "../CutPreview";
 import { effectiveSettings, passRowLabel, type PresetLookup } from "../viewmodel";
@@ -28,6 +29,7 @@ export function StepPreview({
   theme,
   connected,
   hosts,
+  machines,
   presetLookup,
   grouping,
   weedOn,
@@ -39,6 +41,7 @@ export function StepPreview({
   theme: ResolvedTheme;
   connected: DeviceInfo | null;
   hosts: PairedHostView[];
+  machines: MachineProfile[];
   presetLookup: PresetLookup;
   grouping: Grouping;
   weedOn: boolean;
@@ -54,7 +57,7 @@ export function StepPreview({
       </div>
       <div className="space-y-3 text-sm">
         <dl className="space-y-1.5 rounded-lg border border-border bg-card p-3 text-xs">
-          <Row label="Cutter" value={connected?.machine_id ?? "None"} />
+          <Row label="Cutter" value={connected ? (machines.find((machine) => machine.id === connected.machine_id)?.name ?? connected.machine_id) : "None"} />
           <Row label="Runs on" value={runsOn} />
           <Row label="Material" value={materialName(cutting, presetLookup)} />
           <Row label="Colour passes" value={String(cutting.length)} />
@@ -71,7 +74,7 @@ export function StepPreview({
                 {swatch !== null ? <span className="inline-block size-3 rounded-sm" style={{ background: swatch }} /> : null}
                 <span className="truncate">{label.text ?? "This pass"}</span>
                 <span className="ml-auto shrink-0 tabular text-muted-foreground">
-                  {shown(effective.speed)} · force {shown(effective.force)} · {shown(effective.repeatCount)}×
+                  Speed {shown(effective.speed)} · force {shown(effective.force)} · {shown(effective.repeatCount)}×
                 </span>
               </div>
             );

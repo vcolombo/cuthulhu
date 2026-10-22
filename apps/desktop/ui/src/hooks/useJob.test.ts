@@ -265,6 +265,36 @@ describe("useJob", () => {
     expect(api.current?.offlineHost).toBeNull();
   });
 
+  it("does not apply a detach refetch once the aim has moved again", async () => {
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+
+    const stateReads: Array<(next: CutStatus) => void> = [];
+    ipc.getDeviceState.mockImplementation(() => new Promise((resolve) => { stateReads.push(resolve); }));
+    let releaseHosts: (hosts: PairedHostView[]) => void = () => {};
+    ipc.listHosts.mockImplementation(() => new Promise((resolve) => { releaseHosts = resolve; }));
+    const pending = api.current!.refreshDeviceState();
+
+    await act(async () => { api.current?.attach(null); });
+    await act(async () => { stateReads[1](DISCONNECTED_STATUS); });
+    expect(api.current?.status.phase).toBe("Disconnected");
+
+    await act(async () => {
+      releaseHosts([HOST]);
+      stateReads[0](SWAP);
+    });
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => {
+      stateReads[2](SWAP);
+      await pending;
+    });
+    expect(api.current?.status.phase).toBe("Disconnected");
+    expect(api.current?.status.actions.resume).toBe(false);
+  });
+
   it("does not cancel a cut that finished while the host was unreachable", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

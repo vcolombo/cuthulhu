@@ -145,8 +145,12 @@ export function useJob(onError: (message: string) => void) {
         cancelQueuedRef.current = false;
         offlineRef.current = false;
         setOfflineHost(null);
+        // This read belongs to the aim it started under. A later attach is a
+        // different cutter, and applying it would put the paused job back over
+        // the Disconnected the detach just stored. Nothing polls to correct that.
+        const aim = hostIdRef.current;
         return ipc.getDeviceState().then((next) => {
-          if (acceptGenRef.current !== gen) return;
+          if (acceptGenRef.current !== gen || hostIdRef.current !== aim) return;
           ingest(next);
         }).catch((e) => {
           onErrorRef.current(ipc.ipcErrorMessage(e));

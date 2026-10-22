@@ -3926,6 +3926,55 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
     await expect(dialog.locator(`[id="${describedBy}"]`)).toHaveText("Use 1–30");
     await expect(speed).toHaveCSS("border-color", theme === "light" ? "rgb(201, 35, 36)" : "rgb(255, 107, 99)");
     await expect(dialog.getByText("Red vinyl").first()).toBeVisible();
+    // The name track used to be min-content, which for a nowrap label is the whole string.
+    // That row then grew past the header. Restoring the text before the next paint keeps
+    // the shot and the later "Red vinyl" lookup on the real name.
+    const nameTrack = await dialog.evaluate((root) => {
+      const name = [...root.querySelectorAll("span")].find((node) => node.textContent === "Red vinyl");
+      const scroller = root.querySelector(".overflow-auto");
+      const header = [...root.querySelectorAll("span")].find((node) => node.textContent?.startsWith("Speed ("));
+      if (!name || !scroller || !header) return null;
+      const original = name.textContent;
+      name.textContent = "SupercalifragilisticexpialidociousHeatTransferVinyl";
+      const row = name.closest("[data-testid='cut-pass-row']");
+      const field = row?.querySelector("input");
+      const headerBox = header.getBoundingClientRect();
+      const fieldBox = field?.getBoundingClientRect();
+      const measured = {
+        scrollWidth: scroller.scrollWidth,
+        clientWidth: scroller.clientWidth,
+        headerX: headerBox.x,
+        fieldX: fieldBox?.x ?? Number.NaN,
+      };
+      name.textContent = original;
+      return measured;
+    });
+    expect(nameTrack).not.toBeNull();
+    expect(nameTrack!.scrollWidth).toBeLessThanOrEqual(nameTrack!.clientWidth + 1);
+    expect(Math.abs(nameTrack!.headerX - nameTrack!.fieldX)).toBeLessThanOrEqual(2);
+    // A 0 minimum collapsed this column once the fixed tracks filled a narrow sheet.
+    // The shot stays at the desktop width either way.
+    await page.setViewportSize({ width: 390, height: 800 });
+    let narrow: { cell: number; headerX: number; fieldX: number } | null = null;
+    try {
+      narrow = await dialog.evaluate((root) => {
+        const name = [...root.querySelectorAll("span")].find((node) => node.textContent === "Red vinyl");
+        const header = [...root.querySelectorAll("span")].find((node) => node.textContent?.startsWith("Speed ("));
+        const cell = name?.parentElement?.parentElement;
+        const field = name?.closest("[data-testid='cut-pass-row']")?.querySelector("input");
+        if (!name || !header || !cell || !field) return null;
+        return {
+          cell: cell.getBoundingClientRect().width,
+          headerX: header.getBoundingClientRect().x,
+          fieldX: field.getBoundingClientRect().x,
+        };
+      });
+    } finally {
+      await page.setViewportSize({ width: 1440, height: 1000 });
+    }
+    expect(narrow).not.toBeNull();
+    expect(narrow!.cell).toBeGreaterThan(100);
+    expect(Math.abs(narrow!.headerX - narrow!.fieldX)).toBeLessThanOrEqual(2);
     // A shape that starts on the mat's edge used to be the edge of this picture.
     const matBox = (await dialog.getByRole("img", { name: "Shapes in this pass" }).getAttribute("viewBox"))?.split(/[ ,]/).map(Number);
     expect(matBox?.[0]).toBeLessThan(0);

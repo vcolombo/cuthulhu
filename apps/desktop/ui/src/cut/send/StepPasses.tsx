@@ -405,13 +405,13 @@ export function StepPasses({
                   <GripVertical className="size-4" aria-hidden />
                 </button>
                 <div className="min-w-0">
-                  <div className="flex h-8 items-center gap-2">
-                    <div className="grid size-5 place-items-center rounded-full bg-subtle text-2xs tabular">{i + 1}</div>
+                  <div className="flex h-8 min-w-0 items-center gap-2">
+                    <div className="grid size-5 shrink-0 place-items-center rounded-full bg-subtle text-2xs tabular">{i + 1}</div>
                     {swatch !== null ? (
-                      <span className="inline-block size-4 rounded-sm border border-foreground/20" style={{ background: swatch }} />
+                      <span className="inline-block size-4 shrink-0 rounded-sm border border-foreground/20" style={{ background: swatch }} />
                     ) : null}
-                    {label.text !== null ? <span className="truncate text-sm">{label.text}</span> : null}
-                    <span className="text-xs text-muted-foreground">{row.shapeCount} shape{row.shapeCount === 1 ? "" : "s"}</span>
+                    {label.text !== null ? <span className="min-w-0 truncate text-sm">{label.text}</span> : null}
+                    <span className="shrink-0 text-xs text-muted-foreground">{row.shapeCount} shape{row.shapeCount === 1 ? "" : "s"}</span>
                   </div>
                   <select
                     aria-label={`Preset for pass ${i + 1}`}
@@ -545,9 +545,10 @@ export function StepPasses({
 }
 
 function columns(showSpeed: boolean, showForce: boolean): string {
-  // min-content, not 0: the fixed columns already fill a narrow sheet, and a 0 minimum
-  // collapsed this one so the pass name was clipped to nothing.
-  return ["20px", "minmax(min-content,1fr)", showSpeed ? "104px" : null, showForce ? "104px" : null, "72px", "44px"]
+  // A length, not 0 and not min-content. 0 collapsed this track once the fixed columns
+  // filled a narrow sheet, so the name was clipped to nothing. min-content is the whole
+  // nowrap label, so one long name widened that row past the header and the sheet.
+  return ["20px", "minmax(11rem,1fr)", showSpeed ? "104px" : null, showForce ? "104px" : null, "72px", "44px"]
     .filter((column) => column !== null)
     .join(" ");
 }

@@ -284,7 +284,7 @@ export function StepPasses({
         </select>
         </div>
         {ranges !== null && presetsLoaded ? (
-          <button type="button" className="mb-0.5 shrink-0 text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
+          <button type="button" data-ink="accent" className="mb-0.5 shrink-0 text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
             Edit presets…
           </button>
         ) : null}
@@ -386,6 +386,7 @@ export function StepPasses({
                   aria-label={`Reorder pass ${i + 1}`}
                   draggable={!replanning}
                   disabled={replanning}
+                  data-ink="muted"
                   className="mt-1 cursor-grab text-muted-foreground disabled:cursor-not-allowed"
                   onDragStart={(event) => {
                     event.dataTransfer.setData("text/plain", String(i));

@@ -47,6 +47,7 @@ export function ToolRail({
           type="button"
           aria-label="Select"
           aria-pressed={active}
+          data-ink={active ? "accent" : "muted"}
           onClick={() => onSelectTool("select")}
           className={cn(btn, "cursor-pointer", active && "border-brand bg-tint/25 text-accent-ink dark:bg-tint/10")}
         >
@@ -55,25 +56,25 @@ export function ToolRail({
         </button>
       </Tip>
       <Tip label="Rectangle" kbd="R" side="right">
-        <button type="button" aria-label="Rectangle" onClick={onAddRect} className={cn(btn, "cursor-pointer")}>
+        <button type="button" aria-label="Rectangle" data-ink="muted" onClick={onAddRect} className={cn(btn, "cursor-pointer")}>
           <Square className="size-4" aria-hidden />
           Rectangle
         </button>
       </Tip>
       <Tip label="Ellipse" kbd="E" side="right">
-        <button type="button" aria-label="Ellipse" onClick={onAddEllipse} className={cn(btn, "cursor-pointer")}>
+        <button type="button" aria-label="Ellipse" data-ink="muted" onClick={onAddEllipse} className={cn(btn, "cursor-pointer")}>
           <Circle className="size-4" aria-hidden />
           Ellipse
         </button>
       </Tip>
       <Tip label="Text" kbd="T" side="right">
-        <button type="button" aria-label="Text" onClick={onAddText} className={cn(btn, "cursor-pointer")}>
+        <button type="button" aria-label="Text" data-ink="muted" onClick={onAddText} className={cn(btn, "cursor-pointer")}>
           <Type className="size-4" aria-hidden />
           Text
         </button>
       </Tip>
       <Tip label="Trace image" kbd="⇧T" side="right">
-        <button type="button" aria-label="Trace" onClick={onTrace} className={cn(btn, "cursor-pointer")}>
+        <button type="button" aria-label="Trace" data-ink="muted" onClick={onTrace} className={cn(btn, "cursor-pointer")}>
           <ImageUp className="size-4" aria-hidden />
           Trace
         </button>
@@ -81,7 +82,7 @@ export function ToolRail({
       <div className="my-1 h-px w-10 bg-border" />
       {BOOLS.map(({ op, label, tip, kbd, Icon }) => (
         <Tip key={op} label={canBoolean ? tip : "Select 2 or more shapes"} kbd={kbd} side="right" disabled={!canBoolean}>
-          <button type="button" aria-label={label} disabled={!canBoolean} onClick={() => onBoolean(op)} className={btn}>
+          <button type="button" aria-label={label} data-ink="muted" disabled={!canBoolean} onClick={() => onBoolean(op)} className={btn}>
             <Icon className="size-4" aria-hidden />
             {label}
           </button>
@@ -89,7 +90,7 @@ export function ToolRail({
       ))}
       <div className="mt-auto mb-1 h-px w-10 bg-border" />
       <Tip label="Delete" kbd="Del" side="right" disabled={!canDelete}>
-        <button type="button" aria-label="Delete" disabled={!canDelete} onClick={onDelete} className={btn}>
+        <button type="button" aria-label="Delete" data-ink="muted" disabled={!canDelete} onClick={onDelete} className={btn}>
           <Trash2 className="size-4" aria-hidden />
           Delete
         </button>

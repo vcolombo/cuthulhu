@@ -18,6 +18,7 @@ const aStatus = (): CutStatus => ({
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 });
 
 describe("groupDevices", () => {

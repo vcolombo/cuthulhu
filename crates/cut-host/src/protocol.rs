@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 pub struct DispatchId(pub String);
 
 /// Everything a reattaching client needs about one cutter in a single value.
-/// `job_id` rides alongside `CutStatus` because the status alone cannot say
-/// *whose* finished Job it is describing.
+/// `job_id` is the id recorded when `cut()` returned. `CutStatus::job_id` is the
+/// id the worker published with that status, which is what a poll matches a job
+/// by. The slot's copy can still be `None` before that return.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub info: DeviceInfo,
@@ -199,6 +200,7 @@ mod tests {
             pass: Some(PassPosition { index: 2, total: 5 }),
             sent: Some(ByteProgress { sent: 4096, total: 20480 }),
             error: Some(DeviceError::Timeout),
+            job_id: 9,
         }
     }
 
@@ -227,6 +229,7 @@ mod tests {
                 assert_eq!(s[0].status.pass, Some(PassPosition { index: 2, total: 5 }));
                 assert_eq!(s[0].status.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
                 assert_eq!(s[0].status.error, Some(DeviceError::Timeout));
+                assert_eq!(s[0].status.job_id, 9);
                 assert_eq!(s[0].job_id, Some(7));
             }
             other => panic!("round trip changed the variant: {other:?}"),
@@ -252,6 +255,44 @@ mod tests {
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }
+    }
+
+    /// A host built before `CutStatus::job_id` omits the field. The desktop still
+    /// has to read the snapshot and the event; 0 is the no-job value the field
+    /// defaults to, which is what a lifecycle report already publishes.
+    #[test]
+    fn a_status_that_omits_job_id_reads_as_no_job() {
+        let snapshot = Response::Snapshots(vec![DeviceSnapshot {
+            info: a_device(),
+            status: a_populated_status(),
+            job_id: Some(7),
+        }]);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json["Snapshots"][0]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Response = serde_json::from_value(json).unwrap();
+        match back {
+            Response::Snapshots(s) => {
+                assert_eq!(s[0].status.job_id, 0);
+                assert_eq!(s[0].status.phase, Phase::Sending);
+                assert_eq!(s[0].job_id, Some(7));
+            }
+            other => panic!("omitted job id changed the variant: {other:?}"),
+        }
+
+        let event = Event {
+            device: "usb:1:4".into(),
+            event: DeviceEvent {
+                job_id: 3,
+                kind: DeviceEventKind::StateChanged,
+                status: a_populated_status(),
+            },
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["event"]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back.event.job_id, 3);
+        assert_eq!(back.event.status.job_id, 0);
+        assert_eq!(back.event.status.phase, Phase::Sending);
     }
 
     #[test]

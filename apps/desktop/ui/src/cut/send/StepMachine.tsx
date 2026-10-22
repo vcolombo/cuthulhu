@@ -52,11 +52,11 @@ export function useDeviceList({
   }, [refreshList]);
 
   // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
-  // request/reply connection, so this interval is the only thing that moves a remote cutter's
-  // progress. It runs exactly as long as this dialog is mounted and a host is paired.
+  // request/reply connection. This interval covers the open sheet. `useJob` keeps asking
+  // after the sheet closes, because the job panel has to move once this unmounts.
   //
   // With no host there is no gap to fill — a local cutter's status is pushed by the
-  // device-event listener in `App.tsx` — and the cost is not nothing: `list_devices` resolves
+  // device-event listener in `useJob` — and the cost is not nothing: `list_devices` resolves
   // to `HardwareBackendFactory::list_devices`, which walks the USB bus and the serial ports.
   // The Pi is optional, and a desktop without one pays for it once per dialog, as before.
   //

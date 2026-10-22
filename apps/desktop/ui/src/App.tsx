@@ -29,6 +29,9 @@ import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/Canv
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
+import { JobPanel } from "./cut/job/JobPanel";
+import { jobIsActive, jobSurface, placeOf } from "./cut/job/model";
+import { JobStatusChip, SwapBar, SwapChip } from "./cut/job/SwapBar";
 import { SendSheet } from "./cut/send/SendSheet";
 import type { WeedDraft } from "./cut/viewmodel";
 import { TraceDialog } from "./trace/TraceDialog";
@@ -179,6 +182,8 @@ export function App() {
 
   const [tool, setTool] = useState("select");
   const [cutOpen, setCutOpen] = useState(false);
+  const [swapCollapsed, setSwapCollapsed] = useState(false);
+  const [expandJob, setExpandJob] = useState(0);
   // The cut dialog's weed controls, kept here so reopening the dialog keeps them. Per session, not
   // in the project: a weed tweak saved in the document would be an undoable edit that also makes
   // the open plan stale. (`ponytail:` an operator who always borders sets it once per launch;
@@ -213,7 +218,8 @@ export function App() {
     }),
     [rulers],
   );
-  const { status, refreshDeviceState } = useJob(setError);
+  const job = useJob(setError);
+  const status = job.status;
   const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
   const { unit, setUnit } = useUnits(setError);
   const designFor = useCallback((machineId: string) => edit(() => ipc.setMachine({ machineId })), [edit]);
@@ -222,9 +228,12 @@ export function App() {
     shapeCount: countShapes(doc),
     machines,
     designFor,
-    refreshDeviceState,
+    refreshDeviceState: job.refreshDeviceState,
     onError: setError,
   });
+  useEffect(() => {
+    job.attach(cutter.device);
+  }, [cutter.device, job.attach]);
 
   // Backend refuses to close the window mid-cut (main.rs's on_window_event calls
   // prevent_close and emits this instead) — ask the user, then force_quit if they
@@ -537,6 +546,23 @@ export function App() {
   const cutting = status.phase === "Sending" || status.phase === "AwaitingColorSwap" || status.phase === "AwaitingConfirmation";
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);
 
+  const surface = jobSurface(status, job.tracking);
+  // Leaving the swap drops the chip. Set during render so the bar and the chip never both show.
+  if (surface !== "swap" && swapCollapsed) setSwapCollapsed(false);
+  const place = placeOf(cutter.device, machines, hosts);
+  const jobRunning = job.tracking && jobIsActive(status.phase);
+  const viewJob = () => {
+    if (surface === "swap") setSwapCollapsed(false);
+    setExpandJob((n) => n + 1);
+  };
+  useEffect(() => {
+    if (expandJob === 0) return;
+    const frame = requestAnimationFrame(() => {
+      document.getElementById("job-surface")?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [expandJob]);
+
   const reportPick = (info: ipc.DeviceInfo) => {
     void cutter.pick(info).catch((e) => setError(ipc.ipcErrorMessage(e)));
   };
@@ -704,8 +730,40 @@ export function App() {
             <DevicesTab devices={devices} hosts={hosts} listError={deviceListError} active={cutter.device} machines={machines} onPick={reportPick} />
           </TabsContent>
         </Tabs>
+        {surface !== "hidden" && surface !== "swap" ? (
+          <JobPanel
+            key={surface}
+            status={status}
+            snapshot={job.snapshot}
+            surface={surface}
+            place={place}
+            theme={theme.resolved}
+            offlineHost={job.offlineHost}
+            offlineSeconds={job.offlineSeconds}
+            onCancel={job.cancel}
+            onResume={job.resume}
+            onConfirm={job.confirmPassDone}
+            onStartAgain={() => setCutOpen(true)}
+            onDismiss={job.dismiss}
+            expandToken={expandJob}
+          />
+        ) : null}
       </aside>
-      <div style={{ gridColumn: "1 / -1", minWidth: 0 }}>
+      <div style={{ gridColumn: "1 / -1", minWidth: 0 }} className="flex min-w-0 flex-col">
+      {surface === "swap" && !swapCollapsed ? (
+        <SwapBar
+          status={status}
+          snapshot={job.snapshot}
+          cutter={place.cutter}
+          theme={theme.resolved}
+          offlineHost={job.offlineHost}
+          offlineSeconds={job.offlineSeconds}
+          onCancel={job.cancel}
+          onResume={job.resume}
+          onConfirm={job.confirmPassDone}
+          onCollapse={() => setSwapCollapsed(true)}
+        />
+      ) : null}
       <StatusBar
         device={cutter.device}
         profile={doc?.machine ?? null}
@@ -723,6 +781,24 @@ export function App() {
         cursor={interaction.cursor}
         selection={selectionSize}
         unit={unit}
+        hideJobEcho={surface !== "hidden"}
+        trailing={surface === "swap" && swapCollapsed ? (
+          <SwapChip
+            status={status}
+            snapshot={job.snapshot}
+            theme={theme.resolved}
+            offline={job.offlineHost !== null}
+            onExpand={viewJob}
+          />
+        ) : jobRunning ? (
+          <JobStatusChip
+            status={status}
+            snapshot={job.snapshot}
+            theme={theme.resolved}
+            offline={job.offlineHost !== null}
+            onActivate={viewJob}
+          />
+        ) : null}
       />
       </div>
     </div>
@@ -733,7 +809,7 @@ export function App() {
           docMachineId={doc.machine?.id ?? null}
           machines={machines}
           status={status}
-          refreshDeviceState={refreshDeviceState}
+          refreshDeviceState={job.refreshDeviceState}
           connected={cutter.device}
           onConnect={cutter.pick}
           onDisconnect={cutter.disconnect}
@@ -741,6 +817,7 @@ export function App() {
           onConvertMachine={designFor}
           onError={setError}
           onClose={() => setCutOpen(false)}
+          onJobAccepted={job.remember}
           weed={cutWeed}
           onWeedChange={setCutWeed}
           theme={theme.resolved}

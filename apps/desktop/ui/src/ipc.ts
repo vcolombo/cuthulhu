@@ -133,8 +133,8 @@ export type Phase =
 
 /** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
  *  says how the last job finished, which no phase can — a finished cut and a
- *  cancelled one both rest on "Idle". Actions say which buttons are legal.
- *  Nothing here needs interpreting, and nothing needs remembering. */
+ *  cancelled one both rest on "Idle". `jobId` says whose cut it is. 0 is a
+ *  lifecycle report, not a job. Actions say which buttons are legal. */
 export type CutStatus = {
   phase: Phase;
   ended: "Completed" | "Cancelled" | null;
@@ -142,6 +142,7 @@ export type CutStatus = {
   pass: { index: number; total: number } | null;
   sent: { sent: number; total: number } | null;
   error: DeviceError | null;
+  jobId: number;
 };
 
 /** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
@@ -152,6 +153,7 @@ export const DISCONNECTED_STATUS: CutStatus = {
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 };
 
 // `StateChanged` carries no payload: the event's own `status` is what changed.

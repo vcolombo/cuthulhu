@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useState } from "react";
 import * as ipc from "../../ipc";
-import { toCutRequest } from "../viewmodel";
+import type { JobSnapshot } from "../job/model";
+import { passRowLabel, toCutRequest, type PresetLookup } from "../viewmodel";
 import type { InstalledPlan } from "./useCutPlan";
 
-/** Cut, cancel, resume and confirm for the open sheet. Phase 5's job panel reads the same
- *  three: the in-flight latch, the "already accepted" answer, and the four actions. */
+/** Start cut for the open sheet. Resume, cancel and confirm live on the job panel: this hook
+ *  unmounts with the sheet, and a running job has to outlast it. */
 export function useCutDispatch({
   connected,
   plan,
@@ -14,7 +15,8 @@ export function useCutDispatch({
   canSend,
   onStalePlan,
   onError,
-  refreshDeviceState,
+  onAccepted,
+  presetLookup,
 }: {
   connected: ipc.DeviceInfo | null;
   plan: InstalledPlan | null;
@@ -25,7 +27,12 @@ export function useCutDispatch({
   canSend: () => boolean;
   onStalePlan: () => void;
   onError: (msg: string) => void;
-  refreshDeviceState: () => Promise<void>;
+  /** Only a cut the host actually started. A duplicate keeps the sheet, and the passes it
+   *  already remembered. A refusal never gets here. */
+  onAccepted?: (snapshot: JobSnapshot) => void;
+  /** The sheet's list at the moment of the click. The job outlives the sheet, so the
+   *  name has to be copied onto the row rather than looked up again later. */
+  presetLookup: PresetLookup;
 }) {
   /** Set when the Cut Host answered that it had already accepted this dispatch, so nothing new
    *  started. Cleared by the next press of Cut, which is the thing that makes it untrue. */
@@ -48,7 +55,26 @@ export function useCutDispatch({
       // Not an error, and not a success worth saying nothing about: the host recognised this
       // dispatch and started nothing. Told apart, because a cutter that is not moving looks the
       // same either way and only the host knows which happened.
-      .then((started) => setAlreadyAccepted(started.duplicate))
+      .then((started) => {
+        setAlreadyAccepted(started.duplicate);
+        if (started.duplicate || plan === null) return;
+        onAccepted?.({
+          jobId: started.job_id,
+          grouping: plan.grouping,
+          // Disabled rows stay. The worker never sees them, and dropping them here would make
+          // its enabled-pass index point at the wrong vinyl.
+          passes: plan.rows.map((row) => {
+            const label = passRowLabel(row.key, presetLookup, plan.grouping);
+            return {
+              key: row.key,
+              shapeCount: row.shapeCount,
+              enabled: row.enabled,
+              name: label.text ?? row.key,
+              swatch: label.swatch,
+            };
+          }),
+        });
+      })
       .catch((e) => {
         // The open sheet already says the design changed and offers Replan. Toasting the same
         // refusal repeats that banner and covers the summary beside it.
@@ -61,26 +87,5 @@ export function useCutDispatch({
       .finally(() => setCutInFlight(false));
   };
 
-  const resume = () => {
-    ipc
-      .resumeCut()
-      .then(() => refreshDeviceState())
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
-  };
-
-  const cancel = () => {
-    ipc
-      .cancelCut()
-      .then(() => refreshDeviceState())
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
-  };
-
-  const confirmPassDone = () => {
-    ipc
-      .confirmPassDone()
-      .then(() => refreshDeviceState())
-      .catch((e) => onError(ipc.ipcErrorMessage(e)));
-  };
-
-  return { alreadyAccepted, cutInFlight, startCut, resume, cancel, confirmPassDone };
+  return { alreadyAccepted, cutInFlight, startCut };
 }

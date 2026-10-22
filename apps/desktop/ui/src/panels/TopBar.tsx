@@ -176,10 +176,13 @@ export function TopBar(props: Props) {
             key={unit}
             type="button"
             aria-pressed={props.unit === unit}
+            data-ink="muted"
             onClick={() => props.onUnit(unit)}
             className={cn(
               "h-6 cursor-pointer rounded-sm px-2.5 text-xs",
-              props.unit === unit ? "bg-subtle text-foreground" : "text-muted-foreground hover:text-foreground",
+              // Regular 12px "mm" never paints a solid #106c72 pixel, so the
+              // rendered contrast stays under 4.5:1 on the light pressed fill.
+              props.unit === unit ? "font-semibold" : "text-muted-foreground hover:text-foreground",
             )}
           >
             {unit}

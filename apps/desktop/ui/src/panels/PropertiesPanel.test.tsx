@@ -90,7 +90,7 @@ describe("document section", () => {
     expect(field("X").value).toBe("1");
     expect(field("W").value).toBe("2");
     expect(field("W").closest("div")?.textContent).toContain("in");
-    expect(field("W").step).toBe("0.001");
+    expect(field("W").step).toBe("0.01");
     expect(field("Rotation").value).toBe("0");
     expect(field("Rotation").closest("div")?.textContent).toContain("°");
     expect(onChangeX).not.toHaveBeenCalled();
@@ -115,6 +115,7 @@ describe("document section", () => {
   test("no document is an empty state, not the shape layout", () => {
     const panel = render({ documentInfo: null, nothingSelected: true });
     expect(panel.textContent).toContain("No document");
+    expect(panel.querySelector("[aria-label='Design for']")).not.toBeNull();
     expect(panel.querySelector("h2")).toBeNull();
     expect([...panel.querySelectorAll("label")].some((label) => label.textContent?.trim() === "X")).toBe(false);
   });

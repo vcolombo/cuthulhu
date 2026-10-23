@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { useMemo, useRef, useState, type MutableRefObject } from "react";
-import { ChevronDown, ChevronRight, Circle, Group as GroupIcon, Layers, Scissors, Spline, Square, Type } from "lucide-react";
+import { ChevronDown, ChevronRight, Circle, Group as GroupIcon, Layers, Scissors, ScissorsLineDashed, Spline, Square, Type } from "lucide-react";
 import type { DocSnapshot } from "../App";
 import type { Grouping } from "../ipc";
 import type { PresetLookup } from "../cut/viewmodel";
@@ -181,11 +181,15 @@ export function LayersPanel({
                       disabled={editsLocked !== null || block.shapeIds.length === 0}
                       className={cn(
                         "cursor-pointer rounded-sm border p-1",
-                        block.cut === "mixed" ? "border-dashed border-primary" : "border-transparent",
+                        block.cut === "mixed" ? "border-dashed border-primary dark:border-brand" : "border-transparent",
                       )}
                       onClick={() => onToggleCut(block.shapeIds, block.cut === "Cut" ? "NoCut" : "Cut")}
                     >
-                      <Scissors className="size-3.5" aria-hidden />
+                      {theme === "light" && block.cut === "NoCut" ? (
+                        <ScissorsLineDashed className="size-3.5" aria-hidden />
+                      ) : (
+                        <Scissors className="size-3.5" aria-hidden />
+                      )}
                     </button>
                   </div>
                   {open

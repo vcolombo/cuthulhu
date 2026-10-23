@@ -124,7 +124,7 @@ export function PropertiesPanel({
   documentInfo, nothingSelected,
 }: Props) {
   const documentSection = nothingSelected;
-  const step = unit === "in" ? 0.001 : 1;
+  const step = unit === "in" ? 0.01 : 1;
   const lengthSuffix = unit === "in" ? "in" : "mm";
   const commit = (shown: number) => unitToMm(shown, unit);
   const design = onDesignFor ? (
@@ -134,6 +134,7 @@ export function PropertiesPanel({
   if (!documentInfo) {
     return (
       <div className="flex flex-col gap-2 overflow-y-auto p-2">
+        {design}
         <p className="text-xs text-muted-foreground">No document</p>
       </div>
     );

@@ -167,6 +167,57 @@ describe("document section", () => {
     expect(field(panel, "Rotation").value).toBe("");
   });
 
+  test("a minus stays typed when the zero it sent is what arrives", () => {
+    const onChangeRotation = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    };
+    const panel = render(shape);
+    typeInto(field(panel, "Rotation"), "-0");
+    typeInto(field(panel, "Rotation"), "-0.5");
+    rerender({ ...shape, rotation: 0 });
+    expect(field(panel, "Rotation").value).toBe("-0.5");
+    rerender({ ...shape, rotation: -0.5 });
+    expect(field(panel, "Rotation").value).toBe("-0.5");
+    expect(onChangeRotation).toHaveBeenLastCalledWith(-0.5);
+  });
+
+  test("an earlier digit landing keeps the number still being typed", () => {
+    const onChangeRotation = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    };
+    const panel = render(shape);
+    typeInto(field(panel, "Rotation"), "1");
+    typeInto(field(panel, "Rotation"), "12");
+    rerender({ ...shape, rotation: 1 });
+    expect(field(panel, "Rotation").value).toBe("12");
+  });
+
+  test("a value this field did not send replaces a draft it prefixes", () => {
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+    };
+    const panel = render(shape);
+    typeInto(field(panel, "Rotation"), "12");
+    rerender({ ...shape, rotation: 1 });
+    expect(field(panel, "Rotation").value).toBe("1");
+  });
+
   test("a new selection replaces a draft that starts with its number", () => {
     const shape = {
       bounds: { x: 0, y: 0, w: 10, h: 10 },

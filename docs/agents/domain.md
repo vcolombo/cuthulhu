@@ -14,7 +14,7 @@ If any of these files don't exist, **proceed silently**. Don't flag their absenc
 ## File structure
 
 This is a single-context repo: one `GLOSSARY.md` at the root (it already exists and is
-normative vocabulary — see CLAUDE.md), with `docs/adr/` created lazily when the first
+normative vocabulary — see AGENTS.md), with `docs/adr/` created lazily when the first
 decision lands.
 
 ```

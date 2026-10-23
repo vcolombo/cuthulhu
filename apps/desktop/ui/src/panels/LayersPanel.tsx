@@ -62,6 +62,13 @@ function NodeRow({
     <div
       data-testid="layer-row"
       data-selected={selected}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onSelect(row.id, event.shiftKey);
+      }}
       draggable={locked === null}
       onDragStart={(event) => {
         dragId.current = row.id;

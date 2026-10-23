@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import type { DocNode, DocSnapshot } from "../App";
 import type { Grouping } from "../ipc";
 import { effectiveMaterials } from "./materialPreset";
-import { layerFooter, layerHeading, layerModel, reorderTarget, layerPasses, layerRowIds } from "./layerRows";
+import { documentPasses, layerFooter, layerHeading, layerModel, layerRowIds, reorderTarget } from "./layerRows";
 
 const RED = 0xff0000ff;
 const GREEN = 0x00ff00ff;
@@ -57,7 +57,7 @@ function rustFixture(): DocSnapshot {
 }
 
 function passes(snapshot: DocSnapshot, grouping: Grouping) {
-  return layerPasses(snapshot, grouping, effectiveMaterials(snapshot.nodes, snapshot.root));
+  return documentPasses(snapshot, grouping, effectiveMaterials(snapshot.nodes, snapshot.root));
 }
 
 function rowIds(snapshot: DocSnapshot, grouping: Grouping) {

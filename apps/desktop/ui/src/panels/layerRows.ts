@@ -187,7 +187,7 @@ function groupInOrder(shapes: Tagged[]): { order: string[]; byKey: Map<string, T
 }
 
 /** The planner's passes: cut shapes only, first-seen key order. NoCut-only keys are not passes. */
-export function layerPasses(
+export function documentPasses(
   doc: DocSnapshot,
   grouping: Grouping,
   materials: Readonly<Record<number, string | null>>,

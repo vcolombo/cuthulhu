@@ -47,6 +47,19 @@ describe("document section", () => {
     onChangeX.mockReset();
   });
 
+  function field(panel: HTMLElement, name: string) {
+    const label = [...panel.querySelectorAll("label")].find((el) => el.querySelector("span")?.textContent === name);
+    return label?.querySelector("input") as HTMLInputElement;
+  }
+
+  function typeInto(input: HTMLInputElement, raw: string) {
+    act(() => {
+      const proto = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      proto?.set?.call(input, raw);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+
   function render(over: Partial<Parameters<typeof PropertiesPanel>[0]> = {}) {
     host = document.createElement("div");
     document.body.appendChild(host);
@@ -83,17 +96,38 @@ describe("document section", () => {
       nothingSelected: false,
     });
     expect(panel.querySelector("h2")).toBeNull();
-    const field = (name: string) => {
-      const label = [...panel.querySelectorAll("label")].find((el) => el.querySelector("span")?.textContent === name);
-      return label?.querySelector("input") as HTMLInputElement;
-    };
-    expect(field("X").value).toBe("1");
-    expect(field("W").value).toBe("2");
-    expect(field("W").closest("div")?.textContent).toContain("in");
-    expect(field("W").step).toBe("0.01");
-    expect(field("Rotation").value).toBe("0");
-    expect(field("Rotation").closest("div")?.textContent).toContain("°");
+    expect(field(panel, "X").value).toBe("1");
+    expect(field(panel, "W").value).toBe("2");
+    expect(field(panel, "W").closest("div")?.textContent).toContain("in");
+    expect(field(panel, "W").step).toBe("0.01");
+    const described = field(panel, "W").getAttribute("aria-describedby");
+    const suffix = described ? document.getElementById(described) : null;
+    expect(suffix?.textContent).toBe("in");
+    expect(suffix?.getAttribute("aria-hidden")).toBeNull();
+    expect(field(panel, "Rotation").value).toBe("0");
+    expect(field(panel, "Rotation").closest("div")?.textContent).toContain("°");
     expect(onChangeX).not.toHaveBeenCalled();
+  });
+
+  test("clearing rotation stays local until a number is typed", () => {
+    const onChangeRotation = vi.fn();
+    const panel = render({
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut",
+      materialPreset: { state: "inherit" },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    });
+    const input = field(panel, "Rotation");
+    typeInto(input, "");
+    expect(onChangeRotation).not.toHaveBeenCalled();
+    expect(input.value).toBe("");
+
+    typeInto(input, "12.0");
+    expect(onChangeRotation).toHaveBeenCalledTimes(1);
+    expect(onChangeRotation).toHaveBeenCalledWith(12);
+    expect(input.value).toBe("12.0");
   });
 
   test("a mixed material selection keeps the align row and the Mixed option", () => {

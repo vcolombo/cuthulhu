@@ -40,7 +40,7 @@ import { TextDialog } from "./text/TextDialog";
 import { useTheme } from "./useTheme";
 import { colorModeVinyl, selectionHasFaintVinyl } from "./render/vinyl";
 import { matBounds, matKindLabel, matKindsFor, offeredKind, clampRollLength, ROLL_DEFAULT_MM, type MatKind } from "./render/mat";
-import { layerPasses } from "./panels/layerRows";
+import { documentPasses } from "./panels/layerRows";
 import { rotationMove, worldRotationDegrees } from "./panels/rotation";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
@@ -465,7 +465,7 @@ export function App() {
     [doc],
   );
   const passCount = useMemo(
-    () => (doc ? layerPasses(doc, grouping, materialsByNode).length : 0),
+    () => (doc ? documentPasses(doc, grouping, materialsByNode).length : 0),
     [doc, grouping, materialsByNode],
   );
   const effectiveMaterial = summariseEffectiveMaterial(materialsByNode, selected);

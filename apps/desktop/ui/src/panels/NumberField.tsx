@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useRef, useState, type PointerEvent } from "react";
+import { useEffect, useId, useRef, useState, type PointerEvent } from "react";
 
 export function scrubValue(v: number, dx: number, step: number, min = -Infinity): number {
   return Math.max(min, v + dx * step);
@@ -11,7 +11,7 @@ type Props = {
   step?: number;
   min?: number;
   disabled?: boolean;
-  /** Shown after the field, hidden from the accessible name so the label stays the field name. */
+  /** Shown after the field. It is the accessible description, not part of the name. */
   suffix?: string;
   onChange: (v: number) => void;
 };
@@ -21,7 +21,19 @@ type Props = {
  *  pointerup so one drag gesture produces one undo step. */
 export function NumberField({ label, value, step = 1, min, disabled, suffix, onChange }: Props) {
   const drag = useRef<{ startX: number; startValue: number } | null>(null);
+  const suffixId = useId();
   const [preview, setPreview] = useState<number | null>(null);
+  // An empty or half-typed value stays local. Committing Number("") is 0, which
+  // would rotate or move the shape before the next digit arrives.
+  const [text, setText] = useState<string | null>(null);
+  useEffect(() => {
+    setText((current) => {
+      if (current === null) return null;
+      // A cleared or half-typed draft survives only while it still names this value.
+      // An external change (undo, another field) drops it so the input shows the shape.
+      return Number(current) === value ? current : null;
+    });
+  }, [value]);
 
   const valueAt = (clientX: number) => {
     const d = drag.current;
@@ -69,15 +81,31 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
         <input
           type="number"
           aria-label={label}
-          value={preview ?? value}
+          aria-describedby={suffix ? suffixId : undefined}
+          value={preview !== null ? preview : text !== null ? text : value}
           step={step}
           min={min}
           disabled={disabled}
-          onChange={(e) => onChange(Number(e.target.value))}
+          onBlur={() => setText(null)}
+          onChange={(e) => {
+            const raw = e.target.value;
+            if (raw === "") {
+              setText("");
+              return;
+            }
+            const next = Number(raw);
+            if (!Number.isFinite(next)) {
+              setText(raw);
+              return;
+            }
+            const stillTyping = raw.endsWith(".") || (raw.includes(".") && raw.endsWith("0"));
+            setText(stillTyping ? raw : null);
+            onChange(next);
+          }}
           className="w-full rounded-sm border border-input bg-background px-1 text-foreground"
         />
       </label>
-      {suffix ? <span aria-hidden className="w-5 shrink-0">{suffix}</span> : null}
+      {suffix ? <span id={suffixId} className="w-5 shrink-0">{suffix}</span> : null}
     </div>
   );
 }

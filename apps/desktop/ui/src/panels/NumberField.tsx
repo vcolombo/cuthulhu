@@ -32,14 +32,14 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   // would rotate or move the shape before the next digit arrives.
   const [text, setText] = useState<string | null>(null);
   // Finite numbers this field sent while the draft was open, oldest first. Clearing does
-  // not cancel the latest: transformWith may still be applying it. A landed value is
-  // kept as a draft only when it is one of these, so an undo that merely looks like a
-  // prefix (and "-0.5" after a 0) is not guessed from the spelling.
+  // not cancel the latest: transformWith may still be applying it. A landed value stays
+  // in the draft only when this field sent it, so "-0.5" survives its 0 arriving and an
+  // undo that only looks like a prefix does not.
   const sent = useRef<number[]>([]);
   useEffect(() => {
     setText((current) => {
       if (current === null) return null;
-      const last = sent.current.at(-1);
+      const last = sent.current[sent.current.length - 1];
       if (current === "") {
         // Only the acknowledgment of what was typed. Undo or a drag to another number shows.
         if (last !== undefined && value === last) return "";

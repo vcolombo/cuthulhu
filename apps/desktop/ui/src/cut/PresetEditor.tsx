@@ -32,7 +32,6 @@ type Props = {
 
 const btn: CSSProperties = {
   background: "var(--panel)",
-  color: "var(--text)",
   border: "1px solid var(--border)",
   padding: "4px 10px",
   cursor: "pointer",
@@ -99,11 +98,11 @@ export function PresetEditor({
             {mode === "builtin" ? "Save as Copy" : "Duplicate"}
           </button>
         ) : null}
-        {mode === "builtin" ? <span style={{ color: "var(--muted-foreground)" }}>built-in — read-only</span> : null}
+        {mode === "builtin" ? <span className="text-muted-foreground">built-in — read-only</span> : null}
       </div>
 
       {draft === null ? (
-        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
+        <div className="text-xs text-muted-foreground">
           Choose a preset to edit, or add one of your own.
         </div>
       ) : (
@@ -165,7 +164,7 @@ export function PresetEditor({
               pass row's: the preset is stored for that machine and outlives this session, and a
               disabled field is one an operator cannot correct a value out of. What the machine
               ignores is said here instead. */}
-          <div data-testid="preset-preview" style={{ fontSize: 12, color: "var(--muted-foreground)" }}>
+          <div data-testid="preset-preview" className="text-xs text-muted-foreground">
             {presetPreview(draft, caps)}
           </div>
 
@@ -199,7 +198,7 @@ export function PresetEditor({
               saved. The backend's refusal wins: it is the newer fact, and it is about a write that
               was actually attempted. */}
           {(error ?? fault) !== null ? (
-            <div data-testid="preset-error" role="alert" style={{ fontSize: 12, color: "var(--cut)" }}>
+            <div data-testid="preset-error" role="alert" className="text-xs text-destructive">
               {error ?? fault}
             </div>
           ) : null}

@@ -409,7 +409,7 @@ export function StepPasses({
                   <div className="flex h-8 min-w-0 items-center gap-2">
                     <div className="grid size-5 shrink-0 place-items-center rounded-full bg-subtle text-2xs tabular">{i + 1}</div>
                     {swatch !== null ? (
-                      <span className="inline-block size-4 shrink-0 rounded-sm border border-foreground/20" style={{ background: swatch }} />
+                      <span className="inline-block size-4 shrink-0 rounded-sm border border-input" style={{ background: swatch }} />
                     ) : null}
                     {label.text !== null ? <span className="min-w-0 truncate text-sm">{label.text}</span> : null}
                     <span className="shrink-0 text-xs text-muted-foreground">{row.shapeCount} shape{row.shapeCount === 1 ? "" : "s"}</span>
@@ -477,7 +477,7 @@ export function StepPasses({
           <div className="text-sm">
             <div className="flex items-center gap-2 font-medium">
               {shownLabel.swatch !== null ? (
-                <span className="inline-block size-3 rounded-sm" style={{ background: vinylDisplay(shownLabel.swatch, theme).swatch }} />
+                <span className="inline-block size-3 rounded-sm border border-input" style={{ background: vinylDisplay(shownLabel.swatch, theme).swatch }} />
               ) : null}
               {shownLabel.text ?? "This pass"}
             </div>

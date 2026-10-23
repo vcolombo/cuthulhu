@@ -48,6 +48,9 @@ type Props = {
    *  appearance change while this dialog is open would leave the swatches on the old theme. */
   theme: ResolvedTheme;
   unit: LengthUnit;
+  /** Shared with the Layers panel, so a pass list and the colour blocks name the same split. */
+  grouping: ipc.Grouping;
+  onGroupingChange: (grouping: ipc.Grouping) => void;
 };
 
 export function SendSheet({
@@ -69,6 +72,8 @@ export function SendSheet({
   onWeedChange,
   theme,
   unit,
+  grouping,
+  onGroupingChange,
 }: Props) {
   const [step, setStep] = useState<SendStep>(1);
   // The first visit to a step is Next, which is what requires a cutter. Going back to the machine
@@ -95,7 +100,7 @@ export function SendSheet({
       .catch((e) => setRangesError(ipc.ipcErrorMessage(e)));
   }, []);
 
-  const plan = useCutPlan({ weed, onWeedChange, ranges, onError });
+  const plan = useCutPlan({ weed, onWeedChange, ranges, onError, grouping, onGroupingChange });
 
   /** What the operator asked for while a draft was unsaved, held until they decide. Selecting
    *  another preset, changing cutter and closing the dialog all replace the draft, so each one

@@ -19,6 +19,9 @@ export function useDocument(editsLockNow: { current: () => EditsLock }) {
   const [selected, setSelected] = useState<number[]>([]);
   const [machines, setMachines] = useState<MachineProfile[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
+  // False until `listPresets` has answered for the machine on the document. A list still in
+  // flight, a failed read, and no machine are the same fact: the names are not available.
+  const [presetsLoaded, setPresetsLoaded] = useState(false);
   const [error, setErrorState] = useState<string | null>(null);
   // When the message on screen was raised, on the clock the canvas stamps its requests with: a
   // commit clears only a message older than the request it carries (Copilot on #301).
@@ -191,12 +194,29 @@ export function useDocument(editsLockNow: { current: () => EditsLock }) {
   useEffect(() => {
     if (docMachineId === null) {
       setPresets([]);
+      setPresetsLoaded(false);
       return;
     }
+    // The previous machine's list is not an answer for this one. Clear it before the read,
+    // or a slow reply would name the old materials and `loaded` would still say they were current.
+    let cancelled = false;
+    setPresets([]);
+    setPresetsLoaded(false);
     ipc
       .listPresets(docMachineId)
-      .then((p) => setPresets(p as Preset[]))
-      .catch((e) => setError(ipc.ipcErrorMessage(e)));
+      .then((p) => {
+        if (cancelled) return;
+        setPresets(p as Preset[]);
+        setPresetsLoaded(true);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setPresetsLoaded(false);
+        setError(ipc.ipcErrorMessage(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [docMachineId, setError]);
 
   return {
@@ -205,6 +225,7 @@ export function useDocument(editsLockNow: { current: () => EditsLock }) {
     setSelected,
     machines,
     presets,
+    presetsLoaded,
     error,
     setError,
     errorAt,

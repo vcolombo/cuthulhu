@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { CSSProperties } from "react";
 import { AT, AXIS, type AlignMode, type Axis, type DistributeBlock } from "../interaction/align";
 
 type Props = {
@@ -26,14 +25,7 @@ const DISTRIBUTES: { axis: Axis; label: string }[] = [
   { axis: "y", label: "Distribute vertical spacing" },
 ];
 
-const btn: CSSProperties = {
-  background: "var(--panel)",
-  color: "var(--text)",
-  border: "1px solid var(--border)",
-  padding: 3,
-  cursor: "pointer",
-  lineHeight: 0,
-};
+const btn = "cursor-pointer rounded-sm border border-border bg-panel p-[3px] leading-none disabled:cursor-not-allowed";
 
 /** Drawn for x and turned a quarter for y, so the two families cannot drift apart. The line sits
  *  where the mode lines up (0, ½ or 1 across), with a long and a short bar against it. */
@@ -85,7 +77,7 @@ export function AlignRow({ unitCount, locked, distributeBlocked, onAlign, onDist
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
         {ALIGNS.map(({ mode, label }) => (
-          <button key={mode} aria-label={label} title={locked ? `${label}: ${locked}` : label} disabled={locked !== null || unitCount === 0} style={btn}
+          <button key={mode} type="button" aria-label={label} title={locked ? `${label}: ${locked}` : label} disabled={locked !== null || unitCount === 0} className={btn}
                   onClick={() => onAlign(mode)}>
             <AlignIcon at={AT[mode]} vertical={AXIS[mode] === "y"} />
           </button>
@@ -93,7 +85,7 @@ export function AlignRow({ unitCount, locked, distributeBlocked, onAlign, onDist
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
         {DISTRIBUTES.map(({ axis, label }) => (
-          <button key={axis} aria-label={label} disabled={locked !== null || distributeBlocked[axis] !== null} style={btn}
+          <button key={axis} type="button" aria-label={label} disabled={locked !== null || distributeBlocked[axis] !== null} className={btn}
                   title={locked ? `${label}: ${locked}` : distributeTitle(label, distributeBlocked[axis])}
                   onClick={() => onDistribute(axis)}>
             <DistributeIcon vertical={axis === "y"} />

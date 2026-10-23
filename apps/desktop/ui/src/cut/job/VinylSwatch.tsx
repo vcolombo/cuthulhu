@@ -2,13 +2,14 @@
 import { cn } from "../../lib/cn";
 import { vinylDisplay, type VinylTheme } from "../../render/vinyl";
 
-/** The only paint a job swatch uses. A pass with no colour (every shape, a preset) stays on the subtle token. */
+/** The only paint a job swatch uses. A pass with no colour (every shape, a preset) stays on the subtle token.
+ *  The edge is `--input`: `border-foreground/20` was 1.67:1 on black and 2.26:1 on navy in the dark panel. */
 export function VinylSwatch({ color, theme, className }: { color: string | null; theme: VinylTheme; className?: string }) {
   const paint = color === null ? "var(--subtle)" : vinylDisplay(color, theme).swatch;
   return (
     <span
       aria-hidden
-      className={cn("inline-block shrink-0 border border-foreground/20", className)}
+      className={cn("inline-block shrink-0 border border-input", className)}
       style={{ background: paint }}
     />
   );

@@ -2,7 +2,7 @@
 // One Bounds for the whole UI: the renderer's. This module re-exports it so cut-preview
 // callers keep their import path without a second structurally-identical type drifting.
 import type { Bounds } from "../render/hittest";
-import { vinylName } from "../render/vinyl";
+import { vinylName, type VinylStyle } from "../render/vinyl";
 import type { Grouping, PassKey, WeedLines, WeedOptions, WeedRanges } from "../ipc";
 export type { Bounds };
 
@@ -212,6 +212,25 @@ export function parsePassKey(key: PassKey): ParsedPassKey {
   // accepts a silly id and lets the refusal fire.
   if (mode === "preset") return { kind: "preset", presetId: value };
   return { kind: "unknown", raw: key };
+}
+
+function visiblePaint(color: number | null): number | null {
+  if (color === null) return null;
+  // Alpha 0 is absent, the same rule `cutplan::passes::color_key` uses.
+  if ((color & 0xff) === 0) return null;
+  return color >>> 0;
+}
+
+/** The pass key `plan_passes_with` would give this shape. Encoder beside `parsePassKey`, so
+ *  Layers and the Send sheet name a block with one string. */
+export function passKeyFor(grouping: Grouping, style: VinylStyle, material: string | null): PassKey {
+  if (grouping === "Single") return "all";
+  if (grouping === "Preset") return material === null ? "no-preset" : `preset:${material}`;
+  const stroke = visiblePaint(style.stroke);
+  const fill = visiblePaint(style.fill);
+  const color = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
+  if (color === null) return "no-color";
+  return `color:${color.toString(16).padStart(8, "0")}`;
 }
 
 /** The entries a row resolves its material in, and whether they are the aimed cutter's own answer.

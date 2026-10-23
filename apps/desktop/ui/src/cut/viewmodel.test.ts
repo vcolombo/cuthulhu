@@ -118,6 +118,7 @@ import {
   weedDraftFrom,
   type WeedDraft,
   parsePassKey,
+  passKeyFor,
   passRowLabel,
   presetIdForKey,
   presetPicker,
@@ -586,6 +587,19 @@ describe("parsePassKey", () => {
 
   it("keeps a colon inside a preset id", () => {
     expect(parsePassKey("preset:vinyl:thin")).toEqual({ kind: "preset", presetId: "vinyl:thin" });
+  });
+
+  it("encodes the planner's key, and alpha 0 is not a colour", () => {
+    expect(passKeyFor("Color", { stroke: 0xff000000, fill: 0x0000ffff }, null)).toBe("color:0000ffff");
+    expect(passKeyFor("Stroke", { stroke: 0xff000000, fill: 0x0000ffff }, null)).toBe("no-color");
+    expect(passKeyFor("Fill", { stroke: 0xff0000ff, fill: null }, null)).toBe("no-color");
+    expect(passKeyFor("Single", { stroke: null, fill: null }, null)).toBe("all");
+    expect(passKeyFor("Preset", { stroke: null, fill: null }, null)).toBe("no-preset");
+    expect(passKeyFor("Preset", { stroke: null, fill: null }, "cameo5-htv")).toBe("preset:cameo5-htv");
+    expect(parsePassKey(passKeyFor("Color", { stroke: 0xff0000ff, fill: null }, null))).toEqual({
+      kind: "color",
+      color: 0xff0000ff,
+    });
   });
 
   // The collision the grammar exists to avoid: a preset actually called "none" is not the

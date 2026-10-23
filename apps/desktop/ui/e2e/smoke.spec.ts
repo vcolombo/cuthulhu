@@ -3633,13 +3633,15 @@ test("a protocol mismatch says which side to update", async ({ page }) => {
 
   const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
   const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  // Not `{ exact: true }`: the sentence and the "How to update" link share this
+  // element, so the element's text is longer than the sentence.
   await expect(page.getByText(hostOlder)).toBeVisible();
   await expect(page.getByText(desktopOlder)).toBeVisible();
-  await expect(page.getByRole("radiogroup", { name: "Workshop Pi" }).getByRole("radio")).toBeDisabled();
-  await expect(page.getByRole("radiogroup", { name: "Office Pi" }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByRole("radio")).toBeDisabled();
   // The chip and the sentence name the same fact. A timed-out host stays "Unknown".
-  await expect(page.getByRole("radiogroup", { name: "Workshop Pi" }).getByTestId("device-badge")).toHaveText("Update needed");
-  await expect(page.getByRole("radiogroup", { name: "Office Pi" }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
   const how = page.getByRole("link", { name: "How to update" });
   await expect(how).toHaveCount(2);
   await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");

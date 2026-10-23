@@ -60,6 +60,12 @@ describe("document section", () => {
     });
   }
 
+  function rerender(over: Partial<Parameters<typeof PropertiesPanel>[0]> = {}) {
+    act(() => {
+      root.render(createElement(PropertiesPanel, props(over)));
+    });
+  }
+
   function render(over: Partial<Parameters<typeof PropertiesPanel>[0]> = {}) {
     host = document.createElement("div");
     document.body.appendChild(host);
@@ -128,6 +134,18 @@ describe("document section", () => {
     expect(onChangeRotation).toHaveBeenCalledTimes(1);
     expect(onChangeRotation).toHaveBeenCalledWith(12);
     expect(input.value).toBe("12.0");
+
+    typeInto(input, "");
+    rerender({
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut",
+      materialPreset: { state: "inherit" },
+      rotation: 0,
+      nothingSelected: false,
+      onChangeRotation,
+    });
+    expect(onChangeRotation).toHaveBeenCalledTimes(1);
+    expect(field(panel, "Rotation").value).toBe("0");
   });
 
   test("a mixed material selection keeps the align row and the Mixed option", () => {

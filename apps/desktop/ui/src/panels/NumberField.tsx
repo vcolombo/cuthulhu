@@ -29,9 +29,10 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   useEffect(() => {
     setText((current) => {
       if (current === null) return null;
-      // A cleared or half-typed draft survives only while it still names this value.
-      // An external change (undo, another field) drops it so the input shows the shape.
-      return Number(current) === value ? current : null;
+      // Number("") is 0, so a cleared field must not count as still naming a zero.
+      // A half-typed draft survives only while it still names this value. An external
+      // change (undo, another field) drops it so the input shows the shape.
+      return current !== "" && Number(current) === value ? current : null;
     });
   }, [value]);
 

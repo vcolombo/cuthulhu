@@ -18,14 +18,20 @@ use serde::{Deserialize, Serialize};
 pub struct DispatchId(pub String);
 
 /// Everything a reattaching client needs about one cutter in a single value.
+///
 /// `job_id` is the id recorded when `cut()` returned. `CutStatus::job_id` is the
 /// id the worker published with that status, which is what a poll matches a job
 /// by. The slot's copy can still be `None` before that return.
+///
+/// `claimed` is true while a cut is in flight and also across the fact status cannot
+/// publish: a dispatch admitted and on its way to `manager.cut`, before the worker has changed
+/// `actions`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub info: DeviceInfo,
     pub status: CutStatus,
     pub job_id: Option<u64>,
+    pub claimed: bool,
 }
 
 /// `device` is always a `DeviceInfo::instance_id`.
@@ -214,6 +220,7 @@ mod tests {
             info: a_device(),
             status: a_populated_status(),
             job_id: Some(7),
+            claimed: true,
         }]);
         let json = serde_json::to_string(&sent).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -231,6 +238,7 @@ mod tests {
                 assert_eq!(s[0].status.error, Some(DeviceError::Timeout));
                 assert_eq!(s[0].status.job_id, 9);
                 assert_eq!(s[0].job_id, Some(7));
+                assert!(s[0].claimed);
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }
@@ -245,6 +253,7 @@ mod tests {
             info: a_device(),
             status: CutStatus::disconnected(),
             job_id: None,
+            claimed: false,
         }]);
         let json = serde_json::to_string(&sent).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -252,6 +261,7 @@ mod tests {
             Response::Snapshots(s) => {
                 assert_eq!(s[0].status, CutStatus::disconnected());
                 assert_eq!(s[0].job_id, None);
+                assert!(!s[0].claimed);
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }
@@ -266,6 +276,7 @@ mod tests {
             info: a_device(),
             status: a_populated_status(),
             job_id: Some(7),
+            claimed: false,
         }]);
         let mut json = serde_json::to_value(&snapshot).unwrap();
         json["Snapshots"][0]["status"].as_object_mut().unwrap().remove("jobId");

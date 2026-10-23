@@ -71,6 +71,9 @@ export function groupDevices(
  */
 export type ForgetResult = { hosts: PairedHostView[]; message: string | null; forceable: boolean };
 
+/** The refusals a force may get past — the two that would otherwise leave an unremovable row. */
+const FORCEABLE = ["host_unconfirmed", "host_cutter_unreachable"];
+
 /**
  * Forget a Cut Host, all or nothing.
  *
@@ -81,11 +84,15 @@ export type ForgetResult = { hosts: PairedHostView[]; message: string | null; fo
  * refusal would show that host as gone, however briefly, at the one moment it most needs to be
  * reachable.
  *
- * Only the second refusal is `forceable`, and only after it has happened: a Pi that is gone for
- * good must not become unforgettable, but the failed attempt is what tells the operator there is
- * something to think about. A force offered before they have tried teaches them to take it by
- * reflex. A host that answered "busy" is reachable, so `cancel` still works there and no force is
- * offered at all.
+ * Two refusals are `forceable`, and only after they have happened: the host that could not be
+ * asked (`host_unconfirmed`), and the one that answered with a cutter nothing can recover
+ * (`host_cutter_unreachable`). Both would otherwise leave a row that can never be removed. A
+ * force offered before the operator has tried teaches them to take it by reflex, and a host that
+ * answered "busy" is reachable — `cancel` still works there, so no force is offered at all.
+ *
+ * Every other code is a plain refusal. A code Rust adds later is therefore unforceable until this
+ * list names it, which is the safe direction: the operator is told what happened and nothing is
+ * discarded.
  *
  * A refusal leaves the list untouched rather than partly erased. Nothing here clears a stored
  * token on its own: re-pairing replaces it, and a host that plainly needs attention is better
@@ -101,7 +108,10 @@ export async function forgetFrom(
     await forget(id, force);
     return { hosts: hosts.filter(h => h.id !== id), message: null, forceable: false };
   } catch (e) {
-    return { hosts, message: ipcErrorMessage(e), forceable: !force && ipcErrorCode(e) === "host_unconfirmed" };
+    // A throw with no code at all is not one of these two, so it is a plain refusal.
+    const code = ipcErrorCode(e);
+    const forceable = !force && code !== null && FORCEABLE.includes(code);
+    return { hosts, message: ipcErrorMessage(e), forceable };
   }
 }
 

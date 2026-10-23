@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { listen } from "@tauri-apps/api/event";
 import { Cpu, Layers, SlidersHorizontal } from "lucide-react";
 import * as ipc from "./ipc";
+import { armCloseGuard } from "./closeGuard";
 import { Toaster } from "./components/ui/sonner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -248,19 +249,29 @@ export function App() {
     job.attach(cutter.device);
   }, [cutter.device, job.attach]);
 
-  // Backend refuses to close the window mid-cut (main.rs's on_window_event calls
-  // prevent_close and emits this instead) — ask the user, then force_quit if they
-  // confirm. No-op on cancel, so the window just stays open.
-  useEffect(() => {
-    const unlisten = listen("cut-in-progress", () => {
-      if (window.confirm("A cut is in progress — quit anyway?")) {
-        ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
-      }
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
+  // Backend refuses to close the window while a cut it started may still be running (main.rs's
+  // on_window_event emits this and then calls prevent_close) — ask the operator, then force_quit
+  // if they confirm. No-op on cancel, so the window just stays open.
+  //
+  // The handshake itself lives in `closeGuard.ts`: its ordering is the invariant, and an effect
+  // body is not something a test in this UI can observe.
+  useEffect(
+    () =>
+      armCloseGuard({
+        setReady: ipc.setCloseGuardReady,
+        listen: (onWarning) => listen("cut-in-progress", onWarning),
+        onWarning: () => {
+          const quit = window.confirm(
+            "A cut may still be running — quit anyway? Sending to the cutter on this computer " +
+              "stops, but it finishes whatever moves it has already buffered; a Job already sent " +
+              "to a Cut Host keeps running there.",
+          );
+          if (quit) ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
+        },
+        onError: (e) => setError(ipc.ipcErrorMessage(e)),
+      }),
+    [],
+  );
 
   useEffect(() => {
     const ctx = canvasRef.current?.getContext("2d");

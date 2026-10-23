@@ -83,10 +83,16 @@ export function lostLabel(seconds: number): string {
   return `Connection lost · last update ${seconds}s ago`;
 }
 
-/** The address stays whole. A truncated host is the one an operator cannot redial. */
+/** The address is its own token. The banner breaks inside host:port and on word boundaries elsewhere.
+ *  A truncated host is the one an operator cannot redial, so the token is the whole address. */
+export function reconnectingCopy(name: string, address: string): { before: string; address: string | null; after: string } {
+  if (address === "") return { before: `Reconnecting to ${name}. The cut keeps going on the host.`, address: null, after: "" };
+  return { before: `Reconnecting to ${name} (`, address, after: "). The cut keeps going on the host." };
+}
+
 export function reconnectingLine(name: string, address: string): string {
-  const where = address === "" ? name : `${name} (${address})`;
-  return `Reconnecting to ${where}. The cut keeps going on the host.`;
+  const copy = reconnectingCopy(name, address);
+  return copy.address === null ? copy.before : `${copy.before}${copy.address}${copy.after}`;
 }
 
 /** Stripes mean the blade is still taking bytes. A full pass, a confirm, and a frozen host are still. */

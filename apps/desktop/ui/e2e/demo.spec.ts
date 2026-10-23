@@ -66,7 +66,11 @@ test("empty canvas shows the mat card and no shapes", async ({ page }) => {
 
 test("import failed shows the toast from the shared fixture", async ({ page }) => {
   await boot(page, "importFailed");
-  await expect(page.getByText(IMPORT_FAILED)).toBeVisible();
+  const toast = page.locator("[data-sonner-toast]");
+  await expect(toast).toBeVisible();
+  await expect(toast).toContainText(IMPORT_FAILED);
+  // The enter fade is 400ms. A shot or a contrast read before it settles sees the layers through the card.
+  await expect(toast).toHaveCSS("opacity", "1");
 });
 
 test("host offline shows the job banner for the unreachable host", async ({ page }) => {
@@ -117,9 +121,12 @@ test("demo states in light and dark", async ({ page }) => {
       case "emptyCanvas":
         await expect(page.getByRole("heading", { name: "Your mat is empty" })).toBeVisible();
         break;
-      case "importFailed":
-        await expect(page.getByText(IMPORT_FAILED)).toBeVisible();
+      case "importFailed": {
+        const toast = page.locator("[data-sonner-toast]");
+        await expect(toast).toContainText(IMPORT_FAILED);
+        await expect(toast).toHaveCSS("opacity", "1");
         break;
+      }
       case "hostOffline":
         await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
         await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
@@ -134,6 +141,9 @@ test("demo states in light and dark", async ({ page }) => {
     }
     for (const mode of ["Light", "Dark"] as const) {
       await setAppearance(page, mode);
+      if (fixture.id === "importFailed") {
+        await expect(page.locator("[data-sonner-toast]")).toHaveCSS("opacity", "1");
+      }
       await shot(`demo-${fixture.id}-${mode.toLowerCase()}`);
     }
   }

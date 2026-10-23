@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * Sonner's sheet is unlayered. It paints `--normal-bg` (#fff / #000) and
+ * `overflow-wrap: anywhere`, and a utility in `@layer utilities` loses to it.
+ * Every error toast, including a failed import, sat on that sheet: during the
+ * 400ms enter fade the layers behind it read through the message, and at rest
+ * the surface was Sonner's black or white rather than a token.
+ */
+[data-sonner-toaster] [data-sonner-toast][data-styled="true"] {
+  background: var(--popover);
+  border: 1px solid var(--border);
+  color: var(--foreground);
+  box-shadow: var(--shadow-lg);
+  overflow-wrap: normal;
+}

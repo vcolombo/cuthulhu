@@ -12,6 +12,7 @@ import {
   lostLabel,
   passLive,
   passPercent,
+  reconnectingCopy,
   reconnectingLine,
   percentLabel,
   placeOf,
@@ -148,6 +149,11 @@ describe("pass copy", () => {
 describe("offline and failure copy", () => {
   it("counts real seconds and keeps cancel available under a different label", () => {
     expect(lostLabel(5)).toBe("Connection lost · last update 5s ago");
+    expect(reconnectingCopy("Bench Pi", "bench.local:7878")).toEqual({
+      before: "Reconnecting to Bench Pi (",
+      address: "bench.local:7878",
+      after: "). The cut keeps going on the host.",
+    });
     expect(reconnectingLine("Bench Pi", "bench.local:7878")).toBe(
       "Reconnecting to Bench Pi (bench.local:7878). The cut keeps going on the host.",
     );

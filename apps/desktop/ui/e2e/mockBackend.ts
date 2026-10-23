@@ -1219,6 +1219,37 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       failNextCut = true;
       return null;
     },
+    // Test hook (no production counterpart): fires an event the *backend* emits, which no command
+    // of the fake's does. `cut-in-progress` is emitted from `on_window_event` when the close guard
+    // refuses a close, and a window Playwright asks to close never reaches that guard here.
+    __test_emit_backend_event: (a) => {
+      const event = a.event as string;
+      for (const id of eventNameToIds.get(event) ?? []) {
+        callbacksById.get(id)?.({ event, id, payload: null });
+      }
+      return null;
+    },
+    // Same, for whether the page has got as far as subscribing: an emit before the listener is
+    // registered reaches nobody, and `goto` resolving is not that moment.
+    __test_backend_listeners: (a) => (eventNameToIds.get(a.event as string) ?? []).length,
+    // Readiness is recorded with the listener count at the moment it was set, because the ordering
+    // is the whole point of the flag: Rust emits on the strength of it, and `emit` succeeds with
+    // nobody listening — so readiness while no listener exists is a prevented close with no prompt
+    // and no escape. The latest value stays where `emitBackendEvent` reads it.
+    set_close_guard_ready: (a) => {
+      sessionStorage.setItem("__close_guard_ready__", String(a.ready));
+      const listeners = (eventNameToIds.get("cut-in-progress") ?? []).length;
+      const log = sessionStorage.getItem("__ready_log__") ?? "";
+      sessionStorage.setItem("__ready_log__", `${log}${log ? "," : ""}${a.ready}@${listeners}`);
+      return null;
+    },
+    // Mirrors `main.rs`'s `force_quit` as far as a page can: the real one exits the process hosting
+    // this webview, which a fake cannot do, so all a test can observe is that it was asked.
+    // Recorded rather than counted, because the question is whether confirming reached it at all.
+    force_quit: () => {
+      sessionStorage.setItem("__force_quit__", "asked");
+      return null;
+    },
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
     confirm_pass_done: () => {

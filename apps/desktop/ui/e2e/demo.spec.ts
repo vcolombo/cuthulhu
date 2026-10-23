@@ -71,7 +71,7 @@ test("import failed shows the toast from the shared fixture", async ({ page }) =
 
 test("host offline shows the job banner for the unreachable host", async ({ page }) => {
   await boot(page, "hostOffline");
-  await expect(page.getByText(/Connection lost/)).toBeVisible();
+  await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
   await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
 });
 
@@ -121,7 +121,8 @@ test("demo states in light and dark", async ({ page }) => {
         await expect(page.getByText(IMPORT_FAILED)).toBeVisible();
         break;
       case "hostOffline":
-        await expect(page.getByText(/Connection lost/)).toBeVisible();
+        await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
+        await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
         break;
       case "normal":
         await expect(page.getByTestId("layer-row")).toHaveCount(2);

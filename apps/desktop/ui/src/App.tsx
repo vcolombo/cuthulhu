@@ -11,6 +11,7 @@ import { useDevices } from "./hooks/useDevices";
 import { useDocument } from "./hooks/useDocument";
 import { useJob } from "./hooks/useJob";
 import { useUnits } from "./hooks/useUnits";
+import { formatLength } from "./length";
 import { DevicesTab } from "./panels/DevicesTab";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
@@ -38,7 +39,9 @@ import { TraceDialog } from "./trace/TraceDialog";
 import { TextDialog } from "./text/TextDialog";
 import { useTheme } from "./useTheme";
 import { colorModeVinyl, selectionHasFaintVinyl } from "./render/vinyl";
-import { matBounds, matKindsFor, offeredKind, clampRollLength, ROLL_DEFAULT_MM, type MatKind } from "./render/mat";
+import { matBounds, matKindLabel, matKindsFor, offeredKind, clampRollLength, ROLL_DEFAULT_MM, type MatKind } from "./render/mat";
+import { layerPasses } from "./panels/layerRows";
+import { rotationMove, worldRotationDegrees } from "./panels/rotation";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -192,6 +195,9 @@ export function App() {
   const [textOpen, setTextOpen] = useState(false);
   const [tracePath, setTracePath] = useState<string | null>(null);
   const [rightTab, setRightTab] = useState("layers");
+  // Shared with the Send sheet. Layers blocks and the pass list are the same split; a mode
+  // the sheet fails to plan is put back here, so the two cannot disagree.
+  const [grouping, setGrouping] = useState<ipc.Grouping>("Color");
   // The mat is view state. Saving it in the project is #199; a reload starts back on 12×12.
   const [matKind, setMatKind] = useState<MatKind>("12x12");
   const [rollLengthMm, setRollLengthMm] = useState(ROLL_DEFAULT_MM);
@@ -222,6 +228,14 @@ export function App() {
   const status = job.status;
   const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
   const { unit, setUnit } = useUnits(setError);
+  const passCount = useMemo(() => (doc ? layerPasses(doc, grouping).length : 0), [doc, grouping]);
+  const matLabel = useMemo(() => {
+    if (!doc) return "";
+    const kind = offeredKind(matKind, doc.machine?.id ?? null);
+    if (kind === "roll") return `Roll · ${formatLength(rollLengthMm, unit)} ${unit}`;
+    return matKindLabel(kind, unit);
+  }, [doc, matKind, rollLengthMm, unit]);
+  const presetLookup = useMemo(() => ({ presets, loaded: true as const }), [presets]);
   const designFor = useCallback((machineId: string) => edit(() => ipc.setMachine({ machineId })), [edit]);
   const cutter = useActiveCutter({
     profileId: doc?.machine?.id ?? null,
@@ -344,6 +358,10 @@ export function App() {
   const boundsIn = (s: Scene) =>
     selected.length === 1 ? (s.nodes.find((n) => n.id === selected[0])?.bounds ?? null) : null;
   const selectedBounds = boundsIn(interaction.effectiveScene);
+  const selectedNode = selected.length === 1
+    ? interaction.effectiveScene.nodes.find((n) => n.id === selected[0])
+    : undefined;
+  const rotation = selectedNode?.world && selectedNode.local ? worldRotationDegrees(selectedNode.world) : null;
 
   // Through the hook rather than straight to the backend: a field edit then waits behind a
   // commit on the wire and builds its matrix from the geometry as it stands when it is sent, not
@@ -366,6 +384,18 @@ export function App() {
       const k = v / size;
       return axis === "w" ? [k, 0, 0, 1, b.x - k * b.x, 0] : [1, 0, 0, k, 0, b.y - k * b.y];
     });
+
+  // The canvas rotate handle's matrix: a world-space turn about the shape's centre. Groups have
+  // no scene node, so the field stays off for them.
+  const commitRotation = (degrees: number) => {
+    const id = selected[0];
+    if (selected.length !== 1 || id === undefined) return;
+    interaction.transformWith("r", [id], (s): Matrix | null => {
+      const node = s.nodes.find((n) => n.id === id);
+      if (!node?.world || !node.local) return null;
+      return rotationMove(node.world, node.local, degrees);
+    });
+  };
 
   // One unit per selected id that no other selected id contains, bounded by every shape it moves,
   // so a Group lines up as a drag would move it. Read from the scene the hook passes in, which holds
@@ -415,6 +445,11 @@ export function App() {
   const setCutLineType = (value: CutLineTypeJson) => {
     if (selected.length === 0) return;
     edit(() => ipc.setCutLineType({ ids: selected, value }));
+  };
+
+  const setCutLineTypeFor = (ids: number[], value: CutLineTypeJson) => {
+    if (ids.length === 0) return;
+    edit(() => ipc.setCutLineType({ ids, value }));
   };
 
   // The selection's own assignment, and what it resolves to. Both, because `Inherit` alone
@@ -668,7 +703,8 @@ export function App() {
           ref={canvasRef}
           data-testid="design-canvas"
           data-view={`${interaction.view.scale} ${interaction.view.tx} ${interaction.view.ty}`}
-          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block", background: "var(--workspace)", touchAction: "none" }}
+          className="absolute inset-0 block h-full w-full bg-canvas"
+          style={{ touchAction: "none" }}
           {...interaction.handlers}
         />
         {rulers ? <Rulers view={interaction.view} size={interaction.size} unit={unit} /> : null}
@@ -698,8 +734,15 @@ export function App() {
           <TabsContent value="layers" className="mt-0 min-h-0 flex-1 overflow-auto">
             <LayersPanel
               doc={doc}
+              grouping={grouping}
+              theme={theme.resolved}
+              presets={presetLookup}
               selected={selected}
+              editsLocked={lockReason(interaction.editsLock)}
               onSelect={(id, shiftKey) => setSelected((prev) => (shiftKey ? toggleId(prev, id) : [id]))}
+              onSelectShapes={(ids, shiftKey) => setSelected((prev) => (shiftKey ? ids.reduce(toggleId, prev) : ids))}
+              onToggleCut={setCutLineTypeFor}
+              onReorder={(id, newIndex) => edit(() => ipc.reorder({ id, newIndex }))}
             />
           </TabsContent>
           <TabsContent value="properties" className="mt-0 min-h-0 flex-1 overflow-auto">
@@ -709,6 +752,9 @@ export function App() {
               onChangeY={(v) => commitAxis("y", v)}
               onChangeW={(v) => commitScale("w", v)}
               onChangeH={(v) => commitScale("h", v)}
+              rotation={rotation}
+              onChangeRotation={commitRotation}
+              unit={unit}
               unitCount={unitCount}
               distributeBlocked={distributeBlocked}
               editsLocked={lockReason(interaction.editsLock)}
@@ -724,6 +770,7 @@ export function App() {
               machineId={doc?.machine?.id ?? null}
               onDesignFor={designFor}
               faintVinyl={doc ? selectionHasFaintVinyl(doc.nodes, selected) : false}
+              documentInfo={doc ? { matLabel, passCount, objectCount: countShapes(doc) } : null}
             />
           </TabsContent>
           <TabsContent value="devices" className="mt-0 min-h-0 flex-1 overflow-auto">
@@ -822,6 +869,8 @@ export function App() {
           onWeedChange={setCutWeed}
           theme={theme.resolved}
           unit={unit}
+          grouping={grouping}
+          onGroupingChange={setGrouping}
         />
       ) : null}
       {tracePath !== null ? (

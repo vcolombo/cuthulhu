@@ -51,14 +51,15 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
   };
 
   return (
-    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted-foreground)" }}>
+    <label className="flex items-center gap-1 text-xs text-muted-foreground">
       <span
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerCancel}
         onLostPointerCapture={onPointerCancel}
-        style={{ cursor: disabled ? "default" : "ew-resize", userSelect: "none", width: 12 }}
+        className="w-16 shrink-0 select-none"
+        style={{ cursor: disabled ? "default" : "ew-resize" }}
       >
         {label}
       </span>
@@ -69,12 +70,7 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
         min={min}
         disabled={disabled}
         onChange={(e) => onChange(Number(e.target.value))}
-        style={{
-          width: "100%",
-          background: "var(--workspace)",
-          color: "var(--text)",
-          border: "1px solid var(--border)",
-        }}
+        className="w-full rounded-sm border border-input bg-background px-1 text-foreground"
       />
     </label>
   );

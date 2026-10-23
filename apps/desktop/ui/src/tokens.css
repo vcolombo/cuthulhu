@@ -101,6 +101,9 @@
      (same chroma and hue), 3.60:1 on #d4d4d4. */
   --guide: #b73a80;
   --radius: 6px;
+  /* Modal veil. Ink, not black, so it belongs to the palette. Dark is black because the
+     dark foreground is light and would wash the scrim out. */
+  --scrim: rgb(1 47 54 / 0.45);
   /* Pressed pill on a light surface. A white pill is the panel, so the unit
      toggle and Rulers had no fill cue. `--subtle` is the fill those controls
      used before that pill. It is under 1.2:1 on the panel (#f1f6f6, 1.09:1)
@@ -110,15 +113,6 @@
   --btn-pressed: var(--subtle);
   --btn-pressed-edge: var(--brand);
   --btn-pressed-edge-width: 1px;
-
-  /* Names the screens already use. `--accent` is not aliased to `--accent-ink`:
-     that would paint teal behind `--text` on a selected row. `--muted` is the
-     quiet fill now; secondary text is `--muted-foreground`. */
-  --workspace: var(--canvas);
-  --text: var(--foreground);
-  --cut: var(--destructive);
-  --ready: var(--success);
-  --error: var(--destructive);
 }
 
 .dark {
@@ -154,6 +148,7 @@
   --destructive: #ff6b63;
   --destructive-foreground: #ffffff;
   --guide: #f472b6;
+  --scrim: rgb(0 0 0 / 0.55);
   /* 0.42 of the dark foreground on the dark panel is about 3.6:1. 0.55 reads as body text. */
   --disabled-opacity: 0.42;
   /* White pill, no edge. #106c72 on white is 6.16:1, and white on the dark

@@ -22,13 +22,13 @@ export function DevicesTab({ devices, hosts, active, machines, listError, onPick
 
   if (listError !== null && devices.length === 0) {
     return (
-      <p style={{ margin: 0, padding: 12, fontSize: 12, color: "var(--cut)" }}>{listError}</p>
+      <p className="m-0 p-3 text-xs text-destructive">{listError}</p>
     );
   }
 
   if (devices.length === 0) {
     return (
-      <div style={{ padding: 12, fontSize: 12, color: "var(--muted-foreground)", display: "flex", flexDirection: "column", gap: 8 }}>
+      <div className="flex flex-col gap-2 p-3 text-xs text-muted-foreground">
         <p style={{ margin: 0 }}>No cutters yet.</p>
         <p style={{ margin: 0 }}>To pair a Cut Host, open “Send to cutter”. A cutter plugged into this computer shows up here once it is listed.</p>
       </div>
@@ -53,8 +53,8 @@ export function DevicesTab({ devices, hosts, active, machines, listError, onPick
             }}
           >
             <span style={{ flex: 1, minWidth: 0 }}>
-              <span style={{ display: "block", fontSize: 12, color: "var(--text)" }}>{nameOf(info.machine_id)}</span>
-              <span style={{ display: "block", fontSize: 11, color: "var(--muted-foreground)" }}>{whereOf(info)}</span>
+              <span className="block text-xs text-foreground">{nameOf(info.machine_id)}</span>
+              <span className="block text-2xs text-muted-foreground">{whereOf(info)}</span>
             </span>
             <button
               type="button"
@@ -62,7 +62,6 @@ export function DevicesTab({ devices, hosts, active, machines, listError, onPick
               onClick={() => onPick(info)}
               style={{
                 background: "var(--panel)",
-                color: "var(--text)",
                 border: "1px solid var(--border)",
                 padding: "4px 8px",
                 cursor: aimed ? "default" : "pointer",

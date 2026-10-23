@@ -57,3 +57,11 @@ export function formatLength(mm: number, unit: LengthUnit, digits?: number): str
   const shown = unit === "in" ? mm / MM_PER_IN : mm;
   return shown.toFixed(places);
 }
+
+/**
+ * The number a length field shows. Same rounding as `formatLength`; the number input then
+ * drops a trailing zero, so 20 mm stays "20" and 1.00 in stays a value that stores 25.4 mm.
+ */
+export function displayLength(mm: number, unit: LengthUnit): number {
+  return Number(formatLength(mm, unit));
+}

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, test } from "vitest";
-import { formatLength, unitForLocale, unitFromPreference, unitToMm } from "./length";
+import { formatLength, displayLength, unitForLocale, unitFromPreference, unitToMm } from "./length";
 
 describe("length units", () => {
   test("1.000 in stores 25.4 mm and shows 25.4 mm", () => {
@@ -8,6 +8,8 @@ describe("length units", () => {
     expect(stored).toBe(25.4);
     expect(formatLength(stored, "mm")).toBe("25.4");
     expect(formatLength(stored, "in")).toBe("1.00");
+    expect(displayLength(stored, "mm")).toBe(25.4);
+    expect(displayLength(stored, "in")).toBe(1);
   });
 
   test("millimetres round-trip without a conversion", () => {

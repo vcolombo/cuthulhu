@@ -2,6 +2,7 @@
 import type { ComponentProps } from "react";
 import { Toaster as Sonner } from "sonner";
 import "sonner/dist/styles.css";
+import "./sonner.css";
 
 type ToasterProps = ComponentProps<typeof Sonner>;
 

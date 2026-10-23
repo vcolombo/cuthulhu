@@ -32,6 +32,8 @@ type Props = {
   unit: LengthUnit;
   /** The folded colour-swap chip. It replaces the mini progress, which would say the same thing twice. */
   trailing?: ReactNode;
+  /** First item in the bar. The dev demo menu uses it; production passes nothing. */
+  leading?: ReactNode;
   /** The job panel or the swap bar already shows this job. */
   hideJobEcho?: boolean;
 };
@@ -76,7 +78,7 @@ function cursorText(cursor: { x: number; y: number }, unit: LengthUnit): string 
   return `x ${formatLength(cursor.x, "in")}  y ${formatLength(cursor.y, "in")} in`;
 }
 
-export function StatusBar({ device, profile, machines, hosts, mat, status, zoomPercent, cursor, selection, unit, trailing = null, hideJobEcho = false }: Props) {
+export function StatusBar({ device, profile, machines, hosts, mat, status, zoomPercent, cursor, selection, unit, trailing = null, leading = null, hideJobEcho = false }: Props) {
   const connectedName = device ? (machines.find((machine) => machine.id === device.machine_id)?.name ?? device.machine_id) : null;
   const where = device
     ? device.host === null
@@ -93,6 +95,7 @@ export function StatusBar({ device, profile, machines, hosts, mat, status, zoomP
 
   return (
     <footer className="flex h-8 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t border-border bg-panel px-3 text-xs text-muted-foreground">
+      {leading}
       <span className={`inline-block size-2 shrink-0 rounded-full ${phaseDot(status.phase)}`} aria-hidden />
       <span className="truncate text-foreground">{machineText}</span>
       {mat ? (

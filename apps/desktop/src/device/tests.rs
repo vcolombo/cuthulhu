@@ -621,6 +621,51 @@ fn an_unreachable_host_is_still_listed_with_its_reason() {
     assert!(views[0].unreachable.is_some(), "and says why it is unreachable");
 }
 
+/// A host this desktop cannot speak to stays listed, and the row says which side to update.
+/// The cutters stay off the list: nothing was admitted, so there is nothing to show as cutting.
+#[test]
+fn a_protocol_mismatch_names_which_side_to_update_and_lists_no_cutter() {
+    let older = cut_host::client::testing::start_unversioned_host();
+    let newer = cut_host::client::testing::start_host_at_version(
+        cut_host::protocol::PROTOCOL_VERSION + 1,
+        vec![],
+    );
+    let dev = test_device_setup();
+    dev.add_host(PairedHost {
+        fingerprint: older.fingerprint.clone(),
+        ..a_paired_host("host-old", &older.addr)
+    });
+    dev.add_host(PairedHost {
+        id: HostId("host-new".into()),
+        name: "Office Pi".into(),
+        address: newer.addr.clone(),
+        fingerprint: newer.fingerprint.clone(),
+        token: "s3cret".into(),
+    });
+
+    let listed = dev.list_devices();
+    assert!(
+        listed.iter().all(|d| d.host.is_none()),
+        "a mismatched host contributes no cutter: {listed:?}"
+    );
+
+    let views = dev.host_views();
+    let message = |id: &str| {
+        views
+            .iter()
+            .find(|v| v.id.0 == id)
+            .and_then(|v| v.unreachable.clone())
+    };
+    assert_eq!(
+        message("host-old").as_deref(),
+        Some("This Cut Host is running an older version. Update your Cut Host to connect.")
+    );
+    assert_eq!(
+        message("host-new").as_deref(),
+        Some("This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.")
+    );
+}
+
 /// A cutter with no host is this computer's, and must reach the local DeviceManager — the
 /// path every existing user is on.
 #[test]
@@ -804,6 +849,18 @@ fn a_reply_a_verb_cannot_use_is_not_reported_as_an_unreachable_host() {
     // desktop could use ever arrived.
     let offline = host_error(&ClientError::Transport("timed out".into()));
     assert_eq!(offline.code, "host_unreachable", "got {offline:?}");
+
+    // And a version mismatch is not one of those either: the host answered, and the thing to
+    // change is a program, not the network.
+    let mismatch = host_error(&ClientError::Protocol {
+        host_version: None,
+        desktop_version: cut_host::protocol::PROTOCOL_VERSION,
+    });
+    assert_eq!(mismatch.code, "host_protocol", "got {mismatch:?}");
+    assert_eq!(
+        mismatch.message,
+        "This Cut Host is running an older version. Update your Cut Host to connect."
+    );
 }
 
 fn wait_for_cancelled(dev: &DeviceManagerHandle) -> CutStatus {

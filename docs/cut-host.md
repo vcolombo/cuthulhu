@@ -215,6 +215,24 @@ has multiple LAN interfaces and you want the daemon reachable on all of them, sa
 `bind = "0.0.0.0:7878"` in `cutd.toml` and add the flag. Anything that can reach that port is then
 trusted with the same authority as a paired desktop, limited only by the token.
 
+## Protocol version
+
+The desktop and `cuthulhu-cutd` agree one protocol version when they connect, before the token is
+sent. That version is not the application's version. It changes only when the frames they exchange
+change, and the rules are in
+`docs/adr/0003-the-cut-host-protocol-version-is-explicit.md`.
+
+A desktop and a daemon that do not speak the same version do not connect. The desktop says which
+side is older. Update that side:
+
+- **The Cut Host is older.** Replace `/usr/local/bin/cuthulhu-cutd` with a build from the same
+  revision as the desktop, then `sudo systemctl restart cuthulhu-cutd`. A restart waits for a Job
+  already in progress. The Job keeps cutting; a new one is not accepted until the versions match.
+- **Cuthulhu is older.** Install the newer desktop. The daemon stays as it is.
+
+There is no mixed-version mode. A daemon from before this version closes the connection, and the
+desktop reports that as an older Cut Host.
+
 ## Rotating a token
 
 Change that client's line under `[tokens]` in `cutd.toml` and restart. Only that desktop needs to be

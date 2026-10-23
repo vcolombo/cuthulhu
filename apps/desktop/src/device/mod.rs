@@ -110,6 +110,9 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         // that difference; a fifth code would sort them for a UI that has never branched on
         // either (#285).
         ClientError::WrongReply { .. } | ClientError::WrongDispatch => "host_wrong_reply",
+        // Which side is behind is the sentence. The code is the action: update one of the two
+        // programs, which neither the network nor a re-pair will do.
+        ClientError::Protocol { .. } => "host_protocol",
         ClientError::Transport(_) => "host_unreachable",
     };
     IpcError::new(code, e.to_string())
@@ -127,6 +130,9 @@ fn connection_died(e: &cut_host::client::ClientError) -> bool {
         cut_host::client::ClientError::Transport(_)
             | cut_host::client::ClientError::WrongReply { .. }
             | cut_host::client::ClientError::WrongDispatch
+            // A version is agreed once, at connect, which never stores a client. The arm is
+            // here so a mismatch that did surface mid-call cannot be retried on the same socket.
+            | cut_host::client::ClientError::Protocol { .. }
     )
 }
 

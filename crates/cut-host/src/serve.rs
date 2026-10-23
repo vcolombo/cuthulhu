@@ -7,19 +7,19 @@
 //! a certificate and a token to it and nothing else.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{SockRef, TcpKeepalive};
 
 use crate::config::Config;
 use crate::frame::{read_frame, write_frame, FrameError, DEFAULT_BODY_TIMEOUT, SOCKET_POLL_INTERVAL};
 use crate::host::Host;
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, VersionReply, PROTOCOL_VERSION, VERSION_FRAME_MAX};
 
 /// How long a stream may sit silent before the OS sends the first probe. The
 /// request loop's read (`serve_client`) waits with no deadline of its own — a
@@ -65,13 +65,117 @@ fn enable_keepalive(stream: &TcpStream, peer: &str) {
 /// anything beyond this is a bug or an attempt to exhaust it.
 pub const MAX_CLIENTS: usize = 8;
 
-/// How long an unauthenticated peer has to present its token, from the connection being accepted.
+/// How long an unauthenticated peer has, from the connection being accepted, to agree a protocol
+/// version and present its token.
 ///
 /// Short on purpose, and much shorter than `DEFAULT_BODY_TIMEOUT`: a peer that has proved nothing
 /// has earned less patience than a paired desktop mid-dispatch, and until it has, it is holding
-/// one of `MAX_CLIENTS` slots. Spent at most twice — once waiting for the frame to begin, once for
-/// the rest of it — so the worst an unauthenticated peer can squat is roughly `2x` this (#118).
+/// one of `MAX_CLIENTS` slots. One deadline covers both frames, so the version offer does not
+/// buy a second budget. Within a single frame the wait to begin and the rest still stack — that
+/// is `read_frame`'s own bound — so the worst an unauthenticated peer can squat stays roughly
+/// `2x` this (#118).
 const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a connection ended before a token was read. The refusal, when there is one, has already
+/// been written; the caller closes.
+#[derive(Debug)]
+pub(crate) enum VersionFailure {
+    Timeout,
+    Closed,
+    Unsupported { offered: u32 },
+    Unreadable,
+    TooLarge { len: usize },
+    Io(String),
+}
+
+impl std::fmt::Display for VersionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionFailure::Timeout => write!(f, "offered no protocol version in time"),
+            VersionFailure::Closed => write!(f, "closed before offering a protocol version"),
+            VersionFailure::Unsupported { offered } => write!(
+                f,
+                "offered protocol version {offered}, this host speaks {PROTOCOL_VERSION}"
+            ),
+            VersionFailure::Unreadable => {
+                write!(f, "offered something that is not a protocol version")
+            }
+            VersionFailure::TooLarge { len } => {
+                write!(f, "offered a protocol version of {len} bytes, over the {VERSION_FRAME_MAX} byte limit")
+            }
+            VersionFailure::Io(m) => write!(f, "failed during the protocol version ({m})"),
+        }
+    }
+}
+
+/// Agree `PROTOCOL_VERSION`, or write a named refusal and fail.
+///
+/// The offer is read as a `u32` and nothing else. A `Request` is not decoded from
+/// this frame: a peer that sent one fails here, and the connection closes, before
+/// `handle_request` exists on the path. `deadline` is the caller's whole
+/// unauthenticated budget, shared with the token read that follows a success.
+pub(crate) fn establish_version<S: Read + Write>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Result<(), VersionFailure> {
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let offered =
+        match read_frame::<_, u32>(stream, VERSION_FRAME_MAX, Some(remaining()), remaining()) {
+            Ok(offered) => offered,
+            Err(FrameError::Timeout) => return Err(VersionFailure::Timeout),
+            Err(FrameError::Eof) => return Err(VersionFailure::Closed),
+            Err(FrameError::TooLarge { len, .. }) => {
+                // The body was not read: `read_frame` refuses the length first. Whatever
+                // the peer still has to send dies with the socket.
+                write_version_refusal(stream, &VersionReply::Unreadable, deadline);
+                return Err(VersionFailure::TooLarge { len });
+            }
+            Err(FrameError::Malformed(_)) => {
+                write_version_refusal(stream, &VersionReply::Unreadable, deadline);
+                return Err(VersionFailure::Unreadable);
+            }
+            Err(FrameError::Io(m)) => return Err(VersionFailure::Io(m)),
+        };
+
+    if offered != PROTOCOL_VERSION {
+        write_version_refusal(
+            stream,
+            &VersionReply::Unsupported {
+                offered,
+                supported: PROTOCOL_VERSION,
+            },
+            deadline,
+        );
+        return Err(VersionFailure::Unsupported { offered });
+    }
+
+    write_frame(
+        stream,
+        &VersionReply::Agreed {
+            version: PROTOCOL_VERSION,
+        },
+        remaining(),
+    )
+    .map_err(|e| match e {
+        FrameError::Timeout => VersionFailure::Timeout,
+        FrameError::Io(m) => VersionFailure::Io(m),
+        FrameError::Eof => VersionFailure::Closed,
+        FrameError::TooLarge { len, .. } => VersionFailure::TooLarge { len },
+        FrameError::Malformed(m) => VersionFailure::Io(m),
+    })?;
+    Ok(())
+}
+
+/// Best-effort: a peer that has already stopped reading learns nothing from a refusal it
+/// cannot hear, and the connection is about to close either way. Bounded by whatever is
+/// left of the unauthenticated budget so the write cannot outlive it.
+fn write_version_refusal<W: Write>(stream: &mut W, reply: &VersionReply, deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    let _ = write_frame(stream, reply, remaining);
+}
 
 /// The name of the token that matched, or `None`. Every candidate is compared in full, so the
 /// time taken says nothing about how much of a token was right — and comparing all of them,
@@ -170,7 +274,11 @@ pub fn serve(host: Arc<Host>, config: Config, allow_public_bind: bool) -> io::Re
     }
 
     let (certs, _) = load_or_make_cert(&config.cert_dir)?;
-    eprintln!("cut host: certificate fingerprint {}", fingerprint(&certs[0]));
+    eprintln!("cut host: protocol version {PROTOCOL_VERSION}");
+    eprintln!(
+        "cut host: certificate fingerprint {}",
+        fingerprint(&certs[0])
+    );
 
     let listener = TcpListener::bind(config.bind)?;
     eprintln!("cut host: listening on {}", config.bind);
@@ -247,11 +355,18 @@ fn serve_client(
     let conn = rustls::ServerConnection::new(tls).map_err(io::Error::other)?;
     let mut tls_stream = rustls::StreamOwned::new(conn, stream);
 
-    // The token before anything else: an unauthenticated frame must never reach a
-    // device, and a failed attempt is slowed so the port cannot be worked through.
+    // The version before the token, and the token before anything else. An
+    // unauthenticated frame must never reach a device. Both reads share one budget
+    // from the moment the connection was accepted: the version offer is not a
+    // second chance to hold the slot.
+    let unauth = Instant::now() + PRE_AUTH_TIMEOUT;
+    if let Err(e) = establish_version(&mut tls_stream, unauth) {
+        eprintln!("cut host: {peer} {e}");
+        return Err(io::Error::other(e.to_string()));
+    }
+    let remaining = unauth.saturating_duration_since(Instant::now());
     let presented: String =
-        read_frame(&mut tls_stream, 1024, Some(PRE_AUTH_TIMEOUT), PRE_AUTH_TIMEOUT)
-            .map_err(io::Error::other)?;
+        read_frame(&mut tls_stream, 1024, Some(remaining), remaining).map_err(io::Error::other)?;
     let Some(client) = match_token(&presented, tokens) else {
         eprintln!("cut host: {peer} presented a token matching no client");
         thread::sleep(std::time::Duration::from_secs(2));
@@ -301,8 +416,11 @@ fn serve_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{read_frame, write_frame, SOCKET_POLL_INTERVAL};
     use crate::host::testing::{TwoCutterFactory, CAMEO};
+    use crate::protocol::{VersionReply, PROTOCOL_VERSION, VERSION_FRAME_MAX};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn list_devices_answers_with_every_cutter() {
@@ -386,6 +504,152 @@ mod tests {
         enable_keepalive(&server, "test");
 
         assert!(socket2::SockRef::from(&server).keepalive().unwrap());
+    }
+
+    /// A version both sides speak is agreed, and the reply is the agreement rather than a
+    /// `Response` — nothing version-specific has a reason to be on this frame.
+    #[test]
+    fn the_version_this_host_speaks_is_agreed() {
+        let (mut client, reply) = talk_version(&PROTOCOL_VERSION, Duration::from_secs(2));
+        assert!(reply.is_ok(), "{reply:?}");
+        let back: VersionReply = read_frame(
+            &mut client,
+            VERSION_FRAME_MAX,
+            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            VersionReply::Agreed {
+                version: PROTOCOL_VERSION
+            }
+        );
+    }
+
+    /// Named, then done. The offer is a different version, not a payload, and the reply carries
+    /// the two numbers and nothing a `Request` would.
+    #[test]
+    fn an_unsupported_version_is_refused_by_name() {
+        let offered = PROTOCOL_VERSION + 1;
+        let (mut client, reply) = talk_version(&offered, Duration::from_secs(2));
+        assert!(matches!(reply, Err(VersionFailure::Unsupported { offered: n }) if n == offered));
+        let back: VersionReply = read_frame(
+            &mut client,
+            VERSION_FRAME_MAX,
+            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            VersionReply::Unsupported {
+                offered,
+                supported: PROTOCOL_VERSION
+            }
+        );
+    }
+
+    /// What an unversioned client sent first: a token string. It is not a version, so it is
+    /// refused without being read as a `Request` — a `Dispatch` in that frame would be how a
+    /// replayed session started a Job.
+    #[test]
+    fn a_frame_that_is_not_a_version_is_refused_without_being_decoded_as_a_request() {
+        let (mut client, reply) = talk_version(&"test-token".to_string(), Duration::from_secs(2));
+        assert!(
+            matches!(reply, Err(VersionFailure::Unreadable)),
+            "{reply:?}"
+        );
+        let back: VersionReply = read_frame(
+            &mut client,
+            VERSION_FRAME_MAX,
+            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(back, VersionReply::Unreadable);
+    }
+
+    /// The length is the dispatch cap, which a later frame may use. The version frame may not,
+    /// and the body is not read to find that out: the script has no body, so a reader that
+    /// allocated it would end on `Io` rather than `TooLarge`.
+    #[test]
+    fn an_oversized_version_frame_is_refused_before_its_body_is_read() {
+        let mut header = Vec::new();
+        header.extend_from_slice(&(crate::frame::DEFAULT_MAX_FRAME as u32).to_be_bytes());
+        let (mut client, mut server) = pair();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        client.write_all(&header).unwrap();
+        let err = establish_version(&mut server, deadline).unwrap_err();
+        assert!(
+            matches!(err, VersionFailure::TooLarge { len } if len == crate::frame::DEFAULT_MAX_FRAME),
+            "{err:?}"
+        );
+        let back: VersionReply = read_frame(
+            &mut client,
+            VERSION_FRAME_MAX,
+            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(back, VersionReply::Unreadable);
+    }
+
+    /// The unauthenticated budget is a deadline, not a suggestion. A peer that accepts the
+    /// connection and then says nothing must not hold the reader.
+    #[test]
+    fn a_version_that_never_arrives_times_out() {
+        let (client, mut server) = pair();
+        // Kept open so the read blocks instead of seeing EOF.
+        let _hold = client.try_clone().unwrap();
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let err = establish_version(&mut server, Instant::now() + budget).unwrap_err();
+        assert!(matches!(err, VersionFailure::Timeout), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A peer that closes after one byte of the length has begun a frame and then left. That is
+    /// a fault, not an agreed version, and it admits nothing because nothing past it runs.
+    #[test]
+    fn a_peer_that_disconnects_mid_version_is_not_agreed() {
+        let (mut client, mut server) = pair();
+        client.write_all(&[0u8]).unwrap();
+        drop(client);
+        let err =
+            establish_version(&mut server, Instant::now() + Duration::from_secs(2)).unwrap_err();
+        assert!(matches!(err, VersionFailure::Io(_)), "{err:?}");
+    }
+
+    fn pair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).unwrap();
+        client
+            .set_write_timeout(Some(SOCKET_POLL_INTERVAL))
+            .unwrap();
+        server.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).unwrap();
+        server
+            .set_write_timeout(Some(SOCKET_POLL_INTERVAL))
+            .unwrap();
+        (client, server)
+    }
+
+    /// Write `offer` as a frame from the client side and run the agreement on the server side.
+    fn talk_version(
+        offer: &impl serde::Serialize,
+        budget: Duration,
+    ) -> (std::os::unix::net::UnixStream, Result<(), VersionFailure>) {
+        let (mut client, mut server) = pair();
+        write_frame(&mut client, offer, budget).unwrap();
+        let reply = establish_version(&mut server, Instant::now() + budget);
+        (client, reply)
     }
 
     /// Revoking one client must leave the others working — the property the whole change exists

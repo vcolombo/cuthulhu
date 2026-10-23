@@ -14,7 +14,10 @@ use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
 
 use crate::frame::{read_frame, write_frame, FrameError};
-use crate::protocol::{Admitted, DeviceSnapshot, DispatchId, Event, Refusal, Request, Response};
+use crate::protocol::{
+    Admitted, DeviceSnapshot, DispatchId, Event, Refusal, Request, Response, VersionReply,
+    PROTOCOL_VERSION, VERSION_FRAME_MAX,
+};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -39,6 +42,17 @@ pub enum ClientError {
     /// never bounds — the 128-character cap is the *host's*, applied to what it receives — and
     /// putting a peer's payload in front of an operator is the defect #283 was.
     WrongDispatch,
+    /// The two sides did not agree `PROTOCOL_VERSION`.
+    ///
+    /// `host_version` is what the host said it speaks, or `None` when it never got as far as a
+    /// number — it closed, or the offer was not a version. That is an older host: the
+    /// unversioned protocol is the one this replaced, and it ends the connection without a
+    /// reply. `desktop_version` is what this build offered. The sentence says which side to
+    /// update; the numbers stay here so a caller can, and so a peer's payload cannot.
+    Protocol {
+        host_version: Option<u32>,
+        desktop_version: u32,
+    },
     Transport(String),
 }
 
@@ -66,6 +80,19 @@ impl std::fmt::Display for ClientError {
                 write!(f, "this host answered with `{found}` where `{expected}` was expected"),
             ClientError::WrongDispatch =>
                 write!(f, "this host answered about a different dispatch than the one it was sent"),
+            ClientError::Protocol { host_version, desktop_version } => match host_version {
+                Some(host) if host > desktop_version => write!(
+                    f,
+                    "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
+                ),
+                // `None` is a host that never named a version. Equal is a host that refused the
+                // version it claims to speak. Both are the host to replace: this build is current
+                // for the version it offered, and the peer is not speaking it.
+                _ => write!(
+                    f,
+                    "This Cut Host is running an older version. Update your Cut Host to connect."
+                ),
+            },
             ClientError::Transport(m) => write!(f, "the host could not be reached ({m})"),
         }
     }
@@ -300,6 +327,39 @@ pub fn probe_fingerprint(addr: &str, timeout: Duration) -> Result<String, Client
 /// device list, but no longer a frozen everything-else.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The server's half of the agreement. Read as `VersionReply` and nothing else, under the
+/// version cap: a snapshot or a dispatch sent here is over the cap or the wrong shape, and
+/// either way it is not decoded as one.
+///
+/// A timeout is reachability — the peer has not shown it speaks an old protocol, it has shown
+/// nothing. Anything else after the offer was written is an older host. The unversioned daemon
+/// reads this offer as a token, fails, and closes without a reply; a reset instead of a clean
+/// close is the same end.
+fn read_version_reply(stream: &mut Tls, deadline: Instant) -> Result<(), ClientError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match read_frame::<_, VersionReply>(stream, VERSION_FRAME_MAX, Some(remaining), remaining) {
+        Ok(VersionReply::Agreed { version }) if version == PROTOCOL_VERSION => Ok(()),
+        Ok(VersionReply::Agreed { version })
+        | Ok(VersionReply::Unsupported {
+            supported: version, ..
+        }) => Err(ClientError::Protocol {
+            host_version: Some(version),
+            desktop_version: PROTOCOL_VERSION,
+        }),
+        Ok(VersionReply::Unreadable) => Err(ClientError::Protocol {
+            host_version: None,
+            desktop_version: PROTOCOL_VERSION,
+        }),
+        Err(FrameError::Timeout) => Err(ClientError::Transport(
+            "the host did not agree a protocol version in time".into(),
+        )),
+        Err(_) => Err(ClientError::Protocol {
+            host_version: None,
+            desktop_version: PROTOCOL_VERSION,
+        }),
+    }
+}
+
 pub struct HostClient {
     /// Serialized: one request and its reply at a time. A Cut Host answers a
     /// handful of clients and a desktop makes one call at a time, so a lock is the
@@ -347,16 +407,29 @@ impl HostClient {
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
 
-        // Bounded by what is left of the connect budget, like the greeting read below: the
-        // handshake happens inside this write, and a peer that completes the TCP connect and then
-        // stops reading must not hold a short-budget caller open past it.
+        // The version before the token. A peer that has not agreed one is not sent the
+        // credential, and the offer is a `u32` — there is no version-specific payload in it.
+        // Bounded by what is left of the connect budget: the handshake happens inside this
+        // write, and a peer that completes the TCP connect and then stops reading must not
+        // hold a short-budget caller open past it.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        write_frame(&mut stream, &token.to_string(), remaining).map_err(|e| {
+        write_frame(&mut stream, &PROTOCOL_VERSION, remaining).map_err(|e| {
             // A handshake that failed on the pin reaches here as an I/O error, so
             // the more useful message is the one the verifier can give.
             match verifier.seen.lock().unwrap().clone() {
                 Some(found) if found != pinned_fingerprint =>
                     ClientError::Fingerprint { expected: pinned_fingerprint.to_string(), found },
+                _ => ClientError::Transport(e.to_string()),
+            }
+        })?;
+        read_version_reply(&mut stream, deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        write_frame(&mut stream, &token.to_string(), remaining).map_err(|e| {
+            match verifier.seen.lock().unwrap().clone() {
+                Some(found) if found != pinned_fingerprint => ClientError::Fingerprint {
+                    expected: pinned_fingerprint.to_string(),
+                    found,
+                },
                 _ => ClientError::Transport(e.to_string()),
             }
         })?;
@@ -577,12 +650,15 @@ impl From<io::Error> for ClientError {
 /// only replies that request admits — so the mismatch branches need a peer built to break the
 /// protocol.
 pub mod testing {
+    use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::frame::{read_frame, write_frame, DEFAULT_MAX_FRAME, SOCKET_POLL_INTERVAL};
-    use crate::protocol::{Request, Response};
+    use crate::frame::{
+        read_frame, write_frame, FrameError, DEFAULT_MAX_FRAME, SOCKET_POLL_INTERVAL,
+    };
+    use crate::protocol::{Request, Response, VersionReply, PROTOCOL_VERSION, VERSION_FRAME_MAX};
 
     /// Where a misbehaving host is listening, and the fingerprint a client must pin to reach it.
     pub struct MisbehavingHost {
@@ -601,8 +677,124 @@ pub mod testing {
     /// Answers `replies` in order: the first as the greeting a token earns, then one per request.
     ///
     /// Binds port 0 so tests run concurrently, and replays the same script on every connection, so
-    /// a client that redials is answered rather than left hanging.
+    /// a client that redials is answered rather than left hanging. Speaks `PROTOCOL_VERSION`:
+    /// a client that has not agreed it never reaches the script.
     pub fn start_host_answering(replies: Vec<Response>) -> MisbehavingHost {
+        start_host_at_version(PROTOCOL_VERSION, replies)
+    }
+
+    /// A host that speaks `supported` and, when that is the client's version, the script.
+    ///
+    /// A different version is refused by name and the connection closes before the token is
+    /// read — the same order `serve_client` uses, so a desktop test can aim at either side of
+    /// a mismatch without a second protocol.
+    pub fn start_host_at_version(supported: u32, replies: Vec<Response>) -> MisbehavingHost {
+        spawn_host(move |mut tls| {
+            let offered =
+                match read_frame::<_, u32>(&mut tls, VERSION_FRAME_MAX, Some(BUDGET), BUDGET) {
+                    Ok(offered) => offered,
+                    Err(_) => {
+                        let _ = write_frame(&mut tls, &VersionReply::Unreadable, BUDGET);
+                        return;
+                    }
+                };
+            if offered != supported {
+                let _ = write_frame(
+                    &mut tls,
+                    &VersionReply::Unsupported { offered, supported },
+                    BUDGET,
+                );
+                return;
+            }
+            if write_frame(
+                &mut tls,
+                &VersionReply::Agreed { version: supported },
+                BUDGET,
+            )
+            .is_err()
+            {
+                return;
+            }
+            answer_script(&mut tls, &replies);
+        })
+    }
+
+    /// What a daemon from before protocol versions does with the offer: it reads the first
+    /// frame as a token, the offer is not one, and it closes without a reply.
+    pub fn start_unversioned_host() -> MisbehavingHost {
+        spawn_host(|mut tls| {
+            let _ = read_frame::<_, String>(&mut tls, 1024, Some(BUDGET), BUDGET);
+        })
+    }
+
+    /// Reads the version offer, writes `bytes` and nothing else. How a reply that is not a
+    /// `VersionReply` — including one whose length is past the version cap — reaches the client.
+    pub fn start_host_writing_version_reply(bytes: Vec<u8>) -> MisbehavingHost {
+        spawn_host(move |mut tls| {
+            if read_frame::<_, u32>(&mut tls, VERSION_FRAME_MAX, Some(BUDGET), BUDGET).is_err() {
+                return;
+            }
+            let _ = tls.write_all(&bytes);
+        })
+    }
+
+    /// A TLS connection on which no frame has been sent yet. The real `HostClient` agrees a
+    /// version itself; tests that must send something else start here.
+    pub struct RawSession {
+        stream: super::Tls,
+    }
+
+    impl RawSession {
+        pub fn open(addr: &str, fingerprint: &str) -> Result<RawSession, super::ClientError> {
+            let deadline = std::time::Instant::now() + super::CONNECT_TIMEOUT;
+            let verifier = std::sync::Arc::new(super::PinnedCert {
+                fingerprint: fingerprint.to_string(),
+                seen: std::sync::Mutex::new(None),
+            });
+            let config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            let tcp = super::connect_by_deadline(addr, deadline)?;
+            tcp.set_read_timeout(Some(SOCKET_POLL_INTERVAL))
+                .map_err(|e| super::ClientError::Transport(e.to_string()))?;
+            tcp.set_write_timeout(Some(SOCKET_POLL_INTERVAL))
+                .map_err(|e| super::ClientError::Transport(e.to_string()))?;
+            let server_name = rustls::pki_types::ServerName::try_from("cuthulhu-cutd")
+                .map_err(|e| super::ClientError::Transport(e.to_string()))?;
+            let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+                .map_err(|e| super::ClientError::Transport(e.to_string()))?;
+            Ok(RawSession {
+                stream: rustls::StreamOwned::new(conn, tcp),
+            })
+        }
+
+        pub fn send(
+            &mut self,
+            value: &impl serde::Serialize,
+            timeout: Duration,
+        ) -> Result<(), FrameError> {
+            write_frame(&mut self.stream, value, timeout)
+        }
+
+        pub fn recv<T: serde::de::DeserializeOwned>(
+            &mut self,
+            max: usize,
+            timeout: Duration,
+        ) -> Result<T, FrameError> {
+            read_frame(&mut self.stream, max, Some(timeout), timeout)
+        }
+
+        pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            use std::io::Write;
+            self.stream.write_all(bytes)
+        }
+    }
+
+    fn spawn_host<F>(handle: F) -> MisbehavingHost
+    where
+        F: Fn(rustls::StreamOwned<rustls::ServerConnection, TcpStream>) + Send + Sync + 'static,
+    {
         let cert = rcgen::generate_simple_self_signed(vec!["cuthulhu-cutd".to_string()])
             .expect("a self-signed certificate for the fake host");
         let der = cert.cert.der().clone();
@@ -616,40 +808,57 @@ pub mod testing {
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-        let addr = listener.local_addr().expect("the port the OS chose").to_string();
-        let script = Arc::new(replies);
+        let addr = listener
+            .local_addr()
+            .expect("the port the OS chose")
+            .to_string();
+        let handle = Arc::new(handle);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let (tls, script) = (tls.clone(), script.clone());
-                std::thread::spawn(move || answer(stream, tls, &script));
+                let (tls, handle) = (tls.clone(), handle.clone());
+                std::thread::spawn(move || {
+                    // The frame layer re-checks its deadline whenever a read comes back empty, so
+                    // the socket has to come back empty rather than block — the pacing
+                    // `serve_client` sets, for the same reason. Unwrapped rather than ignored so
+                    // the cause is named: this worker is detached, so a fixture blocked in a read
+                    // does not hang the test — the client's own deadline fires and the test fails
+                    // as a timeout, with nothing to say why. The panic prints the reason instead.
+                    stream
+                        .set_read_timeout(Some(SOCKET_POLL_INTERVAL))
+                        .expect("a read timeout on a loopback socket");
+                    stream
+                        .set_write_timeout(Some(SOCKET_POLL_INTERVAL))
+                        .expect("a write timeout on a loopback socket");
+                    let Ok(conn) = rustls::ServerConnection::new(tls) else {
+                        return;
+                    };
+                    handle(rustls::StreamOwned::new(conn, stream));
+                });
             }
         });
         MisbehavingHost { addr, fingerprint }
     }
 
-    fn answer(stream: TcpStream, tls: Arc<rustls::ServerConfig>, replies: &[Response]) {
-        // The frame layer re-checks its deadline whenever a read comes back empty, so the socket
-        // has to come back empty rather than block — the pacing `serve_client` sets, for the same
-        // reason. Unwrapped rather than ignored so the cause is named: this worker is detached, so a
-        // fixture blocked in a read does not hang the test — the client's own deadline fires and the
-        // test fails as a timeout, with nothing to say why. The panic prints the reason instead.
-        stream.set_read_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a read timeout on a loopback socket");
-        stream.set_write_timeout(Some(SOCKET_POLL_INTERVAL)).expect("a write timeout on a loopback socket");
-        let Ok(conn) = rustls::ServerConnection::new(tls) else { return };
-        let mut tls = rustls::StreamOwned::new(conn, stream);
-        // The token is read and discarded: a client that got this far already pinned the
-        // certificate, and nothing here is proving anything about tokens.
-        if read_frame::<_, String>(&mut tls, 1024, Some(BUDGET), BUDGET).is_err() {
+    /// The token and the scripted replies. Reached only after a version was agreed — a client
+    /// that skips that step never gets a greeting, which is the cutover.
+    ///
+    /// The token is read and discarded: a client that got this far already pinned the
+    /// certificate, and nothing here is proving anything about tokens.
+    fn answer_script(
+        tls: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+        replies: &[Response],
+    ) {
+        if read_frame::<_, String>(tls, 1024, Some(BUDGET), BUDGET).is_err() {
             return;
         }
         for reply in replies {
-            if write_frame(&mut tls, reply, BUDGET).is_err() {
+            if write_frame(tls, reply, BUDGET).is_err() {
                 return;
             }
             // Each reply after the greeting waits for the request it answers, so none can land
             // ahead of it and be read as the answer to something else.
-            if read_frame::<_, Request>(&mut tls, DEFAULT_MAX_FRAME, Some(BUDGET), BUDGET).is_err() {
+            if read_frame::<_, Request>(tls, DEFAULT_MAX_FRAME, Some(BUDGET), BUDGET).is_err() {
                 return;
             }
         }
@@ -777,6 +986,22 @@ mod tests {
             (
                 ClientError::Transport("the host closed the connection".into()),
                 "the host could not be reached (the host closed the connection)".into(),
+            ),
+            (
+                ClientError::Protocol {
+                    host_version: None,
+                    desktop_version: PROTOCOL_VERSION,
+                },
+                "This Cut Host is running an older version. Update your Cut Host to connect."
+                    .into(),
+            ),
+            (
+                ClientError::Protocol {
+                    host_version: Some(PROTOCOL_VERSION + 1),
+                    desktop_version: PROTOCOL_VERSION,
+                },
+                "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
+                    .into(),
             ),
         ];
         for (error, sentence) in cases {
@@ -941,6 +1166,87 @@ mod tests {
         assert_eq!(
             connect_failure(&host).to_string(),
             "this host refused the token; pair again with the one in its `cutd.toml`"
+        );
+    }
+
+    /// The host named a higher version than this build speaks. The sentence tells the operator
+    /// to update Cuthulhu, and no session is opened to send a token into.
+    #[test]
+    fn a_newer_host_is_named_as_a_desktop_to_update() {
+        let host = testing::start_host_at_version(PROTOCOL_VERSION + 1, vec![Response::Ok]);
+        match connect_failure(&host) {
+            ClientError::Protocol {
+                host_version,
+                desktop_version,
+            } => {
+                assert_eq!(host_version, Some(PROTOCOL_VERSION + 1));
+                assert_eq!(desktop_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected a protocol mismatch, got {other:?}"),
+        }
+        assert_eq!(
+            connect_failure(&host).to_string(),
+            "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
+        );
+    }
+
+    /// The other direction: the host speaks a version this build has moved past.
+    #[test]
+    fn an_older_host_is_named_as_a_cut_host_to_update() {
+        let host =
+            testing::start_host_at_version(PROTOCOL_VERSION.saturating_sub(1), vec![Response::Ok]);
+        // PROTOCOL_VERSION is 1, so saturating_sub is 0, which the host reports as what it speaks.
+        assert_eq!(
+            connect_failure(&host).to_string(),
+            "This Cut Host is running an older version. Update your Cut Host to connect."
+        );
+    }
+
+    /// The daemon this change replaces. It does not answer the offer, and the failure is still
+    /// the older host — a dropped connection here used to arrive as "could not be reached".
+    #[test]
+    fn an_unversioned_host_is_the_older_side() {
+        let host = testing::start_unversioned_host();
+        match connect_failure(&host) {
+            ClientError::Protocol {
+                host_version: None, ..
+            } => {}
+            other => panic!("expected a host that named no version, got {other:?}"),
+        }
+        assert_eq!(
+            connect_failure(&host).to_string(),
+            "This Cut Host is running an older version. Update your Cut Host to connect."
+        );
+    }
+
+    /// A version reply is capped before its body is read. A length that would be legal for a
+    /// dispatch must not hold the connect open for the body, and must not be decoded as one.
+    #[test]
+    fn an_oversized_version_reply_is_refused_before_its_body() {
+        let mut header = Vec::new();
+        header.extend_from_slice(&(crate::frame::DEFAULT_MAX_FRAME as u32).to_be_bytes());
+        let host = testing::start_host_writing_version_reply(header);
+        let started = Instant::now();
+        let err = connect_failure(&host);
+        let sentence = err.to_string();
+        assert!(
+            matches!(
+                err,
+                ClientError::Protocol {
+                    host_version: None,
+                    ..
+                }
+            ),
+            "got {sentence}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited for a body {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            sentence,
+            "This Cut Host is running an older version. Update your Cut Host to connect."
         );
     }
 }

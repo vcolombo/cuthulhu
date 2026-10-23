@@ -136,7 +136,7 @@ async function showPresetEditor(page: Page) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedProtocolMismatch?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -625,6 +625,24 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
                unreachable: "the host could not be reached (timed out)" }];
     devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
                    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
+  }
+
+  // The two sentences a protocol mismatch produces, one per side. They arrive as the host row's
+  // `unreachable` string — the same slot a timed-out host uses — because the Rust side owns the
+  // prose and the row already renders it.
+  if (opts?.seedProtocolMismatch) {
+    hosts.push(
+      { id: "host-old", name: "Workshop Pi", address: "pi.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect." },
+      { id: "host-new", name: "Office Pi", address: "office.local:7878",
+        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect." },
+    );
+    devices.push(
+      { instance_id: "usb:pi:old", machine_id: "cameo5",
+        transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-old" },
+      { instance_id: "usb:pi:new", machine_id: "cameo5",
+        transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-new" },
+    );
   }
 
   // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
@@ -3603,6 +3621,22 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
+});
+
+// The sentence is the Rust side's, shown in the slot a connection error already uses. Both
+// directions: the host is the side to update, and this desktop is. The cutters stay listed and
+// not choosable, the same as any other host that cannot be asked.
+test("a protocol mismatch says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi" }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Office Pi" }).getByRole("radio")).toBeDisabled();
 });
 
 // The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for

@@ -281,10 +281,12 @@ export function useJob(onError: (message: string) => void) {
     // A finished job is still on screen. Ingesting the next snapshot would replace
     // Completed, Cancelled or Failed with Idle, or with a cut this session did not start.
     if (!watching) return;
-    // The accept placeholder is Sending. A cache row with no id and no ending is the
-    // previous cut, and it is what a poll already in this turn is holding.
+    // The accept placeholder is Sending. A live cache row with no id and no ending is the
+    // previous cut, and it is what a poll already in this turn is holding. A down poll
+    // still falls through: that is the freeze, and cancel has to be able to queue.
     const placeholder = statusRef.current.phase === "Sending" && statusRef.current.jobId === (snapshotRef.current?.jobId ?? -1);
-    if (placeholder && row !== undefined && row.status.jobId === 0 && row.status.phase === "Idle" && row.status.ended === null) return;
+    const staleIdle = row !== undefined && row.status.jobId === 0 && row.status.phase === "Idle" && row.status.ended === null;
+    if (!down && placeholder && staleIdle) return;
     // A missing cache row is not a failed read, so it is not `down`. A stale or
     // unreachable poll must not ingest the row it happened to be holding.
     return settle({ host, status: down ? null : (row?.status ?? null), down });

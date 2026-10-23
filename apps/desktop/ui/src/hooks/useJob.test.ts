@@ -632,6 +632,17 @@ describe("useJob", () => {
     expect(api.current?.tracking).toBe(true);
     expect(api.current?.status.phase).toBe("Sending");
     expect(api.current?.status.jobId).toBe(2);
+    expect(api.current?.offlineHost).toBeNull();
+
+    await act(async () => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: idle }],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost?.id).toBe("host-3");
+    expect(api.current?.status.phase).toBe("Sending");
   });
 
   it("does not freeze a job when the poll has no status for that cutter yet", async () => {

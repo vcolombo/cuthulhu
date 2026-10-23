@@ -1144,22 +1144,37 @@ impl DeviceManagerHandle {
         self.reconnect_addressed(None, None)
     }
 
+    /// One match for every verb that names a cutter.
+    ///
+    /// Aim, and a local cutter that is the one already aimed, share the helper that
+    /// already knew that verb. A remote cutter is the same verb on that host. Five
+    /// copies of this match are how the local check would drift from the one beside it.
+    fn addressed<T>(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+        aimed: impl FnOnce(&Self) -> Result<T, IpcError>,
+        remote: impl FnOnce(&Self, &HostId, &str) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        match self.resolve_cutter(host, instance_id)? {
+            CutterAddress::Aim => aimed(self),
+            CutterAddress::Local { instance_id } => {
+                self.require_aimed_local(&instance_id)?;
+                aimed(self)
+            }
+            CutterAddress::Remote { host, instance_id } => remote(self, &host, &instance_id),
+        }
+    }
+
     /// Re-open the aimed cutter, or the cutter `(host, instance_id)` names.
     pub fn reconnect_addressed(
         &self,
         host: Option<HostId>,
         instance_id: Option<String>,
     ) -> Result<(), IpcError> {
-        match self.resolve_cutter(host, instance_id)? {
-            CutterAddress::Aim => self.reconnect_aimed(),
-            CutterAddress::Local { instance_id } => {
-                self.require_aimed_local(&instance_id)?;
-                self.reconnect_aimed()
-            }
-            CutterAddress::Remote { host, instance_id } => {
-                self.with_host(&host, |c| c.reconnect(&instance_id))
-            }
-        }
+        self.addressed(host, instance_id, Self::reconnect_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.reconnect(instance_id))
+        })
     }
 
     fn reconnect_aimed(&self) -> Result<(), IpcError> {
@@ -1194,16 +1209,18 @@ impl DeviceManagerHandle {
         host: Option<HostId>,
         instance_id: Option<String>,
     ) -> Result<CutStatus, IpcError> {
-        match self.resolve_cutter(host, instance_id)? {
-            CutterAddress::Aim => Ok(self.status_aimed()),
-            CutterAddress::Local { instance_id } => {
-                self.require_aimed_local(&instance_id)?;
-                Ok(self.status_aimed())
-            }
-            CutterAddress::Remote { host, instance_id } => Ok(self
-                .remote_status(&host, &instance_id)
-                .unwrap_or_else(|_| CutStatus::disconnected())),
-        }
+        // A live host read that fails stays `Disconnected`. That is not `with_host`'s error:
+        // the last cached value is not a live read, and `Idle` would offer a second cut.
+        self.addressed(
+            host,
+            instance_id,
+            |this| Ok(this.status_aimed()),
+            |this, host, instance_id| {
+                Ok(this
+                    .remote_status(host, instance_id)
+                    .unwrap_or_else(|_| CutStatus::disconnected()))
+            },
+        )
     }
 
     fn status_aimed(&self) -> CutStatus {
@@ -1455,16 +1472,9 @@ impl DeviceManagerHandle {
         host: Option<HostId>,
         instance_id: Option<String>,
     ) -> Result<(), IpcError> {
-        match self.resolve_cutter(host, instance_id)? {
-            CutterAddress::Aim => self.cancel_aimed(),
-            CutterAddress::Local { instance_id } => {
-                self.require_aimed_local(&instance_id)?;
-                self.cancel_aimed()
-            }
-            CutterAddress::Remote { host, instance_id } => {
-                self.with_host(&host, |c| c.cancel(&instance_id))
-            }
-        }
+        self.addressed(host, instance_id, Self::cancel_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.cancel(instance_id))
+        })
     }
 
     fn cancel_aimed(&self) -> Result<(), IpcError> {
@@ -1514,16 +1524,9 @@ impl DeviceManagerHandle {
         host: Option<HostId>,
         instance_id: Option<String>,
     ) -> Result<(), IpcError> {
-        match self.resolve_cutter(host, instance_id)? {
-            CutterAddress::Aim => self.resume_aimed(),
-            CutterAddress::Local { instance_id } => {
-                self.require_aimed_local(&instance_id)?;
-                self.resume_aimed()
-            }
-            CutterAddress::Remote { host, instance_id } => {
-                self.with_host(&host, |c| c.resume(&instance_id))
-            }
-        }
+        self.addressed(host, instance_id, Self::resume_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.resume(instance_id))
+        })
     }
 
     fn resume_aimed(&self) -> Result<(), IpcError> {
@@ -1546,16 +1549,9 @@ impl DeviceManagerHandle {
         host: Option<HostId>,
         instance_id: Option<String>,
     ) -> Result<(), IpcError> {
-        match self.resolve_cutter(host, instance_id)? {
-            CutterAddress::Aim => self.confirm_aimed(),
-            CutterAddress::Local { instance_id } => {
-                self.require_aimed_local(&instance_id)?;
-                self.confirm_aimed()
-            }
-            CutterAddress::Remote { host, instance_id } => {
-                self.with_host(&host, |c| c.confirm_pass_done(&instance_id))
-            }
-        }
+        self.addressed(host, instance_id, Self::confirm_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.confirm_pass_done(instance_id))
+        })
     }
 
     fn confirm_aimed(&self) -> Result<(), IpcError> {

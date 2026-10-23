@@ -6,7 +6,8 @@ export default defineConfig({
   // The flag is baked when Vite starts, so the menu-on suite cannot share the menu-off server.
   webServer: [
     {
-      command: "npm run dev",
+      // Vite's default, if 5173 is taken, is the next port. That is the demo server.
+      command: "npm run dev -- --port 5173 --strictPort",
       port: 5173,
       reuseExistingServer: !process.env.CI,
     },

@@ -743,6 +743,7 @@ export function App() {
           <EmptyCanvas
             onImportFile={onImportFile}
             onTrace={onTrace}
+            editsLocked={lockReason(interaction.editsLock)}
             onAddRect={() => {
               void edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } })).then((ok) => {
                 if (ok) interaction.requestFitContent();

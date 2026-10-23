@@ -2766,9 +2766,9 @@ fn forgetting_one_host_leaves_another_holding_the_window() {
     );
 }
 
-/// A mark written while the forget's own question was in flight is not one that answer speaks
-/// for, so it survives: the operator keeps the warning about a Job whose cancel route this
-/// desktop has just discarded, which is the last thing it can still offer.
+/// `retract_marks` drops only the marks it was handed. A mark written after those were captured
+/// is not one of them, so it survives the retraction. `forget` refuses before it retracts when
+/// it sees that mark; this pins the retraction, not the refusal.
 #[test]
 fn forgetting_a_host_keeps_a_mark_its_answer_did_not_cover() {
     let dev = test_device_setup();
@@ -3059,6 +3059,93 @@ fn a_forget_and_a_queued_press_cannot_cross() {
             "the transition was hidden: {err:?}"
         );
     });
+}
+
+/// The early `a_press_is_dispatching_to` check runs before the host is asked. A press that
+/// starts after that, marks, and finishes before `forget` takes the connection again is not
+/// dispatching anymore — and the idle answer did not cover its mark. Forgetting past it
+/// discards the token for a Job that answer never saw.
+#[test]
+fn a_press_that_lands_after_the_idle_answer_refuses_the_forget() {
+    let host = start_loopback_host();
+    let dir = tempfile::tempdir().unwrap();
+    let hosts_path = dir.path().join("hosts.json");
+    let dev = Arc::new(test_device_setup());
+    let id = dev
+        .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+        .expect("pairing with the loopback host");
+
+    // Pair leaves the client unset. The question connects, releases the connection, then
+    // blocks on this lock: the window between the idle answer and publishing `Forgetting`.
+    let persist = dev.hosts_persist.lock().unwrap();
+    let dev_forget = Arc::clone(&dev);
+    let forget_id = id.clone();
+    let path = hosts_path.clone();
+    let forget = std::thread::spawn(move || dev_forget.forget(&forget_id, &path, false));
+    let conn = dev.host_conn(&id).unwrap();
+    wait_until(
+        || conn.try_lock().is_ok_and(|guard| guard.client.is_some()),
+        "the idle question never released the connection",
+    );
+    dev.ledger.mark_dispatched(&id, cut_host::host::testing::CAMEO, AttemptId::next());
+    drop(persist);
+
+    let err = forget
+        .join()
+        .unwrap()
+        .expect_err("a press that landed after the answer was forgotten past");
+    assert_eq!(err.code, "host_busy", "got {err:?}");
+    assert!(err.message.contains("being sent"), "the refusal must say why: {err:?}");
+    assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+    assert_eq!(
+        conn.lock().unwrap().lifecycle,
+        HostLifecycle::Active,
+        "a refused forget published Forgetting"
+    );
+    assert!(dev.a_cut_may_be_running(), "the press's mark was retracted with a token it still needs");
+}
+
+/// The other arm of the same re-check. A press that has `begin_dispatch`'d and not yet marked
+/// holds no mark the answer failed to cover, and the early check already passed. It is still
+/// a Job about to start.
+#[test]
+fn a_press_still_dispatching_after_the_idle_answer_refuses_the_forget() {
+    let host = start_loopback_host();
+    let dir = tempfile::tempdir().unwrap();
+    let hosts_path = dir.path().join("hosts.json");
+    let dev = Arc::new(test_device_setup());
+    let id = dev
+        .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+        .expect("pairing with the loopback host");
+
+    let persist = dev.hosts_persist.lock().unwrap();
+    let dev_forget = Arc::clone(&dev);
+    let forget_id = id.clone();
+    let path = hosts_path.clone();
+    let forget = std::thread::spawn(move || dev_forget.forget(&forget_id, &path, false));
+    let conn = dev.host_conn(&id).unwrap();
+    wait_until(
+        || conn.try_lock().is_ok_and(|guard| guard.client.is_some()),
+        "the idle question never released the connection",
+    );
+    let key = JobKey {
+        host: id.clone(),
+        device: cut_host::host::testing::CAMEO.into(),
+        digest: job_digest("cameo5", &a_square(10.0)),
+    };
+    let press = dev.ledger.begin_dispatch(&key);
+    assert!(dev.ledger.marks_for(&id).is_empty(), "this arm is the press that has not marked yet");
+    drop(persist);
+
+    let err = forget
+        .join()
+        .unwrap()
+        .expect_err("a press still dispatching was forgotten past");
+    assert_eq!(err.code, "host_busy", "got {err:?}");
+    assert!(err.message.contains("being sent"), "the refusal must say why: {err:?}");
+    assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
+    assert_eq!(conn.lock().unwrap().lifecycle, HostLifecycle::Active);
+    drop(press);
 }
 
 /// The production writer for the flag above: a forget leaves the connection itself answering,

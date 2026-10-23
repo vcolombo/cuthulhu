@@ -424,11 +424,12 @@ pub struct DeviceManagerHandle {
     hosts_persist: Mutex<()>,
     /// Every HostId minted or loaded in this process, including hosts since forgotten.
     ///
-    /// A forgotten host can still have a close-guard mark — a dispatch accepted after the host's
-    /// idle answer keeps the warning because its cancel route is gone. Reusing that HostId for a
-    /// new Pi wired at the same socket would give both the same `(HostId, instance_id)` key, and an
-    /// idle poll of the new Pi would erase the old one's warning. Ids therefore remain claimed for
-    /// the process lifetime, which is also the lifetime of those marks.
+    /// A forgotten host can still have a close-guard mark. `forget` refuses rather than discard
+    /// the token when a press lands after the idle answer, but `remove_host` and a retraction
+    /// that names only some presses can still leave one. Reusing that HostId for a new Pi wired
+    /// at the same socket would give both the same `(HostId, instance_id)` key, and an idle poll
+    /// of the new Pi would erase the old one's warning. Ids therefore remain claimed for the
+    /// process lifetime, which is also the lifetime of those marks.
     claimed_host_ids: Mutex<HashSet<HostId>>,
     /// In-doubt ids, the presses using them, and the marks that hold the window.
     /// The only code that locks those maps lives on `Ledger`.
@@ -733,9 +734,9 @@ impl DeviceManagerHandle {
         //
         // The marks are read *inside* that connection, immediately before the question. A press
         // writes its mark under the same connection, so one captured here is one this answer is
-        // about, and a press that gets the connection afterwards keeps its own — the warning is
-        // the last thing this desktop can still offer for a Job whose cancel route it is
-        // discarding.
+        // about. A press that gets the connection after the answer is not: the re-check below
+        // refuses the forget, and the token stays. Discarding it would drop the only route to a
+        // Job this answer never saw.
         //
         // A press that is already inside its dispatch cannot be stopped by anything here: it owns
         // the connection, and the `forgotten` flag below is only read on the way in. So the one
@@ -802,8 +803,8 @@ impl DeviceManagerHandle {
             }
             // Forced past a host that said nothing. Silence covers only what this desktop already
             // held when it asked: those marks can never be cleared by a poll, since the poll is a
-            // call to the host being removed. A dispatch that landed during the question keeps its
-            // mark and its warning — an unclosable prompt is the answer that errs toward the blade.
+            // call to the host being removed. A dispatch that lands after that read is outside the
+            // silence, and the re-check below refuses so the token is not discarded past it.
             Err(_) => before_asking,
         };
 
@@ -824,6 +825,20 @@ impl DeviceManagerHandle {
             return Err(IpcError::new(
                 "host_busy",
                 "this Cut Host is already being forgotten",
+            ));
+        }
+        // The question released this connection before `hosts_persist` was taken. A press can
+        // begin, mark and finish in that gap: the check above already passed, and a finished
+        // press is no longer dispatching when this lock is free. Both are asked again here,
+        // still holding the connection, before `Forgetting` is published. A new mark is a Job
+        // the answer did not cover; a press still dispatching has not marked yet. Either one
+        // refuses, and the token stays.
+        if self.ledger.a_press_is_dispatching_to(id)
+            || self.ledger.marks_for(id).iter().any(|mark| !marks.contains(mark))
+        {
+            return Err(IpcError::new(
+                "host_busy",
+                "a cut is being sent to this host right now; forget it once that press has finished",
             ));
         }
         // Publish the transition before filesystem I/O, then release host control. Calls queued on

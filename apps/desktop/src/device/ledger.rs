@@ -382,10 +382,9 @@ impl Ledger {
     /// Drop exactly the marks named, having learned the presses that wrote them started nothing.
     ///
     /// The retraction `forget` makes, and deliberately narrower than "every mark for that host":
-    /// what makes them stale is the host's own answer that it is idle, and a dispatch accepted
-    /// after that answer is not covered by it. That press keeps its mark and the operator keeps the
-    /// warning — which is all this desktop can still offer, having just discarded the token that
-    /// could have stopped it.
+    /// what makes them stale is the host's own answer that it is idle. A dispatch accepted after
+    /// that answer is not covered by it. `forget` refuses, still holding the connection, when it
+    /// sees that mark, so the token stays; this only drops the marks the answer named.
     pub(super) fn retract_marks(&self, known: &[((HostId, String), AttemptId)]) {
         for ((host, device), attempt) in known {
             self.unmark_dispatched(host, device, *attempt);

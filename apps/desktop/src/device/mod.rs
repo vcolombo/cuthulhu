@@ -828,9 +828,9 @@ impl DeviceManagerHandle {
             ));
         }
         // The question released this connection before `hosts_persist` was taken. A press can
-        // begin, mark and finish in that gap: the check above already passed, and a finished
-        // press is no longer dispatching when this lock is free. Both are asked again here,
-        // still holding the connection, before `Forgetting` is published. A new mark is a Job
+        // begin, mark and finish in that gap: the check before the question already passed, and
+        // a finished press is no longer dispatching when this lock is free. Both are asked again
+        // here, still holding the connection, before `Forgetting` is published. A new mark is a Job
         // the answer did not cover; a press still dispatching has not marked yet. Either one
         // refuses, and the token stays.
         if self.ledger.a_press_is_dispatching_to(id)

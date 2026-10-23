@@ -53,28 +53,31 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   };
 
   return (
-    <label className="flex items-center gap-1 text-xs text-muted-foreground">
-      <span
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerCancel}
-        onLostPointerCapture={onPointerCancel}
-        className="w-16 shrink-0 select-none"
-        style={{ cursor: disabled ? "default" : "ew-resize" }}
-      >
-        {label}
-      </span>
-      <input
-        type="number"
-        value={preview ?? value}
-        step={step}
-        min={min}
-        disabled={disabled}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full rounded-sm border border-input bg-background px-1 text-foreground"
-      />
-      {suffix ? <span aria-hidden className="shrink-0">{suffix}</span> : null}
-    </label>
+    <div className="flex items-center gap-1 text-xs text-muted-foreground">
+      <label className="flex min-w-0 flex-1 items-center gap-1">
+        <span
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={onPointerCancel}
+          onLostPointerCapture={onPointerCancel}
+          className="w-16 shrink-0 select-none"
+          style={{ cursor: disabled ? "default" : "ew-resize" }}
+        >
+          {label}
+        </span>
+        <input
+          type="number"
+          aria-label={label}
+          value={preview ?? value}
+          step={step}
+          min={min}
+          disabled={disabled}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="w-full rounded-sm border border-input bg-background px-1 text-foreground"
+        />
+      </label>
+      {suffix ? <span aria-hidden className="w-5 shrink-0">{suffix}</span> : null}
+    </div>
   );
 }

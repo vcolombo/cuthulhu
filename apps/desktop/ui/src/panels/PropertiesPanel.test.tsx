@@ -89,10 +89,10 @@ describe("document section", () => {
     };
     expect(field("X").value).toBe("1");
     expect(field("W").value).toBe("2");
-    expect(field("W").parentElement?.textContent).toContain("in");
+    expect(field("W").closest("div")?.textContent).toContain("in");
     expect(field("W").step).toBe("0.001");
     expect(field("Rotation").value).toBe("0");
-    expect(field("Rotation").parentElement?.textContent).toContain("°");
+    expect(field("Rotation").closest("div")?.textContent).toContain("°");
     expect(onChangeX).not.toHaveBeenCalled();
   });
 

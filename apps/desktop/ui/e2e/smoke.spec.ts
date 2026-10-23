@@ -2331,7 +2331,7 @@ test("an offline host keeps the cut frozen, then shows the reading from after it
   // After the card is up, the next reading is the one that will not stamp over this.
   await callFakeWith(page, "__test_set_last_seen", { id: "host-4", at: Date.now() - 2 * 60 * 60 * 1000 });
   await expect(page.getByText("Last seen 2 hours ago")).toBeVisible();
-  await expect(page.getByText("garage.local:7878")).toBeVisible();
+  await expect(page.getByText("garage.local:7878").first()).toBeVisible();
   await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
   await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
   await expect(page.getByText(/Reconnecting to Garage Pi/)).toBeVisible();

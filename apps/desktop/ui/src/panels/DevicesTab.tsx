@@ -188,7 +188,7 @@ export function DevicesTab({
                 <h3 className="m-0 text-sm font-medium text-foreground" data-testid="devices-body">Can't reach {host.name}</h3>
                 <p className="m-0 text-xs text-muted-foreground" data-testid="devices-muted">{lastSeenLabel(host.last_seen, now)}</p>
                 <p className="m-0 wrap-anywhere text-xs text-foreground">{host.address}</p>
-                <p className="m-0 text-xs text-warning" data-testid="devices-warning">{host.unreachable}</p>
+                <p className="m-0 text-sm text-foreground" data-testid="devices-warning">{host.unreachable}</p>
                 {side !== null ? (
                   <a
                     href={protocolUpdateUrl(side)}

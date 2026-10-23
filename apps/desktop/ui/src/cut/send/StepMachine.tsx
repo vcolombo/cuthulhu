@@ -214,10 +214,12 @@ export function StepMachine({
               // id *and* the host: two hosts wired alike hand out the same fallback id, and
               // giving one host's status to the other's row hands Cancel to the wrong machine.
               const isAimed = sameCutter(connected, d);
-              // The aimed cutter follows the job's live status. Every other cutter on the
-              // host comes from the snapshot cache, matched on id and host.
+              // The aimed cutter follows the job once that job has a status of its own.
+              // Disconnected is the job's initial value, and it must not hide the snapshot
+              // of a cutter that is already aimed when the sheet opens. Every other cutter
+              // comes from that snapshot, matched on id and host.
               const cached = statuses.find((row) => sameCutter(row, d))?.status ?? null;
-              const aimed = isAimed ? status : cached;
+              const aimed = isAimed && status.phase !== "Disconnected" ? status : (cached ?? (isAimed ? status : null));
               const live = deviceBadge(aimed);
               // A mismatch is not an unfetched status. The chip uses the same tones as
               // "Unknown"; the label is what the message above already asked for.

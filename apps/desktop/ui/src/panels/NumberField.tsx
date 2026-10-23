@@ -32,32 +32,48 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   // would rotate or move the shape before the next digit arrives.
   const [text, setText] = useState<string | null>(null);
   // Finite numbers this field sent while the draft was open, oldest first. Clearing does
-  // not cancel the latest: transformWith may still be applying it. A landed value stays
-  // in the draft only when this field sent it, so "-0.5" survives its 0 arriving and an
-  // undo that only looks like a prefix does not.
+  // not cancel them: transformWith may still apply the first digit and then the rest.
+  // A landed value stays in the draft only when this field sent it, so "-0.5" survives
+  // its 0 arriving and an undo that only looks like a prefix does not.
   const sent = useRef<number[]>([]);
+  // The latest sent number, once it has arrived into an empty field. Remembering it
+  // lets the list be dropped without the empty draft collapsing on a second pass.
+  const caught = useRef<number | null>(null);
+  const forgetSent = () => {
+    sent.current = [];
+    caught.current = null;
+  };
   useEffect(() => {
     setText((current) => {
       if (current === null) return null;
-      const last = sent.current[sent.current.length - 1];
       if (current === "") {
-        // Only the acknowledgment of what was typed. Undo or a drag to another number shows.
-        if (last !== undefined && value === last) return "";
-        sent.current = [];
+        // Every keystroke of the cleared number, not only the last. The first digit of
+        // 12 lands before 12 does; treating it as unrelated would fill the field back in.
+        if (caught.current === value) return "";
+        const last = sent.current[sent.current.length - 1];
+        if (last !== undefined && sent.current.some((n) => n === value)) {
+          if (value === last) {
+            caught.current = value;
+            sent.current = [];
+          }
+          return "";
+        }
+        forgetSent();
         return null;
       }
       const next = Number(current);
+      const last = sent.current[sent.current.length - 1];
       if (!Number.isFinite(next)) {
-        sent.current = [];
+        forgetSent();
         return null;
       }
       if (next === value) {
-        if (!spellingInProgress(current)) sent.current = [];
+        if (!spellingInProgress(current)) forgetSent();
         return spellingInProgress(current) ? current : null;
       }
       // An earlier keystroke from this draft has landed; the latest is still in flight.
       if (last === next && sent.current.some((n) => n === value)) return current;
-      sent.current = [];
+      forgetSent();
       return null;
     });
   }, [value]);
@@ -83,7 +99,7 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
     drag.current = null;
     setPreview(null);
     // The drag is a new value. Leaving the typed draft up would hide where the shape moved.
-    sent.current = [];
+    forgetSent();
     setText(null);
     if (final !== value) onChange(final);
   };
@@ -118,7 +134,7 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
           disabled={disabled}
           onBlur={() => {
             // Blur abandons the draft, so a late acknowledgment of what was typed should show.
-            sent.current = [];
+            forgetSent();
             setText(null);
           }}
           onChange={(e) => {

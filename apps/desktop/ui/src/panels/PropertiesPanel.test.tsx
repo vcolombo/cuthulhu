@@ -167,6 +167,29 @@ describe("document section", () => {
     expect(field(panel, "Rotation").value).toBe("");
   });
 
+  test("a cleared field stays empty when an earlier digit arrives first", () => {
+    const onChangeRotation = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    };
+    const panel = render(shape);
+    const input = field(panel, "Rotation");
+    typeInto(input, "1");
+    typeInto(input, "12");
+    typeInto(input, "");
+    rerender({ ...shape, rotation: 1 });
+    expect(field(panel, "Rotation").value).toBe("");
+    rerender({ ...shape, rotation: 12 });
+    expect(field(panel, "Rotation").value).toBe("");
+    rerender({ ...shape, rotation: 1 });
+    expect(field(panel, "Rotation").value).toBe("1");
+  });
+
   test("a minus stays typed when the zero it sent is what arrives", () => {
     const onChangeRotation = vi.fn();
     const shape = {

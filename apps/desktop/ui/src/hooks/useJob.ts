@@ -281,6 +281,10 @@ export function useJob(onError: (message: string) => void) {
     // A finished job is still on screen. Ingesting the next snapshot would replace
     // Completed, Cancelled or Failed with Idle, or with a cut this session did not start.
     if (!watching) return;
+    // The accept placeholder is Sending. A cache row with no id and no ending is the
+    // previous cut, and it is what a poll already in this turn is holding.
+    const placeholder = statusRef.current.phase === "Sending" && statusRef.current.jobId === (snapshotRef.current?.jobId ?? -1);
+    if (placeholder && row !== undefined && row.status.jobId === 0 && row.status.phase === "Idle" && row.status.ended === null) return;
     // A missing cache row is not a failed read, so it is not `down`. A stale or
     // unreachable poll must not ingest the row it happened to be holding.
     return settle({ host, status: down ? null : (row?.status ?? null), down });
@@ -296,6 +300,9 @@ export function useJob(onError: (message: string) => void) {
     acceptGenRef.current += 1;
     snapshotRef.current = next;
     setSnapshot(next);
+    // The render that clears `dismissed` has not happened yet. A poll in this turn
+    // would otherwise still see the previous dismiss and treat the new job as untracked.
+    dismissedRef.current = false;
     setDismissed(false);
     cancelQueuedRef.current = false;
     const prev = statusRef.current;
@@ -322,7 +329,10 @@ export function useJob(onError: (message: string) => void) {
     setLastStatusAt(Date.now());
   }, []);
 
-  const dismiss = useCallback(() => setDismissed(true), []);
+  const dismiss = useCallback(() => {
+    dismissedRef.current = true;
+    setDismissed(true);
+  }, []);
 
   const targetOf = (): ipc.CutterTarget | undefined => {
     const instance = instanceRef.current;

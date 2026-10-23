@@ -609,6 +609,31 @@ describe("useJob", () => {
     expect(api.current?.status).toEqual(plain);
   });
 
+  it("does not let a poll in the same turn as remember cover the new job", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
+    await act(async () => { api.current?.dismiss(); });
+
+    const idle = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    await act(async () => {
+      api.current?.remember(snapshot(2));
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: idle }],
+        stale: false,
+      });
+    });
+    expect(api.current?.tracking).toBe(true);
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(2);
+  });
+
   it("does not freeze a job when the poll has no status for that cutter yet", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

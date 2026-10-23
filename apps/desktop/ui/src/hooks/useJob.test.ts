@@ -569,6 +569,46 @@ describe("useJob", () => {
     expect(api.current?.status.phase).toBe("Sending");
   });
 
+  it("leaves a finished job on screen when the next poll is a different reading", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
+    expect(api.current?.status.ended).toBe("Completed");
+    expect(api.current?.tracking).toBe(true);
+
+    const plain = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    const someoneElse = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      jobId: 9,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: someoneElse }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.ended).toBe("Completed");
+    expect(api.current?.status.jobId).toBe(1);
+
+    act(() => { api.current?.dismiss(); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: plain }],
+        stale: false,
+      });
+    });
+    expect(api.current?.tracking).toBe(false);
+    expect(api.current?.status).toEqual(plain);
+  });
+
   it("does not freeze a job when the poll has no status for that cutter yet", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

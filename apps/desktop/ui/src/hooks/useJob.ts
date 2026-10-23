@@ -47,10 +47,12 @@ export function useJob(onError: (message: string) => void) {
 
   const statusRef = useRef(status);
   const snapshotRef = useRef(snapshot);
+  const dismissedRef = useRef(dismissed);
   // During render, not a layout effect. The listeners and the poll read these between
   // commit and layout, which is the window the mirror exists for.
   statusRef.current = status;
   snapshotRef.current = snapshot;
+  dismissedRef.current = dismissed;
   const offlineRef = useRef(false);
   const hostIdRef = useRef<string | null>(null);
   const instanceRef = useRef<string | null>(null);
@@ -268,13 +270,17 @@ export function useJob(onError: (message: string) => void) {
     const host = snap.hosts.find((item) => item.id === id) ?? null;
     const down = snap.stale || host === null || host.unreachable !== null;
     const row = snap.statuses.find((item) => sameCutter(item, { instance_id: instance, host: id }));
-    const watching = snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
-    if (!watching) {
+    const tracked = snapshotRef.current !== null && !dismissedRef.current;
+    const watching = tracked && (jobIsActive(statusRef.current.phase) || offlineRef.current);
+    if (!tracked) {
       // A down host is not frozen here. Freeze is the job panel's outage, and there is
       // no job. A missing row is still not a failed read.
       if (!down && row !== undefined) ingest(row.status);
       return;
     }
+    // A finished job is still on screen. Ingesting the next snapshot would replace
+    // Completed, Cancelled or Failed with Idle, or with a cut this session did not start.
+    if (!watching) return;
     // A missing cache row is not a failed read, so it is not `down`. A stale or
     // unreachable poll must not ingest the row it happened to be holding.
     return settle({ host, status: down ? null : (row?.status ?? null), down });

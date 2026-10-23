@@ -9,58 +9,18 @@
 //! onto the socket before the host should read one. None of them may leave a Job, a dispatch
 //! id, or a cutter claimed.
 
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cut_host::client::testing::RawSession;
 use cut_host::client::HostClient;
-use cut_host::config::Config;
 use cut_host::frame::FrameError;
-use cut_host::host::testing::TwoCutterFactory;
 use cut_host::host::Host;
 use cut_host::protocol::{DispatchId, Request, VersionReply, PROTOCOL_VERSION, VERSION_FRAME_MAX};
-use cut_host::serve::{fingerprint_of_cert_dir, serve_on};
 use driver_core::Phase;
 
-// The shared fixture also builds a host this file does not use. This binary keeps its own
-// `Arc<Host>`, which is what the admission assertions read.
-#[allow(dead_code)]
 mod fixtures;
-use fixtures::{square_pass, CAMEO, TOKEN};
-
-struct Running {
-    addr: String,
-    fingerprint: String,
-    host: Arc<Host>,
-    _dir: tempfile::TempDir,
-}
-
-fn start() -> Running {
-    let dir = tempfile::tempdir().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let config = Config {
-        bind: listener.local_addr().unwrap(),
-        tokens: [("test-client".to_string(), TOKEN.to_string())]
-            .into_iter()
-            .collect(),
-        max_frame: cut_host::frame::DEFAULT_MAX_FRAME,
-        cert_dir: dir.path().to_path_buf(),
-    };
-    let fingerprint = fingerprint_of_cert_dir(&config.cert_dir).unwrap();
-    let host = Host::start(Arc::new(TwoCutterFactory));
-    let serve_host = host.clone();
-    thread::spawn(move || {
-        let _ = serve_on(listener, serve_host, config);
-    });
-    Running {
-        addr,
-        fingerprint,
-        host,
-        _dir: dir,
-    }
-}
+use fixtures::{square_pass, start_test_host, TestHost, CAMEO, TOKEN};
 
 /// Long enough for a mock cut to park if one was admitted, short enough that a test which
 /// wrongly waits on the body timeout fails for a different reason than this window.
@@ -88,7 +48,7 @@ fn assert_nothing_admitted(host: &Host) {
     }
 }
 
-fn open(running: &Running) -> RawSession {
+fn open(running: &TestHost) -> RawSession {
     RawSession::open(&running.addr, &running.fingerprint).expect("tls to the test host")
 }
 
@@ -96,7 +56,7 @@ const BUDGET: Duration = Duration::from_secs(5);
 
 #[test]
 fn a_different_version_is_refused_by_name_and_admits_nothing() {
-    let running = start();
+    let running = start_test_host();
     let mut raw = open(&running);
     raw.send(&(PROTOCOL_VERSION + 1), BUDGET).unwrap();
     let reply: VersionReply = raw.recv(VERSION_FRAME_MAX, BUDGET).unwrap();
@@ -130,7 +90,7 @@ fn a_different_version_is_refused_by_name_and_admits_nothing() {
 
 #[test]
 fn a_frame_that_is_not_a_version_admits_nothing() {
-    let running = start();
+    let running = start_test_host();
     let mut raw = open(&running);
     // A dispatch-shaped object, small enough to fit the version cap, so the refusal is the
     // shape and not the length. Decoded as a `u32` it is not one; decoded as a `Request` it
@@ -147,7 +107,7 @@ fn a_frame_that_is_not_a_version_admits_nothing() {
 /// bytes that would cut. They are on the socket, and they must not be read as a `Request`.
 #[test]
 fn replaying_an_unversioned_session_admits_no_job() {
-    let running = start();
+    let running = start_test_host();
     let mut raw = open(&running);
     raw.send(&TOKEN.to_string(), BUDGET).unwrap();
     let dispatch = Request::Dispatch {
@@ -167,7 +127,7 @@ fn replaying_an_unversioned_session_admits_no_job() {
 
 #[test]
 fn a_peer_that_disconnects_after_agreeing_a_version_admits_nothing() {
-    let running = start();
+    let running = start_test_host();
     let mut raw = open(&running);
     raw.send(&PROTOCOL_VERSION, BUDGET).unwrap();
     let reply: VersionReply = raw.recv(VERSION_FRAME_MAX, BUDGET).unwrap();
@@ -184,7 +144,7 @@ fn a_peer_that_disconnects_after_agreeing_a_version_admits_nothing() {
 
 #[test]
 fn a_peer_that_disconnects_before_offering_a_version_admits_nothing() {
-    let running = start();
+    let running = start_test_host();
     let raw = open(&running);
     drop(raw);
     assert_nothing_admitted(&running.host);

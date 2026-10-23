@@ -775,6 +775,7 @@ export function App() {
               onDesignFor={designFor}
               faintVinyl={doc ? selectionHasFaintVinyl(doc.nodes, selected) : false}
               nothingSelected={selected.length === 0}
+              selectionKey={selected.slice().sort((a, b) => a - b).join(",")}
               documentInfo={doc ? { matLabel, passLabel: passFactLabel(grouping), passCount, objectCount: countShapes(doc) } : null}
             />
           </TabsContent>

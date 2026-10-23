@@ -45,6 +45,8 @@ type Props = {
   documentInfo: { matLabel: string; passLabel: string; passCount: number; objectCount: number } | null;
   /** App knows the selection. Bounds being null is also a multi-select and a group. */
   nothingSelected: boolean;
+  /** Selected ids. A new selection remounts the fields; the same selection's own refresh must not. */
+  selectionKey?: string;
 };
 
 /** What the material row reads for each state. Exported for its own test: it is the consumer
@@ -121,7 +123,7 @@ export function PropertiesPanel({
   onChangeX, onChangeY, onChangeW, onChangeH, rotation, onChangeRotation, unit,
   unitCount, editsLocked, distributeBlocked, onAlign, onDistribute,
   onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor, faintVinyl,
-  documentInfo, nothingSelected,
+  documentInfo, nothingSelected, selectionKey,
 }: Props) {
   const documentSection = nothingSelected;
   const step = unit === "in" ? 0.01 : 1;
@@ -158,14 +160,14 @@ export function PropertiesPanel({
           <div className="text-2xs uppercase text-muted-foreground">Properties</div>
           {bounds ? (
             <>
-              <NumberField label="X" suffix={lengthSuffix} value={displayLength(bounds.x, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeX(commit(v))} />
-              <NumberField label="Y" suffix={lengthSuffix} value={displayLength(bounds.y, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeY(commit(v))} />
-              <NumberField label="W" suffix={lengthSuffix} value={displayLength(bounds.w, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeW(commit(v))} />
-              <NumberField label="H" suffix={lengthSuffix} value={displayLength(bounds.h, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeH(commit(v))} />
+              <NumberField key={`${selectionKey ?? ""}:x`} label="X" suffix={lengthSuffix} value={displayLength(bounds.x, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeX(commit(v))} />
+              <NumberField key={`${selectionKey ?? ""}:y`} label="Y" suffix={lengthSuffix} value={displayLength(bounds.y, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeY(commit(v))} />
+              <NumberField key={`${selectionKey ?? ""}:w`} label="W" suffix={lengthSuffix} value={displayLength(bounds.w, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeW(commit(v))} />
+              <NumberField key={`${selectionKey ?? ""}:h`} label="H" suffix={lengthSuffix} value={displayLength(bounds.h, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeH(commit(v))} />
             </>
           ) : null}
           {rotation !== null ? (
-            <NumberField label="Rotation" suffix="°" value={rotation} step={1} disabled={editsLocked !== null} onChange={onChangeRotation} />
+            <NumberField key={`${selectionKey ?? ""}:r`} label="Rotation" suffix="°" value={rotation} step={1} disabled={editsLocked !== null} onChange={onChangeRotation} />
           ) : null}
           {/* Also outside the bounds branch, since aligning is mostly for multi-node selections. Always shown, disabled
               when it cannot act, so the buttons do not jump the rows below them in and out. */}

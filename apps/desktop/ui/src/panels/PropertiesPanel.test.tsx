@@ -148,6 +148,40 @@ describe("document section", () => {
     expect(field(panel, "Rotation").value).toBe("0");
   });
 
+  test("a cleared field stays empty when the number it sent arrives", () => {
+    const onChangeRotation = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    };
+    const panel = render(shape);
+    const input = field(panel, "Rotation");
+    typeInto(input, "12");
+    typeInto(input, "");
+    rerender({ ...shape, rotation: 12 });
+    expect(onChangeRotation).toHaveBeenCalledTimes(1);
+    expect(field(panel, "Rotation").value).toBe("");
+  });
+
+  test("a new selection replaces a draft that starts with its number", () => {
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 1,
+      nothingSelected: false,
+      selectionKey: "1",
+    };
+    const panel = render(shape);
+    typeInto(field(panel, "Rotation"), "12");
+    rerender({ ...shape, selectionKey: "2" });
+    expect(field(panel, "Rotation").value).toBe("1");
+  });
+
   test("a leading zero stays typed when the size does not change", () => {
     const onChangeW = vi.fn();
     const shape = {

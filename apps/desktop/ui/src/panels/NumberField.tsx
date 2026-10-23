@@ -31,15 +31,32 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   // An empty or half-typed value stays local. Committing Number("") is 0, which
   // would rotate or move the shape before the next digit arrives.
   const [text, setText] = useState<string | null>(null);
+  // The last finite number this field sent. Clearing does not cancel it: transformWith
+  // may still be applying it, and dropping the empty draft would put that number back.
+  const submitted = useRef<number | null>(null);
   useEffect(() => {
     setText((current) => {
-      if (current === null || current === "") return null;
+      if (current === null) return null;
+      if (current === "") {
+        // Only the acknowledgment of what was typed. Undo or a drag to another number shows.
+        if (submitted.current !== null && value === submitted.current) return "";
+        submitted.current = null;
+        return null;
+      }
       const next = Number(current);
-      if (!Number.isFinite(next)) return null;
+      if (!Number.isFinite(next)) {
+        submitted.current = null;
+        return null;
+      }
       // The preview of an earlier digit is a prefix of the number still being typed.
       // Anything else — a label drag, undo — replaces the draft.
-      if (next === value) return spellingInProgress(current) ? current : null;
-      return current.startsWith(String(value)) ? current : null;
+      if (next === value) {
+        if (!spellingInProgress(current)) submitted.current = null;
+        return spellingInProgress(current) ? current : null;
+      }
+      if (current.startsWith(String(value))) return current;
+      submitted.current = null;
+      return null;
     });
   }, [value]);
 
@@ -96,7 +113,11 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
           step={step}
           min={min}
           disabled={disabled}
-          onBlur={() => setText(null)}
+          onBlur={() => {
+            // Blur abandons the draft, so a late acknowledgment of what was typed should show.
+            submitted.current = null;
+            setText(null);
+          }}
           onChange={(e) => {
             const raw = e.target.value;
             if (raw === "") {
@@ -110,6 +131,7 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
             }
             // Keep every finite keystroke. The first digit previews immediately and later
             // digits queue; clearing the draft makes the next keystroke edit that preview.
+            submitted.current = next;
             setText(raw);
             onChange(next);
           }}

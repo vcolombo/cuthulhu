@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, hostCardTitle, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -300,6 +300,13 @@ describe("protocol mismatch", () => {
     expect(s.unreachable).toBe("the host could not be reached (timed out)");
   });
 
+  it("titles a mismatch by which side is older, and an outage as can't reach", () => {
+    expect(hostCardTitle("Workshop Pi", "host", true)).toBe("Workshop Pi needs an update");
+    expect(hostCardTitle("Office Pi", "desktop", true)).toBe("Update Cuthulhu to use Office Pi");
+    expect(hostCardTitle("Garage Pi", null, true)).toBe("Can't reach Garage Pi");
+    expect(hostCardTitle("Garage Pi", null, false)).toBe("Garage Pi · Pi Cut Host");
+  });
+
   it("points the host at the daemon update and the desktop at the releases", () => {
     expect(protocolUpdateUrl("host")).toBe("https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
     expect(protocolUpdateUrl("desktop")).toBe("https://github.com/vcolombo/cuthulhu/releases");
@@ -331,6 +338,17 @@ describe("connectedControl", () => {
   it("asks a Cut Host to re-open its own cutter rather than dropping the aim", () => {
     const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
     expect(connectedControl(unconfirmed, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
+  });
+
+  // Ready means the transport is already open. Reconnect there is a second way to
+  // say the same thing, and it crowds the cutter's name. A local Ready still disconnects.
+  it("withholds Reconnect while a remote cutter can take a cut", () => {
+    const ready: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, cut: true } };
+    expect(connectedControl(ready, true)).toBeNull();
+    expect(connectedControl({ ...ready, ended: "Cancelled" }, true)).toBeNull();
+    expect(connectedControl(ready, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+    const gone: CutStatus = { ...aStatus(), phase: "Disconnected" };
+    expect(connectedControl(gone, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
   });
 
   // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a

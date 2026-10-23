@@ -193,6 +193,25 @@ export function protocolSide(side: string | null | undefined): ProtocolSide | nu
   }
 }
 
+/**
+ * The host card's title. A protocol mismatch is a host that answered, so it is
+ * not "can't reach", and it is not a reading that never succeeded.
+ */
+export function hostCardTitle(name: string, side: ProtocolSide | null, unreachable: boolean): string {
+  switch (side) {
+    case "host":
+      return `${name} needs an update`;
+    case "desktop":
+      return `Update Cuthulhu to use ${name}`;
+    case null:
+      return unreachable ? `Can't reach ${name}` : `${name} · Pi Cut Host`;
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
+  }
+}
+
 /** Where "How to update" goes. The host page is the binary swap; the desktop page is the releases. */
 export function protocolUpdateUrl(side: ProtocolSide): string {
   switch (side) {
@@ -278,5 +297,8 @@ export function connectedControl(
   if (status === null || status.actions.cancel || status.actions.resume || status.actions.confirm) {
     return null;
   }
+  // A remote cutter that can take a cut is already open. Reconnect is the way back
+  // when it is disconnected or the last cut errored — every other state left here.
+  if (onHost && status.actions.cut) return null;
   return onHost ? { label: "Reconnect", verb: "reconnect" } : { label: "Disconnect", verb: "disconnect" };
 }

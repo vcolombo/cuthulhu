@@ -303,6 +303,18 @@ ul {
   list-style: disc;
 }
 
+/* This rule is unlayered, same as the disc above, so it wins where Tailwind
+   `list-none` does not. The Devices cards stay a list; the marker would sit
+   beside every one of them. */
+.devices-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.devices-list > li {
+  list-style: none;
+}
+
 ol {
   list-style: decimal;
 }

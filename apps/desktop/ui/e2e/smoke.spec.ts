@@ -2307,8 +2307,16 @@ test("two cutters on one host keep their own status, and cancel names that cutte
   await expect.poll(() => page.evaluate(() =>
     (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_cancel_targets"),
   )).toEqual([{ host: "host-4", instanceId: "usb:garage:cameo" }]);
-  await expect(cameo.getByText("Ready (last cut cancelled)")).toBeVisible();
+  await expect(cameo.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(cameo.getByText("Last cut cancelled")).toBeVisible();
   await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Last cut cancelled")).toHaveCount(0);
+  await expect(puma.getByRole("button", { name: /Reconnect/ })).toHaveCount(0);
+  await expect(page.getByRole("listitem").filter({ hasText: "USB on this computer" }).getByText("Not checked").first()).toBeVisible();
+  await expect(page.getByTestId("devices-panel").getByText("Unknown", { exact: true })).toHaveCount(0);
+  for (const list of await page.getByTestId("devices-panel").getByRole("list").all()) {
+    expect(await list.evaluate((el) => getComputedStyle(el).listStyleType)).toBe("none");
+  }
   if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-light.png" });
   if (devicesShots()) {
     await page.getByRole("button", { name: "Appearance" }).click();
@@ -2330,11 +2338,14 @@ test("an offline host keeps the cut frozen, then shows the reading from after it
   await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toBeVisible();
   // After the card is up, the next reading is the one that will not stamp over this.
   await callFakeWith(page, "__test_set_last_seen", { id: "host-4", at: Date.now() - 2 * 60 * 60 * 1000 });
-  await expect(page.getByText("Last seen 2 hours ago")).toBeVisible();
-  await expect(page.getByText("garage.local:7878").first()).toBeVisible();
+  await expect(page.getByText("Last seen 2 hours ago · garage.local:7878")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
   await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
-  await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
-  await expect(page.getByText(/Reconnecting to Garage Pi/)).toBeVisible();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await expect(page.getByText(/Connection lost · last update/)).toHaveCount(0);
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toBeVisible();
   await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
   await expect(page.getByText("40% of this pass")).toBeVisible();
   await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
@@ -2379,9 +2390,19 @@ test("a protocol mismatch on the devices host card says which side to update", a
 
   const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
   const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  await expect(page.getByRole("heading", { name: "Workshop Pi needs an update" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Update Cuthulhu to use Office Pi" })).toBeVisible();
+  await expect(page.getByText("Can't reach", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("No successful reading yet")).toHaveCount(0);
   await expect(page.getByText(hostOlder)).toBeVisible();
   await expect(page.getByText(desktopOlder)).toBeVisible();
   await expect(page.getByText("Update needed")).toHaveCount(2);
+  const workshop = page.getByRole("listitem").filter({ hasText: "Workshop Pi" });
+  const office = page.getByRole("listitem").filter({ hasText: "Office Pi" });
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Workshop Pi needs an update");
+  await expect(office.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(office.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Update Cuthulhu to use Office Pi");
   const how = page.getByRole("link", { name: "How to update" });
   await expect(how).toHaveCount(2);
   await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");

@@ -4,7 +4,6 @@ import { Cpu, RefreshCw } from "lucide-react";
 import type { MachineProfile } from "../App";
 import { Button } from "../components/ui/button";
 import { JobButtons } from "../cut/job/JobButtons";
-import { OfflineBanner } from "../cut/job/OfflineBanner";
 import { passLive, passPercent, percentLabel } from "../cut/job/model";
 import { TONE_BADGE } from "../cut/send/chrome";
 import { HostPairing } from "../cut/send/StepMachine";
@@ -12,11 +11,13 @@ import {
   connectedControl,
   deviceBadge,
   forgetFrom,
+  hostCardTitle,
   lastSeenLabel,
   protocolSide,
   protocolUpdateUrl,
   sameCutter,
   UPDATE_NEEDED_BADGE,
+  type ProtocolSide,
 } from "../hosts/deviceList";
 import * as ipc from "../ipc";
 import { cn } from "../lib/cn";
@@ -32,7 +33,6 @@ type Props = {
   /** The job panel is showing the aimed cutter's cut. */
   tracking: boolean;
   status: ipc.CutStatus;
-  offlineSeconds: number;
   onPick: (info: ipc.DeviceInfo) => void;
   onDisconnect: () => void;
   onRefresh: () => void;
@@ -43,15 +43,19 @@ type Props = {
   onError: (message: string) => void;
 };
 
+type CutterVerb = "cancel" | "resume" | "confirm";
+
 const UNAVAILABLE = { label: "Unavailable", tone: "gone" as const };
+/** A local cutter #59 has not polled yet. "Unknown" reads as a failure. */
+const NOT_CHECKED = { label: "Not checked", tone: "unknown" as const };
 
 /**
  * Every cutter, including the ones the aim is not on.
  *
  * A host that cannot be reached keeps the cutters from the last reading that worked, inside one
  * card. A cutter with a job still on it stays frozen at that reading; the others say they are
- * unavailable. The raw host sentence stays on the card: a protocol mismatch is that sentence,
- * and the chip and the update link are how it is acted on.
+ * unavailable. A protocol mismatch is a host that answered on the wrong version: the title names
+ * which side to update, and the chip and the link are how it is acted on.
  */
 export function DevicesTab({
   devices,
@@ -63,7 +67,6 @@ export function DevicesTab({
   listError,
   tracking,
   status,
-  offlineSeconds,
   onPick,
   onDisconnect,
   onRefresh,
@@ -76,7 +79,7 @@ export function DevicesTab({
   const [pairing, setPairing] = useState(false);
   const [forceHost, setForceHost] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const offline = hosts.some((host) => host.unreachable !== null);
+  const offline = hosts.some((host) => host.unreachable !== null && protocolSide(host.protocol_side) === null);
 
   useEffect(() => {
     if (!offline) return;
@@ -100,6 +103,28 @@ export function DevicesTab({
       .catch((e) => onError(ipc.ipcErrorMessage(e)));
   };
 
+  const command = (info: ipc.DeviceInfo, verb: CutterVerb) => {
+    const target = { host: info.host, instanceId: info.instance_id };
+    const call = (() => {
+      switch (verb) {
+        case "cancel":
+          return ipc.cancelCut(target);
+        case "resume":
+          return ipc.resumeCut(target);
+        case "confirm":
+          return ipc.confirmPassDone(target);
+        default: {
+          const neverVerb: never = verb;
+          return neverVerb;
+        }
+      }
+    })();
+    void call.then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
+  };
+
+  /** The job panel owns the aimed cutter. Every other cutter is addressed directly. */
+  const jobControls = (info: ipc.DeviceInfo) => sameCutter(active, info) && tracking;
+
   const local = devices.filter((device) => device.host === null);
   const paired = new Set(hosts.map((host) => host.id));
   const orphanIds = [...new Set(devices.flatMap((device) => (
@@ -108,7 +133,7 @@ export function DevicesTab({
   const empty = devices.length === 0 && hosts.length === 0;
 
   return (
-    <div className="flex flex-col gap-3 p-3">
+    <div className="flex flex-col gap-3 p-3" data-testid="devices-panel">
       <div className="flex items-center gap-2">
         <h2 className="flex flex-1 items-center gap-1.5 text-sm font-medium text-foreground">
           <Cpu className="size-3.5" aria-hidden />
@@ -140,19 +165,19 @@ export function DevicesTab({
       {local.length > 0 ? (
         <section className="space-y-2">
           <h3 className="m-0 text-xs font-medium text-muted-foreground">This computer · USB</h3>
-          <ul className="m-0 flex list-none flex-col gap-2 p-0">
+          <ul className="devices-list m-0 flex flex-col gap-2 p-0">
             {local.map((info) => (
               <CutterCard
                 key={`local:${info.instance_id}`}
                 info={info}
                 model={nameOf(info.machine_id)}
                 where="USB on this computer"
-                active={active}
-                tracking={tracking}
-                jobStatus={status}
-                cached={null}
+                aimed={sameCutter(active, info)}
+                live={statusOf(info, active, tracking, status, statuses)}
                 offline={false}
                 protocol={null}
+                activateReasonId={null}
+                tracked={jobControls(info)}
                 onPick={onPick}
                 onDisconnect={onDisconnect}
                 onReconnect={() => reconnect(info)}
@@ -160,15 +185,7 @@ export function DevicesTab({
                 onJobCancel={onJobCancel}
                 onJobResume={onJobResume}
                 onJobConfirm={onJobConfirm}
-                onDirectCancel={() => {
-                  void ipc.cancelCut({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                }}
-                onDirectResume={() => {
-                  void ipc.resumeCut({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                }}
-                onDirectConfirm={() => {
-                  void ipc.confirmPassDone({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                }}
+                onCommand={(verb) => command(info, verb)}
               />
             ))}
           </ul>
@@ -178,17 +195,26 @@ export function DevicesTab({
       {hosts.map((host) => {
         const side = protocolSide(host.protocol_side);
         const down = host.unreachable !== null;
+        const mismatch = side !== null;
         const rows = devices.filter((device) => device.host === host.id);
-        const seconds = down ? secondsSince(host, now, offlineSeconds, active) : 0;
-        const jobHere = rows.some((info) => cutterIsBusy(statusOf(info, active, tracking, status, statuses)));
+        const titleId = `devices-host-${host.id}`;
+        const jobHere = !mismatch && rows.some((info) => cutterIsBusy(statusOf(info, active, tracking, status, statuses)));
         return (
           <section key={host.id} className={cn("space-y-2 rounded-lg border p-3", down ? "border-warning bg-warning/10" : "border-border bg-card")}>
-            {down ? (
-              <div className="space-y-1">
-                <h3 className="m-0 text-sm font-medium text-foreground" data-testid="devices-body">Can't reach {host.name}</h3>
-                <p className="m-0 text-xs text-muted-foreground" data-testid="devices-muted">{lastSeenLabel(host.last_seen, now)}</p>
-                <p className="m-0 wrap-anywhere text-xs text-foreground">{host.address}</p>
-                <p className="m-0 text-sm text-foreground" data-testid="devices-warning">{host.unreachable}</p>
+            <div className="flex items-start gap-2">
+              <div className="min-w-0 flex-1 space-y-1">
+                <h3 id={titleId} className="m-0 text-sm font-medium text-foreground" data-testid={down ? "devices-body" : undefined}>
+                  {hostCardTitle(host.name, side, down)}
+                </h3>
+                {mismatch ? (
+                  <p className="m-0 text-sm text-foreground">{host.unreachable}</p>
+                ) : down ? (
+                  <p className="m-0 text-xs text-muted-foreground" data-testid="devices-muted">
+                    {lastSeenLabel(host.last_seen, now)} · {host.address}
+                  </p>
+                ) : (
+                  <p className="m-0 text-xs text-muted-foreground">{host.address}</p>
+                )}
                 {side !== null ? (
                   <a
                     href={protocolUpdateUrl(side)}
@@ -199,19 +225,24 @@ export function DevicesTab({
                     How to update
                   </a>
                 ) : null}
-                {jobHere ? <OfflineBanner host={{ ...host, unreachable: host.unreachable ?? "" }} seconds={seconds} /> : null}
+                {jobHere ? (
+                  <p className="m-0 text-sm text-foreground" data-testid="devices-warning">
+                    Reconnecting. The cut keeps going on the host.
+                  </p>
+                ) : null}
+                {!mismatch && down && host.unreachable !== null ? (
+                  <details className="text-xs text-muted-foreground">
+                    <summary>Details</summary>
+                    <p className="m-0 mt-1 text-foreground">{host.unreachable}</p>
+                  </details>
+                ) : null}
               </div>
-            ) : (
-              <div className="space-y-1">
-                <h3 className="m-0 text-sm font-medium text-foreground">{host.name} · Pi Cut Host</h3>
-                <p className="m-0 text-xs text-muted-foreground">{host.address}</p>
+              <div className="ml-auto flex shrink-0 gap-2">
+                {down ? (
+                  <Button variant="secondary" size="sm" aria-label={`Retry ${host.name}`} onClick={onRefresh}>Retry</Button>
+                ) : null}
+                <Button variant="ghost" size="sm" aria-label={`Forget ${host.name}`} onClick={() => forget(host.id)}>Forget</Button>
               </div>
-            )}
-            <div className="flex flex-wrap gap-2">
-              {down ? (
-                <Button variant="secondary" size="sm" aria-label={`Retry ${host.name}`} onClick={onRefresh}>Retry</Button>
-              ) : null}
-              <Button variant="ghost" size="sm" aria-label={`Forget ${host.name}`} onClick={() => forget(host.id)}>Forget</Button>
             </div>
             {forceHost === host.id ? (
               <div className="flex flex-wrap items-center gap-2 text-xs text-destructive">
@@ -231,19 +262,19 @@ export function DevicesTab({
             {rows.length === 0 ? (
               <p className="m-0 text-xs text-muted-foreground">No cutters are attached to it yet.</p>
             ) : (
-              <ul className="m-0 flex list-none flex-col gap-2 p-0">
+              <ul className="devices-list m-0 flex flex-col gap-2 p-0">
                 {rows.map((info) => (
                   <CutterCard
                     key={`${host.id}:${info.instance_id}`}
                     info={info}
                     model={nameOf(info.machine_id)}
                     where={host.name}
-                    active={active}
-                    tracking={tracking}
-                    jobStatus={status}
-                    cached={statuses.find((row) => sameCutter(row, info))?.status ?? null}
-                    offline={down}
+                    aimed={sameCutter(active, info)}
+                    live={statusOf(info, active, tracking, status, statuses)}
+                    offline={down && !mismatch}
                     protocol={side}
+                    activateReasonId={mismatch ? titleId : null}
+                    tracked={jobControls(info)}
                     onPick={onPick}
                     onDisconnect={onDisconnect}
                     onReconnect={() => reconnect(info)}
@@ -251,15 +282,7 @@ export function DevicesTab({
                     onJobCancel={onJobCancel}
                     onJobResume={onJobResume}
                     onJobConfirm={onJobConfirm}
-                    onDirectCancel={() => {
-                      void ipc.cancelCut({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                    }}
-                    onDirectResume={() => {
-                      void ipc.resumeCut({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                    }}
-                    onDirectConfirm={() => {
-                      void ipc.confirmPassDone({ host: info.host, instanceId: info.instance_id }).then(onRefresh).catch((e) => onError(ipc.ipcErrorMessage(e)));
-                    }}
+                    onCommand={(verb) => command(info, verb)}
                   />
                 ))}
               </ul>
@@ -280,12 +303,6 @@ export function DevicesTab({
   );
 }
 
-function secondsSince(host: ipc.PairedHostView, now: number, jobSeconds: number, active: ipc.DeviceInfo | null): number {
-  if (active?.host === host.id && jobSeconds > 0) return jobSeconds;
-  if (host.last_seen == null) return jobSeconds;
-  return Math.max(0, Math.round((now - host.last_seen) / 1000));
-}
-
 function cutterIsBusy(row: ipc.CutStatus | null): boolean {
   if (row === null) return false;
   return row.actions.cancel || row.actions.resume || row.actions.confirm;
@@ -302,16 +319,30 @@ function statusOf(
   return statuses.find((row) => sameCutter(row, info))?.status ?? null;
 }
 
+function presentedBadge(
+  live: ipc.CutStatus | null,
+  offline: boolean,
+  protocol: ProtocolSide | null,
+  local: boolean,
+): { label: string; tone: "idle" | "busy" | "attention" | "unknown" | "gone" } {
+  if (protocol !== null) return UPDATE_NEEDED_BADGE;
+  if (offline && !cutterIsBusy(live)) return UNAVAILABLE;
+  if (live === null && local) return NOT_CHECKED;
+  const badge = deviceBadge(live);
+  if (badge.label === "Ready (last cut cancelled)") return { label: "Ready", tone: badge.tone };
+  return badge;
+}
+
 function CutterCard({
   info,
   model,
   where,
-  active,
-  tracking,
-  jobStatus,
-  cached,
+  aimed,
+  live,
   offline,
   protocol,
+  activateReasonId,
+  tracked,
   onPick,
   onDisconnect,
   onReconnect,
@@ -319,19 +350,18 @@ function CutterCard({
   onJobCancel,
   onJobResume,
   onJobConfirm,
-  onDirectCancel,
-  onDirectResume,
-  onDirectConfirm,
+  onCommand,
 }: {
   info: ipc.DeviceInfo;
   model: string;
   where: string;
-  active: ipc.DeviceInfo | null;
-  tracking: boolean;
-  jobStatus: ipc.CutStatus;
-  cached: ipc.CutStatus | null;
+  aimed: boolean;
+  live: ipc.CutStatus | null;
   offline: boolean;
-  protocol: "host" | "desktop" | null;
+  protocol: ProtocolSide | null;
+  /** The host title, when Set as active has to say why it is disabled. */
+  activateReasonId: string | null;
+  tracked: boolean;
   onPick: (info: ipc.DeviceInfo) => void;
   onDisconnect: () => void;
   onReconnect: () => void;
@@ -339,30 +369,29 @@ function CutterCard({
   onJobCancel: () => void;
   onJobResume: () => void;
   onJobConfirm: () => void;
-  onDirectCancel: () => void;
-  onDirectResume: () => void;
-  onDirectConfirm: () => void;
+  onCommand: (verb: CutterVerb) => void;
 }) {
-  const aimed = sameCutter(active, info);
-  const live = aimed && tracking ? jobStatus : cached;
   const busy = cutterIsBusy(live);
-  const badge = protocol !== null
-    ? UPDATE_NEEDED_BADGE
-    : offline && !busy
-      ? UNAVAILABLE
-      : deviceBadge(live);
+  const badge = presentedBadge(live, offline, protocol, info.host === null);
+  const note = deviceBadge(live).label === "Ready (last cut cancelled)" && badge.label === "Ready"
+    ? "Last cut cancelled"
+    : null;
   const control = connectedControl(live, info.host !== null);
   const showControl = control !== null && (control.verb === "reconnect" || aimed);
-  const jobControls = aimed && tracking;
   const pct = live === null ? null : passPercent(live.sent);
   const frozen = offline || (live !== null && !passLive(live.phase, pct, offline) && busy);
+  const onCancel = tracked ? onJobCancel : () => onCommand("cancel");
+  const onResume = tracked ? onJobResume : () => onCommand("resume");
+  const onConfirm = tracked ? onJobConfirm : () => onCommand("confirm");
 
   return (
     <li className="rounded-lg border border-border bg-card p-3">
       <div className="flex items-start gap-2">
         <span className="min-w-0 flex-1">
           <span className="block text-sm font-medium text-foreground">{model}</span>
-          <span className="block text-xs text-muted-foreground">{where}</span>
+          <span className="block text-xs text-muted-foreground">
+            {note === null ? where : `${where} · ${note}`}
+          </span>
         </span>
         <span
           data-testid="device-badge"
@@ -398,15 +427,16 @@ function CutterCard({
         <Button
           variant="secondary"
           size="sm"
-          disabled={aimed || (!aimed && badge.tone === "busy")}
+          disabled={aimed || (!aimed && badge.tone === "busy") || activateReasonId !== null}
+          aria-describedby={activateReasonId ?? undefined}
           onClick={() => onPick(info)}
         >
           {aimed ? "Active" : "Set as active"}
         </Button>
-        {aimed && tracking ? (
+        {aimed && tracked ? (
           <Button variant="ghost" size="sm" onClick={onViewJob}>Open job</Button>
         ) : null}
-        {showControl ? (
+        {showControl && control !== null ? (
           <Button
             variant="secondary"
             size="sm"
@@ -421,9 +451,9 @@ function CutterCard({
             actions={live.actions}
             place="panel"
             offline={offline}
-            onCancel={jobControls ? onJobCancel : onDirectCancel}
-            onResume={jobControls ? onJobResume : onDirectResume}
-            onConfirm={jobControls ? onJobConfirm : onDirectConfirm}
+            onCancel={onCancel}
+            onResume={onResume}
+            onConfirm={onConfirm}
           />
         ) : null}
       </div>

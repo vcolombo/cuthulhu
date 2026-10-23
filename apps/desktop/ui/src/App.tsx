@@ -822,7 +822,6 @@ export function App() {
               machines={machines}
               tracking={job.tracking}
               status={status}
-              offlineSeconds={job.offlineSeconds}
               onPick={reportPick}
               onDisconnect={() => { void cutter.disconnect(); }}
               onRefresh={() => { void refreshDevices(); }}

@@ -15,7 +15,7 @@ const listeners: Listener[] = [];
 const ipc = vi.hoisted(() => ({
   getDeviceState: vi.fn<() => Promise<CutStatus>>(),
   listHosts: vi.fn<() => Promise<PairedHostView[]>>(),
-  cancelCut: vi.fn<() => Promise<void>>(),
+  cancelCut: vi.fn<(target?: { host: string | null; instanceId: string }) => Promise<void>>(),
   resumeCut: vi.fn<() => Promise<void>>(),
   confirmPassDone: vi.fn<() => Promise<void>>(),
 }));
@@ -32,7 +32,7 @@ vi.mock("../ipc", () => ({
   },
   getDeviceState: () => ipc.getDeviceState(),
   listHosts: () => ipc.listHosts(),
-  cancelCut: () => ipc.cancelCut(),
+  cancelCut: (target?: { host: string | null; instanceId: string }) => ipc.cancelCut(target),
   resumeCut: () => ipc.resumeCut(),
   confirmPassDone: () => ipc.confirmPassDone(),
   ipcErrorMessage: (e: unknown) => String(e),
@@ -471,7 +471,46 @@ describe("useJob", () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(ipc.cancelCut).toHaveBeenCalledOnce();
+    expect(ipc.cancelCut).toHaveBeenCalledWith({ host: "host-3", instanceId: "usb:pi:C" });
     expect(api.current?.status).toEqual({ ...SWAP, jobId: 1 });
+  });
+
+  it("names the same cutter when a poll delivers a cancel that was queued offline", async () => {
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost?.id).toBe("host-3");
+    act(() => { api.current?.cancel(); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: SWAP }],
+        stale: false,
+      });
+    });
+    expect(ipc.cancelCut).toHaveBeenCalledWith({ host: "host-3", instanceId: "usb:pi:C" });
+  });
+
+  it("does not freeze a job when the poll has no status for that cutter yet", async () => {
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+    act(() => {
+      api.current?.applyPoll({ hosts: [HOST], statuses: [], stale: false });
+    });
+    expect(api.current?.offlineHost).toBeNull();
+    expect(api.current?.status.phase).toBe("AwaitingColorSwap");
   });
 
   it("refreshes after resume, cancel and confirm land, and reports a refusal without refreshing", async () => {

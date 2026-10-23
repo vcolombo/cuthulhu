@@ -98,6 +98,58 @@ export function useJob(onError: (message: string) => void) {
     setOfflineHost((prev) => (sameHost(prev, host) ? prev : host));
   }, []);
 
+  /**
+   * One reading of the aimed cutter: freeze, send the queued cancel, or show it.
+   *
+   * The dial and the poll both call this. `down` is a failed dial, a stale poll, or a
+   * host that is gone. A poll that has no cache row yet passes `down: false` and
+   * `status: null`, and the surface stays — a missing row is not a failed read.
+   * The queued cancel names this cutter. A cancel with no target would follow the aim.
+   */
+  const settle = useCallback((reading: {
+    host: ipc.PairedHostView | null;
+    status: ipc.CutStatus | null;
+    down: boolean;
+  }) => {
+    const id = hostIdRef.current;
+    if (id === null) return;
+    const host = reading.host;
+    if (host !== null) knownHostRef.current = host;
+    const known = knownHostRef.current;
+    const base = host ?? (known !== null && known.id === id ? known : null);
+    if (reading.down || reading.status?.phase === "Disconnected") {
+      freeze({
+        id,
+        name: base?.name ?? id,
+        address: base?.address ?? "",
+        unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
+        // A returned host's null is the fact. A missing host keeps the last side.
+        protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
+        last_seen: host?.last_seen ?? base?.last_seen ?? null,
+      });
+      return;
+    }
+    if (reading.status === null) return;
+    const next = reading.status;
+    const wasQueued = cancelQueuedRef.current;
+    offlineRef.current = false;
+    setOfflineHost(null);
+    if (wasQueued) cancelQueuedRef.current = false;
+    // A cut that finished during the outage is not cancellable. Sending the queued
+    // cancel would rest that job on Cancelled. `next` is the reading from before the
+    // host answered. The cancel emit is the status; writing the reading over it would
+    // put Sending back on top of Cancelling.
+    if (wasQueued && jobIsActive(next.phase) && next.actions.cancel) {
+      const instance = instanceRef.current;
+      const target = instance === null ? undefined : { host: id, instanceId: instance };
+      return ipc.cancelCut(target).catch((e) => {
+        ingest(next);
+        onErrorRef.current(ipc.ipcErrorMessage(e));
+      });
+    }
+    ingest(next);
+  }, [freeze, ingest]);
+
   const refreshDeviceState = useCallback((): Promise<void> => {
     const id = hostIdRef.current;
     const gen = acceptGenRef.current;
@@ -148,43 +200,12 @@ export function useJob(onError: (message: string) => void) {
         });
       }
       const host = hostsResult.status === "fulfilled" ? hostsResult.value.find((item) => item.id === id) ?? null : null;
-      if (host !== null) knownHostRef.current = host;
       const unreachable = hostsResult.status === "fulfilled" && (host === null || host.unreachable !== null);
-      // A live read while the host is down is `disconnected`, which would wipe the bar.
-      // A failed read is the same fact: keep the last status that arrived.
-      const liveDrop = statusResult.status === "fulfilled" && statusResult.value.phase === "Disconnected";
-      if (statusResult.status === "rejected" || unreachable || liveDrop) {
-        const known = knownHostRef.current;
-        const base = host ?? (known !== null && known.id === id ? known : null);
-        freeze({
-          id,
-          name: base?.name ?? id,
-          address: base?.address ?? "",
-          unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
-          // A returned host's null is the fact. A missing host keeps the last side.
-          protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
-          last_seen: host?.last_seen ?? base?.last_seen ?? null,
-        });
-        return;
-      }
-      const next = statusResult.value;
-      const wasQueued = cancelQueuedRef.current;
-      offlineRef.current = false;
-      setOfflineHost(null);
-      if (wasQueued) cancelQueuedRef.current = false;
-      // A cut that finished during the outage is not cancellable. Sending the queued
-      // cancel would rest that job on Cancelled.
-      if (wasQueued && jobIsActive(next.phase) && next.actions.cancel) {
-        // `next` is the poll from before the host answered. The cancel emit is the status;
-        // writing the poll over it would put Sending back on top of Cancelling.
-        return ipc.cancelCut().catch((e) => {
-          ingest(next);
-          onErrorRef.current(ipc.ipcErrorMessage(e));
-        });
-      }
-      ingest(next);
+      // A rejected dial is a failed read. A fulfilled Disconnected is handled in `settle`.
+      const live = statusResult.status === "fulfilled" ? statusResult.value : null;
+      return settle({ host, status: live, down: statusResult.status === "rejected" || unreachable });
     });
-  }, [freeze, ingest]);
+  }, [ingest, settle]);
 
   const refreshRef = useRef(refreshDeviceState);
   refreshRef.current = refreshDeviceState;
@@ -244,42 +265,12 @@ export function useJob(onError: (message: string) => void) {
     const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
     if (!watching || id === null || instance === null) return;
     const host = snap.hosts.find((item) => item.id === id) ?? null;
-    if (host !== null) knownHostRef.current = host;
-    const known = knownHostRef.current;
-    const base = host ?? (known !== null && known.id === id ? known : null);
-    const frozen = (): ipc.PairedHostView => ({
-      id,
-      name: base?.name ?? id,
-      address: base?.address ?? "",
-      unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
-      protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
-      last_seen: host?.last_seen ?? base?.last_seen ?? null,
-    });
     const down = snap.stale || host === null || host.unreachable !== null;
-    if (down) {
-      freeze(frozen());
-      return;
-    }
     const row = snap.statuses.find((item) => sameCutter(item, { instance_id: instance, host: id }));
-    if (!row || row.status.phase === "Disconnected") {
-      if (!row) return;
-      freeze(frozen());
-      return;
-    }
-    const next = row.status;
-    const wasQueued = cancelQueuedRef.current;
-    offlineRef.current = false;
-    setOfflineHost(null);
-    if (wasQueued) cancelQueuedRef.current = false;
-    if (wasQueued && jobIsActive(next.phase) && next.actions.cancel) {
-      const target = { host: id, instanceId: instance };
-      return ipc.cancelCut(target).catch((e) => {
-        ingest(next);
-        onErrorRef.current(ipc.ipcErrorMessage(e));
-      });
-    }
-    ingest(next);
-  }, [freeze, ingest]);
+    // A missing cache row is not a failed read, so it is not `down`. A stale or
+    // unreachable poll must not ingest the row it happened to be holding.
+    return settle({ host, status: down ? null : (row?.status ?? null), down });
+  }, [settle]);
 
   useEffect(() => {
     if (offlineHost === null) return;

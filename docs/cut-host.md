@@ -215,6 +215,23 @@ has multiple LAN interfaces and you want the daemon reachable on all of them, sa
 `bind = "0.0.0.0:7878"` in `cutd.toml` and add the flag. Anything that can reach that port is then
 trusted with the same authority as a paired desktop, limited only by the token.
 
+## Update
+
+When the desktop says this Cut Host is running an older version, replace
+`/usr/local/bin/cuthulhu-cutd` with a build from the same revision as the desktop, then restart:
+
+```sh
+sudo install -m 0755 cuthulhu-cutd /usr/local/bin/cuthulhu-cutd
+sudo systemctl restart cuthulhu-cutd
+```
+
+`systemctl restart` waits for a Job already in progress. That Job keeps cutting. A new connection
+is refused until the daemon speaks the desktop's protocol version. Build the binary with the steps
+under [Build](#build).
+
+When the desktop says this version of Cuthulhu is older, install a newer desktop from the
+[releases](https://github.com/vcolombo/cuthulhu/releases) page and leave the daemon as it is.
+
 ## Protocol version
 
 The desktop and `cuthulhu-cutd` agree one protocol version when they connect, before the token is

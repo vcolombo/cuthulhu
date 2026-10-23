@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolSide, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -259,6 +259,25 @@ describe("deviceBadge", () => {
     const unconfirmed: CutStatus = { ...confirmed, actions: { ...aStatus().actions, cut: false } };
     expect(deviceBadge(unconfirmed).tone).toBe("attention");
     expect(deviceBadge(unconfirmed).label).toMatch(/not confirmed/);
+  });
+});
+
+describe("protocol mismatch", () => {
+  it("names which side the sentence names, and ignores every other failure", () => {
+    expect(protocolSide("This Cut Host is running an older version. Update your Cut Host to connect.")).toBe("host");
+    expect(protocolSide("This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.")).toBe("desktop");
+    expect(protocolSide("the host could not be reached (timed out)")).toBeNull();
+    expect(protocolSide(null)).toBeNull();
+  });
+
+  it("points the host at the daemon update and the desktop at the releases", () => {
+    expect(protocolUpdateUrl("host")).toBe("https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+    expect(protocolUpdateUrl("desktop")).toBe("https://github.com/vcolombo/cuthulhu/releases");
+  });
+
+  it("keeps Update needed on the unknown chip", () => {
+    expect(UPDATE_NEEDED_BADGE).toEqual({ label: "Update needed", tone: "unknown" });
+    expect(UPDATE_NEEDED_BADGE.tone).toBe(deviceBadge(null).tone);
   });
 });
 

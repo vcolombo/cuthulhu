@@ -3637,6 +3637,13 @@ test("a protocol mismatch says which side to update", async ({ page }) => {
   await expect(page.getByText(desktopOlder)).toBeVisible();
   await expect(page.getByRole("radiogroup", { name: "Workshop Pi" }).getByRole("radio")).toBeDisabled();
   await expect(page.getByRole("radiogroup", { name: "Office Pi" }).getByRole("radio")).toBeDisabled();
+  // The chip and the sentence name the same fact. A timed-out host stays "Unknown".
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi" }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Office Pi" }).getByTestId("device-badge")).toHaveText("Update needed");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
 });
 
 // The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for

@@ -131,6 +131,46 @@ export function staleSection(previous: DeviceSection, e: unknown): DeviceSection
 // cutters can share the same phase (e.g. "Disconnected") while one is legal to cut and the
 // other isn't; only `actions` tells them apart. `phase` may still end up in UI copy as
 // descriptive text, but nothing below branches on it.
+/** Which side a protocol mismatch names, or null when the row is some other failure.
+ *
+ * The code is `host_protocol` either way. The sentence is what says which program to
+ * replace, and it is `ClientError`'s own — the desktop test pins both wordings. A
+ * rewording there has to land here too, or the chip stays "Unknown" and the link goes.
+ */
+export type ProtocolSide = "host" | "desktop";
+
+const HOST_OLDER =
+  "This Cut Host is running an older version. Update your Cut Host to connect.";
+const DESKTOP_OLDER =
+  "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+
+export function protocolSide(unreachable: string | null): ProtocolSide | null {
+  if (unreachable === HOST_OLDER) return "host";
+  if (unreachable === DESKTOP_OLDER) return "desktop";
+  return null;
+}
+
+/** Where "How to update" goes. The host page is the binary swap; the desktop page is the releases. */
+export function protocolUpdateUrl(side: ProtocolSide): string {
+  switch (side) {
+    case "host":
+      return "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update";
+    case "desktop":
+      return "https://github.com/vcolombo/cuthulhu/releases";
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
+  }
+}
+
+/** The unpolled chip, with the words the mismatch message already used. Same tone: this is
+ *  not a cutter that wants a person at the machine, it is a row we cannot ask. */
+export const UPDATE_NEEDED_BADGE: { label: string; tone: "unknown" } = {
+  label: "Update needed",
+  tone: "unknown",
+};
+
 export function deviceBadge(status: CutStatus | null): { label: string; tone: "idle" | "busy" | "attention" | "unknown" | "gone" } {
   if (status === null) {
     // No status has arrived for this cutter yet (distinct from DISCONNECTED_STATUS, which is a

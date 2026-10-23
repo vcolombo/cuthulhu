@@ -2288,6 +2288,27 @@ function devicesShots(): boolean {
   return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.DEVICES_SHOTS === "1";
 }
 
+/** Retry and Forget stay on the title row. The line under them uses the card. */
+async function hostCopySpansTheCard(page: Page, heading: string, copy: Locator) {
+  const card = page.locator("section").filter({ has: page.getByRole("heading", { name: heading, exact: true }) });
+  const cardBox = await card.boundingBox();
+  const copyBox = await copy.boundingBox();
+  const button = card.getByRole("button", { name: /^Forget / });
+  const buttonBox = await button.boundingBox();
+  expect(cardBox).not.toBeNull();
+  expect(copyBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  expect(copyBox!.width).toBeGreaterThan(cardBox!.width * 0.75);
+  expect(copyBox!.y).toBeGreaterThanOrEqual(buttonBox!.y + buttonBox!.height - 1);
+  expect(buttonBox!.x + buttonBox!.width).toBeGreaterThan(cardBox!.x + cardBox!.width - 28);
+  const titleBox = await card.getByRole("heading", { name: heading, exact: true }).boundingBox();
+  expect(titleBox).not.toBeNull();
+  const sharesRow = buttonBox!.y < titleBox!.y + titleBox!.height && titleBox!.y < buttonBox!.y + buttonBox!.height;
+  // A title beside the buttons stays one line. One that cannot fit takes the row.
+  if (sharesRow) expect(titleBox!.height).toBeLessThan(28);
+  else expect(titleBox!.width).toBeGreaterThan(cardBox!.width * 0.7);
+}
+
 test("two cutters on one host keep their own status, and cancel names that cutter", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -2360,6 +2381,7 @@ test("an offline host keeps the cut frozen, then shows the reading from after it
   expect(lightBody.ratio).toBeGreaterThanOrEqual(4.5);
   expect(lightMuted.ratio).toBeGreaterThanOrEqual(4.5);
   expect(lightWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
   if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-light.png" });
 
   await page.getByRole("button", { name: "Appearance" }).click();
@@ -2371,6 +2393,7 @@ test("an offline host keeps the cut frozen, then shows the reading from after it
   expect(darkBody.ratio).toBeGreaterThanOrEqual(4.5);
   expect(darkMuted.ratio).toBeGreaterThanOrEqual(4.5);
   expect(darkWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
   if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-dark.png" });
   await page.getByRole("button", { name: "Appearance" }).click();
   await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
@@ -2413,10 +2436,14 @@ test("a protocol mismatch on the devices host card says which side to update", a
   const active = page.getByRole("button", { name: "Set as active" }).first();
   await active.focus();
   await expect(active).toBeFocused();
+  await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+  await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
   if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-light.png" });
   if (devicesShots()) {
     await page.getByRole("button", { name: "Appearance" }).click();
     await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+    await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
     await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-dark.png" });
   }
 });

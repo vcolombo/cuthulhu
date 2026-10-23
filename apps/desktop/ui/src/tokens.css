@@ -315,6 +315,15 @@ ul {
   list-style: none;
 }
 
+/* The title shares its row with Retry and Forget only while the whole title
+   fits. Past that, the minimum width is the row and the buttons wrap under it.
+   A flex basis of 0 would otherwise shrink the title to its longest word. */
+.devices-host-title {
+  flex: 1 1 auto;
+  min-width: min(100%, max-content);
+  max-width: 100%;
+}
+
 ol {
   list-style: decimal;
 }

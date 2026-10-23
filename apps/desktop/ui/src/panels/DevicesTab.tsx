@@ -201,48 +201,54 @@ export function DevicesTab({
         const jobHere = !mismatch && rows.some((info) => cutterIsBusy(statusOf(info, active, tracking, status, statuses)));
         return (
           <section key={host.id} className={cn("space-y-2 rounded-lg border p-3", down ? "border-warning bg-warning/10" : "border-border bg-card")}>
-            <div className="flex items-start gap-2">
-              <div className="min-w-0 flex-1 space-y-1">
-                <h3 id={titleId} className="m-0 text-sm font-medium text-foreground" data-testid={down ? "devices-body" : undefined}>
+            <div className="space-y-1">
+              {/* The title keeps a whole line when it cannot sit beside the buttons, and
+                  the buttons drop under it. Everything below uses the card width. */}
+              <div className="flex flex-wrap items-center gap-2">
+                <h3
+                  id={titleId}
+                  className="devices-host-title m-0 text-sm font-medium text-foreground"
+                  data-testid={down ? "devices-body" : undefined}
+                >
                   {hostCardTitle(host.name, side, down)}
                 </h3>
-                {mismatch ? (
-                  <p className="m-0 text-sm text-foreground">{host.unreachable}</p>
-                ) : down ? (
-                  <p className="m-0 text-xs text-muted-foreground" data-testid="devices-muted">
-                    {lastSeenLabel(host.last_seen, now)} · {host.address}
-                  </p>
-                ) : (
-                  <p className="m-0 text-xs text-muted-foreground">{host.address}</p>
-                )}
-                {side !== null ? (
-                  <a
-                    href={protocolUpdateUrl(side)}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-xs font-medium text-accent-ink underline-offset-2 hover:underline"
-                  >
-                    How to update
-                  </a>
-                ) : null}
-                {jobHere ? (
-                  <p className="m-0 text-sm text-foreground" data-testid="devices-warning">
-                    Reconnecting. The cut keeps going on the host.
-                  </p>
-                ) : null}
-                {!mismatch && down && host.unreachable !== null ? (
-                  <details className="text-xs text-muted-foreground">
-                    <summary>Details</summary>
-                    <p className="m-0 mt-1 text-foreground">{host.unreachable}</p>
-                  </details>
-                ) : null}
+                <div className="ml-auto flex shrink-0 gap-2">
+                  {down ? (
+                    <Button variant="secondary" size="sm" aria-label={`Retry ${host.name}`} onClick={onRefresh}>Retry</Button>
+                  ) : null}
+                  <Button variant="ghost" size="sm" aria-label={`Forget ${host.name}`} onClick={() => forget(host.id)}>Forget</Button>
+                </div>
               </div>
-              <div className="ml-auto flex shrink-0 gap-2">
-                {down ? (
-                  <Button variant="secondary" size="sm" aria-label={`Retry ${host.name}`} onClick={onRefresh}>Retry</Button>
-                ) : null}
-                <Button variant="ghost" size="sm" aria-label={`Forget ${host.name}`} onClick={() => forget(host.id)}>Forget</Button>
-              </div>
+              {mismatch ? (
+                <p className="m-0 text-sm text-foreground">{host.unreachable}</p>
+              ) : down ? (
+                <p className="m-0 text-xs text-muted-foreground" data-testid="devices-muted">
+                  {lastSeenLabel(host.last_seen, now)} · {host.address}
+                </p>
+              ) : (
+                <p className="m-0 text-xs text-muted-foreground">{host.address}</p>
+              )}
+              {side !== null ? (
+                <a
+                  href={protocolUpdateUrl(side)}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs font-medium text-accent-ink underline-offset-2 hover:underline"
+                >
+                  How to update
+                </a>
+              ) : null}
+              {jobHere ? (
+                <p className="m-0 text-sm text-foreground" data-testid="devices-warning">
+                  Reconnecting. The cut keeps going on the host.
+                </p>
+              ) : null}
+              {!mismatch && down && host.unreachable !== null ? (
+                <details className="text-xs text-muted-foreground">
+                  <summary>Details</summary>
+                  <p className="m-0 mt-1 text-foreground">{host.unreachable}</p>
+                </details>
+              ) : null}
             </div>
             {forceHost === host.id ? (
               <div className="flex flex-wrap items-center gap-2 text-xs text-destructive">

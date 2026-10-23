@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { MachineProfile } from "../App";
 import * as ipc from "../ipc";
+import { sameCutter } from "../hosts/deviceList";
 
 type Args = {
   profileId: string | null;
@@ -13,10 +14,6 @@ type Args = {
   refreshDeviceState: () => Promise<void>;
   onError: (message: string) => void;
 };
-
-function sameCutter(a: ipc.DeviceInfo, b: ipc.DeviceInfo): boolean {
-  return a.instance_id === b.instance_id && a.host === b.host;
-}
 
 /**
  * The one place a cutter becomes the connected device, and the one place that then offers to

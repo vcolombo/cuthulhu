@@ -233,7 +233,10 @@ export function App() {
   );
   const job = useJob(setError);
   const status = job.status;
-  const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
+  // One interval for every host. Live while someone is looking, or a job still needs the poll
+  // that notices the host has gone. Idle is ten seconds, and no hosts means no interval.
+  const devicesLive = cutOpen || rightTab === "devices" || (job.tracking && (jobIsActive(status.phase) || job.offlineHost !== null));
+  const { devices, hosts, statuses, stale, listError: deviceListError, refresh: refreshDevices } = useDevices(devicesLive, job.applyPoll);
   const { unit, setUnit } = useUnits(setError);
   const matLabel = useMemo(() => {
     if (!doc) return "";
@@ -598,7 +601,7 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
 
-  const cutting = status.phase === "Sending" || status.phase === "AwaitingColorSwap" || status.phase === "AwaitingConfirmation";
+  const cutting = status.actions.cancel || statuses.some((row) => row.status.actions.cancel);
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);
 
   const surface = jobSurface(status, job.tracking);
@@ -809,7 +812,26 @@ export function App() {
             />
           </TabsContent>
           <TabsContent value="devices" className="mt-0 min-h-0 flex-1 overflow-auto">
-            <DevicesTab devices={devices} hosts={hosts} listError={deviceListError} active={cutter.device} machines={machines} onPick={reportPick} />
+            <DevicesTab
+              devices={devices}
+              hosts={hosts}
+              statuses={statuses}
+              stale={stale}
+              listError={deviceListError}
+              active={cutter.device}
+              machines={machines}
+              tracking={job.tracking}
+              status={status}
+              offlineSeconds={job.offlineSeconds}
+              onPick={reportPick}
+              onDisconnect={() => { void cutter.disconnect(); }}
+              onRefresh={() => { void refreshDevices(); }}
+              onViewJob={viewJob}
+              onJobCancel={job.cancel}
+              onJobResume={job.resume}
+              onJobConfirm={job.confirmPassDone}
+              onError={setError}
+            />
           </TabsContent>
         </Tabs>
         {surface !== "hidden" && surface !== "swap" ? (
@@ -892,7 +914,11 @@ export function App() {
           docMachineId={doc.machine?.id ?? null}
           machines={machines}
           status={status}
-          refreshDeviceState={job.refreshDeviceState}
+          devices={devices}
+          hosts={hosts}
+          statuses={statuses}
+          listError={deviceListError}
+          refreshDevices={() => { void refreshDevices(); }}
           connected={cutter.device}
           onConnect={cutter.pick}
           onDisconnect={cutter.disconnect}

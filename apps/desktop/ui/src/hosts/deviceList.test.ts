@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolSide, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -366,5 +366,46 @@ describe("sameCutter", () => {
   it("matches nothing when either side is absent", () => {
     expect(sameCutter(null, { instance_id: "usb:1:4", host: null })).toBe(false);
     expect(sameCutter(undefined, undefined)).toBe(false);
+  });
+});
+
+describe("lastSeenLabel", () => {
+  const now = 1_700_000_000_000;
+
+  it("names a host that has never answered", () => {
+    expect(lastSeenLabel(null, now)).toBe("No successful reading yet");
+    expect(lastSeenLabel(undefined, now)).toBe("No successful reading yet");
+  });
+
+  it("counts seconds, minutes, hours and days", () => {
+    expect(lastSeenLabel(now - 5_000, now)).toBe("Last seen 5s ago");
+    expect(lastSeenLabel(now - 60_000, now)).toBe("Last seen 1 minute ago");
+    expect(lastSeenLabel(now - 2 * 3_600_000, now)).toBe("Last seen 2 hours ago");
+    expect(lastSeenLabel(now - 3 * 86_400_000, now)).toBe("Last seen 3 days ago");
+  });
+});
+
+describe("retainOffline", () => {
+  const host = (unreachable: string | null): PairedHostView => ({
+    id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable, protocol_side: null,
+  });
+  const remote = (id: string): DeviceInfo => ({ ...aDevice(), instance_id: id, host: "host-1" });
+
+  it("keeps the previous cutters of a host that can no longer be reached", () => {
+    const previous = [remote("usb:pi:A")];
+    const kept = retainOffline(previous, [], [], [host("timed out")], []);
+    expect(kept.devices.map((device) => device.instance_id)).toEqual(["usb:pi:A"]);
+  });
+
+  it("uses the first reading when there is nothing older to keep", () => {
+    const next = [remote("usb:pi:A")];
+    const kept = retainOffline([], [], next, [host("timed out")], []);
+    expect(kept.devices).toEqual(next);
+  });
+
+  it("takes the new snapshot once the host answers again", () => {
+    const next = [remote("usb:pi:B")];
+    const kept = retainOffline([remote("usb:pi:A")], [], next, [host(null)], []);
+    expect(kept.devices).toEqual(next);
   });
 });

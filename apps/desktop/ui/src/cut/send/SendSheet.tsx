@@ -28,7 +28,11 @@ type Props = {
   docMachineId: string | null;
   machines: MachineProfile[];
   status: ipc.CutStatus;
-  refreshDeviceState: () => Promise<void>;
+  devices: ipc.DeviceInfo[];
+  hosts: ipc.PairedHostView[];
+  statuses: ipc.CutterStatusView[];
+  listError: string | null;
+  refreshDevices: () => void;
   onConvertMachine: (machineId: string) => boolean | Promise<boolean>;
   /** The connected cutter, from the one store the pill and the status bar read. */
   connected: ipc.DeviceInfo | null;
@@ -59,7 +63,11 @@ export function SendSheet({
   docMachineId,
   machines,
   status,
-  refreshDeviceState,
+  devices,
+  hosts,
+  statuses,
+  listError,
+  refreshDevices,
   onConvertMachine,
   connected,
   onConnect,
@@ -86,7 +94,7 @@ export function SendSheet({
   // the first run focuses the heading as the sheet opens, ahead of the dialog's own focus.
   const stepSeen = useRef(step);
   const [weedEditing, setWeedEditing] = useState(false);
-  const device = useDeviceList({ refreshDeviceState, onError, onReconnect });
+  const device = useDeviceList({ devices, hosts, listError, refreshList: refreshDevices, onError, onReconnect });
 
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
    *  cut over them. Held rather than defaulted: with no answer there is nothing to validate a
@@ -296,6 +304,7 @@ export function SendSheet({
                 setForceHost={device.setForceHost}
                 connected={connected}
                 status={status}
+                statuses={statuses}
                 aiming={presets.aiming}
                 guardUnsaved={guardUnsaved}
                 onConnect={presets.connect}

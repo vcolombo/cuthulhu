@@ -3,7 +3,7 @@
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; seedProtocolMismatch?: boolean; demo?: { id: string } }) {
+export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; seedTwoCutters?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; seedProtocolMismatch?: boolean; demo?: { id: string } }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -490,7 +490,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
 
   // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
   // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
-  let hosts: { id: string; name: string; address: string; unreachable: string | null; protocol_side: "host" | "desktop" | null }[] = [];
+  let hosts: { id: string; name: string; address: string; unreachable: string | null; protocol_side: "host" | "desktop" | null; last_seen?: number | null }[] = [];
   const addBusyHost = () => {
     hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
                unreachable: "the host could not be reached (timed out)", protocol_side: null }];
@@ -536,8 +536,28 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
   };
   if (opts?.seedRemoteConnected || opts?.seedRemoteIdle) {
-    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null, protocol_side: null });
+    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null, protocol_side: null, last_seen: null });
     devices.push(REMOTE_CUTTER);
+  }
+
+  // Two cutters on one reachable host. Statuses live in `remoteStatus` so a cancel for one
+  // does not move the other, which is the desktop's (host, cutter) key rather than the aim.
+  const remoteStatus = new Map<string, CutStatus>();
+  const cancelTargets: { host: string | null; instanceId: string }[] = [];
+  const statusKey = (host: string | null, instance: string) => `${host ?? ""}\0${instance}`;
+  if (opts?.seedTwoCutters) {
+    hosts.push({
+      id: "host-4", name: "Garage Pi", address: "garage.local:7878",
+      unreachable: null, protocol_side: null, last_seen: Date.now() - 2 * 60 * 60 * 1000,
+    });
+    devices.push(
+      { instance_id: "usb:garage:cameo", machine_id: "cameo5", transport: { Usb: { locator: "garage" } }, candidate: false, host: "host-4" },
+      { instance_id: "usb:garage:puma", machine_id: "puma", transport: { Usb: { locator: "garage-puma" } }, candidate: false, host: "host-4" },
+    );
+    remoteStatus.set(statusKey("host-4", "usb:garage:cameo"), statusOf(
+      "Sending", { cancel: true }, { sent: { sent: 40, total: 100 }, pass: { index: 0, total: 1 } },
+    ));
+    remoteStatus.set(statusKey("host-4", "usb:garage:puma"), statusOf("Idle", { cut: true }));
   }
 
   let connected: DeviceInfo | null = opts?.seedRemoteConnected ? REMOTE_CUTTER : null;
@@ -549,6 +569,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     : DISCONNECTED;
   let deviceStateCalls = 0;
   let listDeviceCalls = 0;
+  let listReads = 0;
   let nextJobId = 1;
   let planPasses: { key: string; enabled: boolean }[] = [];
   type CutRequest = {
@@ -988,8 +1009,18 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     // the list at all) does not itself eat the window a test is trying to observe.
     list_devices: () => {
       if (opts?.failList) throw ipcError("device_error", "the device list could not be read");
+      listReads++;
       const slow = opts?.slowList && listDeviceCalls++ > 0;
-      return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
+      // A reachable host just answered. An unreachable one keeps the stamp from the last
+      // reading that worked, which is what "Last seen" is counting.
+      const publish = () => {
+        const now = Date.now();
+        for (const host of hosts) {
+          if (host.unreachable === null) host.last_seen = now;
+        }
+        return [...devices];
+      };
+      return slow ? new Promise((r) => setTimeout(() => r(publish()), 3000)) : publish();
     },
     connect_device: (a) => {
       const info = a.info as DeviceInfo;
@@ -1044,10 +1075,28 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       return null;
     },
     get_device_state: () => {
-      // Counted because the dialog's poll is only observable as a call rate: what has to be
-      // proven is that it stops, and a stopped interval leaves no other trace.
+      // Counted because a desktop with no host must not dial a status. The device-list poll
+      // is counted separately: that is the one interval, and it is not this command.
       deviceStateCalls++;
       return status;
+    },
+    // The cache `list_devices` would have stored. Explicit rows win; the aimed remote cutter
+    // otherwise follows the global status the job events already drive.
+    cutter_statuses: () => {
+      const rows: { host: string; instance_id: string; status: CutStatus }[] = [];
+      for (const [key, rowStatus] of remoteStatus) {
+        const split = key.indexOf("\0");
+        const host = key.slice(0, split);
+        if (host === "") continue;
+        rows.push({ host, instance_id: key.slice(split + 1), status: rowStatus });
+      }
+      if (connected?.host) {
+        const key = statusKey(connected.host, connected.instance_id);
+        if (!remoteStatus.has(key)) {
+          rows.push({ host: connected.host, instance_id: connected.instance_id, status });
+        }
+      }
+      return rows;
     },
     get_connected_device: () => connected,
     plan_cut: (a) => {
@@ -1177,7 +1226,24 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       // dedupe to be caught by, so it is always false here.
       return { job_id: jobId, duplicate: false };
     },
-    cancel_cut: () => {
+    cancel_cut: (a) => {
+      const targeted = typeof a.instanceId === "string"
+        ? { host: a.host == null ? null : String(a.host), instanceId: a.instanceId }
+        : null;
+      if (targeted) cancelTargets.push(targeted);
+      const matchesAim = targeted === null || (connected !== null
+        && connected.instance_id === targeted.instanceId
+        && (connected.host ?? null) === targeted.host);
+      // A cutter that is not the aim still has a status of its own. Cancelling it must not
+      // move the aimed cutter, and must not be dropped because the aim is elsewhere.
+      if (!matchesAim && targeted) {
+        const key = statusKey(targeted.host, targeted.instanceId);
+        const prev = remoteStatus.get(key);
+        if (prev) {
+          remoteStatus.set(key, statusOf("Idle", { cut: true }, { ended: "Cancelled", pass: prev.pass, sent: prev.sent }));
+        }
+        return null;
+      }
       // Mirrors driver-core::manager: cancel is unconditional and lands on the
       // Cancelled resting state — nothing is happening, so the phase is Idle, but
       // `ended` names the cancel. Cut is legal again only because this fake stands in
@@ -1273,6 +1339,8 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     },
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
+    __test_list_count: () => listReads,
+    __test_cancel_targets: () => cancelTargets,
     confirm_pass_done: () => {
       status = statusOf("Idle", { cut: true }, { ended: "Completed" });
       emit("StateChanged");
@@ -1284,6 +1352,19 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       const total = status.sent?.total ?? Number(a.total ?? 100);
       status = { ...status, sent: { sent, total } };
       emit("StateChanged");
+      return null;
+    },
+    __test_set_remote_sent: (a) => {
+      const key = statusKey(a.host == null ? null : String(a.host), String(a.instanceId));
+      const prev = remoteStatus.get(key);
+      if (!prev) return null;
+      const total = prev.sent?.total ?? Number(a.total ?? 100);
+      remoteStatus.set(key, { ...prev, sent: { sent: Number(a.sent), total } });
+      return null;
+    },
+    __test_set_last_seen: (a) => {
+      const host = hosts.find((item) => item.id === String(a.id));
+      if (host) host.last_seen = Number(a.at);
       return null;
     },
     __test_set_status: (a) => {
@@ -1442,7 +1523,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       return [PAIRED_CUTTER];
     },
     pair_host: (a) => {
-      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null, protocol_side: null };
+      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null, protocol_side: null, last_seen: null };
       hosts.push(host);
       // The cutter is only in `list_devices` once the host is paired, which is what the dialog
       // re-reads for: the Test listed it to prove the token, not to populate the device list.

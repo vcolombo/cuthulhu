@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import * as ipc from "../ipc";
 import { jobIsActive, type JobSnapshot } from "../cut/job/model";
+import { sameCutter } from "../hosts/deviceList";
 
 const UNREACHABLE = "the host could not be reached";
 
@@ -19,9 +20,13 @@ const ACCEPTED_STATUS: ipc.CutStatus = {
   jobId: 0,
 };
 
+function seen(host: ipc.PairedHostView | null): number | null {
+  return host?.last_seen ?? null;
+}
+
 function sameHost(a: ipc.PairedHostView | null, b: ipc.PairedHostView): boolean {
   return a !== null && a.id === b.id && a.name === b.name && a.address === b.address
-    && a.unreachable === b.unreachable && a.protocol_side === b.protocol_side;
+    && a.unreachable === b.unreachable && a.protocol_side === b.protocol_side && seen(a) === seen(b);
 }
 
 /**
@@ -158,6 +163,7 @@ export function useJob(onError: (message: string) => void) {
           unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
           // A returned host's null is the fact. A missing host keeps the last side.
           protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
+          last_seen: host?.last_seen ?? base?.last_seen ?? null,
         });
         return;
       }
@@ -229,25 +235,51 @@ export function useJob(onError: (message: string) => void) {
     };
   }, [ingest]);
 
-  const watching = hostId !== null && snapshot !== null && (jobIsActive(status.phase) || offlineHost !== null);
-  useEffect(() => {
-    if (!watching) return;
-    let stopped = false;
-    let inFlight = false;
-    const tick = () => {
-      if (stopped || inFlight) return;
-      inFlight = true;
-      void Promise.resolve(refreshRef.current()).finally(() => {
-        inFlight = false;
+  // `useDevices` is the only interval. This is how a job hears that poll without dialling
+  // the host a second time: a missing cache row is not a failed read, and a newer status
+  // for a host that is still unreachable is not a live one.
+  const applyPoll = useCallback((snap: { hosts: ipc.PairedHostView[]; statuses: ipc.CutterStatusView[]; stale: boolean }) => {
+    const id = hostIdRef.current;
+    const instance = instanceRef.current;
+    const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
+    if (!watching || id === null || instance === null) return;
+    const host = snap.hosts.find((item) => item.id === id) ?? null;
+    if (host !== null) knownHostRef.current = host;
+    const known = knownHostRef.current;
+    const base = host ?? (known !== null && known.id === id ? known : null);
+    const frozen = (): ipc.PairedHostView => ({
+      id,
+      name: base?.name ?? id,
+      address: base?.address ?? "",
+      unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
+      protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
+      last_seen: host?.last_seen ?? base?.last_seen ?? null,
+    });
+    const down = snap.stale || host === null || host.unreachable !== null;
+    if (down) {
+      freeze(frozen());
+      return;
+    }
+    const row = snap.statuses.find((item) => sameCutter(item, { instance_id: instance, host: id }));
+    if (!row || row.status.phase === "Disconnected") {
+      if (!row) return;
+      freeze(frozen());
+      return;
+    }
+    const next = row.status;
+    const wasQueued = cancelQueuedRef.current;
+    offlineRef.current = false;
+    setOfflineHost(null);
+    if (wasQueued) cancelQueuedRef.current = false;
+    if (wasQueued && jobIsActive(next.phase) && next.actions.cancel) {
+      const target = { host: id, instanceId: instance };
+      return ipc.cancelCut(target).catch((e) => {
+        ingest(next);
+        onErrorRef.current(ipc.ipcErrorMessage(e));
       });
-    };
-    tick();
-    const id = window.setInterval(tick, 1000);
-    return () => {
-      stopped = true;
-      window.clearInterval(id);
-    };
-  }, [watching, hostId]);
+    }
+    ingest(next);
+  }, [freeze, ingest]);
 
   useEffect(() => {
     if (offlineHost === null) return;
@@ -287,14 +319,20 @@ export function useJob(onError: (message: string) => void) {
 
   const dismiss = useCallback(() => setDismissed(true), []);
 
+  const targetOf = (): ipc.CutterTarget | undefined => {
+    const instance = instanceRef.current;
+    if (instance === null) return undefined;
+    return { host: hostIdRef.current, instanceId: instance };
+  };
+
   const resume = useCallback(() => {
     if (offlineRef.current) return;
-    ipc.resumeCut().then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
+    ipc.resumeCut(targetOf()).then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
   }, []);
 
   const confirmPassDone = useCallback(() => {
     if (offlineRef.current) return;
-    ipc.confirmPassDone().then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
+    ipc.confirmPassDone(targetOf()).then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
   }, []);
 
   const cancel = useCallback(() => {
@@ -302,7 +340,7 @@ export function useJob(onError: (message: string) => void) {
       cancelQueuedRef.current = true;
       return;
     }
-    ipc.cancelCut().then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
+    ipc.cancelCut(targetOf()).then(() => refreshRef.current()).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
   }, []);
 
   const offlineSeconds = offlineHost === null ? 0 : Math.max(0, Math.floor((now - lastStatusAt) / 1000));
@@ -320,5 +358,6 @@ export function useJob(onError: (message: string) => void) {
     cancel,
     confirmPassDone,
     attach,
+    applyPoll,
   };
 }

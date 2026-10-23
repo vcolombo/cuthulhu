@@ -134,7 +134,7 @@ export function DevicesTab({
       ) : null}
 
       {empty ? (
-        <p className="m-0 text-sm text-foreground" data-testid="devices-body">No cutters yet</p>
+        <p className="m-0 text-sm text-foreground" data-testid="devices-body">No cutters yet.</p>
       ) : null}
 
       {local.length > 0 ? (

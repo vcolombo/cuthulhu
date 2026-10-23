@@ -106,6 +106,21 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
     IpcError::new(code, e.to_string())
 }
 
+/// Whether this failure left the socket unsafe to reuse.
+///
+/// A transport break, a reply this request cannot use, and an `Accepted` naming some other
+/// dispatch can all leave a frame on the connection that the next verb would read as its own
+/// answer. `on_host`'s callers drop the client on these and redial. A refusal does not: the host
+/// answered about this request, and the framing survived it.
+fn connection_died(e: &cut_host::client::ClientError) -> bool {
+    matches!(
+        e,
+        cut_host::client::ClientError::Transport(_)
+            | cut_host::client::ClientError::WrongReply { .. }
+            | cut_host::client::ClientError::WrongDispatch
+    )
+}
+
 /// What an operator is told when a dispatch failed with something of this Job still outstanding.
 ///
 /// Not a promise that pressing Cut again cannot cut twice, which is what this said until #286.
@@ -163,14 +178,18 @@ fn still_reusable(written: std::time::Instant, now: std::time::Instant) -> bool 
 /// answer to a prompt is not a spinner: past it the send may land, which the prompt already says.
 const CLOSE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// What one press did with the host's connection once it had it.
+/// What one press did once it held the host's connection.
 ///
-/// `NotSent` is not a failure of the host or the network: a close was committed before this press
-/// reached the host — whether it was queued behind a poll or began afterwards — and a Job started
-/// now would keep cutting with nothing left to watch it (#158).
-enum Dispatched {
-    Admitted(cut_host::protocol::Admitted),
+/// One value, because the alternative was a flag for "the closure ran" and another for "the answer
+/// settled", read back beside the bool that said whether this call wrote the in-doubt entry. Those
+/// three could be edited apart, and the empty arm that used to sit between the send and this match
+/// was the result. `NotSent` is not a failure of the host or the network: a close was committed
+/// before this press reached the host, and a Job started now would keep cutting with nothing left
+/// to watch it (#158). `Failed` is the operator-facing error, already plain or unconfirmed.
+enum Sent {
+    Admitted { duplicate: bool },
     NotSent,
+    Failed(IpcError),
 }
 
 /// What a Cut Host's snapshot says about one cutter, in the four states this desktop treats
@@ -1173,6 +1192,49 @@ impl DeviceManagerHandle {
         connect_timeout: std::time::Duration,
         f: impl FnOnce(&HostClient) -> Result<T, cut_host::client::ClientError>,
     ) -> Result<T, IpcError> {
+        self.on_host(id, connect_timeout, |host| {
+            let out = f(host.client.as_ref().expect("on_host calls only once connected"));
+            if let Err(e) = &out {
+                if connection_died(e) {
+                    // A connection that broke mid-call stays broken, and `ensure` only redials
+                    // when there is no client at all — so leaving this one in place fails every
+                    // later verb on this host against the same dead socket. `list_devices` has
+                    // always dropped it here; the call that most needs the same is the retry
+                    // after a lost reply, which is by definition made on a connection that just
+                    // failed (see `send_this_press`).
+                    //
+                    // `WrongReply` is dropped with it, and not only because it was a `Transport`
+                    // until #283. The framing survives a wrong reply — one request written, frames
+                    // read until the reply — but nothing correlates a reply with its request, so a
+                    // peer that answered outside the protocol once may also have volunteered a
+                    // second `Response` this call has not read, and the next verb on this socket
+                    // would take that one for its own answer. Redialling costs a handshake; reading
+                    // a stale reply as the answer to a cut verb does not stop at costing that.
+                    //
+                    // `WrongDispatch` joins them from the other end: it is that hypothesis
+                    // observed rather than feared. An `Accepted` naming a dispatch this call did
+                    // not send is a frame that belongs to somebody else's request, so whatever is
+                    // still on this socket is not this client's to read either (#285).
+                    host.last_error = Some(host_error(e));
+                    host.client = None;
+                }
+            }
+            out.map_err(|e| host_error(&e))
+        })
+    }
+
+    /// Run `f` with `id`'s connection held, once it is connected. `Err` means `f` was not called.
+    ///
+    /// That is the whole of "never reached": an unknown host, one mid-forget, one already
+    /// forgotten, or one that did not connect. A failure *inside* `f` is `f`'s own `Ok` or `Err`
+    /// and is not this one — `send_this_press` relies on the difference, which a flag set inside
+    /// the closure used to stand in for.
+    fn on_host<T>(
+        &self,
+        id: &HostId,
+        connect_timeout: std::time::Duration,
+        f: impl FnOnce(&mut HostConnection) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
         let conn = self.host_conn(id)?;
         let mut guard = conn.lock().unwrap();
         let host = &mut *guard;
@@ -1194,46 +1256,14 @@ impl DeviceManagerHandle {
             }
         }
         // Not `let client = host.ensure_within(...).ok_or_else(...)?;` — that binding would keep
-        // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. Matching
-        // in place lets the borrow end with the arm that doesn't need it.
-        match host.ensure_within(connect_timeout) {
-            Some(client) => {
-                let out = f(client);
-                if let Err(
-                    e @ (cut_host::client::ClientError::Transport(_)
-                    | cut_host::client::ClientError::WrongReply { .. }
-                    | cut_host::client::ClientError::WrongDispatch),
-                ) = &out
-                {
-                    // A connection that broke mid-call stays broken, and `ensure` only redials
-                    // when there is no client at all — so leaving this one in place fails every
-                    // later verb on this host against the same dead socket. `list_devices` has
-                    // always dropped it here; the call that most needs the same is the retry
-                    // after a lost reply, which is by definition made on a connection that just
-                    // failed (see `execute_cut`).
-                    //
-                    // `WrongReply` is dropped with it, and not only because it was a `Transport`
-                    // until #283. The framing survives a wrong reply — one request written, frames
-                    // read until the reply — but nothing correlates a reply with its request, so a
-                    // peer that answered outside the protocol once may also have volunteered a
-                    // second `Response` this call has not read, and the next verb on this socket
-                    // would take that one for its own answer. Redialling costs a handshake; reading
-                    // a stale reply as the answer to a cut verb does not stop at costing that.
-                    //
-                    // `WrongDispatch` joins them from the other end: it is that hypothesis
-                    // observed rather than feared. An `Accepted` naming a dispatch this call did
-                    // not send is a frame that belongs to somebody else's request, so whatever is
-                    // still on this socket is not this client's to read either (#285).
-                    host.last_error = Some(host_error(e));
-                    host.client = None;
-                }
-                out.map_err(|e| host_error(&e))
-            }
-            None => Err(host
-                .last_error
-                .clone()
-                .unwrap_or_else(|| IpcError::new("host_unreachable", "this Cut Host has not answered"))),
+        // `host`'s mutable borrow alive through the `None` arm's `host.last_error` read. The
+        // temporary ends at the semicolon, and `f` then borrows `host` on its own.
+        if host.ensure_within(connect_timeout).is_none() {
+            return Err(host.last_error.clone().unwrap_or_else(|| {
+                IpcError::new("host_unreachable", "this Cut Host has not answered")
+            }));
         }
+        f(host)
     }
 
     /// Whether the local `DeviceManager` currently has a cut in flight, asked directly rather
@@ -1715,87 +1745,12 @@ impl DeviceManagerHandle {
                 // between loses `in_doubt` and is back to cutting twice — persisting it is the fix
                 // if that stops being rare.
                 //
-                // Chosen and written down in one step, before any network call. Choosing and
-                // recording separately let two presses of Cut both find nothing and mint an id
-                // each: if the first reached the host and lost its reply, the second's entry
+                // Chosen and written down in one step, before any network call, inside `send_this_press`.
+                // Choosing and recording separately let two presses of Cut both find nothing and mint
+                // an id each: if the first reached the host and lost its reply, the second's entry
                 // replaced the only record of it, and the retry that should have been recognised
                 // went out under a name the host had never seen.
-                // `first_attempt` is information, not ownership, and it is narrower than it looks:
-                // `true` says only that no entry existed for this Job before this call. So `false`
-                // means an entry stood already — usually an earlier dispatch nothing settled, and
-                // sometimes an earlier press that never reached a host. What it changes is what a
-                // failure here means. It is deliberately not used to decide whether to undo the
-                // reservation.
-                //
-                // Ownership is `attempt`: the press is counted as dispatching and the id chosen in
-                // one call, so no sibling's settling answer can land between the two and clear the
-                // entry this press is about to dispatch under (#290).
-                let (attempt, dispatch_id, first_attempt) = self.begin_dispatch(&key);
-                // Marked immediately before the request, *under the HostConnection lock*. A poll
-                // that already owns that lock therefore runs before the mark exists; a poll that
-                // sees the mark runs after the dispatch has released the lock.
-
-                let reached_the_host = std::sync::atomic::AtomicBool::new(false);
-                let answer_settled = std::sync::atomic::AtomicBool::new(false);
-                let sent = self.with_host(&id, |c| {
-                    reached_the_host.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // Held across the check and the send, and taken inside the connection so it never
-                    // spans the queue wait: a close cannot commit while a permit is out, and a
-                    // press that asks after one committed is told no and starts nothing.
-                    let Some(_permit) = self.close_gate.permit() else {
-                        return Ok(Dispatched::NotSent);
-                    };
-                    self.mark_dispatched(&id, &device, attempt.attempt);
-                    let sent = c.dispatch(&dispatch_id, &device, &machine_id, passes);
-                    // Cleared by an answer that settles what the host did — a refusal included,
-                    // since a host that refused says it started nothing. A reply this request
-                    // cannot use settles nothing: it arrived, so nothing was lost, but it does not
-                    // say whether the Job began, so the entry stays.
-                    //
-                    // Keeping it is the only thing that leaves host-side deduplication a chance: a
-                    // fresh id matches nothing the host has seen, so nothing there can read the
-                    // next press as this dispatch again. The same id may still be read as a new
-                    // Job — a host forgets ids past `ID_RETENTION` and past `MAX_REMEMBERED_IDS`,
-                    // and a peer answering outside the protocol may dedupe nothing at all — which
-                    // is why the refusal below is `unconfirmed` rather than an all-clear. Clearing
-                    // the entry would remove the chance rather than improve on it.
-                    //
-                    // A reply about another dispatch stays for the same reason and with less
-                    // known, not more: a wrong variant at least came from a peer answering this
-                    // request badly, while an `Accepted` naming another Job says nothing about
-                    // this one at all (#285).
-                    let settled = !matches!(
-                        sent,
-                        Err(cut_host::client::ClientError::Transport(_)
-                            | cut_host::client::ClientError::WrongReply { .. }
-                            | cut_host::client::ClientError::WrongDispatch)
-                    );
-                    if settled {
-                        self.settle_dispatch(&key, &dispatch_id, attempt.attempt);
-                    }
-                    // The same fact decides what the operator is told below, which is why it is
-                    // carried out rather than re-derived there: an answer that settled what the
-                    // host did is the whole of what happened to this attempt (#288).
-                    answer_settled.store(settled, std::sync::atomic::Ordering::SeqCst);
-                    // A refusal is the host saying it started nothing, so it is not something the
-                    // close guard should hold the window for — this press's mark, and no other.
-                    // A sibling press of the same Job may have been accepted and be cutting right
-                    // now, and this answer is not about that one (#290).
-                    if matches!(sent, Err(cut_host::client::ClientError::Refused(_))) {
-                        self.unmark_dispatched(&id, &device, attempt.attempt);
-                    }
-                    sent.map(Dispatched::Admitted)
-                });
-
-                if !reached_the_host.load(std::sync::atomic::Ordering::SeqCst) {
-                    // The mark is written inside the closure, so nothing reached means there is
-                    // nothing to retract. The reservation stays by choice: a host that was never
-                    // reached cannot have seen the id either, so the next Cut sends that first-seen
-                    // id and is cut normally. Retaining it is harmless; it is not the visible
-                    // duplicate case of a reply that may have been lost.
-                }
-
-                match sent {
+                match self.send_this_press(&id, &device, &machine_id, &key, passes) {
                     // ponytail: a remote dispatch reports job id 0, because `Response::Accepted` carries none —
                     // `DeviceManager::cut` does not return one until the Job reaches a pause point. The sheet
                     // reads 0 as an accept that named no id (`useJob.ts`'s `remember`) and takes the real id
@@ -1806,38 +1761,145 @@ impl DeviceManagerHandle {
                     // knows whether it had already accepted this id, and "already accepted" and
                     // "your Job has started" look identical to the operator otherwise — one of
                     // them means the cutter is never going to move (#121).
-                    Ok(Dispatched::Admitted(admitted)) => Ok(CutStarted {
-                        job_id: 0,
-                        duplicate: admitted == cut_host::protocol::Admitted::AlreadyAccepted,
-                    }),
+                    Ok(Sent::Admitted { duplicate }) => Ok(CutStarted { job_id: 0, duplicate }),
                     // A close was committed before this press reached the host. Nothing was sent
                     // and nothing was marked, which is the point: a Job started now would outlive
                     // the process the operator has just left.
-                    Ok(Dispatched::NotSent) => Err(IpcError::new("closing", CLOSED_MID_PRESS)),
-                    // Whether this call left anything of this Job outstanding. An answer that said
-                    // what the host did settles it, and a call that never reached a host settles it
-                    // too — there was nothing there to have started anything.
-                    //
-                    // Nothing outstanding at all, and the failure is the whole of what happened, so
-                    // it stays the plain error it is. Both halves matter, and a refusal is why the
-                    // second one is not enough on its own: it settles this attempt while saying
-                    // nothing about an earlier one, so it is plain only when there was no earlier
-                    // one (#288). A first press against an offline Pi must not claim the Job may be
-                    // cutting; a press made while an earlier dispatch is unsettled must.
-                    Err(e)
-                        if first_attempt
-                            && (!reached_the_host.load(std::sync::atomic::Ordering::SeqCst)
-                                || answer_settled.load(std::sync::atomic::Ordering::SeqCst)) =>
-                    {
-                        Err(e)
-                    }
-                    // What the next press can do about it is a fact about this desktop's own
-                    // record, so it is asked of the record rather than inferred from the failure —
-                    // and asked as the *next press* will answer it, since an entry this one is
-                    // reusing can age out of reuse while the call it is on is still in flight.
-                    Err(e) => Err(unconfirmed(&e, self.retry_would_reuse(&key, std::time::Instant::now()))),
+                    Ok(Sent::NotSent) => Err(IpcError::new("closing", CLOSED_MID_PRESS)),
+                    // The host was asked, and the error is already plain or unconfirmed.
+                    Ok(Sent::Failed(error)) => Err(error),
+                    // `on_host` returned before calling the closure: nothing was marked, and the
+                    // reservation stays. The error is already plain or unconfirmed.
+                    Err(error) => Err(error),
                 }
             }
+        }
+    }
+
+    /// Send one press to `id` and return the one outcome of that press.
+    ///
+    /// `Err` is `on_host` not calling the closure — the host was never asked. Every other outcome
+    /// is `Ok`, including a dispatch the host refused, so a failure inside the closure cannot be
+    /// mistaken for one that never left this machine. The reservation is not retracted on either
+    /// failure: a host that was never reached cannot have seen the id, and a reply that may have
+    /// been lost is exactly the id the next press must reuse.
+    fn send_this_press(
+        &self,
+        id: &HostId,
+        device: &str,
+        machine_id: &str,
+        key: &JobKey,
+        passes: Vec<CutPass>,
+    ) -> Result<Sent, IpcError> {
+        // `recorded_the_entry` says only that no entry existed for this Job before this call. It
+        // decides what a failure means, and nothing else: it is not used to undo the reservation.
+        // It stays in this function. The press's outcome leaves as `Sent` or as this `Err`.
+        let (attempt, dispatch_id, recorded_the_entry) = self.begin_dispatch(key);
+        let attempt_id = attempt.attempt;
+        // What the closure did, before the operator-facing wording. The wording asks `in_doubt`
+        // and is applied after this returns, so it does not run under the connection lock.
+        enum Asked {
+            Admitted { duplicate: bool },
+            NotSent,
+            Failed { error: IpcError, settled: bool },
+        }
+        let asked = match self.on_host(id, cut_host::client::CONNECT_TIMEOUT, |host| {
+            // Held across the check and the send, and taken inside the connection so it never
+            // spans the queue wait: a close cannot commit while a permit is out, and a press that
+            // asks after one committed is told no and starts nothing.
+            let Some(_permit) = self.close_gate.permit() else {
+                return Ok(Asked::NotSent);
+            };
+            // Marked immediately before the request, under the HostConnection lock. A poll that
+            // already owns that lock therefore runs before the mark exists; a poll that sees the
+            // mark runs after the dispatch has released the lock.
+            self.mark_dispatched(id, device, attempt_id);
+            let sent = {
+                let client = host.client.as_ref().expect("on_host calls only once connected");
+                client.dispatch(&dispatch_id, device, machine_id, passes)
+            };
+            // Cleared by an answer that settles what the host did — a refusal included, since a
+            // host that refused says it started nothing. A reply this request cannot use settles
+            // nothing: it arrived, so nothing was lost, but it does not say whether the Job began,
+            // so the entry stays.
+            //
+            // Keeping it is the only thing that leaves host-side deduplication a chance: a fresh
+            // id matches nothing the host has seen, so nothing there can read the next press as
+            // this dispatch again. The same id may still be read as a new Job — a host forgets ids
+            // past `ID_RETENTION` and past `MAX_REMEMBERED_IDS`, and a peer answering outside the
+            // protocol may dedupe nothing at all — which is why that failure is `unconfirmed`
+            // rather than an all-clear. Clearing the entry would remove the chance rather than
+            // improve on it.
+            //
+            // A reply about another dispatch stays for the same reason and with less known, not
+            // more: a wrong variant at least came from a peer answering this request badly, while
+            // an `Accepted` naming another Job says nothing about this one at all (#285).
+            let settled = !matches!(&sent, Err(e) if connection_died(e));
+            if settled {
+                self.settle_dispatch(key, &dispatch_id, attempt_id);
+            }
+            // A refusal is the host saying it started nothing, so it is not something the close
+            // guard should hold the window for — this press's mark, and no other. A sibling press
+            // of the same Job may have been accepted and be cutting right now, and this answer is
+            // not about that one (#290).
+            if matches!(sent, Err(cut_host::client::ClientError::Refused(_))) {
+                self.unmark_dispatched(id, device, attempt_id);
+            }
+            if let Err(ref e) = sent {
+                if connection_died(e) {
+                    // Same drop `with_host_within` makes. This closure returns `Ok`, so that path's
+                    // match on `Err` would leave the dead socket in place for the retry.
+                    host.last_error = Some(host_error(e));
+                    host.client = None;
+                }
+            }
+            Ok(match sent {
+                Ok(admitted) => Asked::Admitted {
+                    duplicate: admitted == cut_host::protocol::Admitted::AlreadyAccepted,
+                },
+                Err(e) => Asked::Failed { error: host_error(&e), settled },
+            })
+        }) {
+            Ok(asked) => asked,
+            // The closure was not called, so no mark was written. Nothing on the host can have
+            // started, which is the `settled` this report treats as "this press is the whole story"
+            // when it also recorded the entry.
+            Err(missed) => {
+                return Err(self.report_press_failure(key, recorded_the_entry, true, missed));
+            }
+        };
+        Ok(match asked {
+            Asked::Admitted { duplicate } => Sent::Admitted { duplicate },
+            Asked::NotSent => Sent::NotSent,
+            Asked::Failed { error, settled } => {
+                Sent::Failed(self.report_press_failure(key, recorded_the_entry, settled, error))
+            }
+        })
+    }
+
+    /// Plain error when this press is the whole of what happened; unconfirmed when it is not.
+    ///
+    /// `recorded_the_entry` is "no entry stood before this call". `settled` is "this attempt's
+    /// outcome is known" — a refusal, an accept, or a call that never reached a host. Both are
+    /// required, and a refusal is why the second is not enough on its own: it settles this attempt
+    /// while saying nothing about an earlier one, so it is plain only when there was no earlier one
+    /// (#288). A first press against an offline Pi must not claim the Job may be cutting; a press
+    /// made while an earlier dispatch is unsettled must.
+    ///
+    /// What the next press can do about an unconfirmed one is asked of the record, as the *next*
+    /// press will answer it: an entry this call is reusing can age out of reuse while the call is
+    /// still in flight.
+    fn report_press_failure(
+        &self,
+        key: &JobKey,
+        recorded_the_entry: bool,
+        settled: bool,
+        failure: IpcError,
+    ) -> IpcError {
+        if recorded_the_entry && settled {
+            failure
+        } else {
+            unconfirmed(&failure, self.retry_would_reuse(key, std::time::Instant::now()))
         }
     }
 

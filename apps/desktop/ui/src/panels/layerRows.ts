@@ -276,17 +276,50 @@ export function layerModel(
     };
   });
 
-  const trailing: LayerNodeRow[] = [];
-  const walkTrailing = (id: number) => {
+  // A container with no shapes is never an ancestor of a row, so the block loop skips it.
+  // One whose parent was already shown belongs in that parent's first block, in document
+  // order. Sending every such container to the trailing list pulled a nested empty group
+  // out from under its parent and parked it after the last colour.
+  const order = new Map<number, number>();
+  let next = 0;
+  const indexTree = (id: number) => {
+    order.set(id, next);
+    next += 1;
     const node = doc.nodes[String(id)];
-    if (!node) return;
-    if (id !== doc.root && !isShape(node) && !emitted.has(id)) {
-      emitted.add(id);
-      trailing.push(rowFor(id));
-    }
-    if (!isShape(node)) for (const child of node.children) walkTrailing(child);
+    if (node && !isShape(node)) for (const child of node.children) indexTree(child);
   };
-  walkTrailing(doc.root);
+  indexTree(doc.root);
+  const shaped = new Set(emitted);
+  const hostOf = (id: number): LayerBlock | null => {
+    let cur = parents.get(id);
+    while (cur !== undefined && cur !== doc.root) {
+      if (shaped.has(cur)) {
+        return blocks.find((block) => block.rows.some((row) => row.id === cur && !row.repeated)) ?? null;
+      }
+      cur = parents.get(cur);
+    }
+    return null;
+  };
+  const trailing: LayerNodeRow[] = [];
+  const placeEmpty = (id: number) => {
+    const node = doc.nodes[String(id)];
+    if (!node || isShape(node)) return;
+    if (id !== doc.root && !emitted.has(id)) {
+      const row = rowFor(id);
+      const host = hostOf(id);
+      if (host) {
+        const at = (order.get(id) ?? 0);
+        const index = host.rows.findIndex((existing) => !existing.repeated && (order.get(existing.id) ?? 0) > at);
+        if (index === -1) host.rows.push(row);
+        else host.rows.splice(index, 0, row);
+      } else {
+        trailing.push(row);
+      }
+      emitted.add(id);
+    }
+    for (const child of node.children) placeEmpty(child);
+  };
+  placeEmpty(doc.root);
 
   return { blocks, trailing };
 }

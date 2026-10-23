@@ -153,6 +153,40 @@ describe("layer row order", () => {
     expect(rowIds(snapshot, "Color")).toEqual([2, 3, 4, 5, 6, 7]);
   });
 
+  test("an empty group nested under a group stays in that group's block", () => {
+    const root = container(1, "Layer", [2]);
+    const group = container(2, "Group", [3, 8]);
+    const empty = container(8, "Group", []);
+    const snapshot = doc([
+      root,
+      group,
+      shape(3, { stroke: RED, fill: null }),
+      empty,
+    ]);
+    const model = layerModel(snapshot, "Color", effectiveMaterials(snapshot.nodes, snapshot.root));
+    expect(model.blocks.map((block) => block.rows.map((row) => row.id))).toEqual([[2, 3, 8]]);
+    expect(model.trailing).toEqual([]);
+  });
+
+  test("an empty group between two colours of its parent stays with the earlier block", () => {
+    const root = container(1, "Layer", [2]);
+    const group = container(2, "Group", [3, 8, 4]);
+    const empty = container(8, "Group", []);
+    const snapshot = doc([
+      root,
+      group,
+      shape(3, { stroke: RED, fill: null }),
+      empty,
+      shape(4, { stroke: GREEN, fill: null }),
+    ]);
+    const model = layerModel(snapshot, "Color", effectiveMaterials(snapshot.nodes, snapshot.root));
+    expect(model.blocks.map((block) => block.rows.map((row) => [row.id, row.repeated]))).toEqual([
+      [[2, false], [3, false], [8, false]],
+      [[2, true], [4, false]],
+    ]);
+    expect(model.trailing).toEqual([]);
+  });
+
   test("a group whose shapes span colours is repeated, dimmed, under the later block", () => {
     const root = container(1, "Layer", [2]);
     const group = container(2, "Group", [3, 4]);

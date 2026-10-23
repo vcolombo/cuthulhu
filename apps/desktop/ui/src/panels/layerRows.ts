@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import type { DocNode, DocSnapshot, NodeKindJson, StyleJson } from "../App";
+import type { DocNode, DocSnapshot, NodeKindJson } from "../App";
 import type { Grouping } from "../ipc";
-import { passRowLabel, type PresetLookup } from "../cut/viewmodel";
+import { passKeyFor, passRowLabel, type PresetLookup } from "../cut/viewmodel";
 
 /** What a row's icon is. Containers stay "Group" / "Layer" so the existing panel queries still match. */
 export type LayerIcon = "rectangle" | "ellipse" | "text" | "path" | "group" | "layer";
@@ -20,9 +20,7 @@ export type LayerBlock = {
   swatch: string | null;
   /** Cut shapes, document order. This is the planner's pass. */
   cutIds: number[];
-  /** NoCut shapes of the same key, so the row can be turned back on. */
-  heldIds: number[];
-  /** Every shape in the block, document order. */
+  /** Every shape in the block, document order. NoCut shapes stay so the row can be turned back on. */
   shapeIds: number[];
   /** "Cut" when every shape cuts, "NoCut" when none does. */
   cut: "Cut" | "NoCut" | "mixed";
@@ -39,24 +37,6 @@ const EMPTY_LOOKUP: PresetLookup = { presets: [], loaded: false };
 
 function isShape(node: DocNode): boolean {
   return typeof node.kind === "object" && node.kind !== null && "Shape" in node.kind;
-}
-
-/** Alpha 0 is absent, the same rule `cutplan::passes::color_key` uses. */
-function visibleChannel(color: number | null): number | null {
-  if (color === null) return null;
-  if ((color & 0xff) === 0) return null;
-  return color >>> 0;
-}
-
-/** The pass key a shape would take under `grouping`. Mirrors `plan_passes_with`. */
-export function shapePassKey(grouping: Grouping, style: StyleJson, material: string | null): string {
-  if (grouping === "Single") return "all";
-  if (grouping === "Preset") return material === null ? "no-preset" : `preset:${material}`;
-  const stroke = visibleChannel(style.stroke);
-  const fill = visibleChannel(style.fill);
-  const color = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
-  if (color === null) return "no-color";
-  return `color:${color.toString(16).padStart(8, "0")}`;
 }
 
 export function kindLabel(kind: NodeKindJson): "Rectangle" | "Ellipse" | "Text" | "Path" | "Group" | "Layer" {
@@ -133,46 +113,84 @@ function ancestorChain(parents: Map<number, number>, id: number, root: number): 
 
 type Tagged = { id: number; cut: boolean; key: string };
 
-/**
- * Colour blocks in first-seen pass order, plus containers the planner never emits.
- * Cut ids inside a block are `plan_passes_with` for that key: a NoCut shape is held on the
- * block so the toggle can turn the row back on, and it is not part of the pass.
- */
-export function layerModel(doc: DocSnapshot, grouping: Grouping, lookup: PresetLookup = EMPTY_LOOKUP): LayerModel {
-  const names = defaultNames(doc);
-  const parents = parentOf(doc);
+/** Shapes in document preorder. Material comes from `effectiveMaterials`; this walk only places them. */
+function taggedShapes(
+  doc: DocSnapshot,
+  grouping: Grouping,
+  materials: Readonly<Record<number, string | null>>,
+): Tagged[] {
   const seen = new Set<number>();
   const tagged: Tagged[] = [];
-
-  const walk = (id: number, inherited: string | null) => {
+  const walk = (id: number) => {
     if (seen.has(id)) return;
     seen.add(id);
     const node = doc.nodes[String(id)];
     if (!node) return;
-    const assignment = node.material_preset;
-    const material = assignment.state === "preset" ? assignment.id
-      : assignment.state === "unassigned" ? null
-      : inherited;
     if (isShape(node)) {
       tagged.push({
         id,
         cut: node.cut_line_type !== "NoCut",
-        key: shapePassKey(grouping, node.style, material),
+        key: passKeyFor(grouping, node.style, materials[id] ?? null),
       });
     }
-    for (const child of node.children) walk(child, material);
+    for (const child of node.children) walk(child);
   };
-  walk(doc.root, null);
+  walk(doc.root);
+  return tagged;
+}
 
+function groupInOrder(shapes: Tagged[]): { order: string[]; byKey: Map<string, Tagged[]> } {
   const order: string[] = [];
   const byKey = new Map<string, Tagged[]>();
-  for (const shape of tagged) {
+  for (const shape of shapes) {
     const list = byKey.get(shape.key);
     if (list) list.push(shape);
     else {
       order.push(shape.key);
       byKey.set(shape.key, [shape]);
     }
+  }
+  return { order, byKey };
+}
+
+/** The planner's passes: cut shapes only, first-seen key order. NoCut-only keys are not passes. */
+export function layerPasses(
+  doc: DocSnapshot,
+  grouping: Grouping,
+  materials: Readonly<Record<number, string | null>>,
+): { key: string; shapeIds: number[] }[] {
+  const { order, byKey } = groupInOrder(taggedShapes(doc, grouping, materials).filter((shape) => shape.cut));
+  return order.map((key) => ({ key, shapeIds: (byKey.get(key) ?? []).map((shape) => shape.id) }));
+}
+
+/**
+ * Colour blocks in the planner's pass order, plus a NoCut-only key where that colour first
+ * appears, plus containers the planner never emits. NoCut shapes of a key that does cut stay
+ * on that block so the toggle can turn the row back on.
+ */
+export function layerModel(
+  doc: DocSnapshot,
+  grouping: Grouping,
+  materials: Readonly<Record<number, string | null>>,
+  lookup: PresetLookup = EMPTY_LOOKUP,
+): LayerModel {
+  const names = defaultNames(doc);
+  const parents = parentOf(doc);
+  const tagged = taggedShapes(doc, grouping, materials);
+  const all = groupInOrder(tagged);
+  const cuts = groupInOrder(tagged.filter((shape) => shape.cut));
+  const firstAt = new Map<string, number>();
+  const firstCutAt = new Map<string, number>();
+  tagged.forEach((shape, index) => {
+    if (!firstAt.has(shape.key)) firstAt.set(shape.key, index);
+    if (shape.cut && !firstCutAt.has(shape.key)) firstCutAt.set(shape.key, index);
+  });
+  const keys = [...cuts.order];
+  for (const key of all.order) {
+    if (cuts.byKey.has(key)) continue;
+    const at = firstAt.get(key) ?? 0;
+    const insert = keys.findIndex((cutKey) => (firstCutAt.get(cutKey) ?? 0) > at);
+    keys.splice(insert === -1 ? keys.length : insert, 0, key);
   }
 
   const emitted = new Set<number>();
@@ -186,8 +204,8 @@ export function layerModel(doc: DocSnapshot, grouping: Grouping, lookup: PresetL
     };
   };
 
-  const blocks: LayerBlock[] = order.map((key) => {
-    const shapes = byKey.get(key) ?? [];
+  const blocks: LayerBlock[] = keys.map((key) => {
+    const shapes = all.byKey.get(key) ?? [];
     const label = passRowLabel(key, lookup, grouping);
     const rows: LayerNodeRow[] = [];
     for (const shape of shapes) {
@@ -202,14 +220,12 @@ export function layerModel(doc: DocSnapshot, grouping: Grouping, lookup: PresetL
       }
     }
     const cutIds = shapes.filter((shape) => shape.cut).map((shape) => shape.id);
-    const heldIds = shapes.filter((shape) => !shape.cut).map((shape) => shape.id);
-    const cut = cutIds.length === 0 ? "NoCut" : heldIds.length === 0 ? "Cut" : "mixed";
+    const cut = cutIds.length === 0 ? "NoCut" : cutIds.length === shapes.length ? "Cut" : "mixed";
     return {
       key,
       name: label.text ?? key,
       swatch: label.swatch,
       cutIds,
-      heldIds,
       shapeIds: shapes.map((shape) => shape.id),
       cut,
       rows,
@@ -231,31 +247,19 @@ export function layerModel(doc: DocSnapshot, grouping: Grouping, lookup: PresetL
   return { blocks, trailing };
 }
 
-/** The planner's passes: cut shapes only, first-seen key order. NoCut-only blocks are not passes. */
-export function layerPasses(doc: DocSnapshot, grouping: Grouping): { key: string; shapeIds: number[] }[] {
-  return layerModel(doc, grouping).blocks
-    .filter((block) => block.cutIds.length > 0)
-    .map((block) => ({ key: block.key, shapeIds: block.cutIds }));
-}
-
 /** Every `layer-row` id, in the order the panel lists them. */
-export function layerRowIds(doc: DocSnapshot, grouping: Grouping): number[] {
-  const model = layerModel(doc, grouping);
+export function layerRowIds(
+  doc: DocSnapshot,
+  grouping: Grouping,
+  materials: Readonly<Record<number, string | null>>,
+): number[] {
+  const model = layerModel(doc, grouping, materials);
   return [...model.blocks.flatMap((block) => block.rows.map((row) => row.id)), ...model.trailing.map((row) => row.id)];
 }
 
-/**
- * `reorder`'s `newIndex` is the target sibling's current index. Remove-then-insert at that index
- * matches a splice: moving down lands after the target, moving up takes its place.
- * Null when the drop would not move the node.
- */
-export function reorderNewIndex(from: number, to: number): number | null {
-  if (!Number.isInteger(from) || !Number.isInteger(to)) return null;
-  if (from === to || from < 0 || to < 0) return null;
-  return to;
-}
-
-/** Where a drop of `dragId` onto `targetId` lands, or null when they are not siblings or nothing moves. */
+/** Where a drop of `dragId` onto `targetId` lands. `newIndex` is the target sibling's current
+ *  index, which is what `reorder` removes-then-inserts at (`reorderTo` is that splice).
+ *  Null when they are not siblings or nothing moves. */
 export function reorderTarget(
   doc: DocSnapshot,
   dragId: number,
@@ -267,17 +271,8 @@ export function reorderTarget(
   if (parent === undefined || parent !== parents.get(targetId)) return null;
   const siblings = doc.nodes[String(parent)]?.children;
   if (!siblings) return null;
-  const next = reorderNewIndex(siblings.indexOf(dragId), siblings.indexOf(targetId));
-  if (next === null) return null;
-  return { id: dragId, newIndex: next };
-}
-
-/** What `reorder` does to a sibling list. Used to pin the index rule. */
-export function applySiblingReorder<T>(items: T[], from: number, to: number): T[] | null {
-  const index = reorderNewIndex(from, to);
-  if (index === null || from >= items.length || to >= items.length) return null;
-  const next = items.slice();
-  const [item] = next.splice(from, 1);
-  next.splice(index, 0, item);
-  return next;
+  const from = siblings.indexOf(dragId);
+  const to = siblings.indexOf(targetId);
+  if (from < 0 || to < 0 || from === to) return null;
+  return { id: dragId, newIndex: to };
 }

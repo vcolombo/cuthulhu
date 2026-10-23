@@ -43,6 +43,8 @@ type Props = {
   faintVinyl?: boolean;
   /** Shown when nothing is selected. Null until a document is loaded. */
   documentInfo: { matLabel: string; passCount: number; objectCount: number } | null;
+  /** App knows the selection. Bounds being null is also a multi-select and a group. */
+  nothingSelected: boolean;
 };
 
 /** What the material row reads for each state. Exported for its own test: it is the consumer
@@ -63,15 +65,6 @@ export function materialLabel(
            : effective.id === null ? "Inherited — No preset"
            : `Inherited — ${name(effective.id)}`;
   }
-}
-
-/** Nothing selected: no box, no cuttability, no material. A selected group still has the last two. */
-export function showDocumentSection(
-  bounds: Bounds | null,
-  cutLineType: CutLineTypeJson | "mixed" | null,
-  materialPreset: PresetAssignmentJson | "mixed" | undefined,
-): boolean {
-  return bounds === null && cutLineType === null && materialPreset === undefined;
 }
 
 function DesignFor({
@@ -121,9 +114,9 @@ export function PropertiesPanel({
   onChangeX, onChangeY, onChangeW, onChangeH, rotation, onChangeRotation, unit,
   unitCount, editsLocked, distributeBlocked, onAlign, onDistribute,
   onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor, faintVinyl,
-  documentInfo,
+  documentInfo, nothingSelected,
 }: Props) {
-  const documentSection = showDocumentSection(bounds, cutLineType, materialPreset);
+  const documentSection = nothingSelected;
   const step = unit === "in" ? 0.01 : 1;
   const commit = (shown: number) => unitToMm(shown, unit);
   const design = onDesignFor ? (

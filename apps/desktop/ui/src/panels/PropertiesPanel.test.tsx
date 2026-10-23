@@ -3,7 +3,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { PropertiesPanel, showDocumentSection } from "./PropertiesPanel";
+import { PropertiesPanel } from "./PropertiesPanel";
 
 const onChangeX = vi.fn();
 
@@ -32,6 +32,7 @@ function props(over: Partial<Parameters<typeof PropertiesPanel>[0]> = {}): Param
     machineId: "cameo5",
     onDesignFor: () => {},
     documentInfo: { matLabel: "12 × 12 in (305 × 305 mm)", passCount: 3, objectCount: 4 },
+    nothingSelected: true,
     ...over,
   };
 }
@@ -57,7 +58,6 @@ describe("document section", () => {
   }
 
   test("nothing selected shows the document, not the shape fields", () => {
-    expect(showDocumentSection(null, null, undefined)).toBe(true);
     const panel = render();
     expect(panel.querySelector("h2")?.textContent).toBe("Document");
     const fact = (label: string) => {
@@ -79,8 +79,8 @@ describe("document section", () => {
       materialPreset: { state: "inherit" },
       unit: "in",
       rotation: 0,
+      nothingSelected: false,
     });
-    expect(showDocumentSection({ x: 0, y: 0, w: 1, h: 1 }, "Cut", { state: "inherit" })).toBe(false);
     expect(panel.querySelector("h2")).toBeNull();
     const field = (name: string) => {
       const label = [...panel.querySelectorAll("label")].find((el) => el.querySelector("span")?.textContent === name);
@@ -98,6 +98,7 @@ describe("document section", () => {
       cutLineType: "mixed",
       materialPreset: "mixed",
       unitCount: 2,
+      nothingSelected: false,
       distributeBlocked: { x: null, y: "few" },
       faintVinyl: true,
     });

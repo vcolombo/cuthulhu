@@ -5264,15 +5264,15 @@ test("align and distribute are disabled when they cannot act", async ({ page }) 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
   await page.goto("/");
   await showTab(page, "Properties");
-  const alignLeft = page.getByRole("button", { name: "Align left edges" });
-  await showTab(page, "Properties");
-  const distribute = page.getByRole("button", { name: "Distribute horizontal spacing" });
-  await expect(alignLeft).toBeDisabled();
-  await expect(distribute).toBeDisabled();
+  // Nothing selected is the document, not a disabled align row. The buttons come back with a selection.
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Align left edges" })).toHaveCount(0);
 
   // The Group, its own rect and red are two units, since the rect moves with the Group: still too
   // few to distribute.
   await selectRows(page, [0, 1, 2]);
+  const alignLeft = page.getByRole("button", { name: "Align left edges" });
+  const distribute = page.getByRole("button", { name: "Distribute horizontal spacing" });
   // Selecting rows shows Layers, which unmounts these buttons. They follow the selection once
   // Properties is showing again.
   await showTab(page, "Properties");

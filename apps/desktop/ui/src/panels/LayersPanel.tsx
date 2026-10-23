@@ -15,6 +15,8 @@ type Props = {
   theme: VinylTheme;
   /** Names a preset-keyed block. Colour blocks do not read it. */
   presets: PresetLookup;
+  /** Resolved material per node, from `effectiveMaterials`. The pass key reads this, not a second walk. */
+  materials: Readonly<Record<number, string | null>>;
   selected: number[];
   /** Why a cut toggle or a drag is refused, or null. */
   editsLocked: string | null;
@@ -102,6 +104,7 @@ export function LayersPanel({
   grouping,
   theme,
   presets,
+  materials,
   selected,
   editsLocked,
   onSelect,
@@ -110,8 +113,8 @@ export function LayersPanel({
   onReorder,
 }: Props) {
   const model = useMemo(
-    () => (doc ? layerModel(doc, grouping, presets) : { blocks: [], trailing: [] }),
-    [doc, grouping, presets],
+    () => (doc ? layerModel(doc, grouping, materials, presets) : { blocks: [], trailing: [] }),
+    [doc, grouping, materials, presets],
   );
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const dragId = useRef<number | null>(null);

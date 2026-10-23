@@ -2,7 +2,8 @@
 import { describe, expect, test } from "vitest";
 import type { DocNode, DocSnapshot } from "../App";
 import type { Grouping } from "../ipc";
-import { applySiblingReorder, layerPasses, layerRowIds, shapePassKey } from "./layerRows";
+import { effectiveMaterials } from "./materialPreset";
+import { reorderTarget, layerPasses, layerRowIds } from "./layerRows";
 
 const RED = 0xff0000ff;
 const GREEN = 0x00ff00ff;
@@ -55,8 +56,16 @@ function rustFixture(): DocSnapshot {
   ]);
 }
 
+function passes(snapshot: DocSnapshot, grouping: Grouping) {
+  return layerPasses(snapshot, grouping, effectiveMaterials(snapshot.nodes, snapshot.root));
+}
+
+function rowIds(snapshot: DocSnapshot, grouping: Grouping) {
+  return layerRowIds(snapshot, grouping, effectiveMaterials(snapshot.nodes, snapshot.root));
+}
+
 describe("layer passes match the planner", () => {
-  const keys = (grouping: Grouping) => layerPasses(rustFixture(), grouping).map((pass) => pass.key);
+  const keys = (grouping: Grouping) => passes(rustFixture(), grouping).map((pass) => pass.key);
 
   test("every grouping keys the same shapes differently", () => {
     expect(keys("Single")).toEqual(["all"]);
@@ -66,15 +75,15 @@ describe("layer passes match the planner", () => {
     expect(keys("Preset")).toEqual(["no-preset"]);
 
     for (const grouping of ["Single", "Color", "Stroke", "Fill", "Preset"] as const) {
-      const shapes = layerPasses(rustFixture(), grouping).reduce((n, pass) => n + pass.shapeIds.length, 0);
+      const shapes = passes(rustFixture(), grouping).reduce((n, pass) => n + pass.shapeIds.length, 0);
       expect(shapes, grouping).toBe(4);
     }
   });
 
   test("a pass lists its cut shapes in document order", () => {
-    expect(layerPasses(rustFixture(), "Single")[0].shapeIds).toEqual([2, 3, 4, 5]);
-    expect(layerPasses(rustFixture(), "Fill").map((pass) => pass.shapeIds)).toEqual([[2, 3], [4], [5]]);
-    expect(layerPasses(rustFixture(), "Stroke").find((pass) => pass.key === "no-color")?.shapeIds).toEqual([4, 5]);
+    expect(passes(rustFixture(), "Single")[0].shapeIds).toEqual([2, 3, 4, 5]);
+    expect(passes(rustFixture(), "Fill").map((pass) => pass.shapeIds)).toEqual([[2, 3], [4], [5]]);
+    expect(passes(rustFixture(), "Stroke").find((pass) => pass.key === "no-color")?.shapeIds).toEqual([4, 5]);
   });
 
   test("preset grouping follows the resolved material, and unassigned stops the chain", () => {
@@ -87,7 +96,7 @@ describe("layer passes match the planner", () => {
       shape(4, { stroke: RED, fill: null }),
       shape(5, { stroke: GREEN, fill: null }, { material_preset: { state: "preset", id: "card" } }),
     ]);
-    expect(layerPasses(snapshot, "Preset")).toEqual([
+    expect(passes(snapshot, "Preset")).toEqual([
       { key: "preset:htv", shapeIds: [4] },
       { key: "preset:card", shapeIds: [5] },
       { key: "no-preset", shapeIds: [3] },
@@ -101,20 +110,15 @@ describe("layer passes match the planner", () => {
       shape(2, { stroke: RED, fill: null }, { cut_line_type: "NoCut" }),
       shape(3, { stroke: RED, fill: null }),
     ]);
-    expect(layerPasses(snapshot, "Color")).toEqual([{ key: "color:ff0000ff", shapeIds: [3] }]);
-    expect(layerRowIds(snapshot, "Color")).toEqual([2, 3]);
+    expect(passes(snapshot, "Color")).toEqual([{ key: "color:ff0000ff", shapeIds: [3] }]);
+    expect(rowIds(snapshot, "Color")).toEqual([2, 3]);
   });
 
   test("an all-NoCut colour is a row and not a pass", () => {
     const root = container(1, "Layer", [2]);
     const snapshot = doc([root, shape(2, { stroke: RED, fill: null }, { cut_line_type: "NoCut" })]);
-    expect(layerPasses(snapshot, "Color")).toEqual([]);
-    expect(layerRowIds(snapshot, "Color")).toEqual([2]);
-  });
-
-  test("alpha 0 does not key a colour", () => {
-    expect(shapePassKey("Color", { stroke: 0xff000000, fill: BLUE }, null)).toBe("color:0000ffff");
-    expect(shapePassKey("Stroke", { stroke: 0xff000000, fill: BLUE }, null)).toBe("no-color");
+    expect(passes(snapshot, "Color")).toEqual([]);
+    expect(rowIds(snapshot, "Color")).toEqual([2]);
   });
 });
 
@@ -130,7 +134,7 @@ describe("layer row order", () => {
       shape(4, { stroke: RED, fill: null }),
       shape(5, { stroke: GREEN, fill: null }),
     ]);
-    expect(layerRowIds(snapshot, "Color")).toEqual([2, 3, 4, 5]);
+    expect(rowIds(snapshot, "Color")).toEqual([2, 3, 4, 5]);
   });
 
   test("an empty group follows the shapes, as the align seed lays them out", () => {
@@ -146,14 +150,23 @@ describe("layer row order", () => {
       shape(6, { stroke: BLUE, fill: null }),
       empty,
     ]);
-    expect(layerRowIds(snapshot, "Color")).toEqual([2, 3, 4, 5, 6, 7]);
+    expect(rowIds(snapshot, "Color")).toEqual([2, 3, 4, 5, 6, 7]);
   });
 });
 
 describe("reorder index", () => {
-  test("a drop uses the target's current index", () => {
-    expect(applySiblingReorder(["A", "B", "C", "D"], 0, 2)).toEqual(["B", "C", "A", "D"]);
-    expect(applySiblingReorder(["A", "B", "C", "D"], 3, 0)).toEqual(["D", "A", "B", "C"]);
-    expect(applySiblingReorder(["A", "B", "C", "D"], 1, 1)).toBeNull();
+  test("a drop names the target sibling's current index", () => {
+    const root = container(1, "Layer", [2, 3, 4, 5]);
+    const snapshot = doc([
+      root,
+      shape(2, { stroke: RED, fill: null }),
+      shape(3, { stroke: RED, fill: null }),
+      shape(4, { stroke: GREEN, fill: null }),
+      shape(5, { stroke: GREEN, fill: null }),
+    ]);
+    expect(reorderTarget(snapshot, 2, 4)).toEqual({ id: 2, newIndex: 2 });
+    expect(reorderTarget(snapshot, 5, 3)).toEqual({ id: 5, newIndex: 1 });
+    expect(reorderTarget(snapshot, 2, 2)).toBeNull();
+    expect(reorderTarget(snapshot, 3, 1)).toBeNull();
   });
 });

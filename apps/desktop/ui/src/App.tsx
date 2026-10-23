@@ -173,7 +173,7 @@ export function App() {
   const editsLockNow = useRef<() => EditsLock>(() => "loading");
   const docState = useDocument(editsLockNow);
   const {
-    doc, selected, setSelected, machines, presets, setError, errorAt, lastPath, setLastPath,
+    doc, selected, setSelected, machines, presets, presetsLoaded, setError, errorAt, lastPath, setLastPath,
     docRev, history, refresh, run, edit, lockReason, waitForEdits, noteLoaded, root,
   } = docState;
 
@@ -228,14 +228,13 @@ export function App() {
   const status = job.status;
   const { devices, hosts, listError: deviceListError, refresh: refreshDevices } = useDevices();
   const { unit, setUnit } = useUnits(setError);
-  const passCount = useMemo(() => (doc ? layerPasses(doc, grouping).length : 0), [doc, grouping]);
   const matLabel = useMemo(() => {
     if (!doc) return "";
     const kind = offeredKind(matKind, doc.machine?.id ?? null);
     if (kind === "roll") return `Roll · ${formatLength(rollLengthMm, unit)} ${unit}`;
     return matKindLabel(kind, unit);
   }, [doc, matKind, rollLengthMm, unit]);
-  const presetLookup = useMemo(() => ({ presets, loaded: true as const }), [presets]);
+  const presetLookup = useMemo(() => ({ presets, loaded: presetsLoaded }), [presets, presetsLoaded]);
   const designFor = useCallback((machineId: string) => edit(() => ipc.setMachine({ machineId })), [edit]);
   const cutter = useActiveCutter({
     profileId: doc?.machine?.id ?? null,
@@ -464,6 +463,10 @@ export function App() {
   const materialsByNode = useMemo(
     () => (doc ? effectiveMaterials(doc.nodes, doc.root) : {}),
     [doc],
+  );
+  const passCount = useMemo(
+    () => (doc ? layerPasses(doc, grouping, materialsByNode).length : 0),
+    [doc, grouping, materialsByNode],
   );
   const effectiveMaterial = summariseEffectiveMaterial(materialsByNode, selected);
 
@@ -737,6 +740,7 @@ export function App() {
               grouping={grouping}
               theme={theme.resolved}
               presets={presetLookup}
+              materials={materialsByNode}
               selected={selected}
               editsLocked={lockReason(interaction.editsLock)}
               onSelect={(id, shiftKey) => setSelected((prev) => (shiftKey ? toggleId(prev, id) : [id]))}
@@ -770,6 +774,7 @@ export function App() {
               machineId={doc?.machine?.id ?? null}
               onDesignFor={designFor}
               faintVinyl={doc ? selectionHasFaintVinyl(doc.nodes, selected) : false}
+              nothingSelected={selected.length === 0}
               documentInfo={doc ? { matLabel, passCount, objectCount: countShapes(doc) } : null}
             />
           </TabsContent>

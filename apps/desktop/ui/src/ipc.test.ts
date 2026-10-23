@@ -78,7 +78,7 @@ describe("every ipc.ts wrapper calls its own registered command", () => {
   }
 });
 
-// Two wrappers forward the caller's object rather than building one, so calling them with nothing
+// Three wrappers forward the caller's object rather than building one, so calling them with nothing
 // records nothing and says nothing. Their parameter types name the keys, which makes a literal
 // here checked twice: by `tsc` against the wrapper's own type, and below against the inventory. A
 // wrapper typed `{ path, opts }` — #85's own incident — fails the first before reaching the second.
@@ -96,6 +96,12 @@ describe("a wrapper that forwards its caller's payload", () => {
     calls.length = 0;
     await ipc.loadImagePreview({ path: "/tmp/trace.png" });
     checkRecordedCalls("loadImagePreview");
+  });
+
+  test("commitTransforms", async () => {
+    calls.length = 0;
+    await ipc.commitTransforms({ moves: [{ ids: [1], m: [1, 0, 0, 1, 5, 0] }] });
+    checkRecordedCalls("commitTransforms");
   });
 });
 

@@ -225,66 +225,54 @@ Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents
 
 ### PR review
 
-Three stages, in order, and each one coming back clean is the trigger for the next rather than the
-finish line: **Copilot** on the PR, then **`/pr-review-toolkit:review-pr`** — the local agents that
-apply to what changed, which is `code-reviewer` always, `silent-failure-hunter`,
-`type-design-analyzer` and `comment-analyzer` as the diff calls for them, and `pr-test-analyzer`
-whenever behaviour changed (asked for by name — see below) — then **Codex, adversarially**, via
-`/codex:adversarial-review --base <ref>` or `codex exec review --base <ref>`.
-Not `/codex:rescue`: it delegates a *task* through the generic companion path, with no review
-runtime behind it and no `--base` to scope one — and run in the background, as it was here, it hands
-back a job id instead of a review.
-Codex comments nowhere on its own. `code-simplifier` is reachable from the same command and
-is deliberately not in the gate: it rewrites rather than reports, so what it produces is a fix, and
-a fix restarts the cycle.
+Two gates, in order:
 
-Triage, escalation, the posting format, head invalidation and the five-push cap are the machine-wide
-rules in `~/.claude/CLAUDE.md`. This section is repo detail on top of that floor, not a replacement
-for it, and four things are the repo's own:
+1. **In-harness review comes back clean before the PR is opened.** Run the local review agents
+   that fit the change against the pinned range, `git diff <base>...<head>`. Never use a bare
+   `git diff`: on a committed branch it shows nothing, and a reviewer given nothing reports clean.
+   On any behavioural change, ask for the test-coverage reviewer by name. Selectors that key off
+   changed *test* files skip it in exactly the case where the missing test is the finding. Fix
+   what holds up and re-run on the new head until a pass raises nothing new. Then open the PR,
+   naming that pass's base and head in its description.
+2. **Bot review comes back clean after the PR is opened.** Whichever review bots the repo has
+   installed review the PR. Which ones they are does not matter, and nothing should wait on a bot
+   that is not installed: PR #287 sat blocked on a required check nothing in the repo could still
+   produce. Triage every finding. Fix the valid ones, and reply on each thread with the fixing
+   commit or the reason the finding does not apply. Then get every installed bot to review the
+   new head. Some review each push on their own; others only when asked, so request it from those.
+   A review counts for a head only if it is attached to that head's sha (the commit the review
+   was made on, or named in its text). A bot that says nothing when it finds nothing needs its
+   pass recorded on the PR once it has run on the current head, naming the base and head. The
+   gate is passed when every installed bot's review of the current head raises nothing new. If no
+   review bot is installed, the gate has nothing to wait on; say so in the PR description rather
+   than leaving it unaddressed.
 
-- **Brief Codex to attack the change rather than to look it over.** The P1 worth having on PR #289
-  came from asking it to enumerate every combination of `reached_the_host`, `answer_settled` and
-  `first_attempt` and say which arm each landed in; "does this look right" had already returned an
-  approval on the same diff.
-- **Give both local stages the pinned range, and ask for the test analyst by name.** Neither stage
-  scopes itself to a PR: the toolkit command falls back to a bare `git diff` and its agents to the
-  unstaged working tree, so on a committed branch it reviews nothing and reports clean; and
-  `codex exec review --commit <sha>` — the invocation to avoid on a PR — reads only that commit's
-  own change, so on a multi-commit PR it certifies the last fix and never looks at what it was
-  fixing. Name `git diff <base>...<head>` for the toolkit and pass `--base` to Codex.
-  `pr-test-analyzer` needs asking for on any behavioural
-  change, because the command selects it only when *test files* changed — which skips it in exactly
-  the case where the missing test is the finding.
-- **Post every stage-two and stage-three pass, naming the sha it reviewed**, including one that
-  found nothing. Neither stage comments on its own, and a clean pass is what unlocks the next one,
-  so an unposted pass is a gate nobody after you can see.
-- **Every pass names a base and a head, stacked or not** — `main` advancing under an untouched head
-  changes what the PR becomes just as a moved parent does — and a change to either restarts the
-  cycle. A parent that moves can change the child's patch outright, or leave the patch alone and
-  change only what it lands on, depending on how it moved; naming both ends means nobody downstream
-  has to work out which happened.
+The rest applies to both gates:
 
-  A moved base is reviewed by **syncing, not by re-running**. Re-run against a new base and the
-  three-dot diff still resolves from the old merge base, so base-only commits are absent from it and
-  the checkout is still the old tree: the reviewer sees nothing it had not already seen. `gh pr
-  update-branch` first, which produces a head whose tree holds the base's changes, and review that.
-  Strict protection forces the sync before merge anyway, so the only question is whether the review
-  happens before it or after.
+- **No cap on fix rounds.** Every push moves the head, and a pass counts only for the head it
+  reviewed, so each fix restarts the gate it lands in. A finding that calls for a change of design
+  rather than a fix goes to a human instead of into another round.
+- **Brief reviewers to attack the change, not to look it over.** The finding worth having on
+  PR #289 came from asking for every combination of `reached_the_host`, `answer_settled` and
+  `first_attempt` and which arm each landed in. "Does this look right" had already approved the
+  same diff.
+- **A reviewer that rewrites rather than reports is outside the gates.** What it produces is a
+  fix, and a fix restarts the gate.
+- **Every pass names a base and a head**, and a change to either restarts the gate. `main`
+  advancing under an untouched head changes what the PR becomes, just as a moved parent does on a
+  stacked PR.
 
-  The one way out is **both** equalities holding: the reviewed patch unchanged and the resulting tree
-  unchanged. Either alone waives a real review — a conflict resolved in the child's favour keeps the
-  tree while the patch reverts something on the base, and a base that changes an API the child calls
-  leaves the patch byte-equal while the merged result breaks. #289 is the worked example, and the one
-  that got it half wrong: both equalities held, so no pass was owed on the new head — but nothing on
-  the PR said so, which leaves a reader unable to tell a safe sync from an unreviewed merge.
+  Review a moved base by **syncing, not by re-running**. Re-run against a new base and the
+  three-dot diff still resolves from the old merge base: base-only commits are absent from it,
+  and the checkout is still the old tree. Sync first so the head's tree holds the base's
+  changes, then review that head. Once the PR exists, `gh pr update-branch` does it. During gate 1
+  there is no PR yet, so fetch and merge the updated base into the branch locally: the ref used
+  as `<base>` in the pinned range, which is `origin/main` unless the branch is stacked on another.
+  Then run gate 1 again on the merged head.
 
-Three reviewers, three different blind spots, kept prospectively rather than because the history
-proves it: Copilot approved #289 on a diff Codex then filed a P1 against, and the toolkit's first
-pass on this repo found five holes in the section you are reading (#292). Nothing yet shows the
-toolkit catching what Codex would have missed, and the gate does not need it to.
-
-Greptile and CodeRabbit are gone, and nothing waits on either. Their findings are still cited
-across comments and tests by PR number — that is provenance and stays — but a wait on an
-uninstalled bot is how PR #287 sat blocked on `Greptile Review`, a required check that nothing left
-in the repo could produce; it has been dropped from `main`'s protection, which now requires `rust`,
-`python-tools`, `ui` and `cross-pi`.
+  The one way out is when **both** of these hold: the reviewed patch is unchanged and the
+  resulting tree is unchanged. Relying on either one alone skips a review that was owed. A
+  conflict resolved in the child's favour keeps the tree while the patch reverts something on the
+  base. A base that changes an API the child calls leaves the patch byte-equal while the merged
+  result breaks. When both do hold, say so on the PR. Otherwise a reader cannot tell a safe sync
+  from an unreviewed merge.

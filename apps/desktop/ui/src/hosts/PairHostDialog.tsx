@@ -106,7 +106,7 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
               </p>
             )}
             {state.existing && state.existing.sameFingerprint && (
-              <p style={{ margin: 0, color: "var(--muted)" }}>
+              <p style={{ margin: 0, color: "var(--muted-foreground)" }}>
                 “{state.existing.name}” is already paired at this address, with this same
                 certificate. Pairing again adds a second entry rather than replacing it.
               </p>

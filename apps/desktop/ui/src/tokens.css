@@ -1,13 +1,166 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+/*
+ * Semantic tokens are the source of truth. Tailwind utilities read them through
+ * `@theme inline`; the canvas reads them through getComputedStyle. `source(none)`
+ * plus `@source "."` is the spec's `@source "./src"` from the UI root: this sheet
+ * lives in that directory, and without `source(none)` Tailwind would also scan
+ * `dist/` and the e2e fake.
+ */
+@import "tailwindcss" source(none);
+@source ".";
+
+/* The theme follows the class the boot script and the preferences hook toggle,
+   not prefers-color-scheme, so an explicit Light stays light on a dark OS. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: "Inter Variable", system-ui, sans-serif;
+  --text-2xs: 11px;
+  --text-2xs--line-height: 16px;
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 13px;
+  --text-sm--line-height: 20px;
+  --text-base: 14px;
+  --text-base--line-height: 20px;
+  --text-lg: 16px;
+  --text-lg--line-height: 24px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 10px;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-canvas: var(--canvas);
+  --color-panel: var(--panel);
+  --color-card: var(--card);
+  --color-popover: var(--popover);
+  --color-subtle: var(--subtle);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-secondary: var(--secondary);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-brand: var(--brand);
+  --color-tint: var(--tint);
+  --color-ring: var(--ring);
+  --color-mat: var(--mat);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+}
+
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
+
 :root {
-  --workspace: #17171a;
-  --panel: #1f1f23;
-  --border: #2e2e34;
-  --text: #e7e7ea;
-  --muted: #9a9aa2;
-  --accent: #22d3ee; /* selection */
-  --cut: #ff4d4d; /* reserved for cut, unused for now */
-  --ready: #34d399;
+  color-scheme: light;
+  --background: #f8fbfb;
+  --canvas: #e5ebeb;
+  --panel: #f1f6f6;
+  --card: #ffffff;
+  --popover: #ffffff;
+  --subtle: #e3eeee;
+  --muted: #ebf3f3;
+  --secondary: #e0edec;
+  /* Selected-row and hover background. Not accent text, and not the canvas selection. */
+  --accent: #ddebeb;
+  --border: #cfdada;
+  /* #bac7c8 was 1.74:1 on white. #7a8c8e clears 3:1 on card and panel. */
+  --input: #7a8c8e;
+  --foreground: #012f36;
+  --muted-foreground: #425a5f;
+  --primary: #106c72;
+  --primary-foreground: #ffffff;
+  --accent-ink: #106c72;
+  /* Never behind white text (3.79:1). Light uses it for non-text chrome only. */
+  --brand: #219194;
+  --tint: #72adad;
+  --ring: #219194;
+  --mat: #d4d4d4;
+  --mat-grid: #bababa;
+  --selection: #012f36;
+  --selection-handle: #012f36;
+  --success: #1d7d3e;
+  /* #ae6700 was 4.43:1 on white. #9a5b00 clears 4.5:1 on card and panel. */
+  --warning: #9a5b00;
+  --destructive: #c92324;
+  --destructive-foreground: #ffffff;
+  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 is about 3.4:1
+     on the light panel. Dark uses its own value: the same 0.55 is 5.1:1 there. */
+  --disabled-opacity: 0.55;
+  /* #f472b6 is 1.79:1 on the light mat. This is that magenta at OKLCH L 0.55
+     (same chroma and hue), 3.60:1 on #d4d4d4. */
+  --guide: #b73a80;
+  --radius: 6px;
+  /* Pressed pill on a light surface. A white pill is the panel, so the unit
+     toggle and Rulers had no fill cue. `--subtle` is the fill those controls
+     used before that pill. It is under 1.2:1 on the panel (#f1f6f6, 1.09:1)
+     and on the unit track (#f8fbfb, 1.14:1), so the 1px brand edge is what
+     separates it. #106c72 on #e3eeee is 5.20:1. Brand is non-text chrome
+     here: 3.47:1 on the panel, 3.64:1 on the track. */
+  --btn-pressed: var(--subtle);
+  --btn-pressed-edge: var(--brand);
+  --btn-pressed-edge-width: 1px;
+
+  /* Names the screens already use. `--accent` is not aliased to `--accent-ink`:
+     that would paint teal behind `--text` on a selected row. `--muted` is the
+     quiet fill now; secondary text is `--muted-foreground`. */
+  --workspace: var(--canvas);
+  --text: var(--foreground);
+  --cut: var(--destructive);
+  --ready: var(--success);
+  --error: var(--destructive);
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #0b1a1d;
+  --canvas: #081416;
+  --panel: #10252a;
+  --card: #163238;
+  --popover: #163238;
+  --subtle: #234449;
+  --muted: #1a3338;
+  --secondary: #27484e;
+  --accent: #2c4f54;
+  --border: #24444a;
+  /* #2e525a was 1.60:1 on the dark card. #66878c clears 3:1 on card and panel. */
+  --input: #66878c;
+  --foreground: #e6f0f0;
+  --muted-foreground: #9db8b9;
+  --primary: #106c72;
+  --primary-foreground: #ffffff;
+  /* #106c72 behind no white text in dark; accent text is this lighter teal. */
+  --accent-ink: #4fb3b5;
+  --brand: #4fb3b5;
+  --tint: #72adad;
+  --ring: #72adad;
+  --mat: #484848;
+  --mat-grid: #717171;
+  --selection: #e6f0f0;
+  --selection-handle: #012f36;
+  --success: #53be70;
+  --warning: #e29e47;
+  /* #f14e46 was 3.82:1 on the dark card. #ff6b63 clears 4.5:1 on card and panel. */
+  --destructive: #ff6b63;
+  --destructive-foreground: #ffffff;
+  --guide: #f472b6;
+  /* 0.42 of the dark foreground on the dark panel is about 3.6:1. 0.55 reads as body text. */
+  --disabled-opacity: 0.42;
+  /* White pill, no edge. #106c72 on white is 6.16:1, and white on the dark
+     panel (#10252a) is 15.9:1, so the fill itself is the cue. */
+  --btn-pressed: var(--primary-foreground);
+  --btn-pressed-edge: transparent;
+  --btn-pressed-edge-width: 0px;
 }
 
 html,
@@ -18,7 +171,148 @@ body,
 }
 
 body {
-  background: var(--workspace);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: "Inter Variable", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+/* Unlayered, so it wins over Tailwind's reset and over a component outline.
+   The 2px gap is `--background` on purpose: it is what separates the ring from
+   a teal control (the ring itself is only 1.63:1 on that fill). */
+:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
+}
+
+/* Tailwind's preflight sets `appearance: button` and `color: inherit` inside
+   `@layer base`. Unlayered, so this wins. Checkboxes and radios keep their
+   native appearance. */
+button,
+input:where([type="button"], [type="reset"], [type="submit"]) {
+  appearance: none;
+  --btn-ink: var(--foreground);
+  --btn-ink-hover: var(--btn-ink);
+  color: var(--btn-ink, var(--foreground));
+}
+button:hover,
+input:where([type="button"], [type="reset"], [type="submit"]):hover {
+  color: var(--btn-ink-hover, var(--btn-ink, var(--foreground)));
+}
+/* One channel per variant. A selector on a Tailwind class string is the previous
+   theme's ink, because the utility that set it lives in a layer and loses. */
+button[data-ink="fill"] {
+  --btn-ink: var(--primary-foreground);
+  --btn-ink-hover: var(--primary-foreground);
+}
+button[data-ink="muted"] {
+  --btn-ink: var(--muted-foreground);
+  --btn-ink-hover: var(--foreground);
+}
+button[data-ink="faded"] {
+  --btn-ink: color-mix(in oklab, var(--foreground) 80%, transparent);
+  --btn-ink-hover: var(--foreground);
+}
+button[data-ink="destructive"] {
+  --btn-ink: var(--destructive);
+  --btn-ink-hover: var(--destructive);
+}
+button[data-ink="accent"] {
+  --btn-ink: var(--accent-ink);
+  --btn-ink-hover: var(--accent-ink);
+}
+button[data-ink="warning"] {
+  --btn-ink: var(--warning);
+  --btn-ink-hover: var(--warning);
+}
+button[data-ink="success"] {
+  --btn-ink: var(--success);
+  --btn-ink-hover: var(--success);
+}
+/* One pressed rule. Ink stays on `--btn-ink` (`--primary`, #106c72 in both
+   themes). Fill and edge are tokens, so light is a bordered surface while
+   dark stays the white pill, without a second selector and without naming a
+   Tailwind class. The tool rail names accent ink and keeps its own fill. */
+button[aria-pressed="true"]:not([data-ink="accent"]),
+button[role="tab"][data-state="active"] {
+  --btn-ink: var(--primary);
+  --btn-ink-hover: var(--primary);
+  background: var(--btn-pressed);
+  color: var(--btn-ink, var(--foreground));
+  border-style: solid;
+  border-width: var(--btn-pressed-edge-width);
+  border-color: var(--btn-pressed-edge);
+}
+
+/* One opacity for every disabled control that used to repeat `opacity: 0.35`.
+   Scoped to buttons and menu items so a disabled field does not fade with them. */
+button:disabled,
+[role="menuitem"][data-disabled],
+[role="menuitemradio"][data-disabled] {
+  opacity: var(--disabled-opacity);
+}
+
+/* Opening a menu with the pointer focuses the trigger and the popover, and
+   Chromium reports that programmatic focus as :focus-visible, so both painted
+   this ring. The ring is the keyboard cue on a control that is not already open. */
+[role="menu"]:focus-visible,
+:is(button, [role="button"])[data-state="open"]:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.appearance-option:hover {
+  background: var(--accent);
+}
+
+/* Preflight zeroes every border and drops list markers. NumberField and AlignRow
+   set their own border inline, which wins over this. Controls that still relied
+   on the user-agent border or marker get them back in the same tokens. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
+select,
+textarea {
+  border: 1px solid var(--border);
+}
+
+/* That reset is unlayered and sets the whole border, so `border-destructive` never
+   paints. The red border is the same fact `aria-invalid` already states. */
+input[aria-invalid="true"]:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
+select[aria-invalid="true"],
+textarea[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
+ul,
+ol {
+  padding-left: 1.5em;
+}
+
+ul {
+  list-style: disc;
+}
+
+ol {
+  list-style: decimal;
+}
+
+/* Stripes on a pass that is still moving. Tokens only: primary and tint, never a literal.
+   Frozen progress drops the class, so a lost host does not look like the blade is advancing. */
+@keyframes progress-live {
+  to {
+    background-position: 16px 0;
+  }
+}
+
+.progress-live {
+  background-image: linear-gradient(90deg, var(--primary) 0 8px, var(--tint) 8px 16px);
+  background-size: 16px 100%;
+  animation: progress-live 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-live {
+    animation: none;
+  }
 }

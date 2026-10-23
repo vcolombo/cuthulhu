@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import type { MachineProfile } from "../App";
 import type { Bounds } from "../render/hittest";
 import type { CutLineTypeJson } from "./cutLineType";
 import type { PresetAssignmentJson } from "../ipc";
 import type { Preset } from "../cut/viewmodel";
 import type { EffectiveMaterial } from "./materialPreset";
 import { NumberField } from "./NumberField";
+import { AlignRow } from "./AlignRow";
+import type { AlignMode, Axis, DistributeBlock } from "../interaction/align";
 
 type Props = {
   bounds: Bounds | null;
@@ -17,8 +20,20 @@ type Props = {
   onChangeY: (v: number) => void;
   onChangeW: (v: number) => void;
   onChangeH: (v: number) => void;
+  unitCount: number;
+  /** Why edits are refused for now, or null; see `CanvasInteraction.editsLock`. */
+  editsLocked: string | null;
+  distributeBlocked: Record<Axis, DistributeBlock | null>;
+  onAlign: (mode: AlignMode) => void;
+  onDistribute: (axis: Axis) => void;
   onChangeCutLineType: (v: CutLineTypeJson) => void;
   onChangeMaterialPreset: (v: PresetAssignmentJson) => void;
+  /** Document machine, chosen without connecting a cutter. Always shown: a selection still has a page. */
+  machines?: MachineProfile[];
+  machineId?: string | null;
+  onDesignFor?: (machineId: string) => void;
+  /** A selected shape whose vinyl alpha is under 0.1. It still cuts. */
+  faintVinyl?: boolean;
 };
 
 /** What the material row reads for each state. Exported for its own test: it is the consumer
@@ -42,19 +57,43 @@ export function materialLabel(
 }
 
 export function PropertiesPanel({ bounds, cutLineType, materialPreset, effectiveMaterial, presets,
-                                  onChangeX, onChangeY, onChangeW, onChangeH,
-                                  onChangeCutLineType, onChangeMaterialPreset }: Props) {
+                                  onChangeX, onChangeY, onChangeW, onChangeH, unitCount, editsLocked, distributeBlocked, onAlign, onDistribute,
+                                  onChangeCutLineType, onChangeMaterialPreset, machines, machineId, onDesignFor, faintVinyl }: Props) {
   return (
     <div style={{ padding: 8, display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" }}>
-      <div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Properties</div>
+      {onDesignFor ? (
+        <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+          Design for
+          <select
+            aria-label="Design for"
+            value={machineId ?? ""}
+            onChange={(e) => {
+              if (e.target.value) onDesignFor(e.target.value);
+            }}
+          >
+            <option value="" disabled>
+              Select machine
+            </option>
+            {(machines ?? []).map((machine) => (
+              <option key={machine.id} value={machine.id}>
+                {machine.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+      <div style={{ fontSize: 11, color: "var(--muted-foreground)", textTransform: "uppercase" }}>Properties</div>
       {bounds ? (
         <>
-          <NumberField label="X" value={bounds.x} onChange={onChangeX} />
-          <NumberField label="Y" value={bounds.y} onChange={onChangeY} />
-          <NumberField label="W" value={bounds.w} min={0} onChange={onChangeW} />
-          <NumberField label="H" value={bounds.h} min={0} onChange={onChangeH} />
+          <NumberField label="X" value={bounds.x} disabled={editsLocked !== null} onChange={onChangeX} />
+          <NumberField label="Y" value={bounds.y} disabled={editsLocked !== null} onChange={onChangeY} />
+          <NumberField label="W" value={bounds.w} min={0} disabled={editsLocked !== null} onChange={onChangeW} />
+          <NumberField label="H" value={bounds.h} min={0} disabled={editsLocked !== null} onChange={onChangeH} />
         </>
       ) : null}
+      {/* Also outside it, since aligning is mostly for multi-node selections. Always shown, disabled
+          when it cannot act, so the buttons do not jump the rows below them in and out. */}
+      <AlignRow unitCount={unitCount} locked={editsLocked} distributeBlocked={distributeBlocked} onAlign={onAlign} onDistribute={onDistribute} />
       {/* Outside the `bounds` branch: `selectedBounds` is null for every multi-node selection
           and for a selected container (App.tsx), both of which do have a cuttability. */}
       {cutLineType !== null ? (
@@ -71,6 +110,9 @@ export function PropertiesPanel({ bounds, cutLineType, materialPreset, effective
           />
           Cut
         </label>
+      ) : null}
+      {faintVinyl ? (
+        <p className="text-2xs text-muted-foreground">Nearly invisible in the file. It still cuts.</p>
       ) : null}
       {materialPreset !== undefined ? (
         <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
@@ -98,13 +140,13 @@ export function PropertiesPanel({ bounds, cutLineType, materialPreset, effective
               <option key={p.id} value={`preset:${p.id}`}>{p.name}</option>
             ))}
           </select>
-          <span style={{ color: "var(--muted)" }}>
+          <span style={{ color: "var(--muted-foreground)" }}>
             {materialLabel(materialPreset, effectiveMaterial, presets)}
           </span>
         </label>
       ) : null}
       {bounds === null && cutLineType === null && materialPreset === undefined ? (
-        <div style={{ fontSize: 12, color: "var(--muted)" }}>No selection</div>
+        <div style={{ fontSize: 12, color: "var(--muted-foreground)" }}>No selection</div>
       ) : null}
     </div>
   );

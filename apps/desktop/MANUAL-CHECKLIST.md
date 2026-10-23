@@ -1,5 +1,5 @@
 # Manual checklist (per release)
-- [ ] Switch machine Cameo 5 ⇄ Puma IV — artboard resizes on the canvas and in the status bar.
+- [ ] Switch machine Cameo 5 ⇄ Puma IV — the mat selector offers 12×12, 12×24, and roll for the Cameo and roll only for the Puma, and the canvas refits to that mat.
 - [ ] Import a complex SVG via the TopBar Import button — paths render as real geometry; stays responsive (pan/zoom deferred — SP4 candidate).
 - [ ] Drag/scale — drag via the canvas, scale via the properties panel W/H fields; one undo reverts the whole gesture. Rotate + on-canvas handles (deferred).
 - [ ] Boolean union/subtract/intersect/exclude on two overlapping shapes — correct result rendered as a real path.
@@ -110,3 +110,61 @@ real network can confirm the swap end to end.
 - [ ] On hardware: `--group-by preset` on a document with two materials cuts one pass per
       material, **each with that preset's own speed and force**, prompting between them. Nothing
       but real material settles that the settings followed the key.
+
+## Viewport and handles (spec 2026-10-06, unverified)
+
+- [ ] Launch on a Retina Mac — strokes and handles are crisp, not blurred; the mat fits the window, inset from the rulers and clear of the zoom bar.
+- [ ] Trackpad: pinch zooms about the fingers; two-finger scroll pans; ⌘0 refits; ⌘1 is CSS reference
+      size — record how far a 100 mm rect is from 100 mm on a ruler, with the display and its OS
+      scaling (it is exact only at the reference density; per-monitor calibration is a ponytail).
+- [ ] Mouse (Windows/Linux): the wheel pans; Ctrl-wheel zooms; middle-drag pans; Space-drag pans.
+- [ ] Switch machine Cameo 5 ⇄ Puma IV — the view refits to the new mat (12×12 / 12×24 / roll), not the whole bed. Resizing the window does not refit.
+- [ ] Marquee a word of imported text; Shift-drag a corner — it scales proportionally; Alt-drag
+      scales from the centre; one undo reverts each gesture.
+- [ ] Pinch-zoom or scroll-pan while dragging a handle — the shape keeps following the pointer
+      instead of snapping back, and the release saves what is on screen. (Canvas pixels are
+      unreadable from e2e, so this one is only checkable by eye.)
+- [ ] Rotate a rect 30° with Shift held (snaps in 15° steps), cut it on the Cameo 5, and measure —
+      the cut matches the screen.
+- [ ] `node apps/desktop/ui/scripts/perf-svg.mjs > /tmp/perf.svg`, Import it, pan and zoom with the
+      WebKit inspector's frame timeline open — record the frame rate here with the machine and date
+      (target 60 fps).
+
+## Snapping (spec 2026-10-07, unverified)
+
+- [ ] Guides read clearly against the artboard and the workspace, distinct from the cyan selection.
+- [ ] Snapping feels sticky but not grabby at fit and at 400%; small deliberate offsets are still
+      reachable with ⌘ (Ctrl) held.
+- [ ] Pressing ⌘ (Ctrl) mid-drag releases a snap; releasing it snaps again on the next move.
+- [ ] A decal snapped to the artboard's left edge cuts flush with the mat's left limit on the Cameo 5.
+
+## Align and distribute (spec 2026-10-07, unverified)
+
+- [ ] Six names aligned left cut in a straight column on the Cameo 5: every left edge on one line.
+- [ ] A single decal centred with "Align horizontal centres" cuts centred on the mat.
+- [ ] A row of letters distributed horizontally weeds with even gaps between neighbours.
+- [ ] Letters distributed with their weed border selected sit inside it with even margins, and the
+      border cuts where it was.
+- [ ] One ⌘Z (Ctrl+Z) after an align puts every moved piece back at once.
+- [ ] The eight icons read as what they do at the panel's size, in the dark theme (light is deferred).
+
+## Weed lines (spec 2026-10-09, unverified)
+
+- [ ] A word cut on the Cameo 5 with Border on (3 mm): the border is cut last, after every letter,
+      and the sheet lifts off the roll in one piece.
+- [ ] The same word with Lines: Both, spacing 25 mm, clearance 1.5 mm: no line nicks a letter, and
+      the waste weeds off strip by strip, including from inside the counters (O, A, e).
+- [ ] A two-colour design grouped by colour: each colour's sheet gets a border sized to its own
+      shapes, cut in that colour's pass.
+- [ ] A design within 3 mm of the mat edge with Border on: the cut is refused, and the message says
+      to shrink the weed margin or move the design.
+- [ ] `cuthulhu cut --group-by color --weed-margin 3 --weed-lines h` on the Puma IV: each pass ends
+      with its lines and then its border, and the strips weed.
+- [ ] Tune the defaults (margin 3, spacing 25, clearance 1.5 mm) on real vinyl and HTV; record the
+      values that weed cleanly here.
+- [ ] Lines: Both at 25 mm on the densest real job at hand (a full sheet of small lettering, a
+      trace): it is planned without "too large or detailed", and typing in a weed field does not
+      lag. The work budget (`cutplan::weed::MAX_WEED_WORK`, 50M tests) measured about 2.9M for a
+      synthetic trace of 1000 closed 100-sided blobs over 300 mm at the defaults (test
+      `a_dense_trace_at_the_default_spacing_is_weeded_not_refused`); raise it, or take the
+      sorted-crossing upgrade, if a real job hits it.

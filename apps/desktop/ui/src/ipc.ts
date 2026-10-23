@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
 import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import type { LengthUnit } from "./length";
+
+export type { LengthUnit };
 
 // ponytail: loose types for delta/snapshot payloads until Rust shape mirrors TS
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -16,6 +19,11 @@ export async function snapshot() {
 
 export async function commitTransform(args: Args) {
   return invoke("commit_transform", args);
+}
+
+/** Several moves, each with its own matrix, committed as one undo (align and distribute). */
+export async function commitTransforms(args: { moves: { ids: number[]; m: number[] }[] }) {
+  return invoke("commit_transforms", args);
 }
 
 export async function addPrimitive(args: Args) {
@@ -44,6 +52,13 @@ export async function setCutLineType(args: Args) {
 
 export async function setMaterialPreset(args: Args) {
   return invoke("set_material_preset", args);
+}
+
+export type HistoryFlags = { can_undo: boolean; can_redo: boolean };
+
+/** The editor's undo stacks. Kept off the document snapshot: that JSON is the project shape (#308). */
+export async function history(): Promise<HistoryFlags> {
+  return invoke("history", {});
 }
 
 export async function undo() {
@@ -118,8 +133,8 @@ export type Phase =
 
 /** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
  *  says how the last job finished, which no phase can — a finished cut and a
- *  cancelled one both rest on "Idle". Actions say which buttons are legal.
- *  Nothing here needs interpreting, and nothing needs remembering. */
+ *  cancelled one both rest on "Idle". `jobId` says whose cut it is. 0 is a
+ *  lifecycle report, not a job. Actions say which buttons are legal. */
 export type CutStatus = {
   phase: Phase;
   ended: "Completed" | "Cancelled" | null;
@@ -127,6 +142,7 @@ export type CutStatus = {
   pass: { index: number; total: number } | null;
   sent: { sent: number; total: number } | null;
   error: DeviceError | null;
+  jobId: number;
 };
 
 /** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
@@ -137,6 +153,7 @@ export const DISCONNECTED_STATUS: CutStatus = {
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 };
 
 // `StateChanged` carries no payload: the event's own `status` is what changed.
@@ -158,6 +175,14 @@ export type PassKey = string;
 /** How the planner splits shapes into passes. Mirrors `cutplan::Grouping`. */
 export type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
 
+/** Mirrors `cutplan::weed::WeedLines`. */
+export type WeedLines = "None" | "Horizontal" | "Vertical" | "Both";
+
+/** Mirrors `cutplan::weed::WeedOptions`, in millimetres. Sent with the plan, the travel and the
+ *  cut, like the grouping: rows previewed with one border and cut with another would send
+ *  geometry nobody saw. */
+export type WeedOptions = { margin_mm: number; lines: WeedLines; spacing_mm: number; clearance_mm: number };
+
 /** Mirrors `document::PresetAssignment`'s adjacently-tagged JSON. */
 export type PresetAssignmentJson =
   | { state: "inherit" }
@@ -171,6 +196,8 @@ export type PlanCutPassSummary = {
   /** Each shape's first world-space point, parallel to node_ids — where the blade lands.
    *  null is a shape whose outline flattened to nothing. */
   starts: ([number, number] | null)[];
+  /** The pass's weed lines then its border, in world mm. Empty without weed options. */
+  weed: [number, number][][];
 };
 
 export type PlanCutResponse = {
@@ -229,8 +256,8 @@ export async function forceQuit(): Promise<void> {
   return invoke("force_quit", {});
 }
 
-export async function planCut(grouping: Grouping): Promise<PlanCutResponse> {
-  return invoke("plan_cut", { grouping });
+export async function planCut(grouping: Grouping, weed: WeedOptions | null): Promise<PlanCutResponse> {
+  return invoke("plan_cut", { grouping, weed });
 }
 
 /** A pass as the dialog has it configured: where it sits in the order, and whether it is cut. */
@@ -243,9 +270,10 @@ export type TravelPass = { key: PassKey; enabled: boolean };
 export async function travelForOrder(
   docRevision: string,
   grouping: Grouping,
+  weed: WeedOptions | null,
   passes: TravelPass[],
 ): Promise<[number, number, number, number][]> {
-  return invoke("travel_for_order", { docRevision, grouping, passes });
+  return invoke("travel_for_order", { docRevision, grouping, weed, passes });
 }
 
 /** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this
@@ -314,7 +342,16 @@ export async function machineCaps(machineId: string) {
  *  `traceControls` is: `cutplan::preflight` is what refuses a cut whose settings sit outside
  *  these, so the preset editor asks it for the bounds instead of keeping a second copy to drift. */
 export type SettingRange = { min: number; max: number };
-export type SettingsRanges = { speed: SettingRange; force: SettingRange; repeatCount: SettingRange };
+/** Mirrors `cutplan::weed::WeedRanges`; same reason as the settings ranges. */
+export type WeedRanges = { margin_mm: SettingRange; spacing_mm: SettingRange; clearance_mm: SettingRange };
+export type SettingsRanges = {
+  speed: SettingRange;
+  force: SettingRange;
+  repeatCount: SettingRange;
+  weed: WeedRanges;
+  /** `cutplan::weed::WEED_DEFAULTS`: where the weed controls start. */
+  weedDefaults: WeedOptions;
+};
 
 export async function settingsRanges(): Promise<SettingsRanges> {
   return invoke("settings_ranges", {});
@@ -386,4 +423,17 @@ export async function loadImagePreview(args: { path: string }): Promise<string> 
 // picked and refuses to trace anything else, so choosing the file here is what grants access.
 export async function pickImagePath(): Promise<string | null> {
   return invoke("pick_image", {});
+}
+
+export type Appearance = "light" | "dark" | "system";
+/** `units` is null until a choice has been saved. The UI resolves the region once and writes it. */
+export type Preferences = { appearance: Appearance; units: LengthUnit | null };
+
+export async function getPreferences(): Promise<Preferences> {
+  return invoke("get_preferences", {});
+}
+
+/** Either field may be omitted. A save merges onto the file, so naming one does not drop the other. */
+export async function setPreferences(appearance?: Appearance, units?: LengthUnit): Promise<Preferences> {
+  return invoke("set_preferences", { appearance, units });
 }

@@ -2,11 +2,20 @@
 import { useEffect, useRef } from "react";
 import { Check, FlaskConical } from "lucide-react";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
-import { DEMO_FIXTURES, DEMO_STORAGE_KEY, type DemoFixture, type DemoId } from "./fixtures";
+import type { JobSnapshot } from "../cut/job/model";
+import { DEMO_FIXTURES, DEMO_STORAGE_KEY, IMPORT_FAILED, type DemoFixture, type DemoId } from "./fixtures";
 
 type Props = {
-  onImportError: (message: string) => void;
-  onHostOffline: () => void;
+  onError: (message: string) => void;
+  remember: (snapshot: JobSnapshot) => void;
+};
+
+// jobId 0 is the accept that carries no id: a non-zero id already on screen would skip the snapshot.
+// The host-offline card mounts only once a job is remembered, and this module is what the production build drops.
+const HOST_OFFLINE_JOB: JobSnapshot = {
+  grouping: "Single",
+  passes: [{ key: "all", shapeCount: 2, enabled: true, name: "All shapes", swatch: null }],
+  jobId: 0,
 };
 
 function currentId(): DemoId | null {
@@ -16,7 +25,7 @@ function currentId(): DemoId | null {
 }
 
 /** Dev-only. The production build drops this module with the flag that imports it. */
-export function DemoMenu({ onImportError, onHostOffline }: Props) {
+export function DemoMenu({ onError, remember }: Props) {
   const applied = useRef(false);
   const current = currentId();
   const label = DEMO_FIXTURES.find((fixture) => fixture.id === current)?.label ?? null;
@@ -24,14 +33,31 @@ export function DemoMenu({ onImportError, onHostOffline }: Props) {
   useEffect(() => {
     if (applied.current || current === null) return;
     applied.current = true;
-    const fixture = DEMO_FIXTURES.find((item) => item.id === current);
-    if (!fixture) return;
-    if (fixture.importError) onImportError(fixture.importError);
-    if (fixture.hostOffline) onHostOffline();
-  }, [current, onImportError, onHostOffline]);
+    switch (current) {
+      case "importFailed":
+        onError(IMPORT_FAILED);
+        break;
+      case "hostOffline":
+        remember(HOST_OFFLINE_JOB);
+        break;
+      case "normal":
+      case "noCutters":
+      case "emptyCanvas":
+        break;
+      default: {
+        const never: never = current;
+        throw new Error(`unhandled demo state: ${never}`);
+      }
+    }
+  }, [current, onError, remember]);
 
   const choose = (fixture: DemoFixture) => {
-    sessionStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(fixture));
+    try {
+      sessionStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify({ id: fixture.id }));
+    } catch {
+      onError("Couldn't save the demo state.");
+      return;
+    }
     window.location.reload();
   };
 

@@ -11,7 +11,10 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
     },
     {
-      command: "VITE_CUTHULHU_DEMO_STATES=1 npm run dev -- --port 5174 --strictPort",
+      command: "npm run dev -- --port 5174 --strictPort",
+      // Merged over process.env. A Unix `VAR=value` prefix fails on Windows cmd, and that
+      // failure stops every webServer, including the suite that does not use the flag.
+      env: { VITE_CUTHULHU_DEMO_STATES: "1" },
       port: 5174,
       reuseExistingServer: !process.env.CI,
     },

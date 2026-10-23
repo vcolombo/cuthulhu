@@ -15,18 +15,15 @@ describe("demo fixtures", () => {
     expect(DEMO_STORAGE_KEY).toBe("cuthulhu.demo");
   });
 
-  it("points each state at the screen the menu is for", () => {
-    const noCutters = demoFixture("noCutters");
-    expect(noCutters.clearDevices).toBe(true);
-    expect(noCutters.seedShapes).toBe(true);
-
-    const empty = demoFixture("emptyCanvas");
-    expect(empty.clearShapes).toBe(true);
-    expect(empty.seedShapes).toBe(false);
-
-    expect(demoFixture("importFailed").importError).toBe(IMPORT_FAILED);
-    expect(demoFixture("hostOffline")).toMatchObject({ hostOffline: true, importError: null, seedShapes: true });
-    expect(demoFixture("normal").clearDevices).toBe(false);
+  it("returns the menu label for a known id and rejects any other", () => {
+    expect(DEMO_FIXTURES.map((fixture) => demoFixture(fixture.id).label)).toEqual([
+      "Normal",
+      "No cutters",
+      "Empty canvas",
+      "Import failed",
+      "Host offline",
+    ]);
+    expect(IMPORT_FAILED).toBe("Couldn't import “logo-final.svg”. The file is not valid SVG.");
     expect(() => demoFixture("missing" as DemoId)).toThrow(/unknown demo state/);
   });
 });

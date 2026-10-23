@@ -5,11 +5,13 @@
  * Every error toast, including a failed import, sat on that sheet: during the
  * 400ms enter fade the layers behind it read through the message, and at rest
  * the surface was Sonner's black or white rather than a token.
+ * `break-word` wraps a sentence at spaces and still breaks a long path that
+ * would otherwise run past the toast.
  */
 [data-sonner-toaster] [data-sonner-toast][data-styled="true"] {
   background: var(--popover);
   border: 1px solid var(--border);
   color: var(--foreground);
   box-shadow: var(--shadow-lg);
-  overflow-wrap: normal;
+  overflow-wrap: break-word;
 }

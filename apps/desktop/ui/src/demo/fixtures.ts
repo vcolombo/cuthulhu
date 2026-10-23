@@ -7,23 +7,18 @@ export const IMPORT_FAILED = "Couldn't import “logo-final.svg”. The file is 
 
 export type DemoId = "normal" | "noCutters" | "emptyCanvas" | "importFailed" | "hostOffline";
 
-/** Flags the fake applies. The menu and the e2e tests pass this object; neither one re-implements the state. */
+/** The id is the whole fixture. The fake switches on it; a second bag of flags could name one state and apply another. */
 export type DemoFixture = {
   id: DemoId;
   label: string;
-  clearDevices: boolean;
-  clearShapes: boolean;
-  seedShapes: boolean;
-  importError: string | null;
-  hostOffline: boolean;
 };
 
 export const DEMO_FIXTURES: readonly DemoFixture[] = [
-  { id: "normal", label: "Normal", clearDevices: false, clearShapes: false, seedShapes: true, importError: null, hostOffline: false },
-  { id: "noCutters", label: "No cutters", clearDevices: true, clearShapes: false, seedShapes: true, importError: null, hostOffline: false },
-  { id: "emptyCanvas", label: "Empty canvas", clearDevices: false, clearShapes: true, seedShapes: false, importError: null, hostOffline: false },
-  { id: "importFailed", label: "Import failed", clearDevices: false, clearShapes: false, seedShapes: true, importError: IMPORT_FAILED, hostOffline: false },
-  { id: "hostOffline", label: "Host offline", clearDevices: false, clearShapes: false, seedShapes: true, importError: null, hostOffline: true },
+  { id: "normal", label: "Normal" },
+  { id: "noCutters", label: "No cutters" },
+  { id: "emptyCanvas", label: "Empty canvas" },
+  { id: "importFailed", label: "Import failed" },
+  { id: "hostOffline", label: "Host offline" },
 ];
 
 export function demoFixture(id: DemoId): DemoFixture {

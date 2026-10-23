@@ -32,7 +32,7 @@ import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
 import { EmptyCanvas } from "./panels/EmptyCanvas";
-import { DemoSlot } from "./demo/DemoSlot";
+import { DemoMenu } from "./demo/DemoMenu";
 import { JobPanel } from "./cut/job/JobPanel";
 import { jobIsActive, jobSurface, placeOf } from "./cut/job/model";
 import { JobStatusChip, SwapBar, SwapChip } from "./cut/job/SwapBar";
@@ -47,7 +47,7 @@ import { documentPasses } from "./panels/layerRows";
 import { rotationMove, worldRotationDegrees } from "./panels/rotation";
 
 // Folded away in a production build: DEV is false, and the env member is replaced before emit,
-// so DemoSlot and the fixture strings are not in dist/.
+// so DemoMenu and the fixture strings are not in dist/.
 const demoStatesOn = import.meta.env.DEV && import.meta.env.VITE_CUTHULHU_DEMO_STATES === "1";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
@@ -863,7 +863,7 @@ export function App() {
         selection={selectionSize}
         unit={unit}
         hideJobEcho={surface !== "hidden"}
-        leading={demoStatesOn ? <DemoSlot onError={setError} remember={job.remember} /> : null}
+        leading={demoStatesOn ? <DemoMenu onError={setError} remember={job.remember} /> : null}
         trailing={surface === "swap" && swapCollapsed ? (
           <SwapChip
             status={status}

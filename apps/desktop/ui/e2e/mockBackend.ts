@@ -3,7 +3,7 @@
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; demo?: { id: string; clearDevices: boolean; clearShapes: boolean; seedShapes: boolean; importError: string | null; hostOffline: boolean } }) {
+export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; demo?: { id: string } }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -60,7 +60,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     doc.nodes[doc.root].children.push(groupId);
   }
 
-  if (opts?.seedTwoColorRects) {
+  const addTwoColorRects = () => {
     const redId = nextId++;
     doc.nodes[redId] = {
       id: redId,
@@ -84,7 +84,8 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       material_preset: { state: "inherit" },
     };
     doc.nodes[doc.root].children.push(redId, greenId);
-  }
+  };
+  if (opts?.seedTwoColorRects) addTwoColorRects();
 
   // Screenshot seed only. Green is not a named swatch; gold is, so the swap bar can say "Gold vinyl".
   // A rect is drawn from its transform (`buildScene` uses w/h at the local origin). An x on the
@@ -490,12 +491,13 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
   // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
   // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
   let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
-  if (opts?.seedBusyHost) {
+  const addBusyHost = () => {
     hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
                unreachable: "the host could not be reached (timed out)" }];
     devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
                    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
-  }
+  };
+  if (opts?.seedBusyHost) addBusyHost();
 
   // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
   // enough for the dialog's pairing flow to be driven end to end rather than stubbed out.
@@ -1500,78 +1502,63 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     },
   } as Record<string, (args: Record<string, unknown>) => unknown>);
 
-  // The dev menu and the demo e2e pass the same fixture. Session storage wins so a menu reload
-  // overrides the init-script argument. The key is spelled out: this function is serialized into
-  // the page and cannot import DEMO_STORAGE_KEY from src/demo/fixtures.ts.
+  // The dev menu stores only the id. Session storage wins so a menu reload overrides the
+  // init-script argument. The key and the import sentence are spelled out: this function is
+  // serialized into the page and cannot import src/demo/fixtures.ts. Switching on the id keeps
+  // a stored "hostOffline" from applying a different screen than the menu.
   const storedDemo = sessionStorage.getItem("cuthulhu.demo");
-  type DemoFlags = { id?: unknown; clearDevices?: unknown; clearShapes?: unknown; seedShapes?: unknown; importError?: unknown; hostOffline?: unknown };
-  let demo: DemoFlags | null = null;
+  let demoId: string | null = null;
   if (storedDemo) {
     try {
       const parsed: unknown = JSON.parse(storedDemo);
-      if (parsed && typeof parsed === "object") demo = parsed as DemoFlags;
+      if (parsed && typeof parsed === "object" && "id" in parsed) {
+        const id = (parsed as { id: unknown }).id;
+        if (typeof id === "string") demoId = id;
+      }
     } catch {
-      demo = null;
+      demoId = null;
     }
-  } else if (opts?.demo) {
-    demo = opts.demo;
+  } else if (typeof opts?.demo?.id === "string") {
+    demoId = opts.demo.id;
   }
-  if (demo) {
-    if (demo.clearDevices === true) {
-      devices.splice(0, devices.length);
-      hosts = [];
-      connected = null;
+  const seedShapes = () => {
+    if (doc.nodes[doc.root].children.length === 0) addTwoColorRects();
+  };
+  if (demoId !== null) {
+    switch (demoId) {
+      case "normal":
+        seedShapes();
+        break;
+      case "noCutters":
+        devices.splice(0, devices.length);
+        hosts = [];
+        connected = null;
+        seedShapes();
+        break;
+      case "emptyCanvas":
+        for (const id of doc.nodes[doc.root].children) delete doc.nodes[id];
+        doc.nodes[doc.root].children = [];
+        break;
+      case "importFailed":
+        seedShapes();
+        demoImportError = "Couldn't import “logo-final.svg”. The file is not valid SVG.";
+        break;
+      case "hostOffline":
+        seedShapes();
+        if (!hosts.some((host) => host.id === "host-1")) addBusyHost();
+        // Connected here, not via aim(): a confirm dialog would sit on the first cutter the menu shows.
+        // Sending, so the job panel stays up when the first device read lands before the menu
+        // remembers the job. A Disconnected read there would leave nothing watching the host.
+        connected = devices.find((device) => device.instance_id === "usb:pi:A") ?? null;
+        status = statusOf("Sending", { cancel: true });
+        break;
+      default:
+        demoId = null;
+        break;
     }
-    if (demo.clearShapes === true) {
-      for (const id of doc.nodes[doc.root].children) delete doc.nodes[id];
-      doc.nodes[doc.root].children = [];
+    if (demoId !== null) {
+      (window as unknown as { __cuthulhuDemo?: unknown }).__cuthulhuDemo = { id: demoId };
     }
-    if (demo.seedShapes === true && doc.nodes[doc.root].children.length === 0) {
-      const redId = nextId++;
-      doc.nodes[redId] = {
-        id: redId,
-        kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
-        transform: [1, 0, 0, 1, 0, 0],
-        style: { stroke: 0xff0000ff, fill: null },
-        children: [],
-        cut_line_type: "Cut",
-        material_preset: { state: "inherit" },
-      };
-      const greenId = nextId++;
-      doc.nodes[greenId] = {
-        id: greenId,
-        kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
-        transform: [1, 0, 0, 1, 0, 0],
-        style: { stroke: 0x00ff00ff, fill: null },
-        children: [],
-        cut_line_type: "Cut",
-        material_preset: { state: "inherit" },
-      };
-      doc.nodes[doc.root].children.push(redId, greenId);
-    }
-    if (demo.hostOffline === true) {
-      // Connected here, not via aim(): a confirm dialog would sit on the first cutter the menu shows.
-      hosts.push({
-        id: "host-1",
-        name: "Workshop Pi",
-        address: "pi.local:7878",
-        unreachable: "the host could not be reached (timed out)",
-      });
-      const cutter: DeviceInfo = {
-        instance_id: "usb:pi:A",
-        machine_id: "cameo5",
-        transport: { Usb: { locator: "pi" } },
-        candidate: false,
-        host: "host-1",
-      };
-      devices.push(cutter);
-      connected = cutter;
-      // Sending, so the job panel stays up when the first device read lands before the menu
-      // remembers the job. A Disconnected read there would leave nothing watching the host.
-      status = statusOf("Sending", { cancel: true });
-    }
-    demoImportError = typeof demo.importError === "string" ? demo.importError : null;
-    (window as unknown as { __cuthulhuDemo?: unknown }).__cuthulhuDemo = demo;
   }
 
   (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {

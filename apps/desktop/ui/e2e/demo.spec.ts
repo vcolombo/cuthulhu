@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { expect, test, type Page } from "@playwright/test";
 import ipcInventory from "../../ipc-inventory.json" with { type: "json" };
-import { DEMO_FIXTURES, IMPORT_FAILED, demoFixture, type DemoId } from "../src/demo/fixtures";
+import { DEMO_FIXTURES, DEMO_STORAGE_KEY, IMPORT_FAILED, type DemoId } from "../src/demo/fixtures";
 import { installMockTauri } from "./mockBackend";
 
 // Copied from smoke.spec.ts. Importing that file would register its tests in this project.
@@ -22,8 +22,46 @@ test.afterEach(async ({ page }) => {
 });
 
 async function boot(page: Page, id: DemoId) {
-  await page.addInitScript(installMockTauri, { demo: demoFixture(id) });
+  await page.addInitScript(installMockTauri, { demo: { id } });
   await page.goto("/");
+}
+
+async function expectState(page: Page, id: DemoId) {
+  switch (id) {
+    case "normal":
+      await expect(page.getByTestId("layer-row")).toHaveCount(2);
+      await expect(page.getByRole("heading", { name: "Your mat is empty" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "No cutter · Add one" })).toHaveCount(0);
+      break;
+    case "noCutters":
+      await showDevices(page);
+      await expect(page.getByText("No cutters yet.")).toBeVisible();
+      await expect(page.getByRole("button", { name: "No cutter · Add one" })).toBeVisible();
+      break;
+    case "emptyCanvas":
+      await expect(page.getByRole("heading", { name: "Your mat is empty" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Import SVG" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Trace an image" })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Draw a rectangle" })).toBeVisible();
+      await expect(page.getByTestId("layer-row")).toHaveCount(0);
+      break;
+    case "importFailed": {
+      const toast = page.locator("[data-sonner-toast]");
+      await expect(toast).toBeVisible();
+      await expect(toast).toContainText(IMPORT_FAILED);
+      // The enter fade is 400ms. A shot or a contrast read before it settles sees the layers through the card.
+      await expect(toast).toHaveCSS("opacity", "1");
+      break;
+    }
+    case "hostOffline":
+      await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
+      await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
+      break;
+    default: {
+      const never: never = id;
+      throw new Error(`unhandled demo state: ${never}`);
+    }
+  }
 }
 
 async function showDevices(page: Page) {
@@ -43,40 +81,27 @@ async function setAppearance(page: Page, mode: "Light" | "Dark") {
 
 test("normal shows the seeded shapes and the connected-cutter controls", async ({ page }) => {
   await boot(page, "normal");
-  await expect(page.getByTestId("layer-row")).toHaveCount(2);
-  await expect(page.getByRole("heading", { name: "Your mat is empty" })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "No cutter · Add one" })).toHaveCount(0);
+  await expectState(page, "normal");
 });
 
 test("no cutters shows the empty devices list and the add-cutter pill", async ({ page }) => {
   await boot(page, "noCutters");
-  await showDevices(page);
-  await expect(page.getByText("No cutters yet.")).toBeVisible();
-  await expect(page.getByRole("button", { name: "No cutter · Add one" })).toBeVisible();
+  await expectState(page, "noCutters");
 });
 
 test("empty canvas shows the mat card and no shapes", async ({ page }) => {
   await boot(page, "emptyCanvas");
-  await expect(page.getByRole("heading", { name: "Your mat is empty" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Import SVG" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Trace an image" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Draw a rectangle" })).toBeVisible();
-  await expect(page.getByTestId("layer-row")).toHaveCount(0);
+  await expectState(page, "emptyCanvas");
 });
 
 test("import failed shows the toast from the shared fixture", async ({ page }) => {
   await boot(page, "importFailed");
-  const toast = page.locator("[data-sonner-toast]");
-  await expect(toast).toBeVisible();
-  await expect(toast).toContainText(IMPORT_FAILED);
-  // The enter fade is 400ms. A shot or a contrast read before it settles sees the layers through the card.
-  await expect(toast).toHaveCSS("opacity", "1");
+  await expectState(page, "importFailed");
 });
 
 test("host offline shows the job banner for the unreachable host", async ({ page }) => {
   await boot(page, "hostOffline");
-  await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
-  await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
+  await expectState(page, "hostOffline");
 });
 
 test("the dev menu reloads into the fixture it writes", async ({ page }) => {
@@ -87,18 +112,18 @@ test("the dev menu reloads into the fixture it writes", async ({ page }) => {
   await page.getByRole("menuitem", { name: "Empty canvas", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Your mat is empty" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Demo state: Empty canvas" })).toBeVisible();
-  const stored = await page.evaluate(() => sessionStorage.getItem("cuthulhu.demo"));
-  expect(JSON.parse(stored ?? "null")).toMatchObject(demoFixture("emptyCanvas"));
+  const stored = await page.evaluate((key) => sessionStorage.getItem(key), DEMO_STORAGE_KEY);
+  expect(JSON.parse(stored ?? "null")).toEqual({ id: "emptyCanvas" });
 });
 
-test("demo states in light and dark", async ({ page }) => {
+test("demo states in light and dark", async ({ page }, testInfo) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 1440, height: 900 });
   const shot = async (name: string) => {
-    await page.screenshot({ path: `/opt/cursor/artifacts/${name}.png` });
+    await page.screenshot({ path: testInfo.outputPath(`${name}.png`) });
   };
 
-  await page.addInitScript(installMockTauri, { demo: demoFixture("normal") });
+  await page.addInitScript(installMockTauri, { demo: { id: "normal" } });
   await page.goto("/");
   await expect(page.getByRole("button", { name: /Demo state/ })).toBeVisible();
   for (const mode of ["Light", "Dark"] as const) {
@@ -110,40 +135,14 @@ test("demo states in light and dark", async ({ page }) => {
   }
 
   for (const fixture of DEMO_FIXTURES) {
-    await page.evaluate(() => sessionStorage.clear());
-    await page.addInitScript(installMockTauri, { demo: fixture });
+    // Only the demo key. sessionStorage.clear() would drop __ipc_violations__ before afterEach reads it.
+    await page.evaluate((key) => sessionStorage.removeItem(key), DEMO_STORAGE_KEY);
+    await page.addInitScript(installMockTauri, { demo: { id: fixture.id } });
     await page.goto("/");
-    switch (fixture.id) {
-      case "noCutters":
-        await showDevices(page);
-        await expect(page.getByText("No cutters yet.")).toBeVisible();
-        break;
-      case "emptyCanvas":
-        await expect(page.getByRole("heading", { name: "Your mat is empty" })).toBeVisible();
-        break;
-      case "importFailed": {
-        const toast = page.locator("[data-sonner-toast]");
-        await expect(toast).toContainText(IMPORT_FAILED);
-        await expect(toast).toHaveCSS("opacity", "1");
-        break;
-      }
-      case "hostOffline":
-        await expect(page.getByText(/Connection lost · last update/)).toBeVisible();
-        await expect(page.getByText(/Reconnecting to Workshop Pi/)).toBeVisible();
-        break;
-      case "normal":
-        await expect(page.getByTestId("layer-row")).toHaveCount(2);
-        break;
-      default: {
-        const never: never = fixture.id;
-        throw new Error(`unhandled demo state: ${never}`);
-      }
-    }
+    await expectState(page, fixture.id);
     for (const mode of ["Light", "Dark"] as const) {
       await setAppearance(page, mode);
-      if (fixture.id === "importFailed") {
-        await expect(page.locator("[data-sonner-toast]")).toHaveCSS("opacity", "1");
-      }
+      await expectState(page, fixture.id);
       await shot(`demo-${fixture.id}-${mode.toLowerCase()}`);
     }
   }

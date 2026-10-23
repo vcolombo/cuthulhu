@@ -16,6 +16,11 @@ type Props = {
   onChange: (v: number) => void;
 };
 
+/** A zero, a trailing dot, or a trailing decimal zero is not finished: "0" is the start of 0.5. */
+function spellingInProgress(raw: string): boolean {
+  return raw === "0" || raw === "-0" || raw.endsWith(".") || (raw.includes(".") && raw.endsWith("0"));
+}
+
 /** Numeric input whose label doubles as a drag-scrub handle (pointer dx * step).
  *  Scrubbing only previews locally as the pointer moves; onChange fires once on
  *  pointerup so one drag gesture produces one undo step. */
@@ -28,11 +33,12 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
   const [text, setText] = useState<string | null>(null);
   useEffect(() => {
     setText((current) => {
-      if (current === null) return null;
-      // Number("") is 0, so a cleared field must not count as still naming a zero.
-      // A half-typed draft survives only while it still names this value. An external
-      // change (undo, another field) drops it so the input shows the shape.
-      return current !== "" && Number(current) === value ? current : null;
+      if (current === null || current === "") return null;
+      const next = Number(current);
+      // A draft that is still a different number is a keystroke the commit has not
+      // landed yet. Dropping it makes the next digit edit the preview.
+      if (!Number.isFinite(next) || next !== value) return current;
+      return spellingInProgress(current) ? current : null;
     });
   }, [value]);
 
@@ -99,14 +105,9 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
               setText(raw);
               return;
             }
-            // A bare 0 is the start of 0.5. Committing it on W or H is rejected (size must
-            // stay positive), and clearing the draft then snaps the field back to the old length.
-            const stillTyping =
-              raw === "0" ||
-              raw === "-0" ||
-              raw.endsWith(".") ||
-              (raw.includes(".") && raw.endsWith("0"));
-            setText(stillTyping ? raw : null);
+            // Keep every finite keystroke. The first digit previews immediately and later
+            // digits queue; clearing the draft makes the next keystroke edit that preview.
+            setText(raw);
             onChange(next);
           }}
           className="w-full rounded-sm border border-input bg-background px-1 text-foreground"

@@ -169,6 +169,27 @@ describe("document section", () => {
     expect(field(panel, "W").value).toBe("0.5");
   });
 
+  test("later digits stay visible while the shown value is still the first digit", () => {
+    const onChangeRotation = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 45,
+      nothingSelected: false,
+      onChangeRotation,
+    };
+    const panel = render(shape);
+    typeInto(field(panel, "Rotation"), "1");
+    rerender({ ...shape, rotation: 1 });
+    typeInto(field(panel, "Rotation"), "12");
+    rerender({ ...shape, rotation: 1 });
+    expect(field(panel, "Rotation").value).toBe("12");
+    typeInto(field(panel, "Rotation"), "123");
+    expect(onChangeRotation).toHaveBeenLastCalledWith(123);
+    expect(field(panel, "Rotation").value).toBe("123");
+  });
+
   test("a mixed material selection keeps the align row and the Mixed option", () => {
     const panel = render({
       bounds: null,

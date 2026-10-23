@@ -136,7 +136,7 @@ async function showPresetEditor(page: Page) {
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
+function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -288,6 +288,22 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     ];
     for (const shape of shapes) doc.nodes[shape.id] = shape;
     doc.nodes[doc.root].children.push(...shapes.map((shape) => shape.id));
+  }
+
+  // Alpha byte 1 is under 0.1. The planner still keys it (alpha 0 is the absent colour), and
+  // the properties note is the only place that says the shape still cuts.
+  if (opts?.seedFaint) {
+    const id = nextId++;
+    doc.nodes[id] = {
+      id,
+      kind: { Shape: { Rect: { w: 10, h: 10 } } },
+      transform: [1, 0, 0, 1, 0, 0],
+      style: { stroke: 0xff000001, fill: null },
+      children: [],
+      cut_line_type: "Cut",
+      material_preset: { state: "inherit" },
+    };
+    doc.nodes[doc.root].children.push(id);
   }
 
   // After the rects: a Group of two 10 mm rects at (50, 20) and (70, 40), so its bounds are
@@ -6919,3 +6935,138 @@ async function assertPressedApart(page: Page, theme: "light" | "dark") {
     }
   }
 }
+
+function phase7Shots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.PHASE7_SHOTS === "1";
+}
+
+async function phaseShot(page: Page, name: string) {
+  if (!phase7Shots()) return;
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+const VINYL_BOARD = ["Gold vinyl", "Red vinyl", "Black vinyl", "White vinyl", "Navy vinyl", "Purple vinyl", "#f5e6a3"] as const;
+
+test("layers follow the colour passes and a cut toggle stays on the row", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedVinylBoard: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+
+  await expect(page.getByTestId("colour-layer")).toHaveCount(VINYL_BOARD.length);
+  for (const name of VINYL_BOARD) {
+    await expect(page.getByRole("button", { name: `Cut ${name}`, exact: true })).toHaveAttribute("aria-pressed", "true");
+  }
+  await expect(page.getByText("Each colour layer is cut as its own pass. Drag to change cut order.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cut this shape", exact: true })).toHaveCount(0);
+
+  const red = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Red vinyl", exact: true }) });
+  const gold = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Gold vinyl", exact: true }) });
+  await red.getByRole("button").nth(1).click();
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "false");
+  await gold.getByRole("button").nth(1).click({ modifiers: ["Shift"] });
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+
+  for (const name of VINYL_BOARD) {
+    if (name === "Red vinyl") continue;
+    await page.getByRole("button", { name: `Collapse ${name}`, exact: true }).click();
+  }
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await expect(page.getByText("Ellipse 1", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "layers-one-open");
+
+  await page.getByRole("button", { name: "Cut Red vinyl", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await phaseShot(page, "layers-cut-off");
+});
+
+test("properties show one shape in millimetres and in inches", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Y", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("H", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "properties-mm");
+
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("0.39");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await phaseShot(page, "properties-in");
+});
+
+test("a mixed selection keeps align and does not pick a material", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("Material preset").locator("option").first()).toHaveText("Mixed");
+  await expect(page.getByLabel("Material preset")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Align left edges", exact: true })).toBeVisible();
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await phaseShot(page, "properties-mixed");
+});
+
+test("an empty selection shows the document, not a second units control", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Properties");
+
+  const section = page.getByRole("region", { name: "Document" });
+  await expect(section.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(section.getByText("Mat", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("12 × 12 in (305 × 305 mm)");
+  await expect(section.getByText("Units", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("mm");
+  await expect(section.getByText("Passes", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByText("Objects", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByLabel("Design for")).toBeVisible();
+  await expect(section.getByRole("button", { name: "mm", exact: true })).toHaveCount(0);
+  await expect(section.getByLabel("Mat size")).toHaveCount(0);
+  await expect(page.getByLabel("Mat size")).toHaveCount(1);
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "document");
+});
+
+test("a nearly invisible shape still says it cuts", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedFaint: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toBeVisible();
+  await page.getByTestId("layer-row").click();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Nearly invisible in the file. It still cuts.")).toBeVisible();
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "faint");
+});

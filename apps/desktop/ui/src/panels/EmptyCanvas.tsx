@@ -22,14 +22,14 @@ export function EmptyCanvas({ onImportFile, onTrace, onAddRect, editsLocked }: P
       <div className="pointer-events-none w-full max-w-xs rounded-md border border-dashed border-border bg-panel px-5 py-4 text-center shadow-sm">
         <h2 className="text-sm font-medium text-foreground">Your mat is empty</h2>
         <p className="mt-1 text-xs text-muted-foreground">Import a design, trace an image, or draw a shape.</p>
-        <div className="pointer-events-auto mt-3 flex flex-wrap items-center justify-center gap-2">
-          <Button variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={() => fileRef.current?.click()}>
+        <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+          <Button className="pointer-events-auto" variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={() => fileRef.current?.click()}>
             Import SVG
           </Button>
-          <Button variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={onTrace}>
+          <Button className="pointer-events-auto" variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={onTrace}>
             Trace an image
           </Button>
-          <Button variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={onAddRect}>
+          <Button className="pointer-events-auto" variant="secondary" size="sm" disabled={editsLocked !== null} title={editsLocked ?? undefined} onClick={onAddRect}>
             Draw a rectangle
           </Button>
           <input

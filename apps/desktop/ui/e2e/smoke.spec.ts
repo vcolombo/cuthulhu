@@ -1740,7 +1740,7 @@ test("a command or key the registered commands do not declare is refused", async
 test("new doc → add rect → save → reload keeps the rect", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
   await page.mouse.click(400, 300);
   await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
@@ -4438,7 +4438,7 @@ test("trace dialog: a control table missing a control reports it instead of hang
 test("text dialog: picking a family and Insert adds a shape", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await dialog.getByLabel("Font family").selectOption("Times New Roman");
@@ -4453,7 +4453,7 @@ test("text dialog: picking a family and Insert adds a shape", async ({ page }) =
 test("text dialog: an empty font list says so and disables Insert", async ({ page }) => {
   await page.addInitScript(installMockTauri, { noFonts: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("No fonts were found on this system")).toBeVisible();
@@ -4773,7 +4773,7 @@ test("Space-drag pans after a toolbar click without pressing the button, and so 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   const beforeAdd = await fittedView(page);
-  await page.getByRole("button", { name: "Rectangle" }).click(); // adds one; focus stays on it
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click(); // adds one; focus stays on it
   await showTab(page, "Layers");
   const rows = page.getByTestId("layer-row");
   await expect(rows).toHaveCount(3);
@@ -6543,7 +6543,7 @@ test("a history reply from an earlier refresh does not rewind Undo", async ({ pa
     page.evaluate(() => ((window as unknown as { __historyWaiters?: unknown[] }).__historyWaiters ?? []).length);
   // StrictMode runs the mount refresh twice. Both are queued before the edit's.
   await expect.poll(waiters).toBe(2);
-  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
   await page.mouse.click(400, 300);
   await expect.poll(waiters).toBe(3);
 

@@ -10,6 +10,8 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use driver_core::manager::CutPass;
 use driver_core::DeviceInfo;
 
@@ -80,15 +82,15 @@ impl std::fmt::Display for ClientError {
                 write!(f, "this host answered with `{found}` where `{expected}` was expected"),
             ClientError::WrongDispatch =>
                 write!(f, "this host answered about a different dispatch than the one it was sent"),
-            ClientError::Protocol { host_version, desktop_version } => match host_version {
-                Some(host) if host > desktop_version => write!(
+            ClientError::Protocol { host_version, desktop_version } => match mismatch_side(
+                host_version,
+                desktop_version,
+            ) {
+                ProtocolSide::Desktop => write!(
                     f,
                     "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
                 ),
-                // `None` is a host that never named a version. Equal is a host that refused the
-                // version it claims to speak. Both are the host to replace: this build is current
-                // for the version it offered, and the peer is not speaking it.
-                _ => write!(
+                ProtocolSide::Host => write!(
                     f,
                     "This Cut Host is running an older version. Update your Cut Host to connect."
                 ),
@@ -98,6 +100,39 @@ impl std::fmt::Display for ClientError {
     }
 }
 impl std::error::Error for ClientError {}
+
+/// Which program a protocol mismatch names. The sentence and the desktop row both
+/// come from this, so a rewording of one cannot drop the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtocolSide {
+    /// The Cut Host is the program to replace.
+    Host,
+    /// This build of Cuthulhu is the program to replace.
+    Desktop,
+}
+
+/// `None` is a host that never named a version. Equal is a host that refused the version
+/// it claims to speak. Both are the host to replace: this build is current for the version
+/// it offered, and the peer is not speaking it. A higher number is a desktop that is behind.
+fn mismatch_side(host_version: &Option<u32>, desktop_version: &u32) -> ProtocolSide {
+    match host_version {
+        Some(host) if host > desktop_version => ProtocolSide::Desktop,
+        _ => ProtocolSide::Host,
+    }
+}
+
+impl ClientError {
+    /// Which program to replace, when this failure is a protocol mismatch.
+    pub fn protocol_side(&self) -> Option<ProtocolSide> {
+        match self {
+            ClientError::Protocol { host_version, desktop_version } => {
+                Some(mismatch_side(host_version, desktop_version))
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Accepts exactly one certificate: the one pinned at pairing. A change is a hard
 /// refusal, not a prompt — the only honest reading of a changed key on a host that

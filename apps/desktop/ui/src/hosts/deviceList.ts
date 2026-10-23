@@ -29,6 +29,8 @@ export type DeviceSection = {
   address: string | null;
   /** Why this section is not normal — unreachable, or naming a host nobody is paired with. */
   unreachable: string | null;
+  /** Which program a protocol mismatch names. Null when the row is some other failure. */
+  protocolSide: ProtocolSide | null;
   devices: DeviceInfo[];
   /** These are the last values a poll managed to read, not what is true now. */
   stale: boolean;
@@ -42,11 +44,12 @@ export function groupDevices(
   devices: DeviceInfo[], hosts: PairedHostView[],
 ): DeviceSection[] {
   const local: DeviceSection = {
-    hostId: null, title: "This computer", address: null, unreachable: null, stale: false,
-    devices: devices.filter(d => d.host === null),
+    hostId: null, title: "This computer", address: null, unreachable: null, protocolSide: null,
+    stale: false, devices: devices.filter(d => d.host === null),
   };
   const known = hosts.map(h => ({
-    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable, stale: false,
+    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable,
+    protocolSide: protocolSide(h.protocol_side), stale: false,
     devices: devices.filter(d => d.host === h.id),
   }));
   // A cutter whose host is in neither list matches no section above — not local, since its `host`
@@ -59,7 +62,7 @@ export function groupDevices(
     devices.flatMap(d => (d.host !== null && !paired.has(d.host) ? [d.host] : [])),
   )];
   return [local, ...known, ...orphaned.map(id => ({
-    hostId: id, title: id, address: null, stale: false,
+    hostId: id, title: id, address: null, stale: false, protocolSide: null,
     unreachable: "this Cut Host is not paired with this computer",
     devices: devices.filter(d => d.host === id),
   }))];
@@ -124,30 +127,26 @@ export async function forgetFrom(
  * moving under a blade. The cutters stay listed with whatever status each already had.
  */
 export function staleSection(previous: DeviceSection, e: unknown): DeviceSection {
-  return { ...previous, stale: true, unreachable: ipcErrorMessage(e) };
+  // The list error replaces the host's sentence, so the chip and the link must not
+  // keep a side that belonged to the sentence that just left the row.
+  return { ...previous, stale: true, unreachable: ipcErrorMessage(e), protocolSide: null };
 }
 
 // A caller is told about a cut through one value, `CutStatus.actions` — never `phase`. Two
 // cutters can share the same phase (e.g. "Disconnected") while one is legal to cut and the
 // other isn't; only `actions` tells them apart. `phase` may still end up in UI copy as
 // descriptive text, but nothing below branches on it.
-/** Which side a protocol mismatch names, or null when the row is some other failure.
- *
- * The code is `host_protocol` either way. The sentence is what says which program to
- * replace, and it is `ClientError`'s own — the desktop test pins both wordings. A
- * rewording there has to land here too, or the chip stays "Unknown" and the link goes.
- */
+/** Which program a protocol mismatch names. The Rust side decides; this only accepts the token. */
 export type ProtocolSide = "host" | "desktop";
 
-const HOST_OLDER =
-  "This Cut Host is running an older version. Update your Cut Host to connect.";
-const DESKTOP_OLDER =
-  "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
-
-export function protocolSide(unreachable: string | null): ProtocolSide | null {
-  if (unreachable === HOST_OLDER) return "host";
-  if (unreachable === DESKTOP_OLDER) return "desktop";
-  return null;
+export function protocolSide(side: string | null | undefined): ProtocolSide | null {
+  switch (side) {
+    case "host":
+    case "desktop":
+      return side;
+    default:
+      return null;
+  }
 }
 
 /** Where "How to update" goes. The host page is the binary swap; the desktop page is the releases. */

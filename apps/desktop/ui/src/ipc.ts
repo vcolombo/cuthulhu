@@ -109,8 +109,13 @@ export type PairedHostView = {
   id: string;
   name: string;
   address: string;
-  /** Why this host cannot be reached, or null when it can. */
+  /** Why this host cannot be reached, or null when it can. The row prints it. */
   unreachable: string | null;
+  /**
+   * Which program a protocol mismatch names. Null for every other failure.
+   * "host" is the Cut Host; "desktop" is this build of Cuthulhu.
+   */
+  protocol_side: "host" | "desktop" | null;
 };
 
 export type DeviceError =

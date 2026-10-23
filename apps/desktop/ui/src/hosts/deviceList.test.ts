@@ -24,7 +24,7 @@ const aStatus = (): CutStatus => ({
 describe("groupDevices", () => {
   it("keeps an unreachable host's cutters listed, with the reason", () => {
     const hosts: PairedHostView[] = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-                                       unreachable: "the host could not be reached (timed out)" }];
+                                       unreachable: "the host could not be reached (timed out)", protocol_side: null }];
     const devices: DeviceInfo[] = [{ ...aDevice(), instance_id: "usb:sn:A", host: "host-1" }];
     const sections = groupDevices(devices, hosts);
     const remote = sections.find(s => s.hostId === "host-1")!;
@@ -34,14 +34,14 @@ describe("groupDevices", () => {
 
   it("lists a paired host that has no cutters, rather than hiding it", () => {
     const sections = groupDevices([], [{ id: "host-1", name: "Workshop Pi",
-                                         address: "pi.local:7878", unreachable: null }]);
+                                         address: "pi.local:7878", unreachable: null, protocol_side: null }]);
     expect(sections.find(s => s.hostId === "host-1")).toBeDefined();
   });
 
   it("puts this computer's cutters first", () => {
     const sections = groupDevices(
       [{ ...aDevice(), host: "host-1" }, { ...aDevice(), instance_id: "usb:sn:L", host: null }],
-      [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null }],
+      [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null }],
     );
     expect(sections[0].hostId).toBeNull();
   });
@@ -66,7 +66,7 @@ describe("groupDevices", () => {
       { ...aDevice(), instance_id: "usb:sn:D", host: "host-1" },
     ];
     const sections = groupDevices(devices, [{ id: "host-1", name: "Workshop Pi",
-                                              address: "pi.local:7878", unreachable: null }]);
+                                              address: "pi.local:7878", unreachable: null, protocol_side: null }]);
     expect(sections.flatMap(s => s.devices)).toHaveLength(devices.length);
     expect(sections.filter(s => s.hostId === "host-gone")).toHaveLength(1);
     // A known host keeps its own section; only the unpaired ids get made up.
@@ -75,8 +75,8 @@ describe("groupDevices", () => {
 });
 
 const PAIRED: PairedHostView[] = [
-  { id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null },
-  { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null },
+  { id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null },
+  { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null, protocol_side: null },
 ];
 
 const runForget = (id: string, forget: (id: string, force: boolean) => Promise<void>, force = false) =>
@@ -188,7 +188,7 @@ describe("forgetFrom", () => {
 describe("staleSection", () => {
   const section = () => groupDevices(
     [{ ...aDevice(), instance_id: "usb:sn:A", host: "host-1" }],
-    [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null }],
+    [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null }],
   ).find(s => s.hostId === "host-1")!;
 
   // The cut is still running on the Pi. A row that blanks or resets reads as "finished", which is
@@ -263,11 +263,41 @@ describe("deviceBadge", () => {
 });
 
 describe("protocol mismatch", () => {
-  it("names which side the sentence names, and ignores every other failure", () => {
-    expect(protocolSide("This Cut Host is running an older version. Update your Cut Host to connect.")).toBe("host");
-    expect(protocolSide("This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.")).toBe("desktop");
+  it("accepts the side token, and ignores every other string", () => {
+    expect(protocolSide("host")).toBe("host");
+    expect(protocolSide("desktop")).toBe("desktop");
+    expect(protocolSide("This Cut Host is running an older version. Update your Cut Host to connect.")).toBeNull();
     expect(protocolSide("the host could not be reached (timed out)")).toBeNull();
     expect(protocolSide(null)).toBeNull();
+    expect(protocolSide(undefined)).toBeNull();
+  });
+
+  it("copies the side onto the section, and a sentence alone does not", () => {
+    const sections = groupDevices([], [
+      { id: "host-old", name: "Workshop Pi", address: "pi.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: "host" },
+      { id: "host-new", name: "Office Pi", address: "office.local:7878",
+        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.",
+        protocol_side: "desktop" },
+      { id: "host-words", name: "Spare Pi", address: "spare.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: null },
+    ]);
+    expect(sections.find(s => s.hostId === "host-old")!.protocolSide).toBe("host");
+    expect(sections.find(s => s.hostId === "host-new")!.protocolSide).toBe("desktop");
+    expect(sections.find(s => s.hostId === "host-words")!.protocolSide).toBeNull();
+  });
+
+  it("drops the side when a later poll error replaces the host's sentence", () => {
+    const previous = groupDevices([], [{
+      id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
+      unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+      protocol_side: "host",
+    }]).find(s => s.hostId === "host-1")!;
+    const s = staleSection(previous, { code: "host_unreachable", message: "the host could not be reached (timed out)" });
+    expect(s.protocolSide).toBeNull();
+    expect(s.unreachable).toBe("the host could not be reached (timed out)");
   });
 
   it("points the host at the daemon update and the desktop at the releases", () => {

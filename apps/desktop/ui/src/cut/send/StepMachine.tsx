@@ -5,7 +5,7 @@ import * as ipc from "../../ipc";
 import { Laptop, Router } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/cn";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolSide, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "../../hosts/deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "../../hosts/deviceList";
 import { PairHostDialog } from "../../hosts/PairHostDialog";
 import { TONE_BADGE } from "./chrome";
 
@@ -185,7 +185,7 @@ export function StepMachine({
         </div>
       ) : null}
       {shown.map((section) => {
-        const side = protocolSide(section.unreachable);
+        const side = section.protocolSide;
         return (
         <div key={section.hostId ?? "local"} className="space-y-2">
           {/* The local section's header is suppressed when it is the only one, so a user with

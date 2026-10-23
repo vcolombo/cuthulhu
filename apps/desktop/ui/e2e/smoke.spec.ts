@@ -619,23 +619,24 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
 
   // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
   // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
-  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
+  let hosts: { id: string; name: string; address: string; unreachable: string | null; protocol_side: "host" | "desktop" | null }[] = [];
   if (opts?.seedBusyHost) {
     hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-               unreachable: "the host could not be reached (timed out)" }];
+               unreachable: "the host could not be reached (timed out)", protocol_side: null }];
     devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
                    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
   }
 
-  // The two sentences a protocol mismatch produces, one per side. They arrive as the host row's
-  // `unreachable` string — the same slot a timed-out host uses — because the Rust side owns the
-  // prose and the row already renders it.
+  // The sentence is what the row prints. Which side is older is `protocol_side`, the token
+  // the chip and the link switch on. A sentence alone leaves the chip on Unknown.
   if (opts?.seedProtocolMismatch) {
     hosts.push(
       { id: "host-old", name: "Workshop Pi", address: "pi.local:7878",
-        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect." },
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: "host" },
       { id: "host-new", name: "Office Pi", address: "office.local:7878",
-        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect." },
+        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.",
+        protocol_side: "desktop" },
     );
     devices.push(
       { instance_id: "usb:pi:old", machine_id: "cameo5",
@@ -663,7 +664,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
     transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
   };
   if (opts?.seedRemoteConnected || opts?.seedRemoteIdle) {
-    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
+    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null, protocol_side: null });
     devices.push(REMOTE_CUTTER);
   }
 
@@ -1569,7 +1570,7 @@ function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: bo
       return [PAIRED_CUTTER];
     },
     pair_host: (a) => {
-      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null };
+      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null, protocol_side: null };
       hosts.push(host);
       // The cutter is only in `list_devices` once the host is paired, which is what the dialog
       // re-reads for: the Test listed it to prove the token, not to populate the device list.

@@ -664,6 +664,14 @@ fn a_protocol_mismatch_names_which_side_to_update_and_lists_no_cutter() {
         message("host-new").as_deref(),
         Some("This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.")
     );
+    let side = |id: &str| {
+        views
+            .iter()
+            .find(|v| v.id.0 == id)
+            .and_then(|v| v.protocol_side)
+    };
+    assert_eq!(side("host-old"), Some(cut_host::client::ProtocolSide::Host));
+    assert_eq!(side("host-new"), Some(cut_host::client::ProtocolSide::Desktop));
 }
 
 /// A cutter with no host is this computer's, and must reach the local DeviceManager — the
@@ -849,6 +857,7 @@ fn a_reply_a_verb_cannot_use_is_not_reported_as_an_unreachable_host() {
     // desktop could use ever arrived.
     let offline = host_error(&ClientError::Transport("timed out".into()));
     assert_eq!(offline.code, "host_unreachable", "got {offline:?}");
+    assert_eq!(offline.protocol_side, None);
 
     // And a version mismatch is not one of those either: the host answered, and the thing to
     // change is a program, not the network.
@@ -857,9 +866,21 @@ fn a_reply_a_verb_cannot_use_is_not_reported_as_an_unreachable_host() {
         desktop_version: cut_host::protocol::PROTOCOL_VERSION,
     });
     assert_eq!(mismatch.code, "host_protocol", "got {mismatch:?}");
+    assert_eq!(mismatch.protocol_side, Some(cut_host::client::ProtocolSide::Host));
     assert_eq!(
         mismatch.message,
         "This Cut Host is running an older version. Update your Cut Host to connect."
+    );
+
+    let newer = host_error(&ClientError::Protocol {
+        host_version: Some(cut_host::protocol::PROTOCOL_VERSION + 1),
+        desktop_version: cut_host::protocol::PROTOCOL_VERSION,
+    });
+    assert_eq!(newer.code, "host_protocol");
+    assert_eq!(newer.protocol_side, Some(cut_host::client::ProtocolSide::Desktop));
+    assert_eq!(
+        newer.message,
+        "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
     );
 }
 

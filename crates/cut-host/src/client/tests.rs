@@ -306,18 +306,20 @@ fn a_refused_token_is_still_a_refused_token_rather_than_a_wrong_reply() {
 #[test]
 fn a_newer_host_is_named_as_a_desktop_to_update() {
     let host = testing::start_host_at_version(PROTOCOL_VERSION + 1, vec![Response::Ok]);
-    match connect_failure(&host) {
+    let err = connect_failure(&host);
+    match &err {
         ClientError::Protocol {
             host_version,
             desktop_version,
         } => {
-            assert_eq!(host_version, Some(PROTOCOL_VERSION + 1));
-            assert_eq!(desktop_version, PROTOCOL_VERSION);
+            assert_eq!(*host_version, Some(PROTOCOL_VERSION + 1));
+            assert_eq!(*desktop_version, PROTOCOL_VERSION);
         }
         other => panic!("expected a protocol mismatch, got {other:?}"),
     }
+    assert_eq!(err.protocol_side(), Some(ProtocolSide::Desktop));
     assert_eq!(
-        connect_failure(&host).to_string(),
+        err.to_string(),
         "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
     );
 }
@@ -328,8 +330,10 @@ fn an_older_host_is_named_as_a_cut_host_to_update() {
     let host =
         testing::start_host_at_version(PROTOCOL_VERSION.saturating_sub(1), vec![Response::Ok]);
     // PROTOCOL_VERSION is 1, so saturating_sub is 0, which the host reports as what it speaks.
+    let err = connect_failure(&host);
+    assert_eq!(err.protocol_side(), Some(ProtocolSide::Host));
     assert_eq!(
-        connect_failure(&host).to_string(),
+        err.to_string(),
         "This Cut Host is running an older version. Update your Cut Host to connect."
     );
 }
@@ -339,14 +343,16 @@ fn an_older_host_is_named_as_a_cut_host_to_update() {
 #[test]
 fn an_unversioned_host_is_the_older_side() {
     let host = testing::start_unversioned_host();
-    match connect_failure(&host) {
+    let err = connect_failure(&host);
+    match &err {
         ClientError::Protocol {
             host_version: None, ..
         } => {}
         other => panic!("expected a host that named no version, got {other:?}"),
     }
+    assert_eq!(err.protocol_side(), Some(ProtocolSide::Host));
     assert_eq!(
-        connect_failure(&host).to_string(),
+        err.to_string(),
         "This Cut Host is running an older version. Update your Cut Host to connect."
     );
 }

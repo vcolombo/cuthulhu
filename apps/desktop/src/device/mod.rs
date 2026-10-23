@@ -27,11 +27,19 @@ use ledger::JobKey;
 use ledger::{AttemptId, MAX_JOBS_IN_DOUBT};
 
 #[derive(Clone, Debug, Serialize)]
-pub struct IpcError { pub code: String, pub message: String }
+pub struct IpcError {
+    pub code: String,
+    pub message: String,
+    /// Set only for `host_protocol`. Skipped on the wire: a thrown error is still
+    /// `{ code, message }`. The host row carries this, because that is what the chip
+    /// and the update link branch on.
+    #[serde(skip)]
+    pub protocol_side: Option<cut_host::client::ProtocolSide>,
+}
 
 impl IpcError {
     pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
-        IpcError { code: code.into(), message: message.into() }
+        IpcError { code: code.into(), message: message.into(), protocol_side: None }
     }
 }
 
@@ -110,12 +118,15 @@ pub(crate) fn host_error(e: &cut_host::client::ClientError) -> IpcError {
         // that difference; a fifth code would sort them for a UI that has never branched on
         // either (#285).
         ClientError::WrongReply { .. } | ClientError::WrongDispatch => "host_wrong_reply",
-        // Which side is behind is the sentence. The code is the action: update one of the two
-        // programs, which neither the network nor a re-pair will do.
+        // The code is the action: update one of the two programs, which neither the network
+        // nor a re-pair will do. Which program is `protocol_side`, recorded here from the
+        // same comparison the sentence uses, so the row does not have to parse the sentence.
         ClientError::Protocol { .. } => "host_protocol",
         ClientError::Transport(_) => "host_unreachable",
     };
-    IpcError::new(code, e.to_string())
+    let mut err = IpcError::new(code, e.to_string());
+    err.protocol_side = e.protocol_side();
+    err
 }
 
 /// Whether this failure left the socket unsafe to reuse.
@@ -381,11 +392,13 @@ pub struct PairedHostView {
     pub name: String,
     pub address: String,
     /// The last thing that went wrong with this host, or `None` while nothing has. The name is the
-    /// serialized one this field has always had, kept because every consumer only prints the
-    /// message: since #283 it also carries a host that answered outside the protocol, which was
-    /// reached and whose sentence says so, and before that a refused token, a changed certificate
-    /// and a refusal. The row prints it when it is present; nothing reads what is in it.
+    /// serialized one this field has always had. The row prints it. The chip and the update
+    /// link do not read it: which program to replace is `protocol_side`, because a rewording
+    /// of this sentence must not drop them.
     pub unreachable: Option<String>,
+    /// Which program a protocol mismatch names. `None` for every other failure, including a
+    /// host that timed out.
+    pub protocol_side: Option<cut_host::client::ProtocolSide>,
 }
 
 /// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
@@ -626,6 +639,7 @@ impl DeviceManagerHandle {
                     name: h.paired.name.clone(),
                     address: h.paired.address.clone(),
                     unreachable: h.last_error.as_ref().map(|e| e.message.clone()),
+                    protocol_side: h.last_error.as_ref().and_then(|e| e.protocol_side),
                 }
             })
             .collect()

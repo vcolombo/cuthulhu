@@ -30,6 +30,8 @@ import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/Canv
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
 import { StatusBar } from "./panels/StatusBar";
+import { EmptyCanvas } from "./panels/EmptyCanvas";
+import { DemoSlot } from "./demo/DemoSlot";
 import { JobPanel } from "./cut/job/JobPanel";
 import { jobIsActive, jobSurface, placeOf } from "./cut/job/model";
 import { JobStatusChip, SwapBar, SwapChip } from "./cut/job/SwapBar";
@@ -42,6 +44,10 @@ import { colorModeVinyl, selectionHasFaintVinyl } from "./render/vinyl";
 import { matBounds, matKindLabel, matKindsFor, offeredKind, clampRollLength, ROLL_DEFAULT_MM, type MatKind } from "./render/mat";
 import { documentPasses } from "./panels/layerRows";
 import { rotationMove, worldRotationDegrees } from "./panels/rotation";
+
+// Folded away in a production build: DEV is false, and the env member is replaced before emit,
+// so DemoSlot and the fixture strings are not in dist/.
+const demoStatesOn = import.meta.env.DEV && import.meta.env.VITE_CUTHULHU_DEMO_STATES === "1";
 
 // Shapes mirroring the Rust `document` crate's serde JSON. Loose but sufficient for the
 // paths this UI actually reads — see crates/document/src/{node,delta,machine}.rs.
@@ -722,6 +728,17 @@ export function App() {
             onToggleRulers={() => setRulers((on) => !on)}
           />
         ) : null}
+        {doc && countShapes(doc) === 0 ? (
+          <EmptyCanvas
+            onImportFile={onImportFile}
+            onTrace={onTrace}
+            onAddRect={() => {
+              void edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } })).then((ok) => {
+                if (ok) interaction.requestFitContent();
+              });
+            }}
+          />
+        ) : null}
       </div>
       <aside className="flex min-h-0 flex-col border-l border-border bg-panel">
         <Tabs value={rightTab} onValueChange={setRightTab} className="flex min-h-0 flex-1 flex-col gap-0">
@@ -835,6 +852,7 @@ export function App() {
         selection={selectionSize}
         unit={unit}
         hideJobEcho={surface !== "hidden"}
+        leading={demoStatesOn ? <DemoSlot onError={setError} remember={job.remember} /> : null}
         trailing={surface === "swap" && swapCollapsed ? (
           <SwapChip
             status={status}

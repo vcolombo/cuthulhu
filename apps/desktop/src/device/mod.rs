@@ -414,6 +414,14 @@ pub struct DeviceManagerHandle {
     /// the `Arc`s out — `host_conn`/`host_conns` are that step — drop it, and lock the connection
     /// after; no network call may run with the map lock held.
     hosts: Mutex<HashMap<HostId, Arc<Mutex<HostConnection>>>>,
+    /// Serializes a `pair` or `forget` rewriting `hosts.json` from a snapshot.
+    ///
+    /// Each of those verbs writes the whole file. A forget publishes `Forgetting` and drops the
+    /// connection before the write, so a snapshot taken in that window still finds the host in
+    /// the map and can put the row back, or land on top of a pairing that arrived during the
+    /// write. Held only around that snapshot and the save, and never under a `HostConnection`:
+    /// `cancel` and a dispatch do not take it.
+    hosts_persist: Mutex<()>,
     /// Every HostId minted or loaded in this process, including hosts since forgotten.
     ///
     /// A forgotten host can still have a close-guard mark — a dispatch accepted after the host's
@@ -464,6 +472,7 @@ impl DeviceManagerHandle {
             local_factory: factory,
             local_manager: Mutex::new(Some(Arc::new(mgr))),
             hosts: Mutex::new(HashMap::new()),
+            hosts_persist: Mutex::new(()),
             claimed_host_ids: Mutex::new(HashSet::new()),
             ledger: Ledger::default(),
             last_remote_status: Mutex::new(HashMap::new()),
@@ -515,6 +524,12 @@ impl DeviceManagerHandle {
         for (id, conn) in self.host_conns() {
             let mut guard = conn.lock().unwrap();
             let host = &mut *guard;
+            // `forget` has published `Forgetting` and released this lock so the save does not pin
+            // it. Dialling anyway would reopen a host the operator is removing; the `Arc` this
+            // call already holds outlives the map entry until the call drops it.
+            if host.lifecycle != HostLifecycle::Active {
+                continue;
+            }
             let Some(client) = host.ensure() else { continue };
             // Same-host dispatches cannot overlap this call: both hold this connection. A mark is
             // therefore written after this snapshot or the snapshot reports after the request.
@@ -612,7 +627,16 @@ impl DeviceManagerHandle {
     /// Every paired host as saved, for `pair`/`forget` to re-derive `hosts.json`'s on-disk
     /// contents and to mint the next id against.
     pub(crate) fn paired_hosts(&self) -> Vec<PairedHost> {
-        self.host_conns().into_iter().map(|(_, conn)| conn.lock().unwrap().paired.clone()).collect()
+        self.host_conns()
+            .into_iter()
+            .filter_map(|(_, conn)| {
+                let h = conn.lock().unwrap();
+                // A host mid-forget is still in the map so queued calls can see `Forgetting` and
+                // refuse. It is not a row to write back: its own save has already dropped it, and
+                // a concurrent `pair` or `forget` rewriting the file would resurrect it.
+                (h.lifecycle == HostLifecycle::Active).then(|| h.paired.clone())
+            })
+            .collect()
     }
 
     /// Whether `address` is already paired, and whether `fingerprint` is what was pinned for it.
@@ -654,8 +678,9 @@ impl DeviceManagerHandle {
 
         // Claimed separately from the paired map because a forgotten host can leave a close-guard
         // mark behind. Reusing its id would let an idle cutter on a new Pi erase that warning.
-        // ponytail: pairing is one modal dialog, so the prospective-file save is still a re-read;
-        // the id itself is unique even if a second call overlaps this one.
+        // The snapshot and the save are one critical section with `forget`: each rewrites the
+        // whole file, and interleaving the two puts a row back or drops one that just landed.
+        let _persist = self.hosts_persist.lock().unwrap();
         let mut prospective = self.paired_hosts();
         let id = self.claim_next_host_id()?;
         let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
@@ -782,9 +807,10 @@ impl DeviceManagerHandle {
             Err(_) => before_asking,
         };
 
-        // Read before the connection is taken: `paired_hosts` locks every connection in turn,
-        // including this one, so gathering it under the guard would deadlock this verb against
-        // itself.
+        // Held across the snapshot and the save, same as `pair`. The connection guard is taken
+        // after the snapshot: `paired_hosts` locks every connection in turn, including this one,
+        // so gathering it under the guard would deadlock this verb against itself.
+        let _persist = self.hosts_persist.lock().unwrap();
         let prospective: Vec<PairedHost> =
             self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
         let conn = self.host_conn(id)?;

@@ -1066,6 +1066,18 @@ fn a_forget_transition_refuses_calls_without_holding_host_control_behind_the_sav
                 HostLifecycle::Forgetting,
                 "calls were not stood down before the save"
             );
+            assert!(
+                dev.paired_hosts().is_empty(),
+                "a host mid-forget was still a row a concurrent save would write back"
+            );
+            // The question above already failed to reach 127.0.0.1:1, so the error it left is
+            // not evidence of this call. Cleared first: dialling would write it straight back.
+            conn.lock().unwrap().last_error = None;
+            dev.list_devices();
+            assert!(
+                conn.lock().unwrap().last_error.is_none(),
+                "list_devices dialled a host that is being forgotten"
+            );
             let call = dev.with_host(&id, |_| Ok(()));
             assert_eq!(
                 call.unwrap_err().code,
@@ -1082,6 +1094,71 @@ fn a_forget_transition_refuses_calls_without_holding_host_control_behind_the_sav
         HostLifecycle::Active,
         "a failed save left the pairing stood down"
     );
+}
+
+/// `pair` and `forget` each rewrite `hosts.json` from a snapshot. The forget publishes
+/// `Forgetting` and then writes; a pair that runs in that window must not put the forgotten
+/// row back, and the forget's own write must not drop the pair.
+#[test]
+fn a_pair_during_a_forget_save_keeps_the_pair_and_drops_the_forgotten_host() {
+    let live = start_loopback_host();
+    let dir = tempfile::tempdir().unwrap();
+    let hosts_path = dir.path().join("hosts.json");
+    let dev = Arc::new(test_device_setup());
+    let forgotten = dev
+        .pair(
+            "Pi".into(),
+            live.addr.clone(),
+            HOST_TOKEN.into(),
+            live.fingerprint.clone(),
+            &hosts_path,
+        )
+        .expect("the first pairing");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let dev_forget = Arc::clone(&dev);
+    let id = forgotten.clone();
+    let forgotten_id = id.clone();
+    let forget = std::thread::spawn(move || {
+        dev_forget.forget_with_save(&id, true, move |prospective| {
+            assert!(
+                prospective.iter().all(|h| h.id != forgotten_id),
+                "the save still named the host being forgotten"
+            );
+            entered_tx.send(()).expect("the test stopped listening");
+            release_rx.recv().expect("the pair was not released");
+            Ok(())
+        })
+    });
+    entered_rx.recv().expect("the forget never reached its save");
+
+    let dev_pair = Arc::clone(&dev);
+    let path_pair = hosts_path.clone();
+    let addr = live.addr.clone();
+    let fingerprint = live.fingerprint.clone();
+    let pair = std::thread::spawn(move || {
+        dev_pair.pair("Again".into(), addr, HOST_TOKEN.into(), fingerprint, &path_pair)
+    });
+    // The pair has to get through `pair_check` and then block on the save this forget holds.
+    // Long enough for a loopback handshake, short of the forget still waiting on us.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        dev.paired_hosts().is_empty(),
+        "the pair finished during the forget's save and rewrote the file out from under it"
+    );
+
+    release_tx.send(()).unwrap();
+    forget.join().unwrap().expect("the forget's save failed");
+    let paired = pair.join().unwrap().expect("the pair that waited out the forget failed");
+    assert_ne!(paired, forgotten);
+
+    let left = dev.paired_hosts();
+    assert_eq!(left.len(), 1, "the forgotten host came back, or the pair was dropped: {left:?}");
+    assert_eq!(left[0].id, paired);
+    let on_disk = crate::hosts::load(&hosts_path).expect("hosts.json");
+    assert_eq!(on_disk.len(), 1);
+    assert_eq!(on_disk[0].id, paired);
 }
 
 /// The reversal: a host that cannot be asked is not a host known to be idle. Drop Wi-Fi

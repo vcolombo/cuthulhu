@@ -57,3 +57,12 @@ export function formatLength(mm: number, unit: LengthUnit, digits?: number): str
   const shown = unit === "in" ? mm / MM_PER_IN : mm;
   return shown.toFixed(places);
 }
+
+/**
+ * The number a length field shows. Inches use three decimals, so 10 mm reads 0.394 in.
+ * Millimetres stay on `formatLength`'s tenth. The number input drops a trailing zero,
+ * so 1.000 in shows as 1 and still stores 25.4 mm.
+ */
+export function displayLength(mm: number, unit: LengthUnit): number {
+  return Number(formatLength(mm, unit, unit === "in" ? 3 : undefined));
+}

@@ -11,7 +11,7 @@ type Props = {
 const panelStyle: CSSProperties = {
   position: "fixed",
   inset: 0,
-  background: "rgba(0,0,0,0.5)",
+  background: "var(--scrim)",
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
@@ -21,7 +21,6 @@ const panelStyle: CSSProperties = {
 const dialogStyle: CSSProperties = {
   background: "var(--panel)",
   border: "1px solid var(--border)",
-  color: "var(--text)",
   padding: 16,
   width: 460,
   display: "flex",
@@ -31,7 +30,6 @@ const dialogStyle: CSSProperties = {
 
 const btn: CSSProperties = {
   background: "var(--panel)",
-  color: "var(--text)",
   border: "1px solid var(--border)",
   padding: "4px 10px",
   cursor: "pointer",
@@ -98,7 +96,7 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
                 second row this will create is unavoidable — pairing cannot overwrite another
                 host's pinned fingerprint — so what is owed is an explanation, not a refusal. */}
             {state.existing && !state.existing.sameFingerprint && (
-              <p role="alert" style={{ margin: 0, color: "var(--cut)" }}>
+              <p role="alert" className="m-0 text-xs text-destructive">
                 “{state.existing.name}” is already paired at this address, and the certificate
                 pinned for it is not the one just presented. Either the Cut Host was reinstalled,
                 or something else is answering at this address. Pairing again adds a second entry;
@@ -106,7 +104,7 @@ export function PairHostDialog({ onPaired, onClose }: Props) {
               </p>
             )}
             {state.existing && state.existing.sameFingerprint && (
-              <p style={{ margin: 0, color: "var(--muted-foreground)" }}>
+              <p className="m-0 text-muted-foreground">
                 “{state.existing.name}” is already paired at this address, with this same
                 certificate. Pairing again adds a second entry rather than replacing it.
               </p>

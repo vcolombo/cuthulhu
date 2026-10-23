@@ -37,9 +37,9 @@ type Props = {
 };
 
 function phaseDot(phase: Phase): string {
-  if (phase === "Idle" || phase === "Disconnected") return "var(--ready)";
-  if (phase === "Failed") return "var(--cut)";
-  return "var(--accent-ink)";
+  if (phase === "Idle" || phase === "Disconnected") return "bg-success";
+  if (phase === "Failed") return "bg-destructive";
+  return "bg-accent-ink";
 }
 
 function RollLength({ mm, unit, onCommit }: { mm: number; unit: LengthUnit; onCommit: (mm: number) => void }) {
@@ -93,7 +93,7 @@ export function StatusBar({ device, profile, machines, hosts, mat, status, zoomP
 
   return (
     <footer className="flex h-8 shrink-0 items-center gap-4 overflow-hidden whitespace-nowrap border-t border-border bg-panel px-3 text-xs text-muted-foreground">
-      <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: phaseDot(status.phase) }} aria-hidden />
+      <span className={`inline-block size-2 shrink-0 rounded-full ${phaseDot(status.phase)}`} aria-hidden />
       <span className="truncate text-foreground">{machineText}</span>
       {mat ? (
         <span className="flex items-center gap-1.5">

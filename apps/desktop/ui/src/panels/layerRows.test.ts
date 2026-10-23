@@ -114,6 +114,17 @@ describe("layer passes match the planner", () => {
     expect(rowIds(snapshot, "Color")).toEqual([2, 3]);
   });
 
+  test("a shape does not contribute the shapes nested under it", () => {
+    const parent = shape(2, { stroke: RED, fill: null }, { children: [3] });
+    const snapshot = doc([
+      container(1, "Layer", [2]),
+      parent,
+      shape(3, { stroke: BLUE, fill: null }),
+    ]);
+    expect(passes(snapshot, "Color")).toEqual([{ key: "color:ff0000ff", shapeIds: [2] }]);
+    expect(rowIds(snapshot, "Color")).toEqual([2]);
+  });
+
   test("an all-NoCut colour is a row and not a pass", () => {
     const root = container(1, "Layer", [2]);
     const snapshot = doc([root, shape(2, { stroke: RED, fill: null }, { cut_line_type: "NoCut" })]);

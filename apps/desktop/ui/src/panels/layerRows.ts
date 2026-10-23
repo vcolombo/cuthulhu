@@ -166,7 +166,10 @@ function taggedShapes(
         key: passKeyFor(grouping, node.style, materials[id] ?? null),
       });
     }
-    for (const child of node.children) walk(child);
+    // The planner stops at a Shape (`NodeKind::Shape` does not push children). A loaded
+    // project does not forbid children on one, and walking them would count a shape Send
+    // will not cut.
+    if (!isShape(node)) for (const child of node.children) walk(child);
   };
   walk(doc.root);
   return tagged;

@@ -135,9 +135,13 @@ test("demo states in light and dark", async ({ page }, testInfo) => {
   }
 
   for (const fixture of DEMO_FIXTURES) {
-    // Only the demo key. sessionStorage.clear() would drop __ipc_violations__ before afterEach reads it.
-    await page.evaluate((key) => sessionStorage.removeItem(key), DEMO_STORAGE_KEY);
-    await page.addInitScript(installMockTauri, { demo: { id: fixture.id } });
+    // The installer above already runs on every navigation, and a stored id wins over its
+    // argument. Another addInitScript would run too, with no promised order, so a later
+    // navigation could apply an earlier fixture. Writing the key also leaves __ipc_violations__.
+    await page.evaluate(
+      ({ key, id }) => sessionStorage.setItem(key, JSON.stringify({ id })),
+      { key: DEMO_STORAGE_KEY, id: fixture.id },
+    );
     await page.goto("/");
     await expectState(page, fixture.id);
     for (const mode of ["Light", "Dark"] as const) {

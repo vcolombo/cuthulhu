@@ -148,6 +148,27 @@ describe("document section", () => {
     expect(field(panel, "Rotation").value).toBe("0");
   });
 
+  test("a leading zero stays typed when the size does not change", () => {
+    const onChangeW = vi.fn();
+    const shape = {
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      cutLineType: "Cut" as const,
+      materialPreset: { state: "inherit" as const },
+      rotation: 0,
+      nothingSelected: false,
+      onChangeW,
+    };
+    const panel = render(shape);
+    const input = field(panel, "W");
+    typeInto(input, "");
+    typeInto(input, "0");
+    expect(input.value).toBe("0");
+    typeInto(input, "0.5");
+    expect(onChangeW).toHaveBeenLastCalledWith(0.5);
+    rerender({ ...shape, bounds: { x: 0, y: 0, w: 0.5, h: 10 } });
+    expect(field(panel, "W").value).toBe("0.5");
+  });
+
   test("a mixed material selection keeps the align row and the Mixed option", () => {
     const panel = render({
       bounds: null,

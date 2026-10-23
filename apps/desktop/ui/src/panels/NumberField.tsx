@@ -99,7 +99,13 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
               setText(raw);
               return;
             }
-            const stillTyping = raw.endsWith(".") || (raw.includes(".") && raw.endsWith("0"));
+            // A bare 0 is the start of 0.5. Committing it on W or H is rejected (size must
+            // stay positive), and clearing the draft then snaps the field back to the old length.
+            const stillTyping =
+              raw === "0" ||
+              raw === "-0" ||
+              raw.endsWith(".") ||
+              (raw.includes(".") && raw.endsWith("0"));
             setText(stillTyping ? raw : null);
             onChange(next);
           }}

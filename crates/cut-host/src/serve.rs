@@ -82,7 +82,7 @@ const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) enum VersionFailure {
     Timeout,
     Closed,
-    Unsupported { offered: u32 },
+    Unsupported { offered: u32, supported: u32 },
     Unreadable,
     TooLarge { len: usize },
     Io(String),
@@ -93,9 +93,9 @@ impl std::fmt::Display for VersionFailure {
         match self {
             VersionFailure::Timeout => write!(f, "offered no protocol version in time"),
             VersionFailure::Closed => write!(f, "closed before offering a protocol version"),
-            VersionFailure::Unsupported { offered } => write!(
+            VersionFailure::Unsupported { offered, supported } => write!(
                 f,
-                "offered protocol version {offered}, this host speaks {PROTOCOL_VERSION}"
+                "offered protocol version {offered}, this host speaks {supported}"
             ),
             VersionFailure::Unreadable => {
                 write!(f, "offered something that is not a protocol version")
@@ -108,8 +108,11 @@ impl std::fmt::Display for VersionFailure {
     }
 }
 
-/// Agree `PROTOCOL_VERSION`, or write a named refusal and fail.
+/// Agree `supported`, or write a named refusal and fail.
 ///
+/// `supported` is the one version this side speaks. The daemon passes
+/// `PROTOCOL_VERSION`; a scripted host passes the version it is pretending to speak,
+/// so the refusal a desktop test sees is this function's and not a second handshake.
 /// The offer is read as a `u32` and nothing else. A `Request` is not decoded from
 /// this frame: a peer that sent one fails here, and the connection closes, before
 /// `handle_request` exists on the path. `deadline` is the caller's whole
@@ -117,6 +120,7 @@ impl std::fmt::Display for VersionFailure {
 pub(crate) fn establish_version<S: Read + Write>(
     stream: &mut S,
     deadline: Instant,
+    supported: u32,
 ) -> Result<(), VersionFailure> {
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let offered =
@@ -137,22 +141,22 @@ pub(crate) fn establish_version<S: Read + Write>(
             Err(FrameError::Io(m)) => return Err(VersionFailure::Io(m)),
         };
 
-    if offered != PROTOCOL_VERSION {
+    if offered != supported {
         write_version_refusal(
             stream,
             &VersionReply::Unsupported {
                 offered,
-                supported: PROTOCOL_VERSION,
+                supported,
             },
             deadline,
         );
-        return Err(VersionFailure::Unsupported { offered });
+        return Err(VersionFailure::Unsupported { offered, supported });
     }
 
     write_frame(
         stream,
         &VersionReply::Agreed {
-            version: PROTOCOL_VERSION,
+            version: supported,
         },
         remaining(),
     )
@@ -360,7 +364,7 @@ fn serve_client(
     // from the moment the connection was accepted: the version offer is not a
     // second chance to hold the slot.
     let unauth = Instant::now() + PRE_AUTH_TIMEOUT;
-    if let Err(e) = establish_version(&mut tls_stream, unauth) {
+    if let Err(e) = establish_version(&mut tls_stream, unauth, PROTOCOL_VERSION) {
         eprintln!("cut host: {peer} {e}");
         return Err(io::Error::other(e.to_string()));
     }
@@ -533,7 +537,10 @@ mod tests {
     fn an_unsupported_version_is_refused_by_name() {
         let offered = PROTOCOL_VERSION + 1;
         let (mut client, reply) = talk_version(&offered, Duration::from_secs(2));
-        assert!(matches!(reply, Err(VersionFailure::Unsupported { offered: n }) if n == offered));
+        assert!(matches!(
+            reply,
+            Err(VersionFailure::Unsupported { offered: n, .. }) if n == offered
+        ));
         let back: VersionReply = read_frame(
             &mut client,
             VERSION_FRAME_MAX,
@@ -580,7 +587,7 @@ mod tests {
         let (mut client, mut server) = pair();
         let deadline = Instant::now() + Duration::from_secs(2);
         client.write_all(&header).unwrap();
-        let err = establish_version(&mut server, deadline).unwrap_err();
+        let err = establish_version(&mut server, deadline, PROTOCOL_VERSION).unwrap_err();
         assert!(
             matches!(err, VersionFailure::TooLarge { len } if len == crate::frame::DEFAULT_MAX_FRAME),
             "{err:?}"
@@ -604,7 +611,8 @@ mod tests {
         let _hold = client.try_clone().unwrap();
         let budget = Duration::from_millis(200);
         let started = Instant::now();
-        let err = establish_version(&mut server, Instant::now() + budget).unwrap_err();
+        let err =
+            establish_version(&mut server, Instant::now() + budget, PROTOCOL_VERSION).unwrap_err();
         assert!(matches!(err, VersionFailure::Timeout), "{err:?}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -621,7 +629,8 @@ mod tests {
         client.write_all(&[0u8]).unwrap();
         drop(client);
         let err =
-            establish_version(&mut server, Instant::now() + Duration::from_secs(2)).unwrap_err();
+            establish_version(&mut server, Instant::now() + Duration::from_secs(2), PROTOCOL_VERSION)
+                .unwrap_err();
         assert!(matches!(err, VersionFailure::Io(_)), "{err:?}");
     }
 
@@ -648,7 +657,7 @@ mod tests {
     ) -> (std::os::unix::net::UnixStream, Result<(), VersionFailure>) {
         let (mut client, mut server) = pair();
         write_frame(&mut client, offer, budget).unwrap();
-        let reply = establish_version(&mut server, Instant::now() + budget);
+        let reply = establish_version(&mut server, Instant::now() + budget, PROTOCOL_VERSION);
         (client, reply)
     }
 

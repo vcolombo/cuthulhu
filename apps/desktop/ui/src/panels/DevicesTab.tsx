@@ -279,7 +279,10 @@ export function DevicesTab({
                     where={host.name}
                     aimed={sameCutter(active, info)}
                     live={statusOf(info, active, tracking, status, statuses)}
-                    offline={down && !mismatch}
+                    // A mismatch is still down: the host sentence is in `unreachable`.
+                    // `offline` here is the job controls. The badge stays "Update needed"
+                    // because that check comes before the offline one.
+                    offline={down}
                     protocol={side}
                     activateReasonId={mismatch ? titleId : null}
                     tracked={jobControls(info)}

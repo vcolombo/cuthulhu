@@ -52,7 +52,6 @@ export function useJob(onError: (message: string) => void) {
   // commit and layout, which is the window the mirror exists for.
   statusRef.current = status;
   snapshotRef.current = snapshot;
-  dismissedRef.current = dismissed;
   const offlineRef = useRef(false);
   const hostIdRef = useRef<string | null>(null);
   const instanceRef = useRef<string | null>(null);

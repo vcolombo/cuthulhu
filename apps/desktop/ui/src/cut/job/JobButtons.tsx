@@ -24,6 +24,7 @@ export function JobButtons({
   actions,
   place,
   offline,
+  queueCancel = offline,
   onCancel,
   onResume,
   onConfirm,
@@ -32,6 +33,9 @@ export function JobButtons({
   actions: CutStatus["actions"];
   place: "panel" | "swap";
   offline: boolean;
+  /** Cancel will be sent when the host answers. False while `offline` means the
+   *  button stays, disabled: there is no queue behind it. */
+  queueCancel?: boolean;
   onCancel: () => void;
   onResume: () => void;
   onConfirm: () => void;
@@ -40,17 +44,21 @@ export function JobButtons({
 }) {
   const [confirming, setConfirming] = useState(false);
   const confirmPrimary = actions.confirm && !actions.resume;
+  const cancelHeld = offline && !queueCancel;
   return (
     <>
       {actions.cancel ? (
-        <Button
-          variant={place === "swap" ? "ghost" : "secondary"}
-          size="sm"
-          className={place === "swap" ? "text-foreground" : undefined}
-          onClick={() => setConfirming(true)}
-        >
-          {cancelLabel(place, offline)}
-        </Button>
+        <Held offline={cancelHeld}>
+          <Button
+            variant={place === "swap" ? "ghost" : "secondary"}
+            size="sm"
+            className={place === "swap" ? "text-foreground" : undefined}
+            disabled={cancelHeld}
+            onClick={() => setConfirming(true)}
+          >
+            {cancelLabel(place, queueCancel)}
+          </Button>
+        </Held>
       ) : null}
       {extra}
       {actions.confirm ? (
@@ -81,7 +89,7 @@ export function JobButtons({
       ) : null}
       <CancelCutDialog
         open={confirming}
-        offline={offline}
+        offline={queueCancel}
         onOpenChange={setConfirming}
         onConfirm={onCancel}
       />

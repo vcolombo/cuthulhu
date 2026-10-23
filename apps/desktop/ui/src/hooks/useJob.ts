@@ -258,19 +258,27 @@ export function useJob(onError: (message: string) => void) {
 
   // `useDevices` is the only interval. This is how a job hears that poll without dialling
   // the host a second time: a missing cache row is not a failed read, and a newer status
-  // for a host that is still unreachable is not a live one.
+  // for a host that is still unreachable is not a live one. With no job on screen the same
+  // poll is what moves the aimed cutter: the sheet's own `getDeviceState` interval is gone,
+  // and Start follows `actions.cut`.
   const applyPoll = useCallback((snap: { hosts: ipc.PairedHostView[]; statuses: ipc.CutterStatusView[]; stale: boolean }) => {
     const id = hostIdRef.current;
     const instance = instanceRef.current;
-    const watching = id !== null && snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
-    if (!watching || id === null || instance === null) return;
+    if (id === null || instance === null) return;
     const host = snap.hosts.find((item) => item.id === id) ?? null;
     const down = snap.stale || host === null || host.unreachable !== null;
     const row = snap.statuses.find((item) => sameCutter(item, { instance_id: instance, host: id }));
+    const watching = snapshotRef.current !== null && (jobIsActive(statusRef.current.phase) || offlineRef.current);
+    if (!watching) {
+      // A down host is not frozen here. Freeze is the job panel's outage, and there is
+      // no job. A missing row is still not a failed read.
+      if (!down && row !== undefined) ingest(row.status);
+      return;
+    }
     // A missing cache row is not a failed read, so it is not `down`. A stale or
     // unreachable poll must not ingest the row it happened to be holding.
     return settle({ host, status: down ? null : (row?.status ?? null), down });
-  }, [settle]);
+  }, [ingest, settle]);
 
   useEffect(() => {
     if (offlineHost === null) return;

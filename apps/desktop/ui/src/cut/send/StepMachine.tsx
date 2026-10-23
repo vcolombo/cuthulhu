@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { MachineProfile } from "../../App";
 import * as ipc from "../../ipc";
 import { Laptop, Router } from "lucide-react";
@@ -83,6 +83,26 @@ export function HostPairing({
   onPaired: () => void;
   onClose: () => void;
 }) {
+  // The dialog has no trigger, and closing it unmounts the tree, so Radix never runs
+  // `onCloseAutoFocus`. The opener is still focused on the render that mounts the dialog.
+  // A layout effect would already be inside it: Radix moves focus in its own layout effect,
+  // which runs before this parent's.
+  const returnFocus = useRef<HTMLElement | null>(null);
+  if (open && returnFocus.current === null && typeof document !== "undefined") {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) returnFocus.current = active;
+  }
+  useLayoutEffect(() => {
+    if (open) return;
+    const back = returnFocus.current;
+    returnFocus.current = null;
+    if (back === null) return;
+    // The parent sets `open` false and this returns null in the same commit. Restoring
+    // synchronously lands on a node Radix is still tearing down.
+    queueMicrotask(() => {
+      if (back.isConnected) back.focus();
+    });
+  }, [open]);
   if (!open) return null;
   return <PairHostDialog onPaired={onPaired} onClose={onClose} />;
 }

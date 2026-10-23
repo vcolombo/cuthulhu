@@ -198,7 +198,9 @@ export function DevicesTab({
         const mismatch = side !== null;
         const rows = devices.filter((device) => device.host === host.id);
         const titleId = `devices-host-${host.id}`;
-        const jobHere = !mismatch && rows.some((info) => cutterIsBusy(statusOf(info, active, tracking, status, statuses)));
+        // A reachable host is not reconnecting. The sentence used to follow any busy cutter,
+        // so a live cut on a host that had just answered still said the cut was out of reach.
+        const reconnecting = down && !mismatch && rows.some((info) => cutterIsBusy(statusOf(info, active, tracking, status, statuses)));
         return (
           <section key={host.id} className={cn("space-y-2 rounded-lg border p-3", down ? "border-warning bg-warning/10" : "border-border bg-card")}>
             <div className="space-y-1">
@@ -238,7 +240,7 @@ export function DevicesTab({
                   How to update
                 </a>
               ) : null}
-              {jobHere ? (
+              {reconnecting ? (
                 <p className="m-0 text-sm text-foreground" data-testid="devices-warning">
                   Reconnecting. The cut keeps going on the host.
                 </p>
@@ -457,6 +459,10 @@ function CutterCard({
             actions={live.actions}
             place="panel"
             offline={offline}
+            // The queued wording is a promise that this desktop will send the cancel.
+            // A cutter this session is not tracking has no such queue: the command
+            // would go out now, against a host that is not answering.
+            queueCancel={offline && tracked}
             onCancel={onCancel}
             onResume={onResume}
             onConfirm={onConfirm}

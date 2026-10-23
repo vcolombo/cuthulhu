@@ -2116,7 +2116,13 @@ test("pairing a Cut Host shows its fingerprint first, then lists it with its cut
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  const addHost = page.getByRole("button", { name: /Add a Cut Host/ });
+  await addHost.click();
+  const pair = page.getByRole("dialog", { name: "Pair a Cut Host" });
+  await pair.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(pair).toHaveCount(0);
+  await expect(addHost).toBeFocused();
+  await addHost.click();
 
   await page.getByLabel("Address").fill("pi.local:7878");
   await page.getByLabel("Token").fill("correct-horse");
@@ -2319,6 +2325,7 @@ test("two cutters on one host keep their own status, and cancel names that cutte
   const puma = page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" });
   await expect(cameo.getByText("Cutting", { exact: true })).toBeVisible();
   await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toHaveCount(0);
   await expect(cameo.getByText("40% of this pass")).toBeVisible();
   await expect(page.getByText("Add to queue")).toHaveCount(0);
   await expect(page.getByText("Up next")).toHaveCount(0);
@@ -2369,7 +2376,10 @@ test("an offline host keeps the cut frozen, then shows the reading from after it
   await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toBeVisible();
   await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
   await expect(page.getByText("40% of this pass")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  // This desktop is not tracking the seeded cut, so Cancel is not a queue.
+  const offlineCameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toHaveCount(0);
+  await expect(offlineCameo.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
   await expect(page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" }).getByText("Unavailable")).toBeVisible();
 
   const body = page.getByRole("heading", { name: "Can't reach Garage Pi" });

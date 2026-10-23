@@ -1269,6 +1269,12 @@ impl DeviceManagerHandle {
                 .map(|s| s.info.instance_id.as_str()),
         );
         let mut cache = self.last_remote_status.lock().unwrap();
+        // A failed dial never gets here, so an unreachable host keeps the rows it had.
+        // A host that answered and no longer names a cutter has unplugged it. This map is
+        // what `cutter_statuses` publishes, and the cutting dot reads `actions.cancel` off it.
+        cache.retain(|(host, instance), _| {
+            host != id || snapshots.iter().any(|s| s.info.instance_id == *instance)
+        });
         for snapshot in snapshots {
             cache.insert((id.clone(), snapshot.info.instance_id.clone()), snapshot.status.clone());
         }

@@ -500,6 +500,75 @@ describe("useJob", () => {
     expect(ipc.cancelCut).toHaveBeenCalledWith({ host: "host-3", instanceId: "usb:pi:C" });
   });
 
+  it("shows a poll of the aimed cutter when no job is watched", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    const ready = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status).toEqual(ready);
+    expect(api.current?.tracking).toBe(false);
+    expect(api.current?.offlineHost).toBeNull();
+
+    const busy = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      jobId: 4,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: busy }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.actions.cut).toBe(false);
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: "usb:pi:D", status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+
+    act(() => {
+      api.current?.applyPoll({ hosts: [HOST], statuses: [], stale: false });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: true,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.offlineHost).toBeNull();
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost).toBeNull();
+    expect(api.current?.status.phase).toBe("Sending");
+  });
+
   it("does not freeze a job when the poll has no status for that cutter yet", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

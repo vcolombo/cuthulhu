@@ -1783,6 +1783,58 @@ fn every_cutter_on_a_host_keeps_its_status_and_takes_its_own_commands() {
     wait_until(|| !cutter_is_active(&direct, PUMA), "the addressed cancel never reached the puma");
 }
 
+fn cache_snapshot(instance_id: &str) -> cut_host::protocol::DeviceSnapshot {
+    cut_host::protocol::DeviceSnapshot {
+        info: DeviceInfo {
+            instance_id: instance_id.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: None,
+        },
+        status: CutStatus::disconnected(),
+        job_id: None,
+        claimed: false,
+    }
+}
+
+/// The cache is what the Devices tab and the cutting dot read. A snapshot that names fewer
+/// cutters has unplugged one; a failed dial never calls `remember_snapshots`, so this is only
+/// the answer a host actually gave.
+#[test]
+fn a_snapshot_that_omits_a_cutter_drops_it_from_the_status_cache() {
+    let dev = test_device_setup();
+    let id = HostId("host-9".into());
+    let other = HostId("host-8".into());
+    let cameo = cache_snapshot("usb:cameo");
+    dev.remember_snapshots(&id, &[cameo.clone(), cache_snapshot("usb:puma")]);
+    dev.remember_snapshots(&other, &[cache_snapshot("usb:other")]);
+
+    dev.remember_snapshots(&id, &[cameo]);
+    let left: Vec<_> = dev
+        .cutter_statuses()
+        .into_iter()
+        .map(|s| (s.host.0, s.instance_id))
+        .collect();
+    assert!(left.iter().any(|(h, i)| h == "host-9" && i == "usb:cameo"), "{left:?}");
+    assert!(
+        !left.iter().any(|(_, i)| i == "usb:puma"),
+        "an unplugged cutter stayed cached: {left:?}"
+    );
+    assert!(
+        left.iter().any(|(h, i)| h == "host-8" && i == "usb:other"),
+        "another host was pruned: {left:?}"
+    );
+
+    dev.remember_snapshots(&id, &[]);
+    let after = dev.cutter_statuses();
+    assert!(
+        !after.iter().any(|s| s.host == id),
+        "an empty answer left this host's cutters: {after:?}"
+    );
+    assert!(after.iter().any(|s| s.host == other), "an empty answer pruned the other host");
+}
+
 fn wait_for_remote(dev: &DeviceManagerHandle, want: impl Fn(&CutStatus) -> bool, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

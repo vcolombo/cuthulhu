@@ -3336,6 +3336,43 @@ fn a_confirmed_quit_commits_before_it_waits_and_the_wait_ends() {
     });
 }
 
+/// A confirmed quit stops the local cutter before it waits out a permit. The permit is what
+/// holds the wait; the local Job does not, because its own permit ended when `cut` returned.
+/// A cancel placed after the wait would still be in the future when a bound shorter than that
+/// wait expires, and the worker would keep transmitting for the whole of it.
+#[test]
+fn a_confirmed_quit_stops_local_motion_before_it_waits() {
+    let mut app = AppState::new();
+    let dev = test_device_setup();
+    app.add_rect(10.0, 10.0);
+    let plan = plan_for(&app);
+    dev.cut_from_request(&app, request_from(plan)).expect("cut");
+    assert!(dev.status().is_active(), "the local cut must be parked mid-flight to be cancellable");
+
+    let permit = dev.close_gate.permit().expect("an open window");
+    std::thread::scope(|s| {
+        let quit = s.spawn(|| dev.commit_close_after_confirmation());
+        let deadline = std::time::Instant::now() + CLOSE_GATE_WAIT / 2;
+        let stopped = loop {
+            let status = dev.status();
+            if status.ended == Some(driver_core::Ended::Cancelled) {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the local cutter was still moving once the quit should have stopped it, at {:?}",
+                status.phase
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(!quit.is_finished(), "stopping the cutter waited out the permit first");
+        assert!(dev.close_gate.permit().is_none(), "a later press was not refused");
+        assert!(!stopped.actions.cut, "quitting left the local cutter taking Jobs");
+        drop(permit);
+        quit.join().unwrap();
+    });
+}
+
 /// A cutter nothing can reach is the one refusal `force` exists to pass, asked through `forget`
 /// in both directions: the unforced attempt refuses under a code of its own, and the forced one
 /// removes the host. Its own code because the webview offers the force from the code — under

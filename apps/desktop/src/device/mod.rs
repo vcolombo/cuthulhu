@@ -1214,9 +1214,16 @@ impl DeviceManagerHandle {
         self.close_gate.commit_regardless();
     }
 
-    /// Commit once the operator has answered the prompt.
+    /// Commit once the operator has answered the prompt, and stop the local cutter before waiting
+    /// out a send already in flight.
+    ///
+    /// The flag, the stop and the wait are one function because each swap is a different bug:
+    /// stopping before the flag lets a press start during the cancel, and waiting before the stop
+    /// lets the local worker keep transmitting for up to `CLOSE_GATE_WAIT`.
     pub fn commit_close_after_confirmation(&self) {
-        self.close_gate.commit_after_confirmation();
+        self.close_gate.commit_regardless();
+        self.stop_local_motion();
+        self.close_gate.wait_for_an_inflight_send();
     }
 
     pub fn set_close_guard_ready(&self, ready: bool) {

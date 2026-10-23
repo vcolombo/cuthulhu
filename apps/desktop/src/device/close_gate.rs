@@ -4,8 +4,8 @@
 //! One type rather than a lock and a flag side by side, because the three obligations are only
 //! correct together: take the gate, check the flag, and keep holding it across whatever starts the
 //! cut. As loose statements at a call site, each was one edit away from being dropped — and the
-//! order inside `commit_after_confirmation` (set the flag, *then* wait) was one swap away from
-//! making its own wait the window it exists to close.
+//! order a confirmed quit has to keep (set the flag, stop what this process is driving, *then*
+//! wait) was one swap away from leaving the local worker transmitting through the wait.
 //!
 //! The mark a remote dispatch writes lives inside the host connection, so a press queued behind a
 //! poll has written nothing and no mark can answer for it; a local press is invisible between the
@@ -63,14 +63,14 @@ impl CloseGate {
         self.closing.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Commit once the operator has answered the prompt.
+    /// Wait out a permit already held, after `closing` is set and local motion has been stopped.
     ///
-    /// Set first, waited second: with the flag already set no press that has yet to ask can
-    /// send, and the wait is only for one already in progress. Bounded, because "quit anyway"
-    /// must not hang behind a Pi that is timing out — a send that outlasts it may still land,
-    /// which is what the prompt says about a Job sent to a Cut Host.
-    pub(super) fn commit_after_confirmation(&self) {
-        self.commit_regardless();
+    /// The wait is only for a send already in progress: with the flag set, a press that has yet
+    /// to ask cannot take one. Bounded, because "quit anyway" must not hang behind a Pi that is
+    /// timing out — a send that outlasts it may still land, which is what the prompt says about
+    /// a Job sent to a Cut Host. It does not stop the local worker; that has to have happened
+    /// already, or the worker keeps transmitting for the whole of this wait.
+    pub(super) fn wait_for_an_inflight_send(&self) {
         let deadline = std::time::Instant::now() + super::CLOSE_GATE_WAIT;
         while self.sends.try_write().is_err() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));

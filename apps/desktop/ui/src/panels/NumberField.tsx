@@ -35,10 +35,11 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
     setText((current) => {
       if (current === null || current === "") return null;
       const next = Number(current);
-      // A draft that is still a different number is a keystroke the commit has not
-      // landed yet. Dropping it makes the next digit edit the preview.
-      if (!Number.isFinite(next) || next !== value) return current;
-      return spellingInProgress(current) ? current : null;
+      if (!Number.isFinite(next)) return null;
+      // The preview of an earlier digit is a prefix of the number still being typed.
+      // Anything else — a label drag, undo — replaces the draft.
+      if (next === value) return spellingInProgress(current) ? current : null;
+      return current.startsWith(String(value)) ? current : null;
     });
   }, [value]);
 
@@ -62,6 +63,8 @@ export function NumberField({ label, value, step = 1, min, disabled, suffix, onC
     const final = valueAt(e.clientX);
     drag.current = null;
     setPreview(null);
+    // The drag is a new value. Leaving the typed draft up would hide where the shape moved.
+    setText(null);
     if (final !== value) onChange(final);
   };
   // A canceled pointer (OS gesture, window blur, lost capture) abandons the scrub:

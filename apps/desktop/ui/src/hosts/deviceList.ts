@@ -29,6 +29,8 @@ export type DeviceSection = {
   address: string | null;
   /** Why this section is not normal — unreachable, or naming a host nobody is paired with. */
   unreachable: string | null;
+  /** Which program a protocol mismatch names. Null when the row is some other failure. */
+  protocolSide: ProtocolSide | null;
   devices: DeviceInfo[];
   /** These are the last values a poll managed to read, not what is true now. */
   stale: boolean;
@@ -42,11 +44,12 @@ export function groupDevices(
   devices: DeviceInfo[], hosts: PairedHostView[],
 ): DeviceSection[] {
   const local: DeviceSection = {
-    hostId: null, title: "This computer", address: null, unreachable: null, stale: false,
-    devices: devices.filter(d => d.host === null),
+    hostId: null, title: "This computer", address: null, unreachable: null, protocolSide: null,
+    stale: false, devices: devices.filter(d => d.host === null),
   };
   const known = hosts.map(h => ({
-    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable, stale: false,
+    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable,
+    protocolSide: protocolSide(h.protocol_side), stale: false,
     devices: devices.filter(d => d.host === h.id),
   }));
   // A cutter whose host is in neither list matches no section above — not local, since its `host`
@@ -59,7 +62,7 @@ export function groupDevices(
     devices.flatMap(d => (d.host !== null && !paired.has(d.host) ? [d.host] : [])),
   )];
   return [local, ...known, ...orphaned.map(id => ({
-    hostId: id, title: id, address: null, stale: false,
+    hostId: id, title: id, address: null, stale: false, protocolSide: null,
     unreachable: "this Cut Host is not paired with this computer",
     devices: devices.filter(d => d.host === id),
   }))];
@@ -124,13 +127,49 @@ export async function forgetFrom(
  * moving under a blade. The cutters stay listed with whatever status each already had.
  */
 export function staleSection(previous: DeviceSection, e: unknown): DeviceSection {
-  return { ...previous, stale: true, unreachable: ipcErrorMessage(e) };
+  // The list error replaces the host's sentence, so the chip and the link must not
+  // keep a side that belonged to the sentence that just left the row.
+  return { ...previous, stale: true, unreachable: ipcErrorMessage(e), protocolSide: null };
 }
 
 // A caller is told about a cut through one value, `CutStatus.actions` — never `phase`. Two
 // cutters can share the same phase (e.g. "Disconnected") while one is legal to cut and the
 // other isn't; only `actions` tells them apart. `phase` may still end up in UI copy as
 // descriptive text, but nothing below branches on it.
+/** Which program a protocol mismatch names. The Rust side decides; this only accepts the token. */
+export type ProtocolSide = "host" | "desktop";
+
+export function protocolSide(side: string | null | undefined): ProtocolSide | null {
+  switch (side) {
+    case "host":
+    case "desktop":
+      return side;
+    default:
+      return null;
+  }
+}
+
+/** Where "How to update" goes. The host page is the binary swap; the desktop page is the releases. */
+export function protocolUpdateUrl(side: ProtocolSide): string {
+  switch (side) {
+    case "host":
+      return "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update";
+    case "desktop":
+      return "https://github.com/vcolombo/cuthulhu/releases";
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
+  }
+}
+
+/** The unpolled chip, with the words the mismatch message already used. Same tone: this is
+ *  not a cutter that wants a person at the machine, it is a row we cannot ask. */
+export const UPDATE_NEEDED_BADGE: { label: string; tone: "unknown" } = {
+  label: "Update needed",
+  tone: "unknown",
+};
+
 export function deviceBadge(status: CutStatus | null): { label: string; tone: "idle" | "busy" | "attention" | "unknown" | "gone" } {
   if (status === null) {
     // No status has arrived for this cutter yet (distinct from DISCONNECTED_STATUS, which is a

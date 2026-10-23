@@ -5,7 +5,7 @@ import * as ipc from "../../ipc";
 import { Laptop, Router } from "lucide-react";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../lib/cn";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "../../hosts/deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "../../hosts/deviceList";
 import { PairHostDialog } from "../../hosts/PairHostDialog";
 import { TONE_BADGE } from "./chrome";
 
@@ -184,7 +184,9 @@ export function StepMachine({
           No devices found — connect a cutter and reopen this dialog.
         </div>
       ) : null}
-      {shown.map((section) => (
+      {shown.map((section) => {
+        const side = section.protocolSide;
+        return (
         <div key={section.hostId ?? "local"} className="space-y-2">
           {/* The local section's header is suppressed when it is the only one, so a user with
               no Cut Host sees the flat list this dialog has always shown — but not when the
@@ -211,7 +213,22 @@ export function StepMachine({
           )}
           {/* An unreachable host keeps its cutters listed below this, not hidden (#42). */}
           {section.unreachable ? (
-            <div className="text-sm text-destructive">{section.unreachable}</div>
+            <div className="text-sm text-destructive">
+              {section.unreachable}
+              {side !== null ? (
+                <>
+                  {" "}
+                  <a
+                    href={protocolUpdateUrl(side)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-sm font-medium text-accent-ink underline-offset-2 hover:underline"
+                  >
+                    How to update
+                  </a>
+                </>
+              ) : null}
+            </div>
           ) : null}
           {/* Says what is being accepted rather than asking "are you sure". The two refusals
               this appears for differ in why — a host that could not be asked, or one whose
@@ -249,13 +266,16 @@ export function StepMachine({
               // giving one host's status to the other's row hands Cancel to the wrong machine.
               const isAimed = sameCutter(connected, d);
               const aimed = isAimed ? status : null;
-              const badge = deviceBadge(aimed);
+              const live = deviceBadge(aimed);
+              // A mismatch is not an unfetched status. The chip uses the same tones as
+              // "Unknown"; the label is what the message above already asked for.
+              const badge = side !== null ? UPDATE_NEEDED_BADGE : live;
               const control = connectedControl(aimed, d.host !== null);
               // A busy cutter cannot be chosen until a queue exists, and an unreachable host's
               // cutters stay listed but cannot be aimed at. The aimed cutter stays selectable:
               // Reconnect is the way back from a stop nothing confirmed.
-              const blocked = section.unreachable !== null || (!isAimed && badge.tone === "busy");
-              const reason = badge.tone === "busy" ? "This cutter is in the middle of a job." : null;
+              const blocked = section.unreachable !== null || (!isAimed && live.tone === "busy");
+              const reason = live.tone === "busy" && side === null ? "This cutter is in the middle of a job." : null;
               const Icon = d.host === null ? Laptop : Router;
               const model = machines.find((machine) => machine.id === d.machine_id)?.name ?? d.machine_id;
               // The section header already names a host. The card's second line is how this
@@ -340,7 +360,8 @@ export function StepMachine({
             })}
           </div>
         </div>
-      ))}
+        );
+      })}
       {/* Pairing lives in the device list on purpose: someone hunting for their Pi looks
           here, and finds nothing if it lives in a settings screen. */}
       <Button variant="secondary" onClick={onAddHost}>Add a Cut Host…</Button>

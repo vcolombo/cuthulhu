@@ -326,7 +326,7 @@ pub fn pair_host(
 ) -> Result<PairedHostView, IpcError> {
     let path = hosts_path()?;
     let id = dev.pair(name.clone(), address.clone(), token, fingerprint, &path)?;
-    Ok(PairedHostView { id, name, address, unreachable: None })
+    Ok(PairedHostView { id, name, address, unreachable: None, protocol_side: None })
 }
 
 // async: the idle check dials the host the same way `test_host` does (see there for why).

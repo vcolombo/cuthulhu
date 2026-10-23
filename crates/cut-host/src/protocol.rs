@@ -11,6 +11,44 @@ use driver_core::manager::{CutPass, DeviceError, DeviceEvent};
 use driver_core::{CutStatus, DeviceInfo};
 use serde::{Deserialize, Serialize};
 
+/// The only protocol version this build speaks.
+///
+/// Not the crate version and not the desktop's version: those move when the
+/// program does, and a frame means the same thing either way. This number moves
+/// when a version-specific payload (`Request`, `Response`, `Event`, and the
+/// types they carry) changes shape or meaning. A peer that does not speak it is
+/// refused before any of those types is decoded. The rules are
+/// `docs/adr/0003-the-cut-host-protocol-version-is-explicit.md`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// How large the version offer and its reply may be.
+///
+/// A version is a handful of bytes. The cap a dispatch is allowed is megabytes,
+/// and spending that before the version is known would decode — or at least
+/// allocate — the payload the check exists to refuse. 128 bytes holds the
+/// largest reply this preamble can honestly be (`Unsupported` of two `u32::MAX`)
+/// and nothing that could be a Job.
+pub const VERSION_FRAME_MAX: usize = 128;
+
+/// The server's answer to a version offer, and the only frame decoded before one
+/// is agreed.
+///
+/// `Agreed` names the single version both sides will speak. `Unsupported` names
+/// both numbers and nothing else: a refusal that carried a `Request` would
+/// decode the payload it exists to refuse. `Unreadable` carries no number,
+/// because the offer was not a version and was not decoded as one.
+///
+/// `deny_unknown_fields` is the preamble staying frozen. A field added here
+/// cannot ride along under the old shape — a peer has to decode *this* frame in
+/// order to learn that it must refuse, so the frame is not itself versioned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VersionReply {
+    Agreed { version: u32 },
+    Unsupported { offered: u32, supported: u32 },
+    Unreadable,
+}
+
 /// A client's own name for one dispatch, so a retry after a dropped reply cannot
 /// cut the same material twice. The host, not the client, decides what it means:
 /// an id it has already seen starts nothing.
@@ -304,6 +342,42 @@ mod tests {
         assert_eq!(back.event.job_id, 3);
         assert_eq!(back.event.status.job_id, 0);
         assert_eq!(back.event.status.phase, Phase::Sending);
+    }
+
+    /// The agreement frame is the one a peer decodes before it knows the version,
+    /// so its own round trip is not allowed to grow a field silently. The cap is
+    /// what keeps a refusal from being a place to hide a payload.
+    #[test]
+    fn a_version_reply_round_trips_and_stays_inside_its_cap() {
+        for reply in [
+            VersionReply::Agreed {
+                version: PROTOCOL_VERSION,
+            },
+            VersionReply::Unsupported {
+                offered: u32::MAX,
+                supported: PROTOCOL_VERSION,
+            },
+            VersionReply::Unreadable,
+        ] {
+            let json = serde_json::to_vec(&reply).unwrap();
+            assert!(
+                json.len() <= VERSION_FRAME_MAX,
+                "{} bytes: {reply:?}",
+                json.len()
+            );
+            assert_eq!(
+                serde_json::from_slice::<VersionReply>(&json).unwrap(),
+                reply
+            );
+        }
+    }
+
+    /// An extra field is not a compatible preamble. A peer that stuffed a payload
+    /// into the agreement frame must fail here, not be read as `Agreed`.
+    #[test]
+    fn a_version_reply_with_an_unknown_field_is_not_an_agreement() {
+        let stuffed = r#"{"protocol":"agreed","version":1,"passes":[]}"#;
+        assert!(serde_json::from_str::<VersionReply>(stuffed).is_err());
     }
 
     #[test]

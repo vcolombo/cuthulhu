@@ -3,7 +3,7 @@
 // can't close over anything outside itself) and mirrors the JSON shape produced by
 // crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
 // which is what actually parses this on the JS side.
-export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; demo?: { id: string } }) {
+export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGold?: boolean; seedThreeVinyl?: boolean; seedVinylBoard?: boolean; seedFaint?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; seedRemoteIdle?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean; seedProtocolMismatch?: boolean; demo?: { id: string } }) {
   type Style = { stroke: number | null; fill: number | null };
   type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
   type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
@@ -490,14 +490,33 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
 
   // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
   // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
-  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
+  let hosts: { id: string; name: string; address: string; unreachable: string | null; protocol_side: "host" | "desktop" | null }[] = [];
   const addBusyHost = () => {
     hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-               unreachable: "the host could not be reached (timed out)" }];
+               unreachable: "the host could not be reached (timed out)", protocol_side: null }];
     devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
                    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
   };
   if (opts?.seedBusyHost) addBusyHost();
+
+  // The sentence is what the row prints. Which side is older is `protocol_side`, the token
+  // the chip and the link switch on. A sentence alone leaves the chip on Unknown.
+  if (opts?.seedProtocolMismatch) {
+    hosts.push(
+      { id: "host-old", name: "Workshop Pi", address: "pi.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: "host" },
+      { id: "host-new", name: "Office Pi", address: "office.local:7878",
+        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.",
+        protocol_side: "desktop" },
+    );
+    devices.push(
+      { instance_id: "usb:pi:old", machine_id: "cameo5",
+        transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-old" },
+      { instance_id: "usb:pi:new", machine_id: "cameo5",
+        transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-new" },
+    );
+  }
 
   // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
   // enough for the dialog's pairing flow to be driven end to end rather than stubbed out.
@@ -517,7 +536,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
   };
   if (opts?.seedRemoteConnected || opts?.seedRemoteIdle) {
-    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
+    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null, protocol_side: null });
     devices.push(REMOTE_CUTTER);
   }
 
@@ -1423,7 +1442,7 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       return [PAIRED_CUTTER];
     },
     pair_host: (a) => {
-      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null };
+      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null, protocol_side: null };
       hosts.push(host);
       // The cutter is only in `list_devices` once the host is paired, which is what the dialog
       // re-reads for: the Test listed it to prove the token, not to populate the device list.

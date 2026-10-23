@@ -20,7 +20,8 @@ const ACCEPTED_STATUS: ipc.CutStatus = {
 };
 
 function sameHost(a: ipc.PairedHostView | null, b: ipc.PairedHostView): boolean {
-  return a !== null && a.id === b.id && a.name === b.name && a.address === b.address && a.unreachable === b.unreachable;
+  return a !== null && a.id === b.id && a.name === b.name && a.address === b.address
+    && a.unreachable === b.unreachable && a.protocol_side === b.protocol_side;
 }
 
 /**
@@ -155,6 +156,8 @@ export function useJob(onError: (message: string) => void) {
           name: base?.name ?? id,
           address: base?.address ?? "",
           unreachable: host?.unreachable ?? base?.unreachable ?? UNREACHABLE,
+          // A returned host's null is the fact. A missing host keeps the last side.
+          protocol_side: host !== null ? host.protocol_side : (base?.protocol_side ?? null),
         });
         return;
       }

@@ -133,7 +133,6 @@ async function showPresetEditor(page: Page) {
   await expect(manage).toBeVisible();
 }
 
-
 // The inventory travels in its own init script because `addInitScript` passes one argument and
 // `opts` already has it, and because the fake is serialized into the page and so can close over
 // nothing outside itself — including this import.
@@ -2041,6 +2040,31 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
+});
+
+// The sentence is the Rust side's, shown in the slot a connection error already uses. Both
+// directions: the host is the side to update, and this desktop is. The cutters stay listed and
+// not choosable, the same as any other host that cannot be asked.
+test("a protocol mismatch says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  // Not `{ exact: true }`: the sentence and the "How to update" link share this
+  // element, so the element's text is longer than the sentence.
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  // The chip and the sentence name the same fact. A timed-out host stays "Unknown".
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
 });
 
 // The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for

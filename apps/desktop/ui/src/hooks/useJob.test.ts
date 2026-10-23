@@ -50,7 +50,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 type JobApi = ReturnType<typeof useJob>;
 
-const HOST: PairedHostView = { id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null };
+const HOST: PairedHostView = { id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null, protocol_side: null };
 const REMOTE = { instance_id: "usb:pi:C", machine_id: "cameo5", host: "host-3" } as DeviceInfo;
 
 function status(patch: Partial<CutStatus> & Pick<CutStatus, "phase">): CutStatus {

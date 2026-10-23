@@ -229,7 +229,9 @@ button[data-ink="success"] {
 /* One pressed rule. Ink stays on `--btn-ink` (`--primary`, #106c72 in both
    themes). Fill and edge are tokens, so light is a bordered surface while
    dark stays the white pill, without a second selector and without naming a
-   Tailwind class. The tool rail names accent ink and keeps its own fill. */
+   Tailwind class. The tool rail names accent ink and keeps its own fill.
+   A colour-block select is not a toggle: it uses `aria-current`, so it never
+   lands here. */
 button[aria-pressed="true"]:not([data-ink="accent"]),
 button[role="tab"][data-state="active"] {
   --btn-ink: var(--primary);
@@ -239,6 +241,19 @@ button[role="tab"][data-state="active"] {
   border-style: solid;
   border-width: var(--btn-pressed-edge-width);
   border-color: var(--btn-pressed-edge);
+}
+
+/* In-list toggles, the scissors on a colour row. The shared pressed rule is a
+   white pill in dark, and a column of them is louder than Send to cutter.
+   Dark uses the accent fill, a 1px brand edge, and foreground ink. Light
+   keeps the shared pressed fill and edge. */
+.dark button[data-toggle="quiet"][aria-pressed="true"] {
+  --btn-ink: var(--foreground);
+  --btn-ink-hover: var(--foreground);
+  background: var(--accent);
+  border-style: solid;
+  border-width: 1px;
+  border-color: var(--brand);
 }
 
 /* One opacity for every disabled control that used to repeat `opacity: 0.35`.
@@ -262,13 +277,13 @@ button:disabled,
   background: var(--accent);
 }
 
-/* Preflight zeroes every border and drops list markers. NumberField and AlignRow
-   set their own border inline, which wins over this. Controls that still relied
-   on the user-agent border or marker get them back in the same tokens. */
+/* Preflight zeroes every border and drops list markers. This rule is unlayered,
+   so it beats `border-input` and has to name `--input` itself. `--border` on a
+   field is 1.31:1 light and 1.52:1 dark. `--input` is 3.23:1 and 4.10:1. */
 input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
 select,
 textarea {
-  border: 1px solid var(--border);
+  border: 1px solid var(--input);
 }
 
 /* That reset is unlayered and sets the whole border, so `border-destructive` never

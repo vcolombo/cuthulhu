@@ -7,7 +7,7 @@ import type { PresetLookup } from "../cut/viewmodel";
 import { vinylDisplay, type VinylTheme } from "../render/vinyl";
 import { cn } from "../lib/cn";
 import type { CutLineTypeJson } from "./cutLineType";
-import { layerModel, reorderTarget, type LayerIcon, type LayerNodeRow } from "./layerRows";
+import { layerFooter, layerHeading, layerModel, reorderTarget, type LayerIcon, type LayerNodeRow } from "./layerRows";
 
 type Props = {
   doc: DocSnapshot | null;
@@ -87,11 +87,13 @@ function NodeRow({
       }}
       onClick={(event) => onSelect(row.id, event.shiftKey)}
       className={cn(
-        "flex cursor-pointer items-center gap-2 border py-1 pr-2 text-xs",
+        "flex cursor-pointer items-center gap-2 rounded-sm border px-1.5 py-1 text-xs",
         selected ? "border-primary bg-accent" : "border-transparent",
+        row.repeated && "text-muted-foreground",
         locked === null && "cursor-grab",
       )}
-      style={{ paddingLeft: 8 + row.depth * 12 }}
+      style={{ marginLeft: 28 + row.depth * 12, marginRight: 4 }}
+      title={row.repeated ? "This group’s shapes continue in this block" : undefined}
     >
       <RowIcon icon={row.icon} />
       <span className="min-w-0 flex-1 truncate">{row.name}</span>
@@ -121,7 +123,7 @@ export function LayersPanel({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="px-2 py-1 text-2xs uppercase text-muted-foreground">Layers</div>
+      <div className="px-2 py-1 text-2xs uppercase text-muted-foreground">{layerHeading(grouping)}</div>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {doc
           ? model.blocks.map((block) => {
@@ -150,8 +152,8 @@ export function LayersPanel({
                     </button>
                     <button
                       type="button"
-                      data-ink="muted"
-                      aria-pressed={allSelected}
+                      data-selected={allSelected}
+                      aria-current={allSelected ? "true" : undefined}
                       className={cn(
                         "flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-sm border px-1.5 py-1 text-left text-xs",
                         allSelected ? "border-primary bg-accent" : "border-transparent",
@@ -160,18 +162,19 @@ export function LayersPanel({
                     >
                       {swatch ? (
                         <span
-                          className="inline-block size-3.5 shrink-0 rounded-sm border border-foreground/20"
+                          className="inline-block size-3.5 shrink-0 rounded-sm border border-input"
                           style={{ background: swatch }}
                         />
                       ) : (
-                        <span className="inline-block size-3.5 shrink-0 rounded-sm border border-border bg-muted" />
+                        <span className="inline-block size-3.5 shrink-0 rounded-sm border border-input bg-muted" />
                       )}
                       <span className="min-w-0 flex-1 truncate">{block.name}</span>
-                      <span className="tabular text-muted-foreground">{block.shapeIds.length}</span>
+                      <span className="tabular">{block.shapeIds.length}</span>
                     </button>
                     <button
                       type="button"
                       data-ink="muted"
+                      data-toggle="quiet"
                       aria-label={`Cut ${block.name}`}
                       aria-pressed={block.cut === "Cut" ? true : block.cut === "mixed" ? "mixed" : false}
                       title={editsLocked ? `Cut ${block.name}: ${editsLocked}` : `Cut ${block.name}`}
@@ -219,7 +222,7 @@ export function LayersPanel({
           : null}
       </div>
       <p className="shrink-0 border-t border-border px-2 py-2 text-2xs text-muted-foreground">
-        Each colour layer is cut as its own pass. Drag to change cut order.
+        {layerFooter(grouping)}
       </p>
     </div>
   );

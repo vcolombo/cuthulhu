@@ -25,7 +25,7 @@ import { viewMatrix, zoomPercent, type Inset } from "./interaction/viewport";
 import { TopBar } from "./panels/TopBar";
 import { ToolRail } from "./panels/ToolRail";
 import { LayersPanel } from "./panels/LayersPanel";
-import { PropertiesPanel } from "./panels/PropertiesPanel";
+import { passFactLabel, PropertiesPanel } from "./panels/PropertiesPanel";
 import { RULER_PX, ZOOM_BAR_CLEAR_PX, Rulers, ZoomControls } from "./panels/CanvasChrome";
 import { selectionCutLineType, type CutLineTypeJson } from "./panels/cutLineType";
 import { effectiveMaterials, selectionAssignment, summariseEffectiveMaterial } from "./panels/materialPreset";
@@ -775,7 +775,7 @@ export function App() {
               onDesignFor={designFor}
               faintVinyl={doc ? selectionHasFaintVinyl(doc.nodes, selected) : false}
               nothingSelected={selected.length === 0}
-              documentInfo={doc ? { matLabel, passCount, objectCount: countShapes(doc) } : null}
+              documentInfo={doc ? { matLabel, passLabel: passFactLabel(grouping), passCount, objectCount: countShapes(doc) } : null}
             />
           </TabsContent>
           <TabsContent value="devices" className="mt-0 min-h-0 flex-1 overflow-auto">

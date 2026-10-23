@@ -11,6 +11,8 @@ export type LayerNodeRow = {
   name: string;
   icon: LayerIcon;
   depth: number;
+  /** A parent already shown under an earlier block. Dimmed, so a group that spans colours stays readable. */
+  repeated: boolean;
 };
 
 export type LayerBlock = {
@@ -34,6 +36,37 @@ export type LayerModel = {
 };
 
 const EMPTY_LOOKUP: PresetLookup = { presets: [], loaded: false };
+
+/** Colour groupings name the blocks by paint. Single and Preset do not. */
+export function layerHeading(grouping: Grouping): string {
+  switch (grouping) {
+    case "Single":
+      return "Layers";
+    case "Preset":
+      return "Materials";
+    case "Color":
+    case "Stroke":
+    case "Fill":
+      return "Colour layers";
+  }
+}
+
+/** Dragging reorders shapes among their siblings. Pass order is the Send sheet's. */
+export function layerFooter(grouping: Grouping): string {
+  const drag = "Drag a shape to reorder it among its siblings.";
+  switch (grouping) {
+    case "Single":
+      return `Every cut shape is one pass. ${drag}`;
+    case "Preset":
+      return `Each material is cut as its own pass. ${drag}`;
+    case "Stroke":
+      return `Each stroke colour is cut as its own pass. ${drag}`;
+    case "Fill":
+      return `Each fill colour is cut as its own pass. ${drag}`;
+    case "Color":
+      return `Each colour is cut as its own pass. ${drag}`;
+  }
+}
 
 function isShape(node: DocNode): boolean {
   return typeof node.kind === "object" && node.kind !== null && "Shape" in node.kind;
@@ -201,6 +234,7 @@ export function layerModel(
       name: names.get(id) ?? "Path",
       icon: node ? iconFor(node.kind) : "path",
       depth: depthOf(parents, id, doc.root),
+      repeated: false,
     };
   };
 
@@ -208,13 +242,23 @@ export function layerModel(
     const shapes = all.byKey.get(key) ?? [];
     const label = passRowLabel(key, lookup, grouping);
     const rows: LayerNodeRow[] = [];
-    for (const shape of shapes) {
-      for (const anc of ancestorChain(parents, shape.id, doc.root)) {
-        if (emitted.has(anc)) continue;
-        emitted.add(anc);
-        rows.push(rowFor(anc));
+    // Seen inside this block. A parent emitted under an earlier colour is repeated
+    // here, dimmed, so its later shapes keep their indent instead of reading as blocks.
+    const seen = new Set<number>();
+    const pushAncestor = (id: number) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      const row = rowFor(id);
+      if (emitted.has(id)) rows.push({ ...row, repeated: true });
+      else {
+        emitted.add(id);
+        rows.push(row);
       }
-      if (!emitted.has(shape.id)) {
+    };
+    for (const shape of shapes) {
+      for (const anc of ancestorChain(parents, shape.id, doc.root)) pushAncestor(anc);
+      if (!seen.has(shape.id)) {
+        seen.add(shape.id);
         emitted.add(shape.id);
         rows.push(rowFor(shape.id));
       }

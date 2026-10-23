@@ -4,7 +4,7 @@ import type { Bounds } from "../render/hittest";
 import type { LengthUnit } from "../length";
 import { displayLength, unitToMm } from "../length";
 import type { CutLineTypeJson } from "./cutLineType";
-import type { PresetAssignmentJson } from "../ipc";
+import type { Grouping, PresetAssignmentJson } from "../ipc";
 import type { Preset } from "../cut/viewmodel";
 import type { EffectiveMaterial } from "./materialPreset";
 import { NumberField } from "./NumberField";
@@ -42,7 +42,7 @@ type Props = {
   /** A selected shape whose vinyl alpha is under 0.1. It still cuts. */
   faintVinyl?: boolean;
   /** Shown when nothing is selected. Null until a document is loaded. */
-  documentInfo: { matLabel: string; passCount: number; objectCount: number } | null;
+  documentInfo: { matLabel: string; passLabel: string; passCount: number; objectCount: number } | null;
   /** App knows the selection. Bounds being null is also a multi-select and a group. */
   nothingSelected: boolean;
 };
@@ -100,6 +100,13 @@ function DesignFor({
   );
 }
 
+/** What the Document section calls the pass count. Colour groupings share one label. */
+export function passFactLabel(grouping: Grouping): string {
+  if (grouping === "Single") return "Passes";
+  if (grouping === "Preset") return "Material passes";
+  return "Colour passes";
+}
+
 function Fact({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3 text-xs">
@@ -117,21 +124,31 @@ export function PropertiesPanel({
   documentInfo, nothingSelected,
 }: Props) {
   const documentSection = nothingSelected;
-  const step = unit === "in" ? 0.01 : 1;
+  const step = unit === "in" ? 0.001 : 1;
+  const lengthSuffix = unit === "in" ? "in" : "mm";
   const commit = (shown: number) => unitToMm(shown, unit);
   const design = onDesignFor ? (
     <DesignFor machines={machines ?? []} machineId={machineId ?? null} onDesignFor={onDesignFor} />
   ) : null;
 
+  if (!documentInfo) {
+    return (
+      <div className="flex flex-col gap-2 overflow-y-auto p-2">
+        <p className="text-xs text-muted-foreground">No document</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-2 overflow-y-auto p-2">
-      {documentSection && documentInfo ? (
+      {documentSection ? (
         <section aria-label="Document" className="flex flex-col gap-2">
           <h2 className="text-2xs uppercase text-muted-foreground">Document</h2>
+          <p className="text-xs text-muted-foreground">Select an object to edit its size and position.</p>
           {design}
           <Fact label="Mat" value={documentInfo.matLabel} />
           <Fact label="Units" value={unit} />
-          <Fact label="Passes" value={String(documentInfo.passCount)} />
+          <Fact label={documentInfo.passLabel} value={String(documentInfo.passCount)} />
           <Fact label="Objects" value={String(documentInfo.objectCount)} />
         </section>
       ) : (
@@ -140,14 +157,14 @@ export function PropertiesPanel({
           <div className="text-2xs uppercase text-muted-foreground">Properties</div>
           {bounds ? (
             <>
-              <NumberField label="X" value={displayLength(bounds.x, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeX(commit(v))} />
-              <NumberField label="Y" value={displayLength(bounds.y, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeY(commit(v))} />
-              <NumberField label="W" value={displayLength(bounds.w, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeW(commit(v))} />
-              <NumberField label="H" value={displayLength(bounds.h, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeH(commit(v))} />
+              <NumberField label="X" suffix={lengthSuffix} value={displayLength(bounds.x, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeX(commit(v))} />
+              <NumberField label="Y" suffix={lengthSuffix} value={displayLength(bounds.y, unit)} step={step} disabled={editsLocked !== null} onChange={(v) => onChangeY(commit(v))} />
+              <NumberField label="W" suffix={lengthSuffix} value={displayLength(bounds.w, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeW(commit(v))} />
+              <NumberField label="H" suffix={lengthSuffix} value={displayLength(bounds.h, unit)} step={step} min={0} disabled={editsLocked !== null} onChange={(v) => onChangeH(commit(v))} />
             </>
           ) : null}
           {rotation !== null ? (
-            <NumberField label="Rotation" value={rotation} step={1} disabled={editsLocked !== null} onChange={onChangeRotation} />
+            <NumberField label="Rotation" suffix="°" value={rotation} step={1} disabled={editsLocked !== null} onChange={onChangeRotation} />
           ) : null}
           {/* Also outside the bounds branch, since aligning is mostly for multi-node selections. Always shown, disabled
               when it cannot act, so the buttons do not jump the rows below them in and out. */}

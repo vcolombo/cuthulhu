@@ -3,7 +3,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { PropertiesPanel } from "./PropertiesPanel";
+import { passFactLabel, PropertiesPanel } from "./PropertiesPanel";
 
 const onChangeX = vi.fn();
 
@@ -31,7 +31,7 @@ function props(over: Partial<Parameters<typeof PropertiesPanel>[0]> = {}): Param
     machines: [{ id: "cameo5", name: "Silhouette Cameo 5", width_mm: 330, height_mm: 3000 }],
     machineId: "cameo5",
     onDesignFor: () => {},
-    documentInfo: { matLabel: "12 × 12 in (305 × 305 mm)", passCount: 3, objectCount: 4 },
+    documentInfo: { matLabel: "12 × 12 in (305 × 305 mm)", passLabel: "Colour passes", passCount: 3, objectCount: 4 },
     nothingSelected: true,
     ...over,
   };
@@ -66,8 +66,9 @@ describe("document section", () => {
     };
     expect(fact("Mat")).toBe("12 × 12 in (305 × 305 mm)");
     expect(fact("Units")).toBe("mm");
-    expect(fact("Passes")).toBe("3");
+    expect(fact("Colour passes")).toBe("3");
     expect(fact("Objects")).toBe("4");
+    expect(panel.textContent).toContain("Select an object to edit its size and position.");
     expect(panel.querySelector("[aria-label='Design for']")).not.toBeNull();
     expect([...panel.querySelectorAll("label")].some((label) => label.textContent?.trim() === "X")).toBe(false);
   });
@@ -88,7 +89,10 @@ describe("document section", () => {
     };
     expect(field("X").value).toBe("1");
     expect(field("W").value).toBe("2");
+    expect(field("W").parentElement?.textContent).toContain("in");
+    expect(field("W").step).toBe("0.001");
     expect(field("Rotation").value).toBe("0");
+    expect(field("Rotation").parentElement?.textContent).toContain("°");
     expect(onChangeX).not.toHaveBeenCalled();
   });
 
@@ -106,5 +110,20 @@ describe("document section", () => {
     expect(panel.querySelector("[aria-label='Align left edges']")).not.toBeNull();
     expect(panel.querySelector("[aria-label='Material preset']")?.querySelector("option")?.textContent).toBe("Mixed");
     expect(panel.textContent).toContain("Nearly invisible");
+  });
+
+  test("no document is an empty state, not the shape layout", () => {
+    const panel = render({ documentInfo: null, nothingSelected: true });
+    expect(panel.textContent).toContain("No document");
+    expect(panel.querySelector("h2")).toBeNull();
+    expect([...panel.querySelectorAll("label")].some((label) => label.textContent?.trim() === "X")).toBe(false);
+  });
+
+  test("the pass label follows the grouping", () => {
+    expect(passFactLabel("Color")).toBe("Colour passes");
+    expect(passFactLabel("Stroke")).toBe("Colour passes");
+    expect(passFactLabel("Fill")).toBe("Colour passes");
+    expect(passFactLabel("Single")).toBe("Passes");
+    expect(passFactLabel("Preset")).toBe("Material passes");
   });
 });

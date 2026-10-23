@@ -10,6 +10,8 @@ describe("length units", () => {
     expect(formatLength(stored, "in")).toBe("1.00");
     expect(displayLength(stored, "mm")).toBe(25.4);
     expect(displayLength(stored, "in")).toBe(1);
+    expect(displayLength(10, "in")).toBe(0.394);
+    expect(formatLength(10, "in")).toBe("0.39");
   });
 
   test("millimetres round-trip without a conversion", () => {

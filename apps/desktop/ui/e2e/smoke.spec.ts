@@ -6963,12 +6963,15 @@ test("layers follow the colour passes and a cut toggle stays on the row", async 
   for (const name of VINYL_BOARD) {
     await expect(page.getByRole("button", { name: `Cut ${name}`, exact: true })).toHaveAttribute("aria-pressed", "true");
   }
-  await expect(page.getByText("Each colour layer is cut as its own pass. Drag to change cut order.")).toBeVisible();
+  await expect(page.getByText("Colour layers", { exact: true })).toBeVisible();
+  await expect(page.getByText("Each colour is cut as its own pass. Drag a shape to reorder it among its siblings.")).toBeVisible();
   await expect(page.getByRole("button", { name: "Cut this shape", exact: true })).toHaveCount(0);
 
   const red = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Red vinyl", exact: true }) });
   const gold = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Gold vinyl", exact: true }) });
   await red.getByRole("button").nth(1).click();
+  await expect(red.getByRole("button").nth(1)).toHaveAttribute("aria-current", "true");
+  await expect(red.getByRole("button").nth(1)).not.toHaveAttribute("aria-pressed");
   await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
   await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "false");
   await gold.getByRole("button").nth(1).click({ modifiers: ["Shift"] });
@@ -7008,7 +7011,7 @@ test("properties show one shape in millimetres and in inches", async ({ page }) 
   await phaseShot(page, "properties-mm");
 
   await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
-  await expect(page.getByLabel("W", { exact: true })).toHaveValue("0.39");
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("0.394");
   await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
   await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
   await phaseShot(page, "properties-in");
@@ -7048,7 +7051,8 @@ test("an empty selection shows the document, not a second units control", async 
   await expect(section.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
   await expect(section.getByText("Mat", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("12 × 12 in (305 × 305 mm)");
   await expect(section.getByText("Units", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("mm");
-  await expect(section.getByText("Passes", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByText("Select an object to edit its size and position.")).toBeVisible();
+  await expect(section.getByText("Colour passes", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
   await expect(section.getByText("Objects", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
   await expect(section.getByLabel("Design for")).toBeVisible();
   await expect(section.getByRole("button", { name: "mm", exact: true })).toHaveCount(0);

@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import type { DocNode, DocSnapshot } from "../App";
 import type { Grouping } from "../ipc";
 import { effectiveMaterials } from "./materialPreset";
-import { reorderTarget, layerPasses, layerRowIds } from "./layerRows";
+import { layerFooter, layerHeading, layerModel, reorderTarget, layerPasses, layerRowIds } from "./layerRows";
 
 const RED = 0xff0000ff;
 const GREEN = 0x00ff00ff;
@@ -151,6 +151,38 @@ describe("layer row order", () => {
       empty,
     ]);
     expect(rowIds(snapshot, "Color")).toEqual([2, 3, 4, 5, 6, 7]);
+  });
+
+  test("a group whose shapes span colours is repeated, dimmed, under the later block", () => {
+    const root = container(1, "Layer", [2]);
+    const group = container(2, "Group", [3, 4]);
+    const snapshot = doc([
+      root,
+      group,
+      shape(3, { stroke: RED, fill: null }),
+      shape(4, { stroke: GREEN, fill: null }),
+    ]);
+    const model = layerModel(snapshot, "Color", effectiveMaterials(snapshot.nodes, snapshot.root));
+    expect(model.blocks.map((block) => block.rows.map((row) => [row.id, row.repeated, row.depth]))).toEqual([
+      [[2, false, 0], [3, false, 1]],
+      [[2, true, 0], [4, false, 1]],
+    ]);
+  });
+});
+
+describe("layer copy", () => {
+  test("colour groupings name colour layers, and the footer never calls a drag a pass reorder", () => {
+    for (const grouping of ["Color", "Stroke", "Fill"] as const) {
+      expect(layerHeading(grouping)).toBe("Colour layers");
+      expect(layerFooter(grouping)).not.toContain("cut order");
+    }
+    expect(layerHeading("Single")).toBe("Layers");
+    expect(layerHeading("Preset")).toBe("Materials");
+    expect(layerFooter("Single")).toContain("one pass");
+    expect(layerFooter("Preset")).toContain("material");
+    expect(layerFooter("Color")).not.toContain("material");
+    expect(layerFooter("Preset")).not.toContain("colour");
+    expect(layerFooter("Single")).not.toContain("colour");
   });
 });
 

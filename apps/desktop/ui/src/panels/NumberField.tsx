@@ -11,13 +11,15 @@ type Props = {
   step?: number;
   min?: number;
   disabled?: boolean;
+  /** Shown after the field, hidden from the accessible name so the label stays the field name. */
+  suffix?: string;
   onChange: (v: number) => void;
 };
 
 /** Numeric input whose label doubles as a drag-scrub handle (pointer dx * step).
  *  Scrubbing only previews locally as the pointer moves; onChange fires once on
  *  pointerup so one drag gesture produces one undo step. */
-export function NumberField({ label, value, step = 1, min, disabled, onChange }: Props) {
+export function NumberField({ label, value, step = 1, min, disabled, suffix, onChange }: Props) {
   const drag = useRef<{ startX: number; startValue: number } | null>(null);
   const [preview, setPreview] = useState<number | null>(null);
 
@@ -72,6 +74,7 @@ export function NumberField({ label, value, step = 1, min, disabled, onChange }:
         onChange={(e) => onChange(Number(e.target.value))}
         className="w-full rounded-sm border border-input bg-background px-1 text-foreground"
       />
+      {suffix ? <span aria-hidden className="shrink-0">{suffix}</span> : null}
     </label>
   );
 }

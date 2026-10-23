@@ -59,9 +59,10 @@ export function formatLength(mm: number, unit: LengthUnit, digits?: number): str
 }
 
 /**
- * The number a length field shows. Same rounding as `formatLength`; the number input then
- * drops a trailing zero, so 20 mm stays "20" and 1.00 in stays a value that stores 25.4 mm.
+ * The number a length field shows. Inches use three decimals, so 10 mm reads 0.394 in.
+ * Millimetres stay on `formatLength`'s tenth. The number input drops a trailing zero,
+ * so 1.000 in shows as 1 and still stores 25.4 mm.
  */
 export function displayLength(mm: number, unit: LengthUnit): number {
-  return Number(formatLength(mm, unit));
+  return Number(formatLength(mm, unit, unit === "in" ? 3 : undefined));
 }

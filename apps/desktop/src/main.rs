@@ -5,9 +5,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use driver_core::manager::DeviceEventKind;
-use tauri::menu::{Menu, MenuItem};
-#[cfg(target_os = "macos")]
-use tauri::menu::MenuItemKind;
 use tauri::{Emitter, Manager};
 
 use desktop::device::{CloseVerdict, DeviceManagerHandle};
@@ -43,42 +40,60 @@ fn chrome_color(theme: ResolvedTheme) -> tauri::webview::Color {
     }
 }
 
-/// The Quit item's id. Not a predefined item, because a predefined one is the OS's `terminate:`.
-const QUIT_MENU_ID: &str = "quit";
+/// Quit routed through the close guard. macOS only: it is the only platform whose default menu
+/// Tauri installs unasked, and the only one whose Quit this closes a gap in. Installing a menu
+/// elsewhere would add a File > Exit that skips the guard where there was no menu at all.
+#[cfg(target_os = "macos")]
+mod quit_menu {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+    use tauri::{Emitter, Manager};
 
-/// Tauri's default menu, with Quit routed through the close guard on macOS.
-///
-/// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
-/// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
-/// so the guard that covers the window's close button was skipped (#327). An item of our own is
-/// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
-/// send `terminate:` and are not covered.
-fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    let menu = Menu::default(app)?;
-    #[cfg(target_os = "macos")]
-    if let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() {
-        // The stock Quit is the last predefined item of that submenu; anything else there is
-        // a layout this does not know, and is left as it is rather than guessed at.
-        if let Some(stock_quit @ MenuItemKind::Predefined(_)) = application.items()?.last() {
-            application.remove(stock_quit)?;
-            application.append(&MenuItem::with_id(
-                app,
-                QUIT_MENU_ID,
-                format!("Quit {}", app.package_info().name),
-                true,
-                Some("CmdOrCtrl+Q"),
-            )?)?;
-        }
+    use desktop::device::{CloseVerdict, DeviceManagerHandle};
+
+    /// The Quit item's id. Not a predefined item, because a predefined one is the OS's `terminate:`.
+    const QUIT_MENU_ID: &str = "quit";
+
+    pub fn install(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+        builder.menu(app_menu).on_menu_event(|app, event| {
+            if event.id() == QUIT_MENU_ID {
+                request_quit(app);
+            }
+        })
     }
-    Ok(menu)
-}
 
-/// What the Quit item does: the same question the window's close button asks, and on a yes the
-/// same exit `force_quit` takes once the operator has answered the prompt.
-fn request_quit(app: &tauri::AppHandle) {
-    let dev = app.state::<DeviceManagerHandle>();
-    if dev.decide_close(|| app.emit("cut-in-progress", ())) == CloseVerdict::Proceed {
-        app.exit(0);
+    /// Tauri's default menu, with Quit replaced by an item of our own.
+    ///
+    /// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
+    /// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
+    /// so the guard that covers the window's close button was skipped (#327). An item of our own is
+    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
+    /// send `terminate:` and are not covered.
+    fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+        let menu = Menu::default(app)?;
+        if let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() {
+            // The stock Quit is the last predefined item of that submenu; anything else there is
+            // a layout this does not know, and is left as it is rather than guessed at.
+            if let Some(stock_quit @ MenuItemKind::Predefined(_)) = application.items()?.last() {
+                application.remove(stock_quit)?;
+                application.append(&MenuItem::with_id(
+                    app,
+                    QUIT_MENU_ID,
+                    format!("Quit {}", app.package_info().name),
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?)?;
+            }
+        }
+        Ok(menu)
+    }
+
+    /// What the Quit item does: the same question the window's close button asks, and on a yes the
+    /// same exit `force_quit` takes once the operator has answered the prompt.
+    fn request_quit(app: &tauri::AppHandle) {
+        let dev = app.state::<DeviceManagerHandle>();
+        if dev.decide_close(|| app.emit("cut-in-progress", ())) == CloseVerdict::Proceed {
+            app.exit(0);
+        }
     }
 }
 
@@ -137,8 +152,10 @@ fn main() {
         dev_handle.add_host(host);
     }
 
-    let app = tauri::Builder::default()
-        .menu(app_menu)
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = quit_menu::install(builder);
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppState::new()))
         .manage(dev_handle)
@@ -240,11 +257,6 @@ fn main() {
                 if dev.decide_close(|| window.emit("cut-in-progress", ())) == CloseVerdict::Warn {
                     api.prevent_close();
                 }
-            }
-        })
-        .on_menu_event(|app, event| {
-            if event.id() == QUIT_MENU_ID {
-                request_quit(app);
             }
         })
         .build(tauri::generate_context!())

@@ -3181,6 +3181,24 @@ fn a_request_to_leave_is_decided_the_same_for_every_door() {
     let verdict = unarmed.decide_close(|| -> Result<(), String> { panic!("no listener, so nothing to warn") });
     assert_eq!(verdict, Proceed);
     assert!(!can_start_a_press(&unarmed), "the app is going, so no press may start");
+
+    // Readiness is a fact about the webview, not about the cut: an idle desktop with its listener
+    // armed must still leave without asking, or every quit would raise the prompt.
+    let idle_and_armed = test_device_setup();
+    idle_and_armed.set_close_guard_ready(true);
+    let verdict = idle_and_armed.decide_close(|| -> Result<(), String> { panic!("nothing is outstanding") });
+    assert_eq!(verdict, Proceed);
+    assert!(!can_start_a_press(&idle_and_armed), "leaving was decided but a press could still start");
+
+    // A press holding its permit has written no mark yet, so the ledger calls the desktop idle.
+    // It is still a Job about to start, and the operator is asked rather than waved through.
+    let sending = test_device_setup();
+    sending.set_close_guard_ready(true);
+    let permit = sending.close_gate.permit().expect("an open gate grants a permit");
+    assert!(!sending.a_cut_may_be_running(), "the ledger has no mark, which is the case under test");
+    assert_eq!(sending.decide_close(|| Ok::<(), String>(())), Warn);
+    assert!(can_start_a_press(&sending), "the app stays open, so a press must still be able to start");
+    drop(permit);
 }
 
 /// An admitted dispatch is not free merely because the worker still publishes Idle. This is

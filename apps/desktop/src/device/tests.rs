@@ -3149,6 +3149,40 @@ fn a_close_is_let_go_only_with_nothing_outstanding() {
     assert!(!armed.close_guard_ready(), "teardown left the native guard armed");
 }
 
+/// The decision both doors share — the window's close button and the Quit menu item (#327). It was
+/// inline in `on_window_event`, where no test could reach it; every arm is a different promise to
+/// the operator or to a press that has not yet asked for its permit.
+#[test]
+fn a_request_to_leave_is_decided_the_same_for_every_door() {
+    use super::CloseVerdict::{Proceed, Warn};
+    let outstanding = || {
+        let dev = test_device_setup();
+        dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        dev
+    };
+    let can_start_a_press = |dev: &DeviceManagerHandle| dev.close_gate.permit().is_some();
+
+    let idle = test_device_setup();
+    let verdict = idle.decide_close(|| -> Result<(), String> { panic!("an idle desktop asked nothing") });
+    assert_eq!(verdict, Proceed);
+    assert!(!can_start_a_press(&idle), "leaving was decided but a press could still start");
+
+    let armed = outstanding();
+    armed.set_close_guard_ready(true);
+    assert_eq!(armed.decide_close(|| Ok::<(), String>(())), Warn);
+    assert!(can_start_a_press(&armed), "the app stays open, so a press must still be able to start");
+
+    let undeliverable = outstanding();
+    undeliverable.set_close_guard_ready(true);
+    assert_eq!(undeliverable.decide_close(|| Err("no webview".to_string())), Proceed);
+    assert!(!can_start_a_press(&undeliverable), "the app is going, so no press may start");
+
+    let unarmed = outstanding();
+    let verdict = unarmed.decide_close(|| -> Result<(), String> { panic!("no listener, so nothing to warn") });
+    assert_eq!(verdict, Proceed);
+    assert!(!can_start_a_press(&unarmed), "the app is going, so no press may start");
+}
+
 /// An admitted dispatch is not free merely because the worker still publishes Idle. This is
 /// the one bit the host added to Snapshot for the accept-to-worker-publication gap.
 #[test]

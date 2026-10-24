@@ -277,6 +277,17 @@ fn unix_millis() -> u64 {
 const CLOSED_MID_PRESS: &str =
     "the app is closing, so this cut was not sent — start it again once it is open";
 
+/// What a request to leave the app comes to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseVerdict {
+    /// The app may go: either nothing is outstanding or the guard could not warn, and the gate
+    /// is committed so no press starts anything new.
+    Proceed,
+    /// A cut may be running and the operator has been asked; the app stays open until the page
+    /// answers through `force_quit`.
+    Warn,
+}
+
 
 #[derive(Deserialize)]
 pub struct CutRequest {
@@ -1443,6 +1454,51 @@ impl DeviceManagerHandle {
     /// window goes because the webview could not be told.
     pub fn commit_close_regardless(&self) {
         self.close_gate.commit_regardless();
+    }
+
+    /// Decide a request to leave the app, from either door: the window's close button or the
+    /// Quit menu item. `warn` shows the operator the prompt.
+    ///
+    /// Never blocking, local or remote. The window callback is synchronous and runs on the main
+    /// thread, and `status()` aimed at a host dials: its 2s budget starts only once that host's
+    /// connection lock is in hand, and `list_devices` holds the same lock across a 30s call — so a
+    /// close arriving during a device-list poll froze the window for the listing plus the poll plus
+    /// an unbounded resolve (#115). What this asks is whether to warn, which a status alone cannot
+    /// answer: a dispatch accepted a second ago has not been polled yet, so the newest status
+    /// anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts every dispatch this
+    /// desktop sent and has not seen finish, on any cutter and whatever is aimed at now (#158); a
+    /// warning about a Job that has since ended costs a dialog the operator dismisses.
+    ///
+    /// `commit_close` answers and commits in one step, so a press queued behind a poll for a host's
+    /// connection cannot cross into its dispatch after the app has been let go: the Job it would
+    /// start outlives the process that started it.
+    ///
+    /// Readiness is the delivery fact: `emit` only proves serialization and returns success even
+    /// with nobody listening, so once the webview has acknowledged its listener a successful `warn`
+    /// and the refusal are one act. Without that acknowledgement the guard fails open by design — a
+    /// refusal with no listener has no escape — but not silently: the log line is the only evidence
+    /// a startup or listener failure disabled it when an operator later reports a missing warning.
+    /// Both fail-open arms commit, because the app goes either way and nothing new may start.
+    pub fn decide_close<E: std::fmt::Display>(
+        &self,
+        warn: impl FnOnce() -> Result<(), E>,
+    ) -> CloseVerdict {
+        if self.commit_close() {
+            return CloseVerdict::Proceed;
+        }
+        if self.close_guard_ready() {
+            match warn() {
+                Ok(()) => return CloseVerdict::Warn,
+                Err(e) => {
+                    self.commit_close_regardless();
+                    eprintln!("cuthulhu: a cut may be running and the warning could not be shown: {e}");
+                }
+            }
+        } else {
+            self.commit_close_regardless();
+            eprintln!("cuthulhu: a cut may be running but the warning listener is not ready; closing");
+        }
+        CloseVerdict::Proceed
     }
 
     /// Commit once the operator has answered the prompt, and stop the local cutter before waiting

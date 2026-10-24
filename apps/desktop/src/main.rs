@@ -5,9 +5,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use driver_core::manager::DeviceEventKind;
+use tauri::menu::{Menu, MenuItem};
+#[cfg(target_os = "macos")]
+use tauri::menu::MenuItemKind;
 use tauri::{Emitter, Manager};
 
-use desktop::device::DeviceManagerHandle;
+use desktop::device::{CloseVerdict, DeviceManagerHandle};
 use desktop::hosts;
 use desktop::ipc;
 use desktop::preferences::ResolvedTheme;
@@ -37,6 +40,45 @@ fn chrome_color(theme: ResolvedTheme) -> tauri::webview::Color {
     match theme {
         ResolvedTheme::Light => tauri::webview::Color(0xF8, 0xFB, 0xFB, 0xFF),
         ResolvedTheme::Dark => tauri::webview::Color(0x0B, 0x1A, 0x1D, 0xFF),
+    }
+}
+
+/// The Quit item's id. Not a predefined item, because a predefined one is the OS's `terminate:`.
+const QUIT_MENU_ID: &str = "quit";
+
+/// Tauri's default menu, with Quit routed through the close guard on macOS.
+///
+/// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
+/// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
+/// so the guard that covers the window's close button was skipped (#327). An item of our own is
+/// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
+/// send `terminate:` and are not covered.
+fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::default(app)?;
+    #[cfg(target_os = "macos")]
+    if let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() {
+        // The stock Quit is the last predefined item of that submenu; anything else there is
+        // a layout this does not know, and is left as it is rather than guessed at.
+        if let Some(stock_quit @ MenuItemKind::Predefined(_)) = application.items()?.last() {
+            application.remove(stock_quit)?;
+            application.append(&MenuItem::with_id(
+                app,
+                QUIT_MENU_ID,
+                format!("Quit {}", app.package_info().name),
+                true,
+                Some("CmdOrCtrl+Q"),
+            )?)?;
+        }
+    }
+    Ok(menu)
+}
+
+/// What the Quit item does: the same question the window's close button asks, and on a yes the
+/// same exit `force_quit` takes once the operator has answered the prompt.
+fn request_quit(app: &tauri::AppHandle) {
+    let dev = app.state::<DeviceManagerHandle>();
+    if dev.decide_close(|| app.emit("cut-in-progress", ())) == CloseVerdict::Proceed {
+        app.exit(0);
     }
 }
 
@@ -96,6 +138,7 @@ fn main() {
     }
 
     let app = tauri::Builder::default()
+        .menu(app_menu)
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppState::new()))
         .manage(dev_handle)
@@ -194,49 +237,14 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                // Never blocking, local or remote. This callback is synchronous and runs on the
-                // main thread, and `status()` aimed at a host dials: its 2s budget starts only
-                // once that host's connection lock is in hand, and `list_devices` holds the same
-                // lock across a 30s call — so a close arriving during a device-list poll froze
-                // the window for the listing plus the poll plus an unbounded resolve (#115).
-                // What this asks is whether to warn, which a status alone cannot answer: a
-                // dispatch accepted a second ago has not been polled yet, so the newest status
-                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts every
-                // dispatch this desktop sent and has not seen finish, on any cutter and whatever
-                // is aimed at now (#158); a warning about a Job that has since ended costs a
-                // dialog the operator dismisses.
-                // `commit_close` answers and commits in one step, so a press queued behind a poll
-                // for a host's connection cannot cross into its dispatch after the window has been
-                // let go: the Job it would start outlives the process that started it.
-                if dev.commit_close() {
-                    return;
+                if dev.decide_close(|| window.emit("cut-in-progress", ())) == CloseVerdict::Warn {
+                    api.prevent_close();
                 }
-                if dev.close_guard_ready() {
-                    // Readiness is the delivery fact: `emit` only proves serialization and returns
-                    // success even with nobody listening. Once the webview has acknowledged its
-                    // listener, a successful emit and the refusal are one act.
-                    match window.emit("cut-in-progress", ()) {
-                        Ok(()) => api.prevent_close(),
-                        Err(e) => {
-                            // The window is going, so the close is a fact whatever the operator
-                            // was told: commit it, or a press queued behind a host's connection
-                            // would still send into a process on its way out.
-                            dev.commit_close_regardless();
-                            eprintln!(
-                                "cuthulhu: a cut may be running and the warning could not be shown: {e}"
-                            );
-                        }
-                    }
-                } else {
-                    // Fail open by design — a refused close with no listener has no escape — but
-                    // not silently: this is the only evidence a startup/listener failure disabled
-                    // the guard when an operator later reports a warning was missing. Committed
-                    // for the same reason as above: the window goes, so nothing new may start.
-                    dev.commit_close_regardless();
-                    eprintln!(
-                        "cuthulhu: a cut may be running but the warning listener is not ready; closing"
-                    );
-                }
+            }
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == QUIT_MENU_ID {
+                request_quit(app);
             }
         })
         .build(tauri::generate_context!())

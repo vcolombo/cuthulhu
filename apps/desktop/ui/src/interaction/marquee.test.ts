@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { marqueeHits, marqueeSelection, normalizeRect, outermost, shapesUnder, toggleId, workspaceShapeIds } from "./marquee";
+import { marqueeHits, marqueeSelection, normalizeRect, outermost, shapesUnder, toggleId } from "./marquee";
 
 describe("marquee", () => {
   it("normalizes a band dragged in any direction", () => {
@@ -27,47 +27,6 @@ describe("marquee", () => {
   it("toggleId adds a missing id and removes a present one", () => {
     expect(toggleId([1, 2], 3)).toEqual([1, 2, 3]);
     expect(toggleId([1, 2], 1)).toEqual([2]);
-  });
-});
-
-describe("workspaceShapeIds", () => {
-  const shape = { Shape: { Rect: { w: 1, h: 1 } } };
-  // root Layer 1 → rect 3, Group 2 → rect 4. Preorder is the scene's order.
-  const nodes = {
-    1: { kind: "Layer", children: [3, 2] },
-    2: { kind: "Group", children: [4] },
-    3: { kind: shape, children: [] },
-    4: { kind: shape, children: [] },
-  };
-
-  it("names every shape on the mat, in document order, and no container", () => {
-    expect(workspaceShapeIds(nodes, 1)).toEqual([3, 4]);
-  });
-
-  it("is empty when the document has no shapes", () => {
-    expect(workspaceShapeIds({ 1: { kind: "Layer", children: [2] }, 2: { kind: "Group", children: [] } }, 1)).toEqual([]);
-  });
-
-  it("takes a node once when a cycle or a repeated child would walk it twice", () => {
-    const cyclic = {
-      1: { kind: "Layer", children: [2] },
-      2: { kind: "Group", children: [1, 3, 3] },
-      3: { kind: shape, children: [] },
-    };
-    expect(workspaceShapeIds(cyclic, 1)).toEqual([3]);
-  });
-
-  it("does not walk a shape's children, which the scene does not draw", () => {
-    const under = {
-      1: { kind: "Layer", children: [3] },
-      3: { kind: shape, children: [4] },
-      4: { kind: shape, children: [] },
-    };
-    expect(workspaceShapeIds(under, 1)).toEqual([3]);
-  });
-
-  it("is empty when the root is missing", () => {
-    expect(workspaceShapeIds(nodes, 99)).toEqual([]);
   });
 });
 

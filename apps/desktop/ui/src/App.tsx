@@ -18,7 +18,7 @@ import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { IDENTITY, compose, transformBounds } from "./render/affine";
-import { outermost, shapesUnder, toggleId, workspaceShapeIds } from "./interaction/marquee";
+import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
@@ -565,12 +565,13 @@ export function App() {
         return;
       }
       // Cmd/Ctrl+A is the webview's select-all, which highlights every label in the window.
-      // The workspace is the shapes on the mat. Shift and Alt stay free — AltGr types through
-      // Ctrl+Alt. A field, a dialog and a menu already returned above and keep the chord.
+      // The workspace is the shapes the canvas already drew, in that order. A node listed under
+      // two parents is taken once. Shift and Alt stay free — AltGr types through Ctrl+Alt.
+      // A field, a dialog and a menu already returned above and keep the chord.
       if (mod && key === "a" && !e.shiftKey && !e.altKey) {
         e.preventDefault();
         window.getSelection()?.removeAllRanges();
-        if (doc) setSelected(workspaceShapeIds(doc.nodes, doc.root));
+        setSelected([...new Set(scene.nodes.map((node) => node.id))]);
         return;
       }
       // Option on macOS and AltGr change `e.key` (Option+S is "ß"), so the physical key is `e.code`.
@@ -608,7 +609,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [doc, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
+  }, [scene, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
 
   const cutting = status.actions.cancel || statuses.some((row) => row.status.actions.cancel);
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);

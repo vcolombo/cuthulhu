@@ -3424,7 +3424,8 @@ test("Command-A selects every shape on the mat and leaves the chrome and a focus
   await showTab(page, "Properties");
   const x = page.getByLabel("X", { exact: true });
   await x.focus();
-  await page.keyboard.press("Control+A");
+  // The platform chord: Ctrl+A on macOS moves the caret, so the field would keep its "0".
+  await page.keyboard.press("ControlOrMeta+A");
   // Replacing the field's "0" commits x = 4. The other rect stays at the origin, so the
   // union below is still 0..80 × 0..50.
   await x.press("4");

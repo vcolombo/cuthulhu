@@ -3431,6 +3431,9 @@ test("Command-A selects every shape on the mat and leaves the chrome and a focus
   await expect(x).toHaveValue("4");
   await showTab(page, "Layers");
   await expect(selectedRows).toHaveCount(1);
+  // Shift stays free. The one selected shape must not become every shape.
+  await page.keyboard.press("Shift+Meta+A");
+  await expect(selectedRows).toHaveCount(1);
 
   // Focus stays on the toolbar button, the same way keyboard zoom is reached.
   await page.getByRole("button", { name: "Select", exact: true }).click();
@@ -3448,6 +3451,18 @@ test("Command-A selects every shape on the mat and leaves the chrome and a focus
   await expect(selectedRows).toHaveCount(1);
   await page.keyboard.press("Control+A");
   await expect(selectedRows).toHaveCount(4);
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
+test("Command-A on an empty mat leaves the chrome unselected", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Control+A");
+  await expect(page.getByText("No selection")).toBeVisible();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Select an object to edit its size and position.")).toBeVisible();
   expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
 });
 

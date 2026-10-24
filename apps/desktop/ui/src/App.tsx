@@ -564,6 +564,16 @@ export function App() {
         if (selected.length >= 2) onBooleanOp("Union");
         return;
       }
+      // Cmd/Ctrl+A is the webview's select-all, which highlights every label in the window.
+      // The workspace is the shapes the canvas already drew, in that order. A node listed under
+      // two parents is taken once. Shift and Alt stay free — AltGr types through Ctrl+Alt.
+      // A field, a dialog and a menu already returned above and keep the chord.
+      if (mod && key === "a" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        setSelected([...new Set(scene.nodes.map((node) => node.id))]);
+        return;
+      }
       // Option on macOS and AltGr change `e.key` (Option+S is "ß"), so the physical key is `e.code`.
       if (mod && e.altKey && e.code === "KeyS") {
         e.preventDefault();
@@ -599,7 +609,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
+  }, [scene, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
 
   const cutting = status.actions.cancel || statuses.some((row) => row.status.actions.cancel);
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);

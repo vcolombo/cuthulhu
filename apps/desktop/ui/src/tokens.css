@@ -171,6 +171,15 @@ body {
   font-family: "Inter Variable", system-ui, sans-serif;
   font-size: 13px;
   line-height: 20px;
+  /* The window is a canvas. A drag, and a select-all the key handler did not catch, must not
+     highlight every label in the chrome. Fields keep a selection of their own. */
+  user-select: none;
+}
+
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
 }
 
 /* Unlayered, so it wins over Tailwind's reset and over a component outline.

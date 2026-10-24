@@ -3408,6 +3408,65 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await expect.poll(async () => (await readView(page)).scale).toBeCloseTo(Math.min(availW / rollW, availH / rollH), 3);
 });
 
+test("Command-A selects every shape on the mat and leaves the chrome and a focused field alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedAlignExtras: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const rows = page.getByTestId("layer-row");
+  // Two loose rects, a group of two rects, and an empty group.
+  await expect(rows).toHaveCount(6);
+  await rows.first().click();
+  const selectedRows = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  await expect(selectedRows).toHaveCount(1);
+  await expect(page.getByText("10.0 × 10.0 mm")).toBeVisible();
+
+  // The chord belongs to the field. Stealing it would select the other three shapes.
+  await showTab(page, "Properties");
+  const x = page.getByLabel("X", { exact: true });
+  await x.focus();
+  // The platform chord: Ctrl+A on macOS moves the caret, so the field would keep its "0".
+  await page.keyboard.press("ControlOrMeta+A");
+  // Replacing the field's "0" commits x = 4. The other rect stays at the origin, so the
+  // union below is still 0..80 × 0..50.
+  await x.press("4");
+  await expect(x).toHaveValue("4");
+  await showTab(page, "Layers");
+  await expect(selectedRows).toHaveCount(1);
+  // Shift stays free. The one selected shape must not become every shape.
+  await page.keyboard.press("Shift+Meta+A");
+  await expect(selectedRows).toHaveCount(1);
+
+  // Focus stays on the toolbar button, the same way keyboard zoom is reached.
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  // The two grouped rects sit at 50,20 and 70,40, so the box is the whole mat, 0..80 × 0..50.
+  await expect(page.getByText("80.0 × 50.0 mm")).toBeVisible();
+  await expect(selectedRows).toHaveCount(4);
+  const groups = rows.filter({ hasText: "Group" });
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0)).toHaveAttribute("data-selected", "false");
+  await expect(groups.nth(1)).toHaveAttribute("data-selected", "false");
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+
+  await rows.first().click();
+  await expect(selectedRows).toHaveCount(1);
+  await page.keyboard.press("Control+A");
+  await expect(selectedRows).toHaveCount(4);
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
+test("Command-A on an empty mat leaves the chrome unselected", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Control+A");
+  await expect(page.getByText("No selection")).toBeVisible();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Select an object to edit its size and position.")).toBeVisible();
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
 test("keyboard zoom works after a toolbar click and leaves a focused field alone", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { ipcErrorCode, ipcErrorMessage, type CutStatus, type DeviceInfo, type PairedHostView } from "../ipc";
+import { ipcErrorCode, ipcErrorMessage, type CutStatus, type CutterStatusView, type DeviceInfo, type PairedHostView } from "../ipc";
 
 /**
  * Whether these are the same cutter — the id *and* the host, never the id alone.
@@ -126,6 +126,50 @@ export async function forgetFrom(
  * idle reads as "finished", which is the one wrong thing to tell someone whose material is still
  * moving under a blade. The cutters stay listed with whatever status each already had.
  */
+/**
+ * How long ago a host last answered, in the offline card's own words.
+ * `null` is a host this desktop has never read a snapshot from.
+ */
+export function lastSeenLabel(at: number | null | undefined, now: number): string {
+  if (at == null) return "No successful reading yet";
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  if (seconds < 60) return `Last seen ${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes === 1 ? "Last seen 1 minute ago" : `Last seen ${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return hours === 1 ? "Last seen 1 hour ago" : `Last seen ${hours} hours ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "Last seen 1 day ago" : `Last seen ${days} days ago`;
+}
+
+/**
+ * An unreachable host keeps the cutters and statuses from the last reading that named them.
+ *
+ * A live snapshot of a host that cannot be reached is empty, and substituting it would drop the
+ * rows or replace a frozen cut with `Disconnected`. The first reading, which has nothing older
+ * to keep, uses whatever the list returned.
+ */
+export function retainOffline(
+  previousDevices: DeviceInfo[],
+  previousStatuses: CutterStatusView[],
+  nextDevices: DeviceInfo[],
+  nextHosts: PairedHostView[],
+  nextStatuses: CutterStatusView[],
+): { devices: DeviceInfo[]; statuses: CutterStatusView[] } {
+  const offline = nextHosts.filter((host) => host.unreachable !== null).map((host) => host.id);
+  if (offline.length === 0) return { devices: nextDevices, statuses: nextStatuses };
+  const held = new Set(offline);
+  const devices = nextDevices.filter((device) => device.host === null || !held.has(device.host));
+  const statuses = nextStatuses.filter((row) => !held.has(row.host));
+  for (const id of offline) {
+    const keptDevices = previousDevices.filter((device) => device.host === id);
+    const keptStatuses = previousStatuses.filter((row) => row.host === id);
+    devices.push(...(keptDevices.length > 0 ? keptDevices : nextDevices.filter((device) => device.host === id)));
+    statuses.push(...(keptStatuses.length > 0 ? keptStatuses : nextStatuses.filter((row) => row.host === id)));
+  }
+  return { devices, statuses };
+}
+
 export function staleSection(previous: DeviceSection, e: unknown): DeviceSection {
   // The list error replaces the host's sentence, so the chip and the link must not
   // keep a side that belonged to the sentence that just left the row.
@@ -146,6 +190,25 @@ export function protocolSide(side: string | null | undefined): ProtocolSide | nu
       return side;
     default:
       return null;
+  }
+}
+
+/**
+ * The host card's title. A protocol mismatch is a host that answered, so it is
+ * not "can't reach", and it is not a reading that never succeeded.
+ */
+export function hostCardTitle(name: string, side: ProtocolSide | null, unreachable: boolean): string {
+  switch (side) {
+    case "host":
+      return `${name} needs an update`;
+    case "desktop":
+      return `Update Cuthulhu to use ${name}`;
+    case null:
+      return unreachable ? `Can't reach ${name}` : `${name} · Pi Cut Host`;
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
   }
 }
 
@@ -234,5 +297,8 @@ export function connectedControl(
   if (status === null || status.actions.cancel || status.actions.resume || status.actions.confirm) {
     return null;
   }
+  // A remote cutter that can take a cut is already open. Reconnect is the way back
+  // when it is disconnected or the last cut errored — every other state left here.
+  if (onHost && status.actions.cut) return null;
   return onHost ? { label: "Reconnect", verb: "reconnect" } : { label: "Disconnect", verb: "disconnect" };
 }

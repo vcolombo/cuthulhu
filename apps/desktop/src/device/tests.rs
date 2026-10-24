@@ -1624,6 +1624,16 @@ fn host_cameo(host: &HostId) -> DeviceInfo {
     }
 }
 
+fn host_puma(host: &HostId) -> DeviceInfo {
+    DeviceInfo {
+        instance_id: cut_host::host::testing::PUMA.into(),
+        machine_id: "puma".into(),
+        transport: TransportKind::Serial { path: "/dev/ttyUSB0".into(), baud: 9600 },
+        candidate: true,
+        host: Some(host.clone()),
+    }
+}
+
 fn a_square(side: f64) -> Vec<CutPass> {
     vec![CutPass {
         job: Job {
@@ -1638,15 +1648,15 @@ fn a_square(side: f64) -> Vec<CutPass> {
     }]
 }
 
-fn cameo_is_active(client: &cut_host::client::HostClient) -> bool {
+fn cutter_is_active(client: &cut_host::client::HostClient, instance_id: &str) -> bool {
     client
         .snapshots()
-        .map(|snaps| {
-            snaps.iter().any(|s| {
-                s.info.instance_id == cut_host::host::testing::CAMEO && s.status.is_active()
-            })
-        })
+        .map(|snaps| snaps.iter().any(|s| s.info.instance_id == instance_id && s.status.is_active()))
         .unwrap_or(false)
+}
+
+fn cameo_is_active(client: &cut_host::client::HostClient) -> bool {
+    cutter_is_active(client, cut_host::host::testing::CAMEO)
 }
 
 fn wait_until(mut done: impl FnMut() -> bool, complaint: &str) {
@@ -1702,6 +1712,127 @@ fn reconnecting_a_remote_cutter_clears_a_cancel_that_could_not_confirm_the_stop(
 
     dev.reconnect().expect("the host re-opens its own cutter");
     assert!(dev.status().actions.cut, "a re-opened cutter takes a Job again");
+}
+
+/// One Pi, two cutters. The snapshot keeps both, and a command names the cutter it means
+/// rather than whichever one the aim happens to be (#307).
+#[test]
+fn every_cutter_on_a_host_keeps_its_status_and_takes_its_own_commands() {
+    use cut_host::host::testing::{CAMEO, PUMA};
+
+    let host = start_loopback_host();
+    let dir = tempfile::tempdir().unwrap();
+    let hosts_path = dir.path().join("hosts.json");
+    let dev = test_device_setup();
+    let id = dev
+        .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
+        .expect("pairing with the loopback host");
+
+    let listed = dev.list_devices();
+    let remote: Vec<_> = listed.iter().filter(|d| d.host.as_ref() == Some(&id)).collect();
+    assert!(remote.iter().any(|d| d.instance_id == CAMEO), "the cameo was dropped: {listed:?}");
+    assert!(remote.contains(&&host_puma(&id)), "the puma was dropped: {listed:?}");
+
+    let statuses = dev.cutter_statuses();
+    assert!(
+        statuses.iter().any(|s| s.host == id && s.instance_id == CAMEO && s.status.actions.cut),
+        "cameo status: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().any(|s| s.host == id && s.instance_id == PUMA && s.status.actions.cut),
+        "puma status: {statuses:?}"
+    );
+    assert!(
+        dev.host_views().iter().any(|v| v.id == id && v.last_seen.is_some()),
+        "a snapshot that landed left no last_seen"
+    );
+
+    *dev.connected.lock().unwrap() = Some(host_cameo(&id));
+    let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
+    direct
+        .dispatch(
+            &cut_host::protocol::DispatchId("d-puma".into()),
+            PUMA,
+            "puma",
+            a_square(10.0),
+        )
+        .unwrap();
+    wait_until(|| cutter_is_active(&direct, PUMA), "the puma never went active");
+
+    dev.list_devices();
+    let cached = dev.cutter_statuses();
+    let puma = cached.iter().find(|s| s.instance_id == PUMA).expect("puma left the cache");
+    let cameo = cached.iter().find(|s| s.instance_id == CAMEO).expect("cameo left the cache");
+    assert!(puma.status.is_active(), "the sibling's status was dropped: {puma:?}");
+    assert!(cameo.status.actions.cut && !cameo.status.is_active(), "the idle cutter was reported busy");
+
+    let aimed = dev.status();
+    assert!(
+        aimed.actions.cut && !aimed.is_active(),
+        "status() stopped answering for the aim: {aimed:?}"
+    );
+    assert!(
+        dev.cutter_statuses().iter().any(|s| s.instance_id == PUMA && s.status.is_active()),
+        "reading the aim replaced the sibling's status"
+    );
+
+    dev.cancel().expect("cancel follows the aim");
+    assert!(cutter_is_active(&direct, PUMA), "cancelling the aim stopped the other cutter");
+
+    dev.cancel_addressed(Some(id), Some(PUMA.into())).expect("the puma is addressed by name");
+    wait_until(|| !cutter_is_active(&direct, PUMA), "the addressed cancel never reached the puma");
+}
+
+fn cache_snapshot(instance_id: &str) -> cut_host::protocol::DeviceSnapshot {
+    cut_host::protocol::DeviceSnapshot {
+        info: DeviceInfo {
+            instance_id: instance_id.into(),
+            machine_id: "cameo5".into(),
+            transport: TransportKind::Usb { locator: "1:4".into() },
+            candidate: false,
+            host: None,
+        },
+        status: CutStatus::disconnected(),
+        job_id: None,
+        claimed: false,
+    }
+}
+
+/// The cache is what the Devices tab and the cutting dot read. A snapshot that names fewer
+/// cutters has unplugged one; a failed dial never calls `remember_snapshots`, so this is only
+/// the answer a host actually gave.
+#[test]
+fn a_snapshot_that_omits_a_cutter_drops_it_from_the_status_cache() {
+    let dev = test_device_setup();
+    let id = HostId("host-9".into());
+    let other = HostId("host-8".into());
+    let cameo = cache_snapshot("usb:cameo");
+    dev.remember_snapshots(&id, &[cameo.clone(), cache_snapshot("usb:puma")]);
+    dev.remember_snapshots(&other, &[cache_snapshot("usb:other")]);
+
+    dev.remember_snapshots(&id, &[cameo]);
+    let left: Vec<_> = dev
+        .cutter_statuses()
+        .into_iter()
+        .map(|s| (s.host.0, s.instance_id))
+        .collect();
+    assert!(left.iter().any(|(h, i)| h == "host-9" && i == "usb:cameo"), "{left:?}");
+    assert!(
+        !left.iter().any(|(_, i)| i == "usb:puma"),
+        "an unplugged cutter stayed cached: {left:?}"
+    );
+    assert!(
+        left.iter().any(|(h, i)| h == "host-8" && i == "usb:other"),
+        "another host was pruned: {left:?}"
+    );
+
+    dev.remember_snapshots(&id, &[]);
+    let after = dev.cutter_statuses();
+    assert!(
+        !after.iter().any(|s| s.host == id),
+        "an empty answer left this host's cutters: {after:?}"
+    );
+    assert!(after.iter().any(|s| s.host == other), "an empty answer pruned the other host");
 }
 
 fn wait_for_remote(dev: &DeviceManagerHandle, want: impl Fn(&CutStatus) -> bool, what: &str) {

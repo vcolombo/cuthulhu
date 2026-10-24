@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { useCallback, useEffect, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { MachineProfile } from "../../App";
 import * as ipc from "../../ipc";
 import { Laptop, Router } from "lucide-react";
@@ -12,76 +12,23 @@ import { TONE_BADGE } from "./chrome";
 /** The device list and the poll that keeps a Cut Host's rows moving. Called from the sheet so its
  *  mount effect stays ahead of the plan: the list and the ranges used to start in one effect. */
 export function useDeviceList({
-  refreshDeviceState,
+  devices,
+  hosts,
+  listError,
+  refreshList,
   onError,
   onReconnect,
 }: {
-  refreshDeviceState: () => Promise<void>;
+  devices: ipc.DeviceInfo[];
+  hosts: ipc.PairedHostView[];
+  listError: string | null;
+  refreshList: () => void;
   onError: (msg: string) => void;
   onReconnect: () => Promise<unknown>;
 }) {
-  const [devices, setDevices] = useState<ipc.DeviceInfo[]>([]);
-  const [hosts, setHosts] = useState<ipc.PairedHostView[]>([]);
-  // What the last read of the two lists failed with, held rather than reported: it is what marks
-  // the rows stale instead of blanking them.
-  const [listError, setListError] = useState<unknown>(null);
   const [pairing, setPairing] = useState(false);
   /** The host whose forget was refused because nothing could confirm it is idle, if any. */
   const [forceHost, setForceHost] = useState<string | null>(null);
-
-  // The whole device list in one request rather than one per host: `list_devices` already
-  // re-reads every paired host in a single call, and `list_hosts` carries why any of them cannot
-  // be reached.
-  const refreshList = useCallback(
-    () =>
-      Promise.all([ipc.listDevices(), ipc.listHosts()])
-        .then(([d, h]) => {
-          setDevices(d);
-          setHosts(h);
-          setListError(null);
-        })
-        // Kept, not raised: a read that failed leaves the last values it managed on screen,
-        // marked stale. A row that blanks reads as "the cut finished", which is the one wrong
-        // thing to tell someone whose material is still moving under a blade.
-        .catch((e) => setListError(e)),
-    [],
-  );
-
-  useEffect(() => {
-    void refreshList();
-  }, [refreshList]);
-
-  // A cut on a Cut Host is watched by asking, not by being told: nothing pushes over the
-  // request/reply connection. This interval covers the open sheet. `useJob` keeps asking
-  // after the sheet closes, because the job panel has to move once this unmounts.
-  //
-  // With no host there is no gap to fill — a local cutter's status is pushed by the
-  // device-event listener in `useJob` — and the cost is not nothing: `list_devices` resolves
-  // to `HardwareBackendFactory::list_devices`, which walks the USB bus and the serial ports.
-  // The Pi is optional, and a desktop without one pays for it once per dialog, as before.
-  //
-  // Clearing it is the deliverable, not tidiness. A leaked interval keeps a Cut Host connection
-  // warm forever and the daemon caps concurrent clients at eight (#103), so one leaked per
-  // dialog-open exhausts a Pi, which then refuses every new connection until it is restarted.
-  useEffect(() => {
-    if (hosts.length === 0) return;
-    // ponytail: one interval for the whole list, not one per host — the two calls behind it each
-    // cover every host at once. Per-host intervals are the upgrade if one slow host ever starts
-    // holding up the others' rows, and they cost a teardown each.
-    let inFlight = false;
-    const id = setInterval(() => {
-      // Skipped rather than queued: an unreachable host can take seconds to answer, and ticks
-      // that wait their turn build a backlog that outlives whatever wedged the host.
-      if (inFlight) return;
-      inFlight = true;
-      Promise.all([refreshList(), refreshDeviceState()]).finally(() => {
-        inFlight = false;
-      });
-    }, 1000);
-    return () => clearInterval(id);
-    // Length, not the array: a poll that replaces `hosts` with an equal list every second would
-    // otherwise tear the interval down and rebuild it every second.
-  }, [refreshList, refreshDeviceState, hosts.length]);
 
   // A refusal keeps the row and shows the host's own words: the Rust side refuses while a cut is
   // active there and whenever it cannot ask, and a row that vanished and came back would say
@@ -136,6 +83,26 @@ export function HostPairing({
   onPaired: () => void;
   onClose: () => void;
 }) {
+  // The dialog has no trigger, and closing it unmounts the tree, so Radix never runs
+  // `onCloseAutoFocus`. The opener is still focused on the render that mounts the dialog.
+  // A layout effect would already be inside it: Radix moves focus in its own layout effect,
+  // which runs before this parent's.
+  const returnFocus = useRef<HTMLElement | null>(null);
+  if (open && returnFocus.current === null && typeof document !== "undefined") {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) returnFocus.current = active;
+  }
+  useLayoutEffect(() => {
+    if (open) return;
+    const back = returnFocus.current;
+    returnFocus.current = null;
+    if (back === null) return;
+    // The parent sets `open` false and this returns null in the same commit. Restoring
+    // synchronously lands on a node Radix is still tearing down.
+    queueMicrotask(() => {
+      if (back.isConnected) back.focus();
+    });
+  }, [open]);
   if (!open) return null;
   return <PairHostDialog onPaired={onPaired} onClose={onClose} />;
 }
@@ -149,6 +116,7 @@ export function StepMachine({
   setForceHost,
   connected,
   status,
+  statuses,
   aiming,
   guardUnsaved,
   onConnect,
@@ -166,6 +134,7 @@ export function StepMachine({
   setForceHost: (id: string | null) => void;
   connected: ipc.DeviceInfo | null;
   status: ipc.CutStatus;
+  statuses: ipc.CutterStatusView[];
   aiming: boolean;
   guardUnsaved: (run: () => void) => void;
   onConnect: (info: ipc.DeviceInfo) => void;
@@ -265,7 +234,12 @@ export function StepMachine({
               // id *and* the host: two hosts wired alike hand out the same fallback id, and
               // giving one host's status to the other's row hands Cancel to the wrong machine.
               const isAimed = sameCutter(connected, d);
-              const aimed = isAimed ? status : null;
+              // The aimed cutter follows the job once that job has a status of its own.
+              // Disconnected is the job's initial value, and it must not hide the snapshot
+              // of a cutter that is already aimed when the sheet opens. Every other cutter
+              // comes from that snapshot, matched on id and host.
+              const cached = statuses.find((row) => sameCutter(row, d))?.status ?? null;
+              const aimed = isAimed && status.phase !== "Disconnected" ? status : (cached ?? (isAimed ? status : null));
               const live = deviceBadge(aimed);
               // A mismatch is not an unfetched status. The chip uses the same tones as
               // "Unknown"; the label is what the message above already asked for.

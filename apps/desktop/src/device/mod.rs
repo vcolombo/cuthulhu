@@ -266,6 +266,13 @@ fn snapshot_is_free(snapshot: &cut_host::protocol::DeviceSnapshot) -> bool {
     classify(snapshot) == CutterState::Free
 }
 
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// What a press is told when the window closed before it could start anything.
 const CLOSED_MID_PRESS: &str =
     "the app is closing, so this cut was not sent — start it again once it is open";
@@ -319,6 +326,11 @@ pub(crate) struct HostConnection {
     /// what tells "the token was refused" from "the Pi is asleep", and flattening it here was one
     /// of the two places that distinction used to be thrown away (#112).
     pub last_error: Option<IpcError>,
+    /// Unix millis of the last snapshot this host actually returned.
+    ///
+    /// Left alone when a dial fails, so an offline card can say when the cutters were last real
+    /// rather than when the failure was noticed.
+    pub last_seen: Option<u64>,
     /// The state a call lifted out of the paired-host map must still check.
     ///
     /// A press lifts this connection out before it queues on the mutex, so removing the map entry
@@ -399,6 +411,30 @@ pub struct PairedHostView {
     /// Which program a protocol mismatch names. `None` for every other failure, including a
     /// host that timed out.
     pub protocol_side: Option<cut_host::client::ProtocolSide>,
+    /// Unix millis of the last successful snapshot, or `None` until one has landed.
+    /// A failed dial leaves the previous value, so the row keeps when the host was last heard.
+    pub last_seen: Option<u64>,
+}
+
+/// One remote cutter's last reported status, read from the cache without dialling.
+///
+/// Fields stay snake_case like `DeviceInfo`. The status inside keeps `CutStatus`'s camelCase.
+#[derive(Clone, Debug, Serialize)]
+pub struct CutterStatusView {
+    pub host: HostId,
+    pub instance_id: String,
+    pub status: CutStatus,
+}
+
+/// Which cutter a command names when the caller does not want the aim.
+enum CutterAddress {
+    /// Both arguments omitted: the connected cutter, including "no aim" for a local cancel.
+    Aim,
+    /// An explicit cutter on this computer. Local multi-cutter is out of scope (#59), so this
+    /// has to be the one already aimed.
+    Local { instance_id: String },
+    /// A cutter on a paired Cut Host, whether or not it is the aim (#307).
+    Remote { host: HostId, instance_id: String },
 }
 
 /// The budget handed to *each* of the two legs `with_host_within` can spend on a status poll —
@@ -558,13 +594,10 @@ impl DeviceManagerHandle {
                     // Both facts are the cutter's authority for "nothing of ours is running":
                     // status says it would take a Job, and `claimed` closes the admitted-
                     // dispatch-before-worker-publication gap status cannot represent.
-                    self.ledger.clear_cutters(
-                        &id,
-                        snapshots
-                            .iter()
-                            .filter(|s| snapshot_is_free(s))
-                            .map(|s| s.info.instance_id.as_str()),
-                    );
+                    // Every cutter is kept, not only the aimed one: a second machine on the
+                    // same Pi used to vanish here (#307).
+                    self.remember_snapshots(&id, &snapshots);
+                    host.last_seen = Some(unix_millis());
                     let listed = snapshots.into_iter().map(|s| s.info).collect();
                     all.extend(crate::hosts::stamp_host(&id, listed));
                 }
@@ -581,7 +614,13 @@ impl DeviceManagerHandle {
 
     pub fn add_host(&self, paired: PairedHost) {
         let id = paired.id.clone();
-        let conn = HostConnection { paired, client: None, last_error: None, lifecycle: HostLifecycle::Active };
+        let conn = HostConnection {
+            paired,
+            client: None,
+            last_error: None,
+            last_seen: None,
+            lifecycle: HostLifecycle::Active,
+        };
         self.claimed_host_ids.lock().unwrap().insert(id.clone());
         self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
     }
@@ -640,6 +679,7 @@ impl DeviceManagerHandle {
                     address: h.paired.address.clone(),
                     unreachable: h.last_error.as_ref().map(|e| e.message.clone()),
                     protocol_side: h.last_error.as_ref().and_then(|e| e.protocol_side),
+                    last_seen: h.last_seen,
                 }
             })
             .collect()
@@ -1101,6 +1141,43 @@ impl DeviceManagerHandle {
     /// Connect, done in one call; on a Cut Host it has to be the host's own verb, since this
     /// desktop never opened that transport and `disconnect` there is bookkeeping only.
     pub fn reconnect(&self) -> Result<(), IpcError> {
+        self.reconnect_addressed(None, None)
+    }
+
+    /// One match for every verb that names a cutter.
+    ///
+    /// Aim, and a local cutter that is the one already aimed, share the helper that
+    /// already knew that verb. A remote cutter is the same verb on that host. Five
+    /// copies of this match are how the local check would drift from the one beside it.
+    fn addressed<T>(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+        aimed: impl FnOnce(&Self) -> Result<T, IpcError>,
+        remote: impl FnOnce(&Self, &HostId, &str) -> Result<T, IpcError>,
+    ) -> Result<T, IpcError> {
+        match self.resolve_cutter(host, instance_id)? {
+            CutterAddress::Aim => aimed(self),
+            CutterAddress::Local { instance_id } => {
+                self.require_aimed_local(&instance_id)?;
+                aimed(self)
+            }
+            CutterAddress::Remote { host, instance_id } => remote(self, &host, &instance_id),
+        }
+    }
+
+    /// Re-open the aimed cutter, or the cutter `(host, instance_id)` names.
+    pub fn reconnect_addressed(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<(), IpcError> {
+        self.addressed(host, instance_id, Self::reconnect_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.reconnect(instance_id))
+        })
+    }
+
+    fn reconnect_aimed(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         let Some(device) = aimed else {
             return Err(IpcError::new("device_error", "no device is connected"));
@@ -1120,6 +1197,33 @@ impl DeviceManagerHandle {
     /// never blocks on the worker — so the window-close handler and the IPC
     /// command can both call it freely, even mid-transmit.
     pub fn status(&self) -> CutStatus {
+        self.status_of(None, None).unwrap_or_else(|_| CutStatus::disconnected())
+    }
+
+    /// The aimed cutter when both arguments are absent, or the cutter they name.
+    ///
+    /// A live host read that fails is `Disconnected`, the same answer `status` has always given:
+    /// the last cached value is not a live read. A target this desktop cannot address is an error.
+    pub fn status_of(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<CutStatus, IpcError> {
+        // A live host read that fails stays `Disconnected`. That is not `with_host`'s error:
+        // the last cached value is not a live read, and `Idle` would offer a second cut.
+        self.addressed(
+            host,
+            instance_id,
+            |this| Ok(this.status_aimed()),
+            |this, host, instance_id| {
+                Ok(this
+                    .remote_status(host, instance_id)
+                    .unwrap_or_else(|_| CutStatus::disconnected()))
+            },
+        )
+    }
+
+    fn status_aimed(&self) -> CutStatus {
         let aimed = self.connected.lock().unwrap().clone();
         let Some(device) = aimed else { return CutStatus::disconnected() };
         match self.route(&device) {
@@ -1131,34 +1235,126 @@ impl DeviceManagerHandle {
             // would report its `Idle` — and so `actions.cut` — for a device this desktop cannot
             // reach, offering a cut that `execute_cut` would then refuse.
             Err(_) => CutStatus::disconnected(),
-            Ok(Route::Host(id)) => {
-                // The status-derived bookkeeping belongs inside the same connection closure as the
-                // snapshot. Returning the snapshot first would release the lock and let a dispatch
-                // write a mark before this poll acted on its older free answer.
-                let key = (id.clone(), device.instance_id.clone());
-                self.with_host_within(&id, STATUS_POLL_TIMEOUT, |c| {
-                    let snapshot = c
-                        .snapshots_within(STATUS_POLL_TIMEOUT)?
-                        .into_iter()
-                        .find(|s| s.info.instance_id == device.instance_id);
-                    if let Some(snapshot) = &snapshot {
-                        if snapshot_is_free(snapshot) {
-                            self.ledger.clear_cutter(&id, &device.instance_id);
-                        }
-                        self.last_remote_status
-                            .lock()
-                            .unwrap()
-                            .insert(key.clone(), snapshot.status.clone());
-                    }
-                    Ok(snapshot.map(|s| s.status))
-                })
-                .ok()
-                .flatten()
-                // A host that cannot be reached mid-cut is not a finished cut: the Job is still
-                // running on the Pi, and saying `Idle` here would invite a second dispatch. The
-                // last known status is deliberately *not* substituted — this is the live read.
-                .unwrap_or_else(CutStatus::disconnected)
+            Ok(Route::Host(id)) => self
+                .remote_status(&id, &device.instance_id)
+                .unwrap_or_else(|_| CutStatus::disconnected()),
+        }
+    }
+
+    /// Every remote cutter's last snapshot, without dialling.
+    pub fn cutter_statuses(&self) -> Vec<CutterStatusView> {
+        self.last_remote_status
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((host, instance_id), status)| CutterStatusView {
+                host: host.clone(),
+                instance_id: instance_id.clone(),
+                status: status.clone(),
+            })
+            .collect()
+    }
+
+    /// Record every cutter a snapshot named, and clear dispatch marks only for the free ones.
+    ///
+    /// `status` used to keep the aimed cutter and drop the rest, so a second machine on the same
+    /// Pi had no status to show and no command could name it (#307). A mark still clears only
+    /// when that cutter itself says it would take a Job.
+    fn remember_snapshots(&self, id: &HostId, snapshots: &[cut_host::protocol::DeviceSnapshot]) {
+        self.ledger.clear_cutters(
+            id,
+            snapshots
+                .iter()
+                .filter(|s| snapshot_is_free(s))
+                .map(|s| s.info.instance_id.as_str()),
+        );
+        let mut cache = self.last_remote_status.lock().unwrap();
+        // A failed dial never gets here, so an unreachable host keeps the rows it had.
+        // A host that answered and no longer names a cutter has unplugged it. This map is
+        // what `cutter_statuses` publishes, and the cutting dot reads `actions.cancel` off it.
+        cache.retain(|(host, instance), _| {
+            host != id || snapshots.iter().any(|s| s.info.instance_id == *instance)
+        });
+        for snapshot in snapshots {
+            cache.insert((id.clone(), snapshot.info.instance_id.clone()), snapshot.status.clone());
+        }
+    }
+
+    /// Snapshot every cutter on `id`, remember them, and note that the host answered.
+    ///
+    /// Bookkeeping stays inside the connection closure: returning the snapshots first would
+    /// release the lock and let a dispatch write a mark before this poll acted on its older
+    /// free answer. A dead socket is dropped here, the same way `with_host_within` does,
+    /// because `ensure` only redials when there is no client at all.
+    fn poll_host(&self, id: &HostId) -> Result<Vec<cut_host::protocol::DeviceSnapshot>, IpcError> {
+        self.on_host(id, STATUS_POLL_TIMEOUT, |host| {
+            let out = host
+                .client
+                .as_ref()
+                .expect("on_host calls only once connected")
+                .snapshots_within(STATUS_POLL_TIMEOUT);
+            if let Err(e) = &out {
+                if connection_died(e) {
+                    host.last_error = Some(host_error(e));
+                    host.client = None;
+                }
             }
+            let snapshots = out.map_err(|e| host_error(&e))?;
+            host.last_seen = Some(unix_millis());
+            self.remember_snapshots(id, &snapshots);
+            Ok(snapshots)
+        })
+    }
+
+    fn remote_status(&self, id: &HostId, instance_id: &str) -> Result<CutStatus, IpcError> {
+        let snapshots = self.poll_host(id)?;
+        Ok(snapshots
+            .into_iter()
+            .find(|s| s.info.instance_id == instance_id)
+            .map(|s| s.status)
+            // A snapshot that omits this cutter is not a finished cut. Callers map a failed
+            // dial to `Disconnected` the same way: the last cached value is not a live read,
+            // and `Idle` would invite a second dispatch onto a Job still running on the Pi.
+            .unwrap_or_else(CutStatus::disconnected))
+    }
+
+    /// `None` for both arguments is the aim. Naming a cutter opts out of the aim (#307).
+    /// A host without a cutter is not a target: the aim is the only place a host id alone means
+    /// "whichever cutter is connected".
+    fn resolve_cutter(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<CutterAddress, IpcError> {
+        match (host, instance_id) {
+            (None, None) => Ok(CutterAddress::Aim),
+            (None, Some(instance_id)) => Ok(CutterAddress::Local { instance_id }),
+            (Some(host), Some(instance_id)) => {
+                if !self.hosts.lock().unwrap().contains_key(&host) {
+                    return Err(IpcError::new(
+                        "unknown_host",
+                        format!("no Cut Host called `{}` is paired", host.0),
+                    ));
+                }
+                Ok(CutterAddress::Remote { host, instance_id })
+            }
+            (Some(_), None) => Err(IpcError::new(
+                "device_mismatch",
+                "a cutter on a Cut Host is named by the host and the cutter together",
+            )),
+        }
+    }
+
+    /// Local multi-cutter is #59. An explicit local target that is not the aimed cutter is refused
+    /// rather than guessed: two USB cutters on this computer are not addressable yet.
+    fn require_aimed_local(&self, instance_id: &str) -> Result<(), IpcError> {
+        let aimed = self.connected.lock().unwrap().clone();
+        match aimed {
+            Some(device) if device.host.is_none() && device.instance_id == instance_id => Ok(()),
+            _ => Err(IpcError::new(
+                "device_mismatch",
+                "this computer addresses one cutter at a time; aim at it first",
+            )),
         }
     }
 
@@ -1270,6 +1466,24 @@ impl DeviceManagerHandle {
     }
 
     pub fn cancel(&self) -> Result<(), IpcError> {
+        self.cancel_addressed(None, None)
+    }
+
+    /// Stop the aimed cutter, or the cutter `(host, instance_id)` names.
+    ///
+    /// The aim is where a Job is sent, not which blade a Cancel reaches. Two cutters on one Pi
+    /// used to share that aim, so stopping one stopped whichever happened to be connected (#307).
+    pub fn cancel_addressed(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<(), IpcError> {
+        self.addressed(host, instance_id, Self::cancel_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.cancel(instance_id))
+        })
+    }
+
+    fn cancel_aimed(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => {
@@ -1308,11 +1522,23 @@ impl DeviceManagerHandle {
     }
 
     pub fn resume(&self) -> Result<(), IpcError> {
+        self.resume_addressed(None, None)
+    }
+
+    pub fn resume_addressed(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<(), IpcError> {
+        self.addressed(host, instance_id, Self::resume_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.resume(instance_id))
+        })
+    }
+
+    fn resume_aimed(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
-            None | Some(Route::Local) => {
-                Ok(self.manager()?.resume()?)
-            }
+            None | Some(Route::Local) => Ok(self.manager()?.resume()?),
             Some(Route::Host(id)) => {
                 let device = aimed.expect("a route implies a device").instance_id;
                 self.with_host(&id, |c| c.resume(&device))
@@ -1321,11 +1547,23 @@ impl DeviceManagerHandle {
     }
 
     pub fn confirm_pass_done(&self) -> Result<(), IpcError> {
+        self.confirm_addressed(None, None)
+    }
+
+    pub fn confirm_addressed(
+        &self,
+        host: Option<HostId>,
+        instance_id: Option<String>,
+    ) -> Result<(), IpcError> {
+        self.addressed(host, instance_id, Self::confirm_aimed, |this, host, instance_id| {
+            this.with_host(host, |c| c.confirm_pass_done(instance_id))
+        })
+    }
+
+    fn confirm_aimed(&self) -> Result<(), IpcError> {
         let aimed = self.connected.lock().unwrap().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
-            None | Some(Route::Local) => {
-                Ok(self.manager()?.confirm_pass_done()?)
-            }
+            None | Some(Route::Local) => Ok(self.manager()?.confirm_pass_done()?),
             Some(Route::Host(id)) => {
                 let device = aimed.expect("a route implies a device").instance_id;
                 self.with_host(&id, |c| c.confirm_pass_done(&device))

@@ -15,7 +15,7 @@ const listeners: Listener[] = [];
 const ipc = vi.hoisted(() => ({
   getDeviceState: vi.fn<() => Promise<CutStatus>>(),
   listHosts: vi.fn<() => Promise<PairedHostView[]>>(),
-  cancelCut: vi.fn<() => Promise<void>>(),
+  cancelCut: vi.fn<(target?: { host: string | null; instanceId: string }) => Promise<void>>(),
   resumeCut: vi.fn<() => Promise<void>>(),
   confirmPassDone: vi.fn<() => Promise<void>>(),
 }));
@@ -32,7 +32,7 @@ vi.mock("../ipc", () => ({
   },
   getDeviceState: () => ipc.getDeviceState(),
   listHosts: () => ipc.listHosts(),
-  cancelCut: () => ipc.cancelCut(),
+  cancelCut: (target?: { host: string | null; instanceId: string }) => ipc.cancelCut(target),
   resumeCut: () => ipc.resumeCut(),
   confirmPassDone: () => ipc.confirmPassDone(),
   ipcErrorMessage: (e: unknown) => String(e),
@@ -471,7 +471,191 @@ describe("useJob", () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await act(async () => { await api.current?.refreshDeviceState(); });
     expect(ipc.cancelCut).toHaveBeenCalledOnce();
+    expect(ipc.cancelCut).toHaveBeenCalledWith({ host: "host-3", instanceId: "usb:pi:C" });
     expect(api.current?.status).toEqual({ ...SWAP, jobId: 1 });
+  });
+
+  it("names the same cutter when a poll delivers a cancel that was queued offline", async () => {
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost?.id).toBe("host-3");
+    act(() => { api.current?.cancel(); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: SWAP }],
+        stale: false,
+      });
+    });
+    expect(ipc.cancelCut).toHaveBeenCalledWith({ host: "host-3", instanceId: "usb:pi:C" });
+  });
+
+  it("shows a poll of the aimed cutter when no job is watched", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    const ready = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status).toEqual(ready);
+    expect(api.current?.tracking).toBe(false);
+    expect(api.current?.offlineHost).toBeNull();
+
+    const busy = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      jobId: 4,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: busy }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.actions.cut).toBe(false);
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: "usb:pi:D", status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+
+    act(() => {
+      api.current?.applyPoll({ hosts: [HOST], statuses: [], stale: false });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: true,
+      });
+    });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.offlineHost).toBeNull();
+
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: ready }],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost).toBeNull();
+    expect(api.current?.status.phase).toBe("Sending");
+  });
+
+  it("leaves a finished job on screen when the next poll is a different reading", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
+    expect(api.current?.status.ended).toBe("Completed");
+    expect(api.current?.tracking).toBe(true);
+
+    const plain = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    const someoneElse = status({
+      phase: "Sending",
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      jobId: 9,
+    });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: someoneElse }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status.ended).toBe("Completed");
+    expect(api.current?.status.jobId).toBe(1);
+
+    act(() => { api.current?.dismiss(); });
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: plain }],
+        stale: false,
+      });
+    });
+    expect(api.current?.tracking).toBe(false);
+    expect(api.current?.status).toEqual(plain);
+  });
+
+  it("does not let a poll in the same turn as remember cover the new job", async () => {
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, done(1)); });
+    await act(async () => { api.current?.dismiss(); });
+
+    const idle = status({
+      phase: "Idle",
+      actions: { cut: true, cancel: false, resume: false, confirm: false },
+      jobId: 0,
+    });
+    await act(async () => {
+      api.current?.remember(snapshot(2));
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: idle }],
+        stale: false,
+      });
+    });
+    expect(api.current?.tracking).toBe(true);
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(2);
+    expect(api.current?.offlineHost).toBeNull();
+
+    await act(async () => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: idle }],
+        stale: false,
+      });
+    });
+    expect(api.current?.offlineHost?.id).toBe("host-3");
+    expect(api.current?.status.phase).toBe("Sending");
+  });
+
+  it("does not freeze a job when the poll has no status for that cutter yet", async () => {
+    ipc.getDeviceState.mockResolvedValue(SWAP);
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(1)); });
+    await act(async () => { emit(1, SWAP); });
+    act(() => {
+      api.current?.applyPoll({ hosts: [HOST], statuses: [], stale: false });
+    });
+    expect(api.current?.offlineHost).toBeNull();
+    expect(api.current?.status.phase).toBe("AwaitingColorSwap");
   });
 
   it("refreshes after resume, cancel and confirm land, and reports a refusal without refreshing", async () => {

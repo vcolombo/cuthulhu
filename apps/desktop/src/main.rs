@@ -125,6 +125,7 @@ fn main() {
             ipc::disconnect_device,
             ipc::reconnect_device,
             ipc::get_device_state,
+            ipc::cutter_statuses,
             ipc::get_connected_device,
             ipc::plan_cut,
             ipc::travel_for_order,

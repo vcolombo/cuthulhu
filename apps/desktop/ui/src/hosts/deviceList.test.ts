@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, protocolSide, protocolUpdateUrl, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, hostCardTitle, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -300,6 +300,13 @@ describe("protocol mismatch", () => {
     expect(s.unreachable).toBe("the host could not be reached (timed out)");
   });
 
+  it("titles a mismatch by which side is older, and an outage as can't reach", () => {
+    expect(hostCardTitle("Workshop Pi", "host", true)).toBe("Workshop Pi needs an update");
+    expect(hostCardTitle("Office Pi", "desktop", true)).toBe("Update Cuthulhu to use Office Pi");
+    expect(hostCardTitle("Garage Pi", null, true)).toBe("Can't reach Garage Pi");
+    expect(hostCardTitle("Garage Pi", null, false)).toBe("Garage Pi · Pi Cut Host");
+  });
+
   it("points the host at the daemon update and the desktop at the releases", () => {
     expect(protocolUpdateUrl("host")).toBe("https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
     expect(protocolUpdateUrl("desktop")).toBe("https://github.com/vcolombo/cuthulhu/releases");
@@ -331,6 +338,17 @@ describe("connectedControl", () => {
   it("asks a Cut Host to re-open its own cutter rather than dropping the aim", () => {
     const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
     expect(connectedControl(unconfirmed, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
+  });
+
+  // Ready means the transport is already open. Reconnect there is a second way to
+  // say the same thing, and it crowds the cutter's name. A local Ready still disconnects.
+  it("withholds Reconnect while a remote cutter can take a cut", () => {
+    const ready: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, cut: true } };
+    expect(connectedControl(ready, true)).toBeNull();
+    expect(connectedControl({ ...ready, ended: "Cancelled" }, true)).toBeNull();
+    expect(connectedControl(ready, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+    const gone: CutStatus = { ...aStatus(), phase: "Disconnected" };
+    expect(connectedControl(gone, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
   });
 
   // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a
@@ -366,5 +384,46 @@ describe("sameCutter", () => {
   it("matches nothing when either side is absent", () => {
     expect(sameCutter(null, { instance_id: "usb:1:4", host: null })).toBe(false);
     expect(sameCutter(undefined, undefined)).toBe(false);
+  });
+});
+
+describe("lastSeenLabel", () => {
+  const now = 1_700_000_000_000;
+
+  it("names a host that has never answered", () => {
+    expect(lastSeenLabel(null, now)).toBe("No successful reading yet");
+    expect(lastSeenLabel(undefined, now)).toBe("No successful reading yet");
+  });
+
+  it("counts seconds, minutes, hours and days", () => {
+    expect(lastSeenLabel(now - 5_000, now)).toBe("Last seen 5s ago");
+    expect(lastSeenLabel(now - 60_000, now)).toBe("Last seen 1 minute ago");
+    expect(lastSeenLabel(now - 2 * 3_600_000, now)).toBe("Last seen 2 hours ago");
+    expect(lastSeenLabel(now - 3 * 86_400_000, now)).toBe("Last seen 3 days ago");
+  });
+});
+
+describe("retainOffline", () => {
+  const host = (unreachable: string | null): PairedHostView => ({
+    id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable, protocol_side: null,
+  });
+  const remote = (id: string): DeviceInfo => ({ ...aDevice(), instance_id: id, host: "host-1" });
+
+  it("keeps the previous cutters of a host that can no longer be reached", () => {
+    const previous = [remote("usb:pi:A")];
+    const kept = retainOffline(previous, [], [], [host("timed out")], []);
+    expect(kept.devices.map((device) => device.instance_id)).toEqual(["usb:pi:A"]);
+  });
+
+  it("uses the first reading when there is nothing older to keep", () => {
+    const next = [remote("usb:pi:A")];
+    const kept = retainOffline([], [], next, [host("timed out")], []);
+    expect(kept.devices).toEqual(next);
+  });
+
+  it("takes the new snapshot once the host answers again", () => {
+    const next = [remote("usb:pi:B")];
+    const kept = retainOffline([remote("usb:pi:A")], [], next, [host(null)], []);
+    expect(kept.devices).toEqual(next);
   });
 });

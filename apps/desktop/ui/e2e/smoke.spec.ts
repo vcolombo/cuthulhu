@@ -2116,7 +2116,13 @@ test("pairing a Cut Host shows its fingerprint first, then lists it with its cut
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  const addHost = page.getByRole("button", { name: /Add a Cut Host/ });
+  await addHost.click();
+  const pair = page.getByRole("dialog", { name: "Pair a Cut Host" });
+  await pair.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(pair).toHaveCount(0);
+  await expect(addHost).toBeFocused();
+  await addHost.click();
 
   await page.getByLabel("Address").fill("pi.local:7878");
   await page.getByLabel("Token").fill("correct-horse");
@@ -2214,10 +2220,18 @@ const pollCount = (page: import("@playwright/test").Page) => () =>
       ) as Promise<number>,
   );
 
+const listCount = (page: import("@playwright/test").Page) => () =>
+  page.evaluate(
+    () =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "__test_list_count",
+      ) as Promise<number>,
+  );
+
 test("the dialog polls while it is open, and stops once it is closed", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   const opened = await polls();
@@ -2225,7 +2239,8 @@ test("the dialog polls while it is open, and stops once it is closed", async ({ 
 
   await page.getByRole("button", { name: "Close" }).click();
   // A tick already in flight when the dialog closed still lands, so settle past one full period
-  // before taking the reading that must not move.
+  // before taking the reading that must not move. Idle is ten seconds, and closing does not
+  // start a tick of its own, so this window stays still.
   await page.waitForTimeout(1500);
   const closed = await polls();
   await page.waitForTimeout(2500);
@@ -2262,16 +2277,185 @@ test("a desktop with no Cut Host paired does not poll at all", async ({ page }) 
 test("a tick whose last request is still in flight is skipped, not queued", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true, slowList: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const opened = await polls();
   await page.waitForTimeout(4500);
   // Four ticks have fired; at three seconds an answer, at most two of them can have started
   // requests. Without the skip the count tracks the tick rate instead, and every extra request
-  // is one more thing the host owes an answer to.
-  const seen = await polls();
+  // is one more thing the host owes an answer to. The mount read is already in `opened`.
+  const seen = (await polls()) - opened;
   expect(seen).toBeGreaterThanOrEqual(1);
   expect(seen).toBeLessThanOrEqual(2);
+});
+
+function devicesShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.DEVICES_SHOTS === "1";
+}
+
+/** Retry and Forget stay on the title row. The line under them uses the card. */
+async function hostCopySpansTheCard(page: Page, heading: string, copy: Locator) {
+  const card = page.locator("section").filter({ has: page.getByRole("heading", { name: heading, exact: true }) });
+  const cardBox = await card.boundingBox();
+  const copyBox = await copy.boundingBox();
+  const button = card.getByRole("button", { name: /^Forget / });
+  const buttonBox = await button.boundingBox();
+  expect(cardBox).not.toBeNull();
+  expect(copyBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  expect(copyBox!.width).toBeGreaterThan(cardBox!.width * 0.75);
+  expect(copyBox!.y).toBeGreaterThanOrEqual(buttonBox!.y + buttonBox!.height - 1);
+  expect(buttonBox!.x + buttonBox!.width).toBeGreaterThan(cardBox!.x + cardBox!.width - 28);
+  const titleBox = await card.getByRole("heading", { name: heading, exact: true }).boundingBox();
+  expect(titleBox).not.toBeNull();
+  const sharesRow = buttonBox!.y < titleBox!.y + titleBox!.height && titleBox!.y < buttonBox!.y + buttonBox!.height;
+  // A title beside the buttons stays one line. One that cannot fit takes the row.
+  if (sharesRow) expect(titleBox!.height).toBeLessThan(28);
+  else expect(titleBox!.width).toBeGreaterThan(cardBox!.width * 0.7);
+}
+
+test("two cutters on one host keep their own status, and cancel names that cutter", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const cameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  const puma = page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" });
+  await expect(cameo.getByText("Cutting", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toHaveCount(0);
+  await expect(cameo.getByText("40% of this pass")).toBeVisible();
+  await expect(page.getByText("Add to queue")).toHaveCount(0);
+  await expect(page.getByText("Up next")).toHaveCount(0);
+
+  await cameo.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_cancel_targets"),
+  )).toEqual([{ host: "host-4", instanceId: "usb:garage:cameo" }]);
+  await expect(cameo.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(cameo.getByText("Last cut cancelled")).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Last cut cancelled")).toHaveCount(0);
+  await expect(puma.getByRole("button", { name: /Reconnect/ })).toHaveCount(0);
+  await expect(page.getByRole("listitem").filter({ hasText: "USB on this computer" }).getByText("Not checked").first()).toBeVisible();
+  await expect(page.getByTestId("devices-panel").getByText("Unknown", { exact: true })).toHaveCount(0);
+  for (const list of await page.getByTestId("devices-panel").getByRole("list").all()) {
+    expect(await list.evaluate((el) => getComputedStyle(el).listStyleType)).toBe("none");
+  }
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+});
+
+test("an offline host keeps the cut frozen, then shows the reading from after it reconnects", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: "the host could not be reached (timed out)" });
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toBeVisible();
+  // After the card is up, the next reading is the one that will not stamp over this.
+  await callFakeWith(page, "__test_set_last_seen", { id: "host-4", at: Date.now() - 2 * 60 * 60 * 1000 });
+  await expect(page.getByText("Last seen 2 hours ago · garage.local:7878")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await expect(page.getByText(/Connection lost · last update/)).toHaveCount(0);
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+  // This desktop is not tracking the seeded cut, so Cancel is not a queue.
+  const offlineCameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toHaveCount(0);
+  await expect(offlineCameo.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+  await expect(page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" }).getByText("Unavailable")).toBeVisible();
+
+  const body = page.getByRole("heading", { name: "Can't reach Garage Pi" });
+  const muted = page.getByTestId("devices-muted");
+  const warning = page.getByTestId("devices-warning");
+  const lightBody = await paintContrast(page, body);
+  const lightMuted = await paintContrast(page, muted);
+  const lightWarning = await paintContrast(page, warning);
+  expect(lightBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-light.png" });
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const darkBody = await paintContrast(page, body);
+  const darkMuted = await paintContrast(page, muted);
+  const darkWarning = await paintContrast(page, warning);
+  expect(darkBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-dark.png" });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+
+  await callFakeWith(page, "__test_set_remote_sent", { host: "host-4", instanceId: "usb:garage:cameo", sent: 90 });
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: null });
+  await expect(page.getByText("90% of this pass")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toHaveCount(0);
+});
+
+test("a protocol mismatch on the devices host card says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  await expect(page.getByRole("heading", { name: "Workshop Pi needs an update" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Update Cuthulhu to use Office Pi" })).toBeVisible();
+  await expect(page.getByText("Can't reach", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("No successful reading yet")).toHaveCount(0);
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByText("Update needed")).toHaveCount(2);
+  const workshop = page.getByRole("listitem").filter({ hasText: "Workshop Pi" });
+  const office = page.getByRole("listitem").filter({ hasText: "Office Pi" });
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Workshop Pi needs an update");
+  await expect(office.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(office.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Update Cuthulhu to use Office Pi");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
+  await page.getByRole("button", { name: "Add cutter" }).focus();
+  await expect(page.getByRole("button", { name: "Add cutter" })).toBeFocused();
+  await expect.poll(() => page.getByRole("button", { name: "Add cutter" }).evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+  const active = page.getByRole("button", { name: "Set as active" }).first();
+  await active.focus();
+  await expect(active).toBeFocused();
+  await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+  await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+    await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-dark.png" });
+  }
 });
 
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {

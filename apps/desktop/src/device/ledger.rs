@@ -492,13 +492,6 @@ impl Ledger {
         !self.remote_dispatched.lock().unwrap().is_empty()
     }
 
-    pub(super) fn clear_cutter(&self, host: &HostId, device: &str) {
-        self.remote_dispatched
-            .lock()
-            .unwrap()
-            .remove(&(host.clone(), device.to_owned()));
-    }
-
     pub(super) fn clear_cutters<'a>(&self, host: &HostId, devices: impl IntoIterator<Item = &'a str>) {
         let mut dispatched = self.remote_dispatched.lock().unwrap();
         for device in devices {

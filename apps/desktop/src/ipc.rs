@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use document::{CutLineType, Delta, MachineProfile, NodeId, PresetAssignment, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
-use crate::device::{plan_cut_response, CutRequest, CutStarted, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse, TravelPassDto};
+use crate::device::{plan_cut_response, CutRequest, CutStarted, CutterStatusView, DeviceManagerHandle, ExistingPairing, IpcError, PairedHostView, PlanCutResponse, TravelPassDto};
 use crate::state::AppState;
 use cutplan::presets::MaterialPreset;
 use cutplan::Grouping;
@@ -151,8 +151,12 @@ pub fn disconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), I
 
 // async for the same reasons as connect_device, plus a remote arm that talks to the Pi.
 #[tauri::command(async)]
-pub fn reconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
-    dev.reconnect()
+pub fn reconnect_device(
+    dev: tauri::State<DeviceManagerHandle>,
+    host: Option<HostId>,
+    instance_id: Option<String>,
+) -> Result<(), IpcError> {
+    dev.reconnect_addressed(host, instance_id)
 }
 
 // async: non-blocking for a local device — the status is published rather than asked of the
@@ -161,8 +165,18 @@ pub fn reconnect_device(dev: tauri::State<DeviceManagerHandle>) -> Result<(), Ip
 // the DNS/mDNS resolve bounded inside the first leg's deadline, and it is called after every
 // connect/cancel/resume/confirm, so it must not run on the main thread.
 #[tauri::command(async)]
-pub fn get_device_state(dev: tauri::State<DeviceManagerHandle>) -> Result<CutStatus, IpcError> {
-    Ok(dev.status())
+pub fn get_device_state(
+    dev: tauri::State<DeviceManagerHandle>,
+    host: Option<HostId>,
+    instance_id: Option<String>,
+) -> Result<CutStatus, IpcError> {
+    dev.status_of(host, instance_id)
+}
+
+/// Every remote cutter's last snapshot, without dialling. The device list is what refreshes it.
+#[tauri::command]
+pub fn cutter_statuses(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<CutterStatusView>, IpcError> {
+    Ok(dev.cutter_statuses())
 }
 
 // Non-blocking cache read, same shape as get_device_state — lets the UI recover which
@@ -203,19 +217,31 @@ pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerH
 }
 
 #[tauri::command(async)]
-pub fn cancel_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
-    dev.cancel()
+pub fn cancel_cut(
+    dev: tauri::State<DeviceManagerHandle>,
+    host: Option<HostId>,
+    instance_id: Option<String>,
+) -> Result<(), IpcError> {
+    dev.cancel_addressed(host, instance_id)
 }
 
 // async: blocks like `cut` while the worker drives the next pass.
 #[tauri::command(async)]
-pub fn resume_cut(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
-    dev.resume()
+pub fn resume_cut(
+    dev: tauri::State<DeviceManagerHandle>,
+    host: Option<HostId>,
+    instance_id: Option<String>,
+) -> Result<(), IpcError> {
+    dev.resume_addressed(host, instance_id)
 }
 
 #[tauri::command(async)]
-pub fn confirm_pass_done(dev: tauri::State<DeviceManagerHandle>) -> Result<(), IpcError> {
-    dev.confirm_pass_done()
+pub fn confirm_pass_done(
+    dev: tauri::State<DeviceManagerHandle>,
+    host: Option<HostId>,
+    instance_id: Option<String>,
+) -> Result<(), IpcError> {
+    dev.confirm_addressed(host, instance_id)
 }
 
 #[tauri::command]
@@ -326,7 +352,7 @@ pub fn pair_host(
 ) -> Result<PairedHostView, IpcError> {
     let path = hosts_path()?;
     let id = dev.pair(name.clone(), address.clone(), token, fingerprint, &path)?;
-    Ok(PairedHostView { id, name, address, unreachable: None, protocol_side: None })
+    Ok(PairedHostView { id, name, address, unreachable: None, protocol_side: None, last_seen: None })
 }
 
 // async: the idle check dials the host the same way `test_host` does (see there for why).

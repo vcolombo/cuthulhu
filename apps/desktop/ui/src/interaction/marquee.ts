@@ -28,6 +28,31 @@ export function toggleId(ids: number[], id: number): number[] {
 
 type TreeNode = { kind: unknown; children: number[] };
 
+function isShape(node: TreeNode): boolean {
+  return typeof node.kind === "object" && node.kind !== null && "Shape" in node.kind;
+}
+
+/** Every shape in the document, preorder from `root`, each once. Select-all names the workspace:
+ *  the shapes on the mat. A container is not one of them — an empty group is not on the mat, and
+ *  the root layer holds the document rather than being a shape in it. The same walk as the scene,
+ *  so the order matches a marquee over the whole mat. A node reached twice (a cycle, or one listed
+ *  under two parents) is taken the first time. A shape's own children are not walked: the scene
+ *  does not draw them, and the planner does not cut them. */
+export function workspaceShapeIds(nodes: Record<string, TreeNode>, root: number): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const walk = (id: number) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const n = nodes[id];
+    if (!n) return;
+    if (isShape(n)) out.push(id);
+    else n.children.forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
 /** Every shape at or beneath `ids`, each once, in the order first met. A selected Group or Layer
  *  commits as its whole subtree (`transform_nodes` moves a container with everything in it), so
  *  the box and the preview have to cover the same shapes or the unpreviewed ones jump on release
@@ -37,7 +62,7 @@ export function shapesUnder(nodes: Record<string, TreeNode>, ids: number[]): num
   const walk = (id: number) => {
     const n = nodes[id];
     if (!n) return;
-    if (typeof n.kind === "object" && n.kind !== null && "Shape" in n.kind) out.add(id);
+    if (isShape(n)) out.add(id);
     else n.children.forEach(walk);
   };
   ids.forEach(walk);

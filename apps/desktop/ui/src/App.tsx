@@ -18,7 +18,7 @@ import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { IDENTITY, compose, transformBounds } from "./render/affine";
-import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
+import { outermost, shapesUnder, toggleId, workspaceShapeIds } from "./interaction/marquee";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
@@ -564,6 +564,15 @@ export function App() {
         if (selected.length >= 2) onBooleanOp("Union");
         return;
       }
+      // Cmd/Ctrl+A is the webview's select-all, which highlights every label in the window.
+      // The workspace is the shapes on the mat. Shift and Alt stay free — AltGr types through
+      // Ctrl+Alt. A field, a dialog and a menu already returned above and keep the chord.
+      if (mod && key === "a" && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        if (doc) setSelected(workspaceShapeIds(doc.nodes, doc.root));
+        return;
+      }
       // Option on macOS and AltGr change `e.key` (Option+S is "ß"), so the physical key is `e.code`.
       if (mod && e.altKey && e.code === "KeyS") {
         e.preventDefault();
@@ -599,7 +608,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
+  }, [doc, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
 
   const cutting = status.actions.cancel || statuses.some((row) => row.status.actions.cancel);
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);

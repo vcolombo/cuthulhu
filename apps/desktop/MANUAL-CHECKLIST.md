@@ -169,13 +169,13 @@ real network can confirm the swap end to end.
       `a_dense_trace_at_the_default_spacing_is_weeded_not_refused`); raise it, or take the
       sorted-crossing upgrade, if a real job hits it.
 
-## Quit menu and the close guard (#327, unverified)
-- [x] Idle app, macOS: the application menu's "Quit Cuthulhu" exits with code 0 (verified
-      2026-10-24 on a `cargo tauri dev` build, by a menu click through System Events). The item
-      reads "Quit Cuthulhu"; the stock one read "Quit desktop".
-- [x] Idle app, macOS: Cmd-Q exits with code 0 (verified 2026-10-24: the process was set frontmost
-      through System Events first, then sent the keystroke; an earlier untargeted keystroke
-      never reached the app and proved nothing).
+## Quit menu and the close guard (#327, partly verified)
+- [x] Idle app: the application menu's "Quit Cuthulhu" exits with code 0 (verified 2026-10-24 on a
+      MacBook Pro Mac15,7 (M3 Pro), macOS 27.0.1, on a `cargo tauri dev` build, by a menu click
+      through System Events). The item reads "Quit Cuthulhu"; the stock one read "Quit desktop".
+- [x] Idle app: Cmd-Q exits with code 0 (verified 2026-10-24 on the same MacBook Pro Mac15,7: the
+      process was set frontmost through System Events first, then sent the keystroke; an earlier
+      untargeted keystroke never reached the app and proved nothing).
 - [ ] A cut outstanding (local Cameo 5, then a Job on a Cut Host): Cmd-Q shows the "A cut may still
       be running" prompt instead of quitting. Cancel leaves the app open and a new press still
       sends; "Quit anyway" exits.

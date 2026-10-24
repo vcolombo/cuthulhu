@@ -68,13 +68,22 @@ mod quit_menu {
     /// so the guard that covers the window's close button was skipped (#327). An item of our own is
     /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
     /// send `terminate:` and are not covered.
+    ///
+    /// The stock item is found by its label, which muda sets to `Quit {app name}` on macOS (About
+    /// and Hide carry their own prefixes), because muda keeps the item's type to itself and its
+    /// position is only an accident of Tauri's default layout. A miss leaves the stock Quit, so the
+    /// guard fails open here as it does when the webview cannot be reached — and, like that arm,
+    /// not silently: the log line is the only evidence an update to either crate disarmed it.
     fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         let menu = Menu::default(app)?;
+        let mut replaced = false;
         if let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() {
-            // The stock Quit is the last predefined item of that submenu; anything else there is
-            // a layout this does not know, and is left as it is rather than guessed at.
-            if let Some(stock_quit @ MenuItemKind::Predefined(_)) = application.items()?.last() {
-                application.remove(stock_quit)?;
+            for item in application.items()? {
+                let MenuItemKind::Predefined(stock) = &item else { continue };
+                if !stock.text()?.starts_with("Quit ") {
+                    continue;
+                }
+                application.remove(&item)?;
                 application.append(&MenuItem::with_id(
                     app,
                     QUIT_MENU_ID,
@@ -82,7 +91,12 @@ mod quit_menu {
                     true,
                     Some("CmdOrCtrl+Q"),
                 )?)?;
+                replaced = true;
+                break;
             }
+        }
+        if !replaced {
+            eprintln!("cuthulhu: the stock Quit item was not found, so Cmd-Q is not guarded");
         }
         Ok(menu)
     }

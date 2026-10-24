@@ -621,6 +621,23 @@ fn an_unreachable_host_is_still_listed_with_its_reason() {
     assert!(views[0].unreachable.is_some(), "and says why it is unreachable");
 }
 
+/// A failed dial is not a sighting. The offline card says when the host last answered;
+/// stamping that clock with the failure would say the cutters were just real.
+#[test]
+fn a_failed_dial_leaves_the_last_successful_reading() {
+    let dev = test_device_setup();
+    let id = HostId("host-1".into());
+    dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+    let seen = 1_700_000_000_000;
+    dev.host_conn(&id).unwrap().lock().unwrap().last_seen = Some(seen);
+
+    let _ = dev.list_devices();
+
+    let view = dev.host_views().into_iter().find(|v| v.id == id).expect("still paired");
+    assert_eq!(view.last_seen, Some(seen), "a failed dial replaced the last real reading");
+    assert!(view.unreachable.is_some(), "the host was treated as reachable");
+}
+
 /// A host this desktop cannot speak to stays listed, and the row says which side to update.
 /// The cutters stay off the list: nothing was admitted, so there is nothing to show as cutting.
 #[test]
@@ -1781,6 +1798,69 @@ fn every_cutter_on_a_host_keeps_its_status_and_takes_its_own_commands() {
 
     dev.cancel_addressed(Some(id), Some(PUMA.into())).expect("the puma is addressed by name");
     wait_until(|| !cutter_is_active(&direct, PUMA), "the addressed cancel never reached the puma");
+}
+
+/// A cutter is named by the host and the cutter together, or it is the one already aimed.
+///
+/// A host id on its own used to mean the aim, so Cancel on a card that only knew the host
+/// stopped whichever blade was connected. A local id that is not that aim is not a second
+/// USB cutter this desktop can reach: guessing would stop the aimed blade. Every verb goes
+/// through the one match, so a copy that drops the check is a blade the operator did not name.
+#[test]
+fn a_cutter_is_named_by_the_pair_or_not_at_all() {
+    let dev = test_device_setup();
+    dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
+    let aimed = test_instance().instance_id;
+    let before = dev.status();
+
+    let named = dev.status_of(None, Some(aimed.clone())).expect("the aimed local cutter");
+    assert_eq!(named, before, "naming the aimed cutter stopped answering for it");
+
+    let other_local = dev.status_of(None, Some("usb:9:9".into())).expect_err("a second local cutter");
+    assert_eq!(other_local.code, "device_mismatch");
+    assert!(other_local.message.contains("aim at it first"), "{other_local:?}");
+
+    let host_only = dev
+        .status_of(Some(HostId("host-1".into())), None)
+        .expect_err("a host id is not a cutter");
+    assert_eq!(host_only.code, "device_mismatch");
+    assert!(host_only.message.contains("host and the cutter together"), "{host_only:?}");
+
+    let unknown = dev
+        .status_of(Some(HostId("host-missing".into())), Some(aimed.clone()))
+        .expect_err("an unpaired host");
+    assert_eq!(unknown.code, "unknown_host");
+    assert_eq!(dev.status(), before, "a bad address changed what the aim reports");
+
+    let wrong = "usb:9:9".to_owned();
+    for (verb, err) in [
+        ("cancel", dev.cancel_addressed(None, Some(wrong.clone())).expect_err("cancel")),
+        ("resume", dev.resume_addressed(None, Some(wrong.clone())).expect_err("resume")),
+        ("confirm", dev.confirm_addressed(None, Some(wrong.clone())).expect_err("confirm")),
+        ("reconnect", dev.reconnect_addressed(None, Some(wrong)).expect_err("reconnect")),
+    ] {
+        assert_eq!(err.code, "device_mismatch", "{verb} did not share the address check: {err:?}");
+    }
+    let host_only_cancel = dev
+        .cancel_addressed(Some(HostId("host-1".into())), None)
+        .expect_err("cancel with only a host");
+    assert_eq!(host_only_cancel.code, "device_mismatch");
+    assert_eq!(dev.status(), before, "refusing an address still moved the local cutter");
+
+    let mut app = AppState::new();
+    app.add_rect(10.0, 10.0);
+    dev.cut_from_request(&app, request_from(plan_for(&app))).expect("cut");
+    assert!(dev.status().is_active(), "the cut never started");
+
+    let missed = dev.cancel_addressed(None, Some("usb:9:9".into())).expect_err("the other local id");
+    assert_eq!(missed.code, "device_mismatch");
+    assert!(
+        dev.status().is_active(),
+        "naming a cutter this computer is not aimed at cancelled the one it is",
+    );
+
+    dev.cancel_addressed(None, Some(aimed)).expect("the aimed local cutter, by name");
+    wait_for_cancelled(&dev);
 }
 
 fn cache_snapshot(instance_id: &str) -> cut_host::protocol::DeviceSnapshot {

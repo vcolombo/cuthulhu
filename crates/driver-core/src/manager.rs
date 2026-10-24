@@ -202,7 +202,7 @@ impl DeviceManager {
         // no longer has a thread behind it. `snapshot()` gets this for free from its
         // channel error; this read path has to ask.
         if self.handle.is_finished() {
-            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0, None);
+            return status_of(&DeviceState::Error(DeviceError::Disconnected), 0, None, 0);
         }
         self.status.lock().unwrap().clone()
     }
@@ -319,7 +319,7 @@ impl Reporter {
     /// rely on: one woken by an event and calling `status()` cannot then see a
     /// value older than the event that woke it.
     fn emit(&self, state: &DeviceState, total_passes: usize, job_id: u64, kind: DeviceEventKind) {
-        let status = status_of(state, total_passes, self.ended.get());
+        let status = status_of(state, total_passes, self.ended.get(), job_id);
         // The guard dies at the end of this statement, so the lock is not held
         // across the send below — nor, anywhere in this worker, across a
         // transport write or read.
@@ -1418,18 +1418,22 @@ mod tests {
         mgr.connect(cameo_info()).unwrap();
         assert_eq!(mgr.status().ended, None, "nothing has run yet");
 
-        mgr.cut(one_pass_job()).expect("cut");
+        let first = mgr.cut(one_pass_job()).expect("cut");
         let done = wait_for_ended(&mgr, Ended::Completed);
         assert_eq!(done.phase, Phase::Idle, "phase says what is happening now: nothing");
         assert_eq!(done.pass, None, "and a finished job leaves no pass position behind");
+        assert_eq!(done.job_id, first, "the resting status names the job that finished");
 
         mgr.disconnect().expect("disconnect");
         mgr.connect(cameo_info()).expect("reconnect");
         assert_eq!(mgr.status().ended, None, "a fresh connection has cut nothing");
+        assert_eq!(mgr.status().job_id, NO_JOB, "a lifecycle report is not a job");
 
-        mgr.cut(two_pass_job()).expect("cut"); // parks for the swap, so it is still in flight
+        let second = mgr.cut(two_pass_job()).expect("cut"); // parks for the swap, so it is still in flight
         let parked = wait_for_phase(&mgr, Phase::AwaitingColorSwap);
         assert_eq!(parked.ended, None, "a job in flight has not ended");
+        assert_eq!(parked.job_id, second);
+        assert_ne!(parked.job_id, first, "the next job does not keep the previous id");
         mgr.shutdown();
     }
 

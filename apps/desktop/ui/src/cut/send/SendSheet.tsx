@@ -14,6 +14,7 @@ import { collectPassIssues } from "./passFields";
 import { AlreadyAcceptedNote, StepPreview } from "./StepPreview";
 import { HostPairing, StepMachine, useDeviceList } from "./StepMachine";
 import { StepPasses } from "./StepPasses";
+import type { JobSnapshot } from "../job/model";
 import { useCutDispatch } from "./useCutDispatch";
 import { useCutPlan } from "./useCutPlan";
 import { usePresetsForAim } from "./usePresetsForAim";
@@ -27,7 +28,11 @@ type Props = {
   docMachineId: string | null;
   machines: MachineProfile[];
   status: ipc.CutStatus;
-  refreshDeviceState: () => Promise<void>;
+  devices: ipc.DeviceInfo[];
+  hosts: ipc.PairedHostView[];
+  statuses: ipc.CutterStatusView[];
+  listError: string | null;
+  refreshDevices: () => void;
   onConvertMachine: (machineId: string) => boolean | Promise<boolean>;
   /** The connected cutter, from the one store the pill and the status bar read. */
   connected: ipc.DeviceInfo | null;
@@ -37,6 +42,8 @@ type Props = {
   onReconnect: () => Promise<unknown>;
   onError: (msg: string) => void;
   onClose: () => void;
+  /** A cut the host accepted. The sheet closes; the passes stay with the job panel. */
+  onJobAccepted: (snapshot: JobSnapshot) => void;
   /** The weed controls as last left, kept by App for the session; null until first changed, when
    *  they start from the backend's defaults. */
   weed: WeedDraft | null;
@@ -45,6 +52,9 @@ type Props = {
    *  appearance change while this dialog is open would leave the swatches on the old theme. */
   theme: ResolvedTheme;
   unit: LengthUnit;
+  /** Shared with the Layers panel, so a pass list and the colour blocks name the same split. */
+  grouping: ipc.Grouping;
+  onGroupingChange: (grouping: ipc.Grouping) => void;
 };
 
 export function SendSheet({
@@ -53,7 +63,11 @@ export function SendSheet({
   docMachineId,
   machines,
   status,
-  refreshDeviceState,
+  devices,
+  hosts,
+  statuses,
+  listError,
+  refreshDevices,
   onConvertMachine,
   connected,
   onConnect,
@@ -61,10 +75,13 @@ export function SendSheet({
   onReconnect,
   onError,
   onClose,
+  onJobAccepted,
   weed,
   onWeedChange,
   theme,
   unit,
+  grouping,
+  onGroupingChange,
 }: Props) {
   const [step, setStep] = useState<SendStep>(1);
   // The first visit to a step is Next, which is what requires a cutter. Going back to the machine
@@ -77,7 +94,7 @@ export function SendSheet({
   // the first run focuses the heading as the sheet opens, ahead of the dialog's own focus.
   const stepSeen = useRef(step);
   const [weedEditing, setWeedEditing] = useState(false);
-  const device = useDeviceList({ refreshDeviceState, onError, onReconnect });
+  const device = useDeviceList({ devices, hosts, listError, refreshList: refreshDevices, onError, onReconnect });
 
   /** The bounds a setting must sit in, from `cutplan::preflight` — the same module that refuses a
    *  cut over them. Held rather than defaulted: with no answer there is nothing to validate a
@@ -91,7 +108,7 @@ export function SendSheet({
       .catch((e) => setRangesError(ipc.ipcErrorMessage(e)));
   }, []);
 
-  const plan = useCutPlan({ weed, onWeedChange, ranges, onError });
+  const plan = useCutPlan({ weed, onWeedChange, ranges, onError, grouping, onGroupingChange });
 
   /** What the operator asked for while a draft was unsaved, held until they decide. Selecting
    *  another preset, changing cutter and closing the dialog all replace the draft, so each one
@@ -120,7 +137,11 @@ export function SendSheet({
     canSend: () => !plan.stalePlan && collectPassIssues(plan.plan?.rows ?? [], presets.presetLookup, presets.caps, ranges).length === 0,
     onStalePlan: () => plan.setStalePlan(true),
     onError,
-    refreshDeviceState,
+    presetLookup: presets.presetLookup,
+    onAccepted: (snapshot) => {
+      onJobAccepted(snapshot);
+      onClose();
+    },
   });
 
   // Moving between steps, not the open itself: the dialog's own focus lands on the first control.
@@ -183,7 +204,7 @@ export function SendSheet({
                   Three quick steps. Nothing is cut until you press Start cut.
                 </SheetDescription>
               </div>
-              <button type="button" aria-label="Close" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => guardUnsaved(onClose)}>
+              <button type="button" aria-label="Close" data-ink="muted" className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => guardUnsaved(onClose)}>
                 <X className="size-4" aria-hidden />
               </button>
             </div>
@@ -214,6 +235,7 @@ export function SendSheet({
                       <button
                         type="button"
                         disabled={!opened}
+                        data-ink={opened ? "faded" : "muted"}
                         onClick={() => go(number)}
                         className={cn("flex items-center gap-2 text-sm", opened ? "text-foreground/80 hover:text-foreground" : "text-muted-foreground")}
                       >
@@ -282,6 +304,7 @@ export function SendSheet({
                 setForceHost={device.setForceHost}
                 connected={connected}
                 status={status}
+                statuses={statuses}
                 aiming={presets.aiming}
                 guardUnsaved={guardUnsaved}
                 onConnect={presets.connect}
@@ -364,24 +387,13 @@ export function SendSheet({
 
           <div className="flex items-center gap-2 border-t border-border px-6 py-3">
             {step === 1 ? (
-              status.actions.cancel ? <span /> : (
-                <Button variant="ghost" onClick={() => guardUnsaved(onClose)}>Cancel</Button>
-              )
+              <Button variant="ghost" onClick={() => guardUnsaved(onClose)}>Cancel</Button>
             ) : (
               <Button variant="ghost" onClick={() => go((step - 1) as SendStep)}>
                 <ArrowLeft aria-hidden /> Back
               </Button>
             )}
             <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground">
-              {status.phase === "AwaitingColorSwap" ? <span>Waiting for color swap</span> : null}
-              {status.phase === "Sending" && status.sent ? (
-                <span>sending {status.sent.sent} / {status.sent.total} bytes</span>
-              ) : null}
-              {status.phase === "Cancelling" ? <span>cancelling</span> : null}
-              {status.phase === "AwaitingConfirmation" ? <span>Awaiting completion</span> : null}
-              {status.ended === "Cancelled" ? <span>Cancelled</span> : null}
-              {status.ended === "Completed" ? <span>Job complete</span> : null}
-              {status.phase === "Failed" ? <span className="text-destructive">Cut failed</span> : null}
               {step === 1 && !readyCutter ? <span>Pick a cutter that's ready.</span> : null}
               {step === 2 && issues.length > 0 ? (
                 <span role="alert" className="text-destructive">
@@ -389,9 +401,6 @@ export function SendSheet({
                 </span>
               ) : null}
             </div>
-            {status.actions.resume ? <Button variant="secondary" size="sm" aria-label="Resume" onClick={dispatch.resume}>Resume</Button> : null}
-            {status.actions.confirm ? <Button variant="secondary" size="sm" aria-label="Confirm pass done" onClick={dispatch.confirmPassDone}>Confirm pass done</Button> : null}
-            {status.actions.cancel ? <Button variant="secondary" size="sm" aria-label="Cancel" onClick={dispatch.cancel}>Cancel</Button> : null}
             {step < 3 ? (
               <Button disabled={step === 1 ? !readyCutter : !passesReady} onClick={() => go((step + 1) as SendStep)}>
                 Next <ArrowRight aria-hidden />

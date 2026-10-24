@@ -160,6 +160,12 @@ A machine that owns Transports to one or more cutters and runs Jobs on them on b
 clients. A Cut Host owns the cut: a client may detach mid-Job and the Job continues.
 _Avoid_: proxy, server, relay, bridge — all four name something that forwards, which this does not.
 
+**Protocol version**:
+The one version a desktop and a Cut Host agree before any authenticated request. Independent of
+the application's version. A peer that speaks a different one is refused and the connection
+closes; nothing is negotiated.
+_Avoid_: app version, API version, feature flag
+
 **Job**:
 The geometry for one pass, as flat polylines in millimetres, together with the Settings to cut it
 with. What a Driver encodes.

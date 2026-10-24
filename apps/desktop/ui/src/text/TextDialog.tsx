@@ -6,7 +6,7 @@ import { canInsert, fontsLoaded, selectFamily, type FontListState } from "./view
 const panelStyle: CSSProperties = {
   position: "fixed",
   inset: 0,
-  background: "rgba(0,0,0,0.5)",
+  background: "var(--scrim)",
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
@@ -16,7 +16,6 @@ const panelStyle: CSSProperties = {
 const dialogStyle: CSSProperties = {
   background: "var(--panel)",
   border: "1px solid var(--border)",
-  color: "var(--text)",
   padding: 16,
   width: 360,
   display: "flex",
@@ -26,7 +25,6 @@ const dialogStyle: CSSProperties = {
 
 const btn: CSSProperties = {
   background: "var(--panel)",
-  color: "var(--text)",
   border: "1px solid var(--border)",
   padding: "4px 10px",
   cursor: "pointer",
@@ -63,7 +61,7 @@ export function TextDialog({ onInsert, onClose }: {
           <span style={{ fontSize: 12 }}>No fonts were found on this system</span>
         )}
         {fonts.kind === "error" && (
-          <span style={{ fontSize: 12, color: "var(--cut)" }}>{fonts.message}</span>
+          <span className="text-xs text-destructive">{fonts.message}</span>
         )}
         {fonts.kind === "ready" && (
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>

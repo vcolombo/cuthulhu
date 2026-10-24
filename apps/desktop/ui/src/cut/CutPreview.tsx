@@ -69,7 +69,7 @@ export function CutPreview({ scene, artboard, passes, travel, theme }: Props) {
     const style = getComputedStyle(document.documentElement);
     const border = style.getPropertyValue("--border").trim() || FALLBACK_BORDER;
     const panel = style.getPropertyValue("--panel").trim() || FALLBACK_PANEL;
-    const text = style.getPropertyValue("--text").trim() || FALLBACK_TEXT;
+    const text = style.getPropertyValue("--foreground").trim() || FALLBACK_TEXT;
     const mat = style.getPropertyValue("--mat").trim() || FALLBACK_MAT;
 
     const nodesById = new Map(scene.nodes.map((n) => [n.id, n]));

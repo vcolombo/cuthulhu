@@ -5,20 +5,15 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeviceInfo } from "../../ipc";
 import type { InstalledPlan } from "./useCutPlan";
+import type { Preset, PresetLookup } from "../viewmodel";
 import { useCutDispatch } from "./useCutDispatch";
 
 const ipc = vi.hoisted(() => ({
-  cut: vi.fn(),
-  resumeCut: vi.fn(),
-  cancelCut: vi.fn(),
-  confirmPassDone: vi.fn(),
+  cut: vi.fn<(request: unknown) => Promise<{ job_id: number; duplicate: boolean }>>(),
 }));
 
 vi.mock("../../ipc", () => ({
   cut: (request: unknown) => ipc.cut(request),
-  resumeCut: () => ipc.resumeCut(),
-  cancelCut: () => ipc.cancelCut(),
-  confirmPassDone: () => ipc.confirmPassDone(),
   ipcErrorMessage: (e: unknown) =>
     e !== null && typeof e === "object" && "message" in e ? String((e as { message: unknown }).message) : String(e),
   ipcErrorCode: (e: unknown) =>
@@ -39,20 +34,50 @@ const plan: InstalledPlan = {
   grouping: "Color",
   weed: null,
   revision: "rev-1",
-  rows: [{
-    key: "color:ff0000ff",
-    shapeCount: 1,
-    nodeIds: [1],
-    starts: [[0, 0]],
-    weed: [],
-    enabled: true,
-    presetId: "vinyl",
-    speed: 4,
-    force: 8,
-    repeatCount: 2,
-  }],
+  rows: [
+    {
+      key: "color:ff0000ff",
+      shapeCount: 2,
+      nodeIds: [1],
+      starts: [[0, 0]],
+      weed: [],
+      enabled: true,
+      presetId: "vinyl",
+      speed: 4,
+      force: 8,
+      repeatCount: 2,
+    },
+    {
+      key: "color:00ff00ff",
+      shapeCount: 1,
+      nodeIds: [],
+      starts: [],
+      weed: [],
+      enabled: false,
+      presetId: null,
+      speed: null,
+      force: null,
+      repeatCount: null,
+    },
+  ],
   skippedNotCut: 0,
   travel: [],
+};
+
+const lookup: PresetLookup = { presets: [], loaded: true };
+
+const htv: Preset = {
+  id: "cameo5-htv",
+  name: "Heat transfer",
+  machine_id: "cameo5",
+  settings: { speed: null, force: null, repeat_count: 1 },
+  builtin: true,
+};
+
+type Accepted = {
+  jobId: number;
+  grouping: string;
+  passes: { key: string; name: string; swatch: string | null; enabled: boolean }[];
 };
 
 type DispatchProps = {
@@ -63,7 +88,8 @@ type DispatchProps = {
   canSend: () => boolean;
   onStalePlan: () => void;
   onError: (msg: string) => void;
-  refreshDeviceState: () => Promise<void>;
+  onAccepted: (snapshot: Accepted) => void;
+  presetLookup: PresetLookup;
 };
 
 function Host({ api, props }: { api: { current: DispatchApi | null }; props: DispatchProps }) {
@@ -76,8 +102,8 @@ describe("useCutDispatch", () => {
   let el: HTMLDivElement;
   const api = { current: null as DispatchApi | null };
   const errors: string[] = [];
+  const accepted: Accepted[] = [];
   let stale = 0;
-  let refreshes = 0;
   let props: DispatchProps;
 
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -88,13 +114,10 @@ describe("useCutDispatch", () => {
 
   beforeEach(() => {
     ipc.cut.mockReset();
-    ipc.resumeCut.mockReset();
-    ipc.cancelCut.mockReset();
-    ipc.confirmPassDone.mockReset();
     api.current = null;
     errors.length = 0;
+    accepted.length = 0;
     stale = 0;
-    refreshes = 0;
     props = {
       connected,
       plan,
@@ -105,9 +128,8 @@ describe("useCutDispatch", () => {
         stale += 1;
       },
       onError: (msg) => errors.push(msg),
-      refreshDeviceState: async () => {
-        refreshes += 1;
-      },
+      onAccepted: (snapshot) => accepted.push(snapshot),
+      presetLookup: lookup,
     };
     el = document.createElement("div");
     document.body.appendChild(el);
@@ -141,6 +163,7 @@ describe("useCutDispatch", () => {
       });
     }
     expect(ipc.cut).not.toHaveBeenCalled();
+    expect(accepted).toEqual([]);
   });
 
   it("sends the installed grouping, weed and rows, and tells a duplicate apart from a cut that started", async () => {
@@ -161,14 +184,24 @@ describe("useCutDispatch", () => {
       doc_revision: "rev-1",
       grouping: "Color",
       weed: null,
-      passes: [{
-        key: "color:ff0000ff",
-        enabled: true,
-        preset_id: "vinyl",
-        speed: 4,
-        force: 8,
-        repeat_count: 2,
-      }],
+      passes: [
+        {
+          key: "color:ff0000ff",
+          enabled: true,
+          preset_id: "vinyl",
+          speed: 4,
+          force: 8,
+          repeat_count: 2,
+        },
+        {
+          key: "color:00ff00ff",
+          enabled: false,
+          preset_id: null,
+          speed: null,
+          force: null,
+          repeat_count: null,
+        },
+      ],
     });
 
     await act(async () => {
@@ -176,8 +209,9 @@ describe("useCutDispatch", () => {
     });
     expect(api.current?.cutInFlight).toBe(false);
     // The host started nothing. A cutter that is not moving looks the same as one that is about
-    // to, and only this flag says which.
+    // to, and only this flag says which. The passes already remembered stay where they are.
     expect(api.current?.alreadyAccepted).toBe(true);
+    expect(accepted).toEqual([]);
 
     ipc.cut.mockResolvedValueOnce({ job_id: 8, duplicate: false });
     await act(async () => {
@@ -185,6 +219,29 @@ describe("useCutDispatch", () => {
     });
     expect(api.current?.alreadyAccepted).toBe(false);
     expect(api.current?.cutInFlight).toBe(false);
+    expect(accepted).toEqual([{
+      jobId: 8,
+      grouping: "Color",
+      passes: [
+        { key: "color:ff0000ff", shapeCount: 2, enabled: true, name: "Red vinyl", swatch: "#ff0000" },
+        { key: "color:00ff00ff", shapeCount: 1, enabled: false, name: "#00ff00", swatch: "#00ff00" },
+      ],
+    }]);
+  });
+
+  it("stores the preset name from the list held when the cut was accepted", async () => {
+    const presetPlan: InstalledPlan = {
+      ...plan,
+      grouping: "Preset",
+      rows: [{ ...plan.rows[0], key: "preset:cameo5-htv" }],
+    };
+    props = { ...props, plan: presetPlan, presetLookup: { presets: [htv], loaded: true } };
+    await mount();
+    ipc.cut.mockResolvedValueOnce({ job_id: 4, duplicate: false });
+    await act(async () => {
+      api.current?.startCut();
+    });
+    expect(accepted[0]?.passes[0]).toMatchObject({ name: "Heat transfer", swatch: null });
   });
 
   it("shows the stale banner and does not toast the same refusal", async () => {
@@ -198,6 +255,7 @@ describe("useCutDispatch", () => {
     });
     expect(stale).toBe(1);
     expect(errors).toEqual([]);
+    expect(accepted).toEqual([]);
     expect(api.current?.cutInFlight).toBe(false);
     expect(api.current?.alreadyAccepted).toBe(false);
   });
@@ -210,32 +268,7 @@ describe("useCutDispatch", () => {
     });
     expect(stale).toBe(0);
     expect(errors).toEqual(["no enabled passes"]);
+    expect(accepted).toEqual([]);
     expect(api.current?.cutInFlight).toBe(false);
-  });
-
-  it("refreshes after resume, cancel and confirm land, and reports a refusal without refreshing", async () => {
-    await mount();
-    const commands: [keyof typeof ipc, () => void][] = [
-      ["resumeCut", () => api.current?.resume()],
-      ["cancelCut", () => api.current?.cancel()],
-      ["confirmPassDone", () => api.current?.confirmPassDone()],
-    ];
-    for (const [method, run] of commands) {
-      ipc[method].mockResolvedValueOnce(undefined);
-      await act(async () => {
-        run();
-      });
-    }
-    expect(refreshes).toBe(3);
-    expect(errors).toEqual([]);
-
-    for (const [method, run] of commands) {
-      ipc[method].mockRejectedValueOnce({ message: "the cutter is busy" });
-      await act(async () => {
-        run();
-      });
-    }
-    expect(refreshes).toBe(3);
-    expect(errors).toEqual(["the cutter is busy", "the cutter is busy", "the cutter is busy"]);
   });
 });

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { renderedContrastFromPixels } from "./renderedContrast";
+import { modeRgb, pillApart, renderedContrastFromPixels, type Rgb } from "./renderedContrast";
 // Generated from the desktop's own generate_handler! registry by
 // apps/desktop/tests/ipc_inventory.rs. Nothing else here calls a real #[tauri::command], so this
-// is what the fake below checks command and argument names against (#85).
+// is what the fake in mockBackend.ts checks command and argument names against (#85).
 // The attribute is not decoration: Playwright loads this file as ESM, where a JSON import without
 // one is a TypeError before any test is collected.
 import ipcInventory from "../../ipc-inventory.json" with { type: "json" };
+import { installMockTauri } from "./mockBackend";
 
 /** The right column shows one panel. Open the tab a locator lives in, and leave it when it is already open. */
 async function showTab(page: Page, name: "Layers" | "Properties" | "Devices") {
@@ -95,8 +96,12 @@ async function reorderPass(page: Page, index: number, dir: -1 | 1) {
   await page.getByRole("button", { name: `Reorder pass ${index + 1}` }).press(dir < 0 ? "Alt+ArrowUp" : "Alt+ArrowDown");
 }
 
-/** Start cut exists only on step 3. Calling this from an earlier step is the walk there. */
+/** Start cut exists only on step 3. Calling this from an earlier step is the walk there.
+ *  A closed sheet is the job panel's doing: Start cut closes it, and a later cut opens a fresh one. */
 async function startCut(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
   await goToSendStep(page, 3);
   await page.getByRole("button", { name: "Start Cut" }).click();
 }
@@ -107,8 +112,12 @@ async function showPreview(page: Page) {
   return page.getByRole("img", { name: /Cut preview/ });
 }
 
-/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again. */
+/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again.
+ *  The sheet closes when a cut starts, so a check after a job opens it again. */
 async function expectStartOffered(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
   const dialog = page.getByRole("dialog", { name: "Send to cutter" });
   const back = Number(await dialog.getAttribute("data-send-step")) < 3;
   await goToSendStep(page, 3);
@@ -122,1449 +131,6 @@ async function showPresetEditor(page: Page) {
   const manage = page.getByLabel("Preset to manage");
   if (!(await manage.isVisible())) await page.getByRole("button", { name: "Edit presets…" }).click();
   await expect(manage).toBeVisible();
-}
-
-// Minimal in-memory fake Tauri backend. Runs inside the page (via addInitScript, so it
-// can't close over anything outside itself) and mirrors the JSON shape produced by
-// crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
-// which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedVinylBoard?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean; seedAlignExtras?: boolean; seedCollapsedGroup?: boolean; collapsedScale?: number; holdPreferences?: boolean; unsetUnits?: boolean; holdHistory?: boolean; holdFirstUnitSave?: boolean; failSetMachine?: boolean }) {
-  type Style = { stroke: number | null; fill: number | null };
-  type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
-  type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
-  type WeedOptions = { margin_mm: number; lines: "None" | "Horizontal" | "Vertical" | "Both"; spacing_mm: number; clearance_mm: number };
-  type Doc = {
-    nodes: Record<number, Node>;
-    root: number;
-    artboard: { x: number; y: number; w: number; h: number };
-    machine: { id: string; name: string; width_mm: number; height_mm: number } | null;
-  };
-
-  const machines = [
-    { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
-    { id: "puma", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
-  ];
-
-  // Mirrors document::Style::default() — a freshly-added shape has an opaque black stroke.
-  const DEFAULT_STYLE: Style = { stroke: 0x000000ff, fill: null };
-  // Every Node below carries `cut_line_type: "Cut"`, the import default. It comes from the two
-  // constructors, `Node::shape` and `Node::container` (crates/document/src/node.rs) — there is no
-  // `CutLineType::default()` to mirror, and the planner reads the attribute rather than defaulting
-  // it. That attribute, not the paint, is what makes a shape cuttable. Containers carry it inertly.
-
-  let nextId = 1;
-  const freshDoc = (): Doc => {
-    const rootId = nextId++;
-    return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } } },
-      root: rootId,
-      artboard: { x: 0, y: 0, w: 330, h: 3000 },
-      // Presets are machine-scoped, so a test that needs the Material control to offer anything
-      // has to name a machine: App reads the list for the document's machine.
-      machine: opts?.seedMachine
-        ? { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 }
-        : null,
-    };
-  };
-  let doc = freshDoc();
-  let saved: Doc | null = null;
-
-  // Seed two differently-stroked rects synchronously (bypassing invoke) so the doc is
-  // already populated by the time App.tsx's mount effect calls snapshot() — avoids a
-  // race between an async seed and React's first fetch.
-  // A Group 30 mm right of the origin holding one 10 × 10 mm rect: a selected container commits as
-  // its whole subtree, which the canvas has to preview and box the same way (Copilot on #298).
-  if (opts?.seedGroup) {
-    const groupId = nextId++;
-    const childId = nextId++;
-    doc.nodes[groupId] = { id: groupId, kind: "Group", transform: [1, 0, 0, 1, 30, 0], style: { stroke: null, fill: null }, children: [childId], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[childId] = { id: childId, kind: { Shape: { Rect: { w: 10, h: 10 } } }, transform: [1, 0, 0, 1, 0, 0], style: { stroke: 0xff0000ff, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[doc.root].children.push(groupId);
-  }
-
-  if (opts?.seedTwoColorRects) {
-    const redId = nextId++;
-    doc.nodes[redId] = {
-      id: redId,
-      kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
-      transform: [1, 0, 0, 1, 0, 0],
-      style: { stroke: 0xff0000ff, fill: null },
-      children: [],
-      cut_line_type: "Cut",
-      material_preset: opts?.seedEmptyPresetAssignment
-        ? { state: "preset", id: "" }
-        : { state: "inherit" },
-    };
-    const greenId = nextId++;
-    doc.nodes[greenId] = {
-      id: greenId,
-      kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
-      transform: [1, 0, 0, 1, 0, 0],
-      style: { stroke: 0x00ff00ff, fill: null },
-      children: [],
-      cut_line_type: "Cut",
-      material_preset: { state: "inherit" },
-    };
-    doc.nodes[doc.root].children.push(redId, greenId);
-  }
-
-  // Seven vinyl colours on a Cameo 12×12. Gold is before red so the red fill covers the gold fill
-  // and the outline pass has to put the gold edge back. Centres are in the test that reads pixels.
-  if (opts?.seedVinylBoard) {
-    doc.machine = machines[0];
-    const pack = (hex: string): number => ((Number.parseInt(hex.slice(1), 16) << 8) | 0xff) >>> 0;
-    const ellipse = (rx: number, tx: number, ty: number, hex: string): Node => {
-      const id = nextId++;
-      return { id, kind: { Shape: { Ellipse: { rx, ry: rx } } }, transform: [1, 0, 0, 1, tx, ty], style: { stroke: pack(hex), fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    };
-    const rect = (x: number, y: number, hex: string): Node => {
-      const id = nextId++;
-      return { id, kind: { Shape: { Rect: { w: 30.48, h: 30.48 } } }, transform: [1, 0, 0, 1, x, y], style: { stroke: pack(hex), fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    };
-    const shapes = [
-      ellipse(22.86, 27.94, 27.94, "#d39900"),
-      ellipse(50.8, 0, 0, "#d02c2a"),
-      rect(115, 10, "#1c1c1c"),
-      rect(160, 10, "#ffffff"),
-      rect(205, 10, "#113663"),
-      rect(115, 55, "#7b3fa0"),
-      rect(160, 55, "#f5e6a3"),
-    ];
-    for (const shape of shapes) doc.nodes[shape.id] = shape;
-    doc.nodes[doc.root].children.push(...shapes.map((shape) => shape.id));
-  }
-
-  // After the rects: a Group of two 10 mm rects at (50, 20) and (70, 40), so its bounds are
-  // 50..80 × 20..50 and no single shape gives them, and an empty Group with nothing to line up.
-  if (opts?.seedAlignExtras) {
-    const groupId = nextId++;
-    const leftId = nextId++;
-    const rightId = nextId++;
-    const emptyId = nextId++;
-    const rect = (id: number, x: number, y: number): Node => ({ id, kind: { Shape: { Rect: { w: 10, h: 10 } } }, transform: [1, 0, 0, 1, x, y], style: { stroke: 0x0000ffff, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } });
-    doc.nodes[groupId] = { id: groupId, kind: "Group", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [leftId, rightId], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[leftId] = rect(leftId, 50, 20);
-    doc.nodes[rightId] = rect(rightId, 70, 40);
-    doc.nodes[emptyId] = { id: emptyId, kind: "Group", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[doc.root].children.push(groupId, emptyId);
-  }
-
-  // A Group scaled to nothing, holding one rect: a move beneath it cannot be put into its space,
-  // which is the geometry refusal `transform_nodes` makes after earlier entries already succeeded.
-  if (opts?.seedCollapsedGroup) {
-    const groupId = nextId++;
-    const childId = nextId++;
-    const k = opts.collapsedScale ?? 0;
-    doc.nodes[groupId] = { id: groupId, kind: "Group", transform: [k, 0, 0, k, 0, 0], style: { stroke: null, fill: null }, children: [childId], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[childId] = { id: childId, kind: { Shape: { Rect: { w: 10, h: 10 } } }, transform: [1, 0, 0, 1, 0, 0], style: { stroke: 0xff0000ff, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[doc.root].children.push(groupId);
-  }
-
-  const unimplemented = (cmd: string): never => {
-    throw new Error(`${cmd}: mocked command the e2e fake does not perform; implement it here to test it`);
-  };
-
-  const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
-    new_doc: () => {
-      doc = freshDoc();
-      return JSON.stringify(doc);
-    },
-    snapshot: () => {
-      // One-shot, armed by a test: a refresh that fails after a commit already landed is the case
-      // whose repair is the opposite of a refusal (silent-failure-hunter on #298).
-      if (failNextSnapshot) {
-        failNextSnapshot = false;
-        throw new Error("snapshot unavailable");
-      }
-      // Read when the command runs, as the backend does, so a held answer still shows the document
-      // as it stood then, even if a load has replaced it before the answer arrives.
-      const json = JSON.stringify(doc);
-      if (holdingSnapshots) return new Promise((resolve) => heldSnapshots.push(() => resolve(json)));
-      return json;
-    },
-    add_primitive: (a) => {
-      const id = nextId++;
-      const style = a.stroke !== undefined ? { stroke: a.stroke as number | null, fill: null } : DEFAULT_STYLE;
-      // Same test-only override as `a.stroke`: no UI control sets cuttability at creation, so
-      // this is the only way to seed a NoCut shape without going through set_cut_line_type.
-      const cutLineType = a.cut_line_type !== undefined ? (a.cut_line_type as "Cut" | "NoCut") : "Cut";
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType, material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return {};
-    },
-    add_text: (a) => {
-      // The real command rejects on the backend's terms; the fake can at least refuse a
-      // caller that stopped forwarding the arguments, so the picker test proves the
-      // selected family actually crosses the IPC boundary.
-      if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
-      if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
-      const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return {};
-    },
-    commit_transform: (a) => {
-      // Composed in full: handles send scale and rotation, and a fake that kept only the
-      // translation passes a frontend whose preview and commit disagree. Recorded so a test can
-      // read the matrix.
-      if (failNextCommit) {
-        failNextCommit = false;
-        throw new Error("transform refused");
-      }
-      const m = a.m as number[];
-      const hooks = window as unknown as { __commitTransforms?: { ids: number[]; m: number[]; batch?: number }[] };
-      hooks.__commitTransforms ??= [];
-      hooks.__commitTransforms.push({ ids: a.ids as number[], m });
-      return answer(() => applyTransforms([{ ids: a.ids as number[], m }]));
-    },
-    commit_transforms: (a) => {
-      // Counted while unanswered: the real backend serialises commands, so two batches on the wire
-      // at once is a frontend that stopped holding its queue (CodeRabbit on #301).
-      const hooks = window as unknown as { __maxInFlightCommits?: number };
-      inFlightCommits += 1;
-      hooks.__maxInFlightCommits = Math.max(hooks.__maxInFlightCommits ?? 0, inFlightCommits);
-      const answered = ((): Promise<unknown> => {
-      // Mirrors commands::transform_each: every move in one undo, all or nothing, each entry on
-      // what the earlier ones left, and nothing moved twice. Each entry is recorded with its batch,
-      // so a test can tell one click from several. A refusal waits on a hold like an answer does,
-      // so a test can queue edits behind a commit that will be refused.
-      if (failNextCommit) {
-        failNextCommit = false;
-        return answer(() => { throw new Error("transform refused"); });
-      }
-      const moves = a.moves as { ids: number[]; m: number[] }[];
-      // Checked before anything is recorded (all or nothing), and answered in turn like every
-      // other outcome: the real backend serialises commands, so a refusal never overtakes a held
-      // commit ahead of it (CodeRabbit on #301).
-      // An empty batch or entry is EmptySelection in transform_each, refused whole (Copilot on #301).
-      if (moves.length === 0 || moves.some((mv) => mv.ids.length === 0)) {
-        return answer(() => { throw new Error("the selection has nothing this command can act on"); });
-      }
-      if (moves.some((mv) => mv.ids.some((id) => !doc.nodes[id]))) {
-        return answer(() => { throw new Error("the node or machine this command names is not there"); });
-      }
-      // So is a transform that cannot be reversed, against the document as it stands, as the missing
-      // node is: a batch Rust refuses whole must not reach the log and take a batch number. It is
-      // staged again when answered, since a held commit ahead of it can still change the document.
-      try {
-        stageTransforms(moves);
-      } catch (e) {
-        return answer(() => { throw e; });
-      }
-      const hooks = window as unknown as { __commitTransforms?: { ids: number[]; m: number[]; batch?: number }[]; __batches?: number };
-      hooks.__commitTransforms ??= [];
-      hooks.__batches = (hooks.__batches ?? 0) + 1;
-      for (const mv of moves) hooks.__commitTransforms.push({ ids: mv.ids, m: mv.m, batch: hooks.__batches });
-      return answer(() => applyTransforms(moves));
-      })();
-      return answered.finally(() => { inFlightCommits -= 1; });
-    },
-    delete: (a) => {
-      for (const id of a.ids as number[]) {
-        delete doc.nodes[id];
-        for (const n of Object.values(doc.nodes)) n.children = n.children.filter((c) => c !== id);
-      }
-      return {};
-    },
-    // Mirrors commands::set_cut_line_type: descends into containers, because the attribute is
-    // read only on the shape that carries it — setting it on a Group alone would do nothing.
-    set_cut_line_type: (a) => {
-      const apply = () => {
-        const value = a.value as "Cut" | "NoCut";
-        const ids = a.ids as number[];
-        if (ids.length === 0) throw new Error("set_cut_line_type: EmptySelection");
-        const seen = new Set<number>();
-        const stack = [...ids];
-        while (stack.length > 0) {
-          const id = stack.pop()!;
-          if (seen.has(id)) continue;
-          seen.add(id);
-          const n = doc.nodes[id];
-          if (!n) throw new Error("set_cut_line_type: NotFound");
-          if (typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object)) n.cut_line_type = value;
-          else stack.push(...n.children);
-        }
-        return {};
-      };
-      // Held, it stands for any edit still on its way when a load is asked for (an import reading
-      // its file): applied on release, so a load that did not wait for it lands first.
-      if (!holdingEdits) return apply();
-      inFlightEdits++;
-      return new Promise((resolve, reject) =>
-        heldEdits.push(() => {
-          inFlightEdits--;
-          try { resolve(apply()); } catch (e) { reject(e); }
-        }));
-    },
-    // Mirrors commands::set_material_preset: writes the selection and nothing else, because a
-    // material inherits and the planner resolves it. Descending here would be the bug the real
-    // command was written to avoid.
-    set_material_preset: (a) => {
-      const value = a.value as PresetAssignment;
-      const ids = a.ids as number[];
-      if (ids.length === 0) throw new Error("set_material_preset: EmptySelection");
-      for (const id of ids) {
-        const n = doc.nodes[id];
-        if (!n) throw new Error("set_material_preset: NotFound");
-        n.material_preset = value;
-      }
-      return {};
-    },
-    // Four commands the fake has never performed. They used to answer "ok" while leaving
-    // `doc` untouched, which is the false green this file exists to avoid: each one edits
-    // the document in the real backend, so a plan made before it goes stale and `plan_cut`
-    // refuses the cut. Refuse here too, loudly, rather than silently permitting one.
-    reorder: () => unimplemented("reorder"),
-    // The stacks are not the document. Nothing in the suite undoes, and the buttons stay disabled
-    // while both flags are false.
-    history: () => {
-      if (!opts?.holdHistory) return { can_undo: false, can_redo: false };
-      // Queued so a test can answer a later refresh before an earlier one. The flags belong to
-      // the snapshot that asked, and a late reply must not rewind Undo.
-      return new Promise((resolve) => {
-        const w = window as unknown as {
-          __historyWaiters?: Array<(flags: { can_undo: boolean; can_redo: boolean }) => void>;
-          __releaseLastHistory?: (flags: { can_undo: boolean; can_redo: boolean }) => void;
-        };
-        w.__historyWaiters = w.__historyWaiters ?? [];
-        w.__historyWaiters.push(resolve);
-        w.__releaseLastHistory = (flags) => {
-          const waiter = w.__historyWaiters?.pop();
-          waiter?.(flags);
-        };
-      });
-    },
-    undo: () => unimplemented("undo"),
-    redo: () => unimplemented("redo"),
-    boolean_op: (a) => {
-      (window as unknown as { __booleanOp?: unknown }).__booleanOp = a.op;
-      return unimplemented("boolean_op");
-    },
-    import_svg: (a) => {
-      (window as unknown as { __docOrder?: string[] }).__docOrder?.push("import_svg");
-      const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return [{}, []];
-    },
-    save_project: () => {
-      saved = JSON.parse(JSON.stringify(doc));
-      return null;
-    },
-    load_project: () => {
-      // The real backend runs commands one at a time, but only a frontend that waits keeps a load
-      // from landing between a commit and the document it named (CodeRabbit on #301).
-      const loads = window as unknown as { __loadDuringCommit?: boolean; __loadDuringEdit?: boolean; __loads?: number };
-      if (inFlightCommits > 0) loads.__loadDuringCommit = true;
-      if (inFlightEdits > 0) loads.__loadDuringEdit = true;
-      loads.__loads = (loads.__loads ?? 0) + 1;
-      (window as unknown as { __docOrder?: string[] }).__docOrder?.push("load_project");
-      const load = () => {
-        if (saved) doc = JSON.parse(JSON.stringify(saved));
-        return JSON.stringify(doc);
-      };
-      // A real load takes as long as the project is big; held, a test can act while it runs.
-      if (holdingLoads) return new Promise((resolve) => heldLoads.push(() => resolve(load())));
-      return load();
-    },
-    set_machine: (a) => {
-      if (opts?.failSetMachine) throw new Error("could not set the machine");
-      const m = machines.find((p) => p.id === a.machineId);
-      if (!m) throw new Error("unknown machine");
-      doc.machine = m;
-      doc.artboard = { x: 0, y: 0, w: m.width_mm, h: m.height_mm };
-      return null;
-    },
-    list_machines: () => machines,
-    // A fixture, not a claim: the real list comes from geometry::list_font_families and is
-    // whatever the OS has installed. This exists only so the dialog has options to render.
-    list_fonts: () => (opts?.noFonts ? [] : ["Arial", "Comic Sans MS", "Times New Roman"]),
-    trace_image: () => ({
-      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
-      pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
-    }),
-    // A fixture, not a claim: the real table lives in trace::CONTROLS and is what ships. This
-    // exists only so the dialog has sliders to render.
-    trace_controls: () => ({
-      controls: [
-        { name: "speckle", label: "Ignore speckles", help: "", min: 0, max: 16, step: 1, default: 4, colorOnly: false },
-        { name: "smoothing", label: "Smoothing", help: "", min: 0, max: 180, step: 1, default: 60, colorOnly: false },
-        { name: "detail", label: "Detail", help: "", min: 3.5, max: 10, step: 0.5, default: 9.5, colorOnly: false },
-        { name: "colors", label: "Colors", help: "", min: 1, max: 8, step: 1, default: 6, colorOnly: true },
-      ].filter((c) => c.name !== opts?.dropTraceControl),
-      defaultMode: "binary",
-      maxDim: 2048,
-    }),
-    load_image_preview: () => {
-      if (opts?.failImagePreview) throw new Error("could not read image: broken thumbnail");
-      return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    },
-  };
-
-  // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
-  // order and driver-core::manager's DeviceEvent shape closely enough to drive the cut
-  // dialog through a real state machine. The statuses below are transcribed from
-  // driver-core/src/status.rs's status_of table — phase and the four action booleans
-  // per internal state — so a frontend that re-derives permissions has nothing to
-  // re-derive them from. ---
-
-  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean; host: string | null };
-  type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
-  type CutStatus = {
-    phase: string;
-    ended: string | null;
-    actions: Actions;
-    pass: { index: number; total: number } | null;
-    sent: { sent: number; total: number } | null;
-    error: unknown;
-  };
-  type DeviceEvent = { job_id: number; kind: unknown; status: CutStatus };
-
-  const NO_ACTIONS: Actions = { cut: false, cancel: false, resume: false, confirm: false };
-  const statusOf = (phase: string, actions: Partial<Actions> = {}, rest: Partial<CutStatus> = {}): CutStatus => ({
-    phase,
-    ended: null,
-    actions: { ...NO_ACTIONS, ...actions },
-    pass: null,
-    sent: null,
-    error: null,
-    ...rest,
-  });
-  const DISCONNECTED = statusOf("Disconnected");
-  const CONNECTING = statusOf("Connecting");
-  // `Idle` alone is a device that has cut nothing; a job that ran to the end rests on
-  // the same phase and says so through `ended`, which is the whole of the difference.
-  const IDLE = statusOf("Idle", { cut: true });
-  const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
-
-  const devices: DeviceInfo[] = [
-    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
-    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true, host: null },
-  ];
-
-  // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
-  // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
-  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
-  if (opts?.seedBusyHost) {
-    hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-               unreachable: "the host could not be reached (timed out)" }];
-    devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
-                   transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
-  }
-
-  // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
-  // enough for the dialog's pairing flow to be driven end to end rather than stubbed out.
-  const HOST_FINGERPRINT = "AB:CD:EF:01:23:45";
-  const HOST_TOKEN = "correct-horse";
-  const PAIRED_CUTTER: DeviceInfo = {
-    instance_id: "usb:pi:B", machine_id: "cameo5",
-    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-2",
-  };
-
-  // A reachable Cut Host with a cutter aimed at and stuck: cancelled, with nothing the operator
-  // may do next. That is the state the Reconnect control exists for, and nothing in this suite
-  // exercised a *remote* connected cutter at all — so the one line joining `connectedControl`'s
-  // answer to `reconnect_device` was covered by neither half's tests (#123).
-  const REMOTE_CUTTER: DeviceInfo = {
-    instance_id: "usb:pi:C", machine_id: "cameo5",
-    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
-  };
-  if (opts?.seedRemoteConnected) {
-    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
-    devices.push(REMOTE_CUTTER);
-  }
-
-  let connected: DeviceInfo | null = opts?.seedRemoteConnected ? REMOTE_CUTTER : null;
-  // A cancel whose stop nothing confirmed: the Job is over, and `driver-core` still refuses a cut
-  // until the transport is re-opened. `Idle` on both sides of the reconnect, which is exactly why
-  // the control is derived from `actions` and not from the phase.
-  let status: CutStatus = opts?.seedRemoteConnected
-    ? { phase: "Idle", ended: "Cancelled", actions: { ...NO_ACTIONS }, pass: null, sent: null, error: null }
-    : DISCONNECTED;
-  let deviceStateCalls = 0;
-  let listDeviceCalls = 0;
-  let nextJobId = 1;
-  let jobId: number | null = null;
-  let planPasses: { key: string; enabled: boolean }[] = [];
-  type CutRequest = {
-    device_instance_id: string;
-    doc_revision: string;
-    grouping: Grouping;
-    weed?: WeedOptions | null;
-    passes: {
-      key: string;
-      enabled: boolean;
-      // Optional on the wire, not merely nullable: `ConfiguredPassDto::preset_id` is an
-      // `Option<String>`, and serde reads a field the caller left out as `None`.
-      preset_id?: string | null;
-      speed: number | null;
-      force: number | null;
-      repeat_count: number | null;
-    }[];
-  };
-  let lastCutRequest: CutRequest | null = null;
-  let failNextResume = false;
-  let failNextCut = false;
-  let failNextPlan = false;
-  // Presets as `cutplan::presets` keeps them: builtins ship per machine, the operator's own
-  // entries live in one file beside them, and an entry replaces a builtin only when the whole pair
-  // `(machine_id, id)` matches — an id is the operator's own string, so `my-vinyl` names one
-  // material on a Cameo and another on a Puma (#153).
-  type MaterialPreset = {
-    id: string; name: string; machine_id: string;
-    settings: { speed: number | null; force: number | null; repeat_count: number };
-    builtin: boolean;
-  };
-  const BUILTIN_PRESETS: MaterialPreset[] = [
-    { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
-      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
-    // The Puma takes speed and force from its own panel, so its builtins name a material and
-    // nothing else — the state the editor's preview has to read back as the panel's.
-    { id: "puma-htv", name: "HTV", machine_id: "puma",
-      settings: { speed: null, force: null, repeat_count: 1 }, builtin: true },
-  ];
-  let userPresets: MaterialPreset[] = opts?.seedUserPreset
-    ? [{ id: "card-stock", name: "Card Stock", machine_id: "cameo5",
-        settings: { speed: 6, force: 18, repeat_count: 1 }, builtin: false }]
-    : [];
-  const effectivePresets = (machineId: string): MaterialPreset[] => {
-    const mine = userPresets.filter((p) => p.machine_id === machineId);
-    const shipped = BUILTIN_PRESETS.filter(
-      (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
-    );
-    return [...shipped, ...mine];
-  };
-  let failNextPresetSave = false;
-  let failNextPresetList = false;
-  // Parked responses for the reorder/replan race, released from the test in the order it
-  // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
-  // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
-  // Armed by the test rather than by a call count — StrictMode plans twice on mount, so
-  // "hold from the second call" holds the dialog's own opening plan and it never gets rows.
-  let holding = false;
-  // Set by a test that needs a held plan to fail when released rather than install: a replan that
-  // is out while the operator keeps typing, and then refused.
-  let refuseHeldPlans = false;
-  const heldPlans: (() => void)[] = [];
-  // The weed controls start from the defaults `settings_ranges` carries, so a test needs the window
-  // before they arrive, and the case where they never do.
-  let holdingRanges = false;
-  let rangesFail = false;
-  const heldRanges: (() => void)[] = [];
-  const heldTravel: (() => void)[] = [];
-  const release = (queue: (() => void)[]) => {
-    queue.splice(0).forEach((f) => f());
-    // One macrotask, so the settled promises' handlers have run by the time the test's
-    // `evaluate` resolves and it can assert on what they did (or did not) change.
-    return new Promise((r) => setTimeout(r, 0));
-  };
-  // Presets hold on their own switch. The race they exist for is a list read for one cutter landing
-  // after the operator aimed at another, and arming the plan hold with it would leave the dialog
-  // without rows for the whole test.
-  let holdingPresets = false;
-  const heldPresets: (() => void)[] = [];
-  // Transforms hold on their own switch too: the race they exist for is a second gesture pressed
-  // while the first one's commit is still on the wire.
-  let holdingCommits = false;
-  const heldCommits: (() => void)[] = [];
-  let failNextCommit = false;
-  let inFlightCommits = 0;
-  let holdingLoads = false;
-  const heldLoads: (() => void)[] = [];
-  let failNextSnapshot = false;
-  let holdingEdits = false;
-  const heldEdits: (() => void)[] = [];
-  let inFlightEdits = 0;
-  let holdingSnapshots = false;
-  const heldSnapshots: (() => void)[] = [];
-  // See `__holdPass` below: the advance out of Sending, parked until a test releases it.
-  let holdPass = false;
-  let heldPass: (() => void) | null = null;
-  Object.assign(window, {
-    __holdSnapshots: () => { holdingSnapshots = true; },
-    __holdEdits: () => { holdingEdits = true; },
-    __releaseEdits: () => { holdingEdits = false; return release(heldEdits); },
-    // Oldest first, one at a time: the race is which document's answer renders last.
-    __releaseSnapshot: () => release(heldSnapshots.splice(0, 1)),
-    __releaseLatestSnapshot: () => release(heldSnapshots.splice(-1, 1)),
-    __failNextCommit: () => { failNextCommit = true; },
-    __failNextSnapshot: () => { failNextSnapshot = true; },
-    __holdCommits: () => { holdingCommits = true; },
-    __holdLoad: () => { holdingLoads = true; },
-    __releaseLoad: () => { holdingLoads = false; return release(heldLoads); },
-    __releaseCommits: () => { holdingCommits = false; return release(heldCommits); },
-    __armHold: () => { holding = true; },
-    __releasePlans: () => release(heldPlans),
-    __refuseHeldPlans: () => { refuseHeldPlans = true; },
-    __holdRanges: () => { holdingRanges = true; },
-    __releaseRanges: () => release(heldRanges),
-    __failRanges: () => { rangesFail = true; },
-    __releaseTravel: () => release(heldTravel),
-    // The scripted pass leaves Sending after 50ms. Step 1 is where the badge is, and getting
-    // there takes longer than that, so a test that wants the transmitting tone holds the advance.
-    __holdPass: () => { holdPass = true; },
-    __releasePass: () => {
-      holdPass = false;
-      const advance = heldPass;
-      heldPass = null;
-      advance?.();
-    },
-  });
-
-  // Mirrors crates/document/src/commands.rs transform_nodes_in, which transform_nodes and
-  // transform_each share: `m` is world-space, so each node's local transform becomes
-  // local · parentWorld · m · parentWorld⁻¹, and a node whose ancestor any entry selects is skipped,
-  // since the ancestor already carries it. Composing `m` straight onto a nested node's local
-  // transform lands it where the real backend never would (Copilot on #298).
-  function applyTransforms(moves: { ids: number[]; m: number[] }[]) {
-    for (const [id, t] of stageTransforms(moves)) doc.nodes[id].transform = t;
-    return {};
-  }
-
-  // Every entry's result, or a throw for the whole batch. Nothing is written here.
-  function stageTransforms(moves: { ids: number[]; m: number[] }[]) {
-    const cmp = (p: number[], q: number[]) => [
-      q[0] * p[0] + q[2] * p[1], q[1] * p[0] + q[3] * p[1],
-      q[0] * p[2] + q[2] * p[3], q[1] * p[2] + q[3] * p[3],
-      q[0] * p[4] + q[2] * p[5] + q[4], q[1] * p[4] + q[3] * p[5] + q[5],
-    ];
-    const inv = (p: number[]) => {
-      const det = p[0] * p[3] - p[1] * p[2];
-      // As Rust's `pw.inverse()` refusing: the whole batch goes, not just this entry. Exactly zero,
-      // as `Affine::inverse` checks: a tolerance refused tiny scales Rust accepts (Copilot on #301).
-      if (det === 0) throw new Error("something in the selection sits under a transform that cannot be reversed");
-      const [ia, ib, ic, id] = [p[3] / det, -p[1] / det, -p[2] / det, p[0] / det];
-      return [ia, ib, ic, id, -(ia * p[4] + ic * p[5]), -(ib * p[4] + id * p[5])];
-    };
-    // Staged, then published only if every entry succeeds: Rust collects every entry's update and
-    // commits none on any refusal, so a later entry's failure must leave the earlier ones unwritten
-    // (Copilot on #301). Later entries read the staged transforms, as Rust's read the transforms
-    // the earlier ones wrote.
-    const staged = new Map<number, number[]>();
-    const transformOf = (id: number) => staged.get(id) ?? doc.nodes[id].transform;
-    const parentOf = (id: number) => Object.values(doc.nodes).find((n) => n.children.includes(id))?.id;
-    const worldOf = (id: number | undefined): number[] =>
-      id === undefined ? [1, 0, 0, 1, 0, 0] : cmp(transformOf(id), worldOf(parentOf(id)));
-    const selectedIds = new Set(moves.flatMap((mv) => mv.ids));
-    const hasSelectedAncestor = (id: number) => {
-      for (let p = parentOf(id); p !== undefined; p = parentOf(p)) if (selectedIds.has(p)) return true;
-      return false;
-    };
-    for (const { ids, m } of moves) {
-      for (const id of new Set(ids)) {
-        // Checked again when answered: a node deleted while the batch was held is NotFound in
-        // Rust, which refuses the whole batch rather than skipping it (Copilot on #301).
-        if (!doc.nodes[id]) throw new Error("the node or machine this command names is not there");
-        if (hasSelectedAncestor(id)) continue;
-        const pw = worldOf(parentOf(id));
-        staged.set(id, cmp(cmp(cmp(transformOf(id), pw), m), inv(pw)));
-      }
-    }
-    return staged;
-  }
-
-  // Answered on a later task, as a real IPC round trip is: resolving in the same microtask burst
-  // let a whole chain of queued commits finish before React rendered between them, which hid the
-  // window where an intermediate snapshot renders while the next commit is on the wire.
-  function answer<T>(run: () => T): Promise<T> {
-    return new Promise((resolve, reject) => {
-      const settle = () => {
-        try { resolve(run()); } catch (e) { reject(e); }
-      };
-      if (holdingCommits) heldCommits.push(settle);
-      else setTimeout(settle, 0);
-    });
-  }
-
-  function ipcError(code: string, message: string) {
-    return { code, message };
-  }
-
-  // Mirrors cutplan::weed. WEED_RANGES and WeedOptions::validate, refusing with the same sentences.
-  const WEED_RANGES = { margin_mm: { min: 0.5, max: 50 }, spacing_mm: { min: 5, max: 500 }, clearance_mm: { min: 0.2, max: 20 } };
-  function validateWeed(w: WeedOptions) {
-    const check = (name: string, v: number, r: { min: number; max: number }) => {
-      if (!(v >= r.min && v <= r.max)) throw ipcError("plan_error", `the weed ${name} must be ${r.min}–${r.max} mm`);
-    };
-    check("margin", w.margin_mm, WEED_RANGES.margin_mm);
-    if (w.lines === "None") return;
-    check("line spacing", w.spacing_mm, WEED_RANGES.spacing_mm);
-    check("line clearance", w.clearance_mm, WEED_RANGES.clearance_mm);
-    if (w.clearance_mm >= w.margin_mm) {
-      throw ipcError("plan_error", `the weed line clearance (${w.clearance_mm} mm) must be less than the margin (${w.margin_mm} mm)`);
-    }
-  }
-
-  // Mirrors cutplan::weed::weed_geometry for what the fixtures hold: axis-aligned rects. For a
-  // closed axis-aligned rect, the band clipping plus the winding test reduce exactly to blocking
-  // the rect's box grown by the clearance, so this is the real output, not an approximation of it.
-  type Box = { x: number; y: number; w: number; h: number };
-  function weedFor(boxes: Box[], w: WeedOptions): [number, number][][] {
-    if (boxes.length === 0) return [];
-    const left = Math.min(...boxes.map((b) => b.x)) - w.margin_mm;
-    const top = Math.min(...boxes.map((b) => b.y)) - w.margin_mm;
-    const right = Math.max(...boxes.map((b) => b.x + b.w)) + w.margin_mm;
-    const bottom = Math.max(...boxes.map((b) => b.y + b.h)) + w.margin_mm;
-    const c = w.clearance_mm;
-    const out: [number, number][][] = [];
-    // `at` is the line's position on one axis; each box blocks [lo, hi] on the other if it comes
-    // within the clearance of the line.
-    const pieces = (at: number, from: number, to: number, spans: { near: [number, number]; block: [number, number] }[]) => {
-      const blocked = spans.filter((s) => at >= s.near[0] - c && at <= s.near[1] + c)
-        .map((s) => [s.block[0] - c, s.block[1] + c]).sort((p, q) => p[0] - q[0]);
-      const free: [number, number][] = [];
-      let pos = from;
-      for (const [a, b] of blocked) {
-        if (a > pos) free.push([pos, Math.min(a, to)]);
-        pos = Math.max(pos, b);
-        if (pos >= to) break;
-      }
-      if (pos < to) free.push([pos, to]);
-      return free.filter(([a, b]) => b - a >= 2);
-    };
-    const steps = (from: number, to: number) => {
-      const v: number[] = [];
-      for (let k = 1; from + k * w.spacing_mm < to - 1e-9; k++) v.push(from + k * w.spacing_mm);
-      return v;
-    };
-    if (w.lines === "Horizontal" || w.lines === "Both") {
-      const spans = boxes.map((b) => ({ near: [b.y, b.y + b.h] as [number, number], block: [b.x, b.x + b.w] as [number, number] }));
-      for (const y of steps(top, bottom)) for (const [a, b] of pieces(y, left, right, spans)) out.push([[a, y], [b, y]]);
-    }
-    if (w.lines === "Vertical" || w.lines === "Both") {
-      const spans = boxes.map((b) => ({ near: [b.x, b.x + b.w] as [number, number], block: [b.y, b.y + b.h] as [number, number] }));
-      for (const x of steps(left, right)) for (const [a, b] of pieces(x, top, bottom, spans)) out.push([[x, a], [x, b]]);
-    }
-    out.push([[left, top], [right, top], [right, bottom], [left, bottom], [left, top]]);
-    return out;
-  }
-
-  function planFromDoc(grouping: Grouping = "Color", weed: WeedOptions | null = null) {
-    if (weed) validateWeed(weed);
-    // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
-    // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
-    // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
-    // absent), the resolved material, or `all` for one pass. Absence is its own token
-    // (`no-color`, `no-preset`) because a preset id may be any string, so a preset called
-    // `none` must not write what no preset at all writes.
-    const byKey = new Map<string, { key: string; node_ids: number[]; boxes: Box[] }>();
-    let skipped = 0;
-    const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
-    const colorKey = (n: Node) => {
-      const stroke = visible(n.style.stroke);
-      const fill = visible(n.style.fill);
-      const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
-      return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
-    };
-    const mul = (p: number[], q: number[]) => [
-      q[0] * p[0] + q[2] * p[1], q[1] * p[0] + q[3] * p[1],
-      q[0] * p[2] + q[2] * p[3], q[1] * p[2] + q[3] * p[3],
-      q[0] * p[4] + q[2] * p[5] + q[4], q[1] * p[4] + q[3] * p[5] + q[5],
-    ];
-    // A Rect's world box, for the weed. Other kinds carry no geometry here, so they add none.
-    const worldBox = (n: Node, world: number[]): Box | null => {
-      const r = (n.kind as { Shape?: { Rect?: { x?: number; y?: number; w: number; h: number } } }).Shape?.Rect;
-      if (!r) return null;
-      const [x0, y0] = [r.x ?? 0, r.y ?? 0];
-      const pts = [[x0, y0], [x0 + r.w, y0], [x0, y0 + r.h], [x0 + r.w, y0 + r.h]]
-        .map(([x, y]) => [world[0] * x + world[2] * y + world[4], world[1] * x + world[3] * y + world[5]]);
-      const xs = pts.map((p) => p[0]);
-      const ys = pts.map((p) => p[1]);
-      return { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
-    };
-    const walk = (id: number, inherited: string | null, parentWorld: number[] = [1, 0, 0, 1, 0, 0]) => {
-      const n = doc.nodes[id];
-      if (!n) return;
-      const world = mul(n.transform, parentWorld);
-      const a = n.material_preset;
-      const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
-      const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
-      if (isShape) {
-        if (n.cut_line_type === "NoCut") {
-          skipped++;
-        } else {
-          const key =
-            grouping === "Single" ? "all"
-            : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
-            : colorKey(n);
-          const box = worldBox(n, world);
-          const existing = byKey.get(key);
-          if (existing) {
-            existing.node_ids.push(id);
-            if (box) existing.boxes.push(box);
-          } else byKey.set(key, { key, node_ids: [id], boxes: box ? [box] : [] });
-        }
-      }
-      for (const c of n.children) walk(c, material, world);
-    };
-    walk(doc.root, null);
-    // starts is all-null on purpose: the fake carries no geometry to flatten, and null
-    // is the real backend's no-outline case — so e2e renders exercise the preview's
-    // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
-    const passes = [...byKey.values()].map((p) => ({
-      key: p.key,
-      shape_count: p.node_ids.length,
-      node_ids: p.node_ids,
-      starts: p.node_ids.map(() => null),
-      weed: weed ? weedFor(p.boxes, weed) : [],
-    }));
-    // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
-    // snapshot_json: a doc edited back to a previous state is not stale. A counter
-    // bumped per command diverges on that, and silently goes stale-blind for any
-    // command that mutates `doc` and forgets to bump (commit_transform did).
-    // Travel by the same rule `travel_for_order` uses below - one segment per adjacent pair of
-    // passes to be cut - because the real `plan_cut` returns the travel for the order it just
-    // planned, and a fake that plans passes but never any travel between them cannot show a
-    // preview going empty. Every pass a fresh plan produces is enabled.
-    const travel = syntheticTravel(passes);
-    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel };
-  }
-
-  // One synthetic segment per adjacent pair of passes cut, plus one per weed polyline, which the
-  // real `travel_moves` visits after each pass's shapes. The fake has no blade path to put them on.
-  function syntheticTravel(cut: { weed: [number, number][][] }[]) {
-    const between = cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
-    const toWeed = cut.flatMap((p) => p.weed.map(() => [0, 0, 0, 0] as [number, number, number, number]));
-    return [...between, ...toWeed];
-  }
-
-  // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
-  // calls transformCallback(handler) to get a numeric id (stored in callbacksById),
-  // then invoke("plugin:event|listen", {event, handler: id}) associates that id with
-  // an event name (eventNameToIds). Emitting calls the stored callback directly, like
-  // the real event bridge thread does via window["_" + id](payload).
-  const callbacksById = new Map<number, (e: unknown) => void>();
-  const eventNameToIds = new Map<string, number[]>();
-  let nextCallbackId = 1;
-
-  // Mirrors Reporter::emit: the event carries the status that held when it was sent, so
-  // a listener renders from what it received rather than polling for a newer value.
-  function emit(kind: unknown) {
-    const ev: DeviceEvent = { job_id: jobId ?? 0, kind, status };
-    for (const id of eventNameToIds.get("device-event") ?? []) {
-      callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
-    }
-  }
-
-  // Drives the scripted pass sequence for one pass, then either pauses at
-  // WaitingForColorSwap (more enabled passes remain) or completes the job — matching
-  // execute_cut's documented behavior of blocking until the next pause point.
-  //
-  // The initial Transmitting(0 bytes) StateChanged fires synchronously (matches real
-  // execute_cut, which enters Transmitting immediately) but everything after it is
-  // deferred a tick: in production, event delivery crosses real async Tauri IPC (worker
-  // thread -> event bridge -> window.emit/listen), giving React's setJobId(null)/
-  // jobIdRef sync effect time to commit before any event arrives. This mock's invoke()
-  // used to run every command fully synchronously in the same call stack as the click
-  // handler, so a second cut's events could arrive before React had committed the new
-  // jobId — a mock-fidelity gap, not a production bug. The setTimeout also makes
-  // Transmitting observable to Playwright's polling assertions instead of being
-  // superseded within the same synchronous burst.
-  function runPass(passIndex: number, enabledIndices: number[]) {
-    const total = 100;
-    const sending = (sent: number) =>
-      statusOf("Sending", { cancel: true }, { pass: { index: passIndex, total: enabledIndices.length }, sent: { sent, total } });
-    status = sending(0);
-    emit("StateChanged");
-    const advance = () => {
-      status = sending(total);
-      emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
-      emit({ PassComplete: passIndex });
-
-      const pos = enabledIndices.indexOf(passIndex);
-      const isLast = pos === enabledIndices.length - 1;
-      if (isLast) {
-        // finish_pass emits JobComplete *before* the state becomes Idle, so this event's
-        // status still reads Sending. A frontend that treats the JobComplete kind as
-        // "finished" would show a completed job as still cutting; only the Idle status
-        // below says the job is over.
-        emit("JobComplete");
-        status = COMPLETED;
-        emit("StateChanged");
-        // Production releases the job id once the job is over: all later lifecycle
-        // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
-        // mock keeps stamping finished-job ids on lifecycle events production
-        // would never stamp.
-        jobId = null;
-      } else {
-        const next = enabledIndices[pos + 1];
-        status = statusOf(
-          "AwaitingColorSwap",
-          { cancel: true, resume: true },
-          { pass: { index: next, total: enabledIndices.length } },
-        );
-        emit("StateChanged");
-      }
-    };
-    // Held before the timer: Sending is only on screen for 50ms, and the badge that has to
-    // show it lives on step 1, a navigation away.
-    if (holdPass) heldPass = advance;
-    else setTimeout(advance, 50);
-  }
-
-  Object.assign(commands, {
-    // A copy, as a Rust `Vec<DeviceInfo>` crossing the IPC boundary is. Handing out the live
-    // array let a later mutation here reach into React's own state and repair a list the
-    // frontend had not re-read — a fake that quietly fixes the frontend's bugs for it.
-    //
-    // Slow from the second call on when asked, so the first read (the one that puts a host in
-    // the list at all) does not itself eat the window a test is trying to observe.
-    list_devices: () => {
-      if (opts?.failList) throw ipcError("device_error", "the device list could not be read");
-      const slow = opts?.slowList && listDeviceCalls++ > 0;
-      return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
-    },
-    connect_device: (a) => {
-      const info = a.info as DeviceInfo;
-      // Mirrors `DeviceManager`'s worker: a Connect is refused unless the manager is disconnected
-      // or failed (`crates/driver-core/src/manager.rs`), so aiming at a second *local* cutter means
-      // letting go of the first — while a failed one, which holds nothing, can be aimed away from
-      // directly. A fake that switched outright let tests exercise a sequence production refuses
-      // (Codex on PR #264). A cutter on a Cut Host is not that sequence:
-      // `DeviceManagerHandle::connect` releases the local manager and records the aim, with no
-      // transport of its own to open.
-      const holdsATransport = status.phase !== "Disconnected" && status.phase !== "Failed";
-      if (connected && connected.host === null && info.host === null
-          && connected.instance_id !== info.instance_id && holdsATransport) {
-        throw ipcError("device_busy", "the cutter cannot do that right now");
-      }
-      connected = info;
-      // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
-      // emitting them here (instead of silently mutating the status) is what lets
-      // these tests catch a frontend that filters lifecycle events out.
-      status = CONNECTING;
-      emit("StateChanged");
-      status = IDLE;
-      emit("StateChanged");
-      if (info.host !== null) {
-        // Aiming at a host releases the local manager. That Disconnected is emitted on the
-        // bridge after this command has answered, so it can land after the UI stores the host.
-        // The cell stays the host's status: get_device_state is aimed at the host, and the
-        // event is only the local transport letting go.
-        setTimeout(() => {
-          const ev: DeviceEvent = { job_id: jobId ?? 0, kind: "StateChanged", status: DISCONNECTED };
-          for (const id of eventNameToIds.get("device-event") ?? []) {
-            callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
-          }
-          (window as unknown as { __hostReleaseEmitted?: boolean }).__hostReleaseEmitted = true;
-        }, 0);
-      }
-      return null;
-    },
-    disconnect_device: () => {
-      connected = null;
-      status = DISCONNECTED;
-      emit("StateChanged");
-      return null;
-    },
-    // Keeps the aim, unlike `disconnect_device`: the cutter is still there and still aimed at, it
-    // has simply had its transport re-opened. On a Cut Host this is the host's own verb — this
-    // desktop never opened that transport, so a disconnect here would leave it exactly as stuck.
-    reconnect_device: () => {
-      if (!connected) throw ipcError("device_error", "no device is connected");
-      status = IDLE;
-      emit("StateChanged");
-      return null;
-    },
-    get_device_state: () => {
-      // Counted because the dialog's poll is only observable as a call rate: what has to be
-      // proven is that it stops, and a stopped interval leaves no other trace.
-      deviceStateCalls++;
-      return status;
-    },
-    get_connected_device: () => connected,
-    plan_cut: (a) => {
-      const planned = (window as unknown as { __planCalls?: number }).__planCalls ?? 0;
-      (window as unknown as { __planCalls?: number }).__planCalls = planned + 1;
-      // A planner that refuses is an ordinary outcome — a font that will not resolve, a shape
-      // with no outline — and the dialog has to survive one without lying about what it will
-      // cut next.
-      if (failNextPlan) {
-        failNextPlan = false;
-        throw ipcError("plan_error", "shape #2: no fonts are installed on this system");
-      }
-      // Answered from the document as it is *now*, like the real command, then parked if
-      // the test has armed the hold: which of a replan and an older reorder settles first
-      // is the whole subject of the race test, and a timing race cannot state it.
-      const plan = planFromDoc(a.grouping as Grouping, (a.weed as WeedOptions | null | undefined) ?? null);
-      if (!holding) return plan;
-      return new Promise((resolve, reject) => heldPlans.push(() =>
-        refuseHeldPlans ? reject(ipcError("plan_error", "shape #2: no fonts are installed on this system")) : resolve(plan)));
-    },
-    // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
-    // refusal, the same exact-once identity check over the requested keys, then synthetic
-    // segments (one per adjacent pair of *enabled* passes, x encoding the position in the
-    // order) — the real command does not route the head to a pass that will not be cut.
-    // Received lists are recorded on `window.__travelRequests` so a test can assert what the
-    // dialog asked for; travel itself lands on a canvas Playwright cannot read.
-    travel_for_order: (a) => {
-      const passes = a.passes as { key: string; enabled: boolean }[];
-      const grouping = a.grouping as Grouping;
-      // The page's own hook object, which only this fake and the tests reading it touch. Named
-      // rather than cast inline at each use: `window` genuinely has no type for a property the
-      // test harness invents, and one reason beats two identical assertions.
-      const hooks = window as unknown as { __travelRequests?: typeof passes[] };
-      hooks.__travelRequests ??= [];
-      hooks.__travelRequests.push(passes);
-      const settle = () => {
-        // Decided at settle time, like the real command — a request issued before a replan is
-        // stale even if it settles after one.
-        const plan = planFromDoc(grouping, (a.weed as WeedOptions | null | undefined) ?? null);
-        if (plan.doc_revision !== a.docRevision) {
-          throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-        }
-        // The list must name each planned pass exactly once. Without this the fake accepts
-        // rows from a previous grouping and the suite stays green on a frontend that cannot
-        // work — which is the whole reason the dialog installs a plan atomically.
-        const remaining = plan.passes.map((p) => p.key);
-        for (const pass of passes) {
-          const i = remaining.indexOf(pass.key);
-          if (i === -1) {
-            throw plan.passes.some((p) => p.key === pass.key)
-              ? ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
-              : ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
-          }
-          remaining.splice(i, 1);
-        }
-        if (remaining.length > 0) {
-          throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
-        }
-        const cut = passes.filter((p) => p.enabled).map((p) => plan.passes.find((q) => q.key === p.key)!);
-        return syntheticTravel(cut);
-      };
-      if (!holding) return settle();
-      return new Promise((resolve, reject) => heldTravel.push(() => {
-        try { resolve(settle()); } catch (e) { reject(e); }
-      }));
-    },
-    cut: (a) => {
-      const request = a.request as CutRequest;
-      if (!connected) throw ipcError("not_connected", "no device connected");
-      if (connected.instance_id !== request.device_instance_id) {
-        throw ipcError("device_mismatch", "connected device changed since planning");
-      }
-      // Refused before the revision, machine and pass-key checks below, mirroring `prepare_cut`,
-      // which resolves an enabled pass's preset before it parses the revision or plans. Named is
-      // spelled out rather than tested for truth, in both directions: an empty id names a preset
-      // and must be refused, while an omitted field is the `None` serde reads and must not be —
-      // a fake that diverges either way is a green test for a cut the backend does not make.
-      const available = effectivePresets(connected.machine_id);
-      for (const pass of request.passes) {
-        const named = pass.preset_id;
-        if (pass.enabled && named !== null && named !== undefined
-          && !available.some((p) => p.id === named)) {
-          throw ipcError("unknown_preset",
-            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
-        }
-      }
-      const plan = planFromDoc(request.grouping, request.weed ?? null);
-      if (plan.doc_revision !== request.doc_revision) {
-        throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-      }
-      if (doc.machine && doc.machine.id !== connected.machine_id) {
-        throw ipcError("machine_mismatch", "document is set up for a different machine");
-      }
-      // A key this plan does not have is refused here too, so rows from a previous grouping
-      // cannot cut the wrong shapes just because the fake was more forgiving than Rust.
-      for (const pass of request.passes) {
-        if (!plan.passes.some((p) => p.key === pass.key)) {
-          throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
-        }
-      }
-      planPasses = request.passes;
-      jobId = nextJobId++;
-      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
-      if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
-      // Recorded once nothing can still refuse the request, so the hook answers the cut that was
-      // accepted rather than the last one attempted.
-      lastCutRequest = request;
-      if (failNextCut) {
-        // The opening write dies: Sending and then Failed both go out in this same
-        // synchronous burst, so the only status the frontend ever commits is the failed
-        // one — the mid-flight status it faulted from never reaches a render.
-        failNextCut = false;
-        const id = jobId;
-        status = statusOf("Sending", { cancel: true }, { pass: { index: enabledIndices[0], total: enabledIndices.length }, sent: { sent: 0, total: 100 } });
-        emit("StateChanged");
-        emit({ Failed: "Timeout" });
-        status = statusOf("Failed", {}, { error: "Timeout" });
-        emit("StateChanged");
-        jobId = null;
-        return { job_id: id, duplicate: false };
-      }
-      runPass(enabledIndices[0], enabledIndices);
-      // `duplicate` is the Cut Host's own answer — it is the only party that knows whether it had
-      // already accepted this dispatch id. This fake stands in for a local cutter, which has no
-      // dedupe to be caught by, so it is always false here.
-      return { job_id: jobId, duplicate: false };
-    },
-    cancel_cut: () => {
-      // Mirrors driver-core::manager: cancel is unconditional and lands on the
-      // Cancelled resting state — nothing is happening, so the phase is Idle, but
-      // `ended` names the cancel. Cut is legal again only because this fake stands in
-      // for a pollable cutter whose stop was confirmed; a Puma's never is, and
-      // status.rs's Cancelled arm then withholds `actions.cut`.
-      const sent = status.sent?.sent ?? 0;
-      const pass = status.pass;
-      // CancelRequested then Stopping — two distinct internal states that both report
-      // phase Cancelling with *no* actions at all. The dialog has to survive losing
-      // every button for a moment, so the mock must not skip them.
-      status = statusOf("Cancelling");
-      emit("StateChanged");
-      status = statusOf("Cancelling");
-      emit("StateChanged");
-      // The worker only rests on Cancelled once it has woken and stopped, so the
-      // resting state lands a tick later, as it does in production.
-      setTimeout(() => {
-        status = statusOf("Idle", { cut: true }, { ended: "Cancelled", pass, sent: { sent, total: sent } });
-        emit("StateChanged");
-        jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
-      }, 50);
-      return null;
-    },
-    resume_cut: () => {
-      // Production's own refusal, verbatim: the worker answers a `Resume` outside
-      // `WaitingForColorSwap` with `DeviceError::Busy`, which the desktop reports as
-      // `device_busy` (#73). It used to read `device_error` with an invented message.
-      if (status.phase !== "AwaitingColorSwap") throw ipcError("device_busy", "the cutter cannot do that right now");
-      const nextIndex = status.pass?.index ?? 0;
-      if (failNextResume) {
-        // Async failure, as in production: resume_cut returns Ok and the failure
-        // arrives via the event stream (Failed carries the job's id, then the
-        // device rests in Error). Job over — id released so later lifecycle
-        // events go out as NO_JOB=0.
-        failNextResume = false;
-        setTimeout(() => {
-          emit({ Failed: "Timeout" });
-          status = statusOf("Failed", {}, { error: "Timeout" });
-          emit("StateChanged");
-          jobId = null;
-        }, 50);
-        return null;
-      }
-      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
-      runPass(nextIndex, enabledIndices);
-      return null;
-    },
-    // Test hook (no production counterpart): arms a one-shot failure for the next
-    // resume_cut so tests can drive the failed-job → reconnect recovery path.
-    __test_fail_next_resume: () => {
-      failNextResume = true;
-      return null;
-    },
-    // Same, for a fault during the first pass of the next cut.
-    __test_fail_next_plan: () => {
-      failNextPlan = true;
-      return {};
-    },
-    __test_fail_next_cut: () => {
-      failNextCut = true;
-      return null;
-    },
-    // Test hook (no production counterpart): how many times the dialog has asked for a status.
-    __test_poll_count: () => deviceStateCalls,
-    confirm_pass_done: () => {
-      status = COMPLETED;
-      emit("StateChanged");
-      return null;
-    },
-    // Mirrors `desktop::device::list_presets`: this machine's builtins, minus any the operator's
-    // own entries shadow by pair, plus those entries. The cut handler resolves against this same
-    // list so a preset the dialog just saved can be cut.
-    list_presets: (a) => {
-      // Test hook: a read that fails *after* a write that did not is the interleaving the write and
-      // the refresh are held apart for.
-      if (failNextPresetList) {
-        failNextPresetList = false;
-        // Production's own words and code: `cutplan::presets::PresetError::Unreadable` through
-        // `From<PresetError> for IpcError`. Invented prose here (it used to throw
-        // `Corrupt("the presets file could not be read")`) meant the two assertions on this
-        // banner matched a string production never sends (#278).
-        throw ipcError("presets_unreadable",
-          "the presets file could not be read (Permission denied (os error 13))");
-      }
-      const list = effectivePresets(a.machineId as string);
-      if (!holdingPresets) return list;
-      // Executor form, like the parked plan and travel replies above: the UI's `lib` is older than
-      // `Promise.withResolvers`, and widening it for a fake is the wrong end of the trade.
-      return new Promise<MaterialPreset[]>((resolve) => heldPresets.push(() => resolve(list)));
-    },
-    // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
-    // to answer something; the casing and the numbers are pinned on the Rust side.
-    settings_ranges: () => {
-      const ranges = {
-        speed: { min: 1, max: 30 },
-        force: { min: 1, max: 33 },
-        repeatCount: { min: 1, max: 10 },
-        weed: WEED_RANGES,
-        weedDefaults: { margin_mm: 3, lines: "None", spacing_mm: 25, clearance_mm: 1.5 },
-      };
-      if (rangesFail) throw ipcError("io", "settings ranges could not be read");
-      if (holdingRanges) return new Promise((resolve) => heldRanges.push(() => resolve(ranges)));
-      return ranges;
-    },
-    // Every refusal `desktop::device::save_preset` makes, because the editor is what must never
-    // send one: an entry under a builtin's pair shadows a shipped material with no way back, an
-    // id-less entry is dropped on load (a save the operator never gets back), and a setting out of
-    // range is refused at cut time instead. A fake more forgiving than Rust would let the editor
-    // ship any of those green.
-    save_preset: (a) => {
-      const p = a.p as MaterialPreset;
-      // In the backend's order: what the entry *is* before what it holds, so a test cannot pass
-      // against a precedence production does not use (CodeRabbit on PR #264).
-      if (p.id === "" || p.machine_id === "") {
-        throw ipcError("invalid_preset", "a material preset needs an id and the machine it is for");
-      }
-      if (BUILTIN_PRESETS.some((b) => b.machine_id === p.machine_id && b.id === p.id)) {
-        throw ipcError("builtin_preset",
-          `\`${p.id}\` is a material preset that ships with the app; save your own under a different id`);
-      }
-      if (p.name.trim() === "") {
-        throw ipcError("invalid_preset", "a material preset needs a name");
-      }
-      const range = { speed: [1, 30], force: [1, 33], repeat_count: [1, 10] } as const;
-      for (const field of ["speed", "force", "repeat_count"] as const) {
-        const v = p.settings[field];
-        if (v !== null && (v < range[field][0] || v > range[field][1])) {
-          throw ipcError("invalid_preset", `${field} must be ${range[field][0]}..=${range[field][1]}`);
-        }
-      }
-      // Last, because the file is the last thing production touches: every refusal above is
-      // decided without writing, so none of them may lose the race to a disk fault
-      // (`what_a_preset_is_refuses_it_before_the_file_is_touched`). Production's own words and
-      // code, as on the read side above.
-      if (failNextPresetSave) {
-        failNextPresetSave = false;
-        throw ipcError("presets_unwritable",
-          "the presets file could not be written (Permission denied (os error 13))");
-      }
-      userPresets = [
-        ...userPresets.filter((u) => !(u.machine_id === p.machine_id && u.id === p.id)),
-        { ...p, builtin: false },
-      ];
-      return null;
-    },
-    // Named rather than silent when it removed nothing, as Rust is: a delete that reports success
-    // having deleted nothing is how the editor would come to show a preset that is still there.
-    delete_preset: (a) => {
-      const machineId = a.machineId as string;
-      const id = a.id as string;
-      const before = userPresets.length;
-      userPresets = userPresets.filter((u) => !(u.machine_id === machineId && u.id === id));
-      if (userPresets.length === before) {
-        if (BUILTIN_PRESETS.some((b) => b.machine_id === machineId && b.id === id)) {
-          throw ipcError("builtin_preset", `\`${id}\` ships with the app, so there is nothing of yours to delete`);
-        }
-        throw ipcError("unknown_preset", `no material preset \`${id}\` is saved for \`${machineId}\``);
-      }
-      return null;
-    },
-    // Test hook (no production counterpart): arms a one-shot failure for the next preset write, so
-    // a test can prove a refused save keeps the operator's edit on screen.
-    __test_fail_next_preset_save: () => {
-      failNextPresetSave = true;
-      return null;
-    },
-    __test_fail_next_preset_list: () => {
-      failNextPresetList = true;
-      return null;
-    },
-    // Test hook (no production counterpart): the request the last accepted cut arrived with, so a
-    // test can state which preset id the dialog sent rather than which one it displayed.
-    __test_last_cut_request: () => lastCutRequest,
-    // Test hooks (no production counterpart): park every `list_presets` reply from here, then let
-    // them all land — the only way to state that a list read for one cutter arrives after the
-    // operator has aimed at another.
-    __test_hold_presets: () => {
-      holdingPresets = true;
-      return null;
-    },
-    // Releasing ends the window as well as draining it: a test that carries on aiming at cutters
-    // afterwards wants their lists answered, not parked behind a switch nobody turned off.
-    __test_release_presets: () => {
-      holdingPresets = false;
-      return release(heldPresets);
-    },
-    // Deliberately one constant, not a per-machine table: that mapping is pinned in
-    // Rust by each Driver's own caps test, and restating it here would recreate the
-    // copy this change removed — in a file nobody thinks of as production code.
-    machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
-    // Empty unless a test asks for a host, so existing assertions (device list, connect flow)
-    // are unaffected.
-    list_hosts: () => {
-      const hooks = window as unknown as { __hostListCalls?: number };
-      hooks.__hostListCalls = (hooks.__hostListCalls ?? 0) + 1;
-      return hosts;
-    },
-    // Sends no token, so it answers whatever the address is — mirroring a TLS handshake that
-    // has vouched for nothing yet.
-    probe_host: () => HOST_FINGERPRINT,
-    // Whether this address is already paired, asked between the probe and the confirm. Mirrors
-    // `DeviceManagerHandle::existing_pairing`: matched on the address as typed.
-    existing_pairing: (a) => {
-      const already = hosts.find((h) => h.address === a.address);
-      if (!already) return null;
-      return { id: already.id, name: already.name, sameFingerprint: a.fingerprint === HOST_FINGERPRINT };
-    },
-    // Refuses the token rather than the address: a host that answers but does not accept this
-    // token is the failure the pairing flow exists to catch before anything is saved.
-    test_host: (a) => {
-      if (a.fingerprint !== HOST_FINGERPRINT) throw ipcError("host_unreachable", "the host's fingerprint changed");
-      if (a.token !== HOST_TOKEN) throw ipcError("host_unreachable", "the token was refused");
-      return [PAIRED_CUTTER];
-    },
-    pair_host: (a) => {
-      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null };
-      hosts.push(host);
-      // The cutter is only in `list_devices` once the host is paired, which is what the dialog
-      // re-reads for: the Test listed it to prove the token, not to populate the device list.
-      devices.push(PAIRED_CUTTER);
-      return host;
-    },
-    // Mirrors `DeviceManagerHandle::forget`: a host that cannot be asked whether it is cutting
-    // refuses like one that answered "busy" — the Pi keeps cutting when the network drops, and
-    // the desktop must keep the row rather than discard the token for a Job it could no longer
-    // cancel. Distinct code, because only this one can be forced past.
-    forget_host: (a) => {
-      if (!a.force && hosts.some((h) => h.id === a.id && h.unreachable !== null))
-        throw ipcError(
-          "host_unconfirmed",
-          "this Cut Host could not be asked whether it is cutting (timed out); if it is, forgetting it discards the only way to stop it",
-        );
-      hosts = hosts.filter((h) => h.id !== a.id);
-      // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
-      // pairing that was just discarded, so it cannot still be reporting what is attached to it.
-      for (let i = devices.length - 1; i >= 0; i--) if (devices[i].host === a.id) devices.splice(i, 1);
-      return null;
-    },
-    // The picker now lives in Rust so the backend, not the caller, decides what is readable.
-    pick_image: () => "/tmp/fake.png",
-    // Persisted in sessionStorage so a reload keeps it: addInitScript rebuilds this closure,
-    // and localStorage is the boot cache of the resolved theme, not the preference.
-    get_preferences: () => {
-      const read = () => {
-        const raw = sessionStorage.getItem("cuthulhu.preferences");
-        // A saved millimetre, not the locale default. The suite's cursor readout is millimetres.
-        // `unsetUnits` is the first-run file: null until something saves a unit.
-        if (!raw) return { appearance: "system", units: opts?.unsetUnits ? null : "mm" };
-        const parsed = JSON.parse(raw) as { appearance?: string; units?: string };
-        const saved = parsed.units === "in" || parsed.units === "mm" ? parsed.units : null;
-        const units = saved ?? (opts?.unsetUnits ? null : "mm");
-        return { appearance: parsed.appearance ?? "system", units };
-      };
-      if (opts?.holdPreferences) {
-        // Theme and units both read preferences on mount. One resolver would release only the
-        // later call, and the theme would stay on the boot script's class.
-        return new Promise((resolve) => {
-          const w = window as unknown as { __prefWaiters?: Array<() => void>; __releasePreferences?: () => void };
-          w.__prefWaiters = w.__prefWaiters ?? [];
-          w.__prefWaiters.push(() => resolve(read()));
-          w.__releasePreferences = () => {
-            const waiters = w.__prefWaiters ?? [];
-            w.__prefWaiters = [];
-            for (const release of waiters) release();
-          };
-        });
-      }
-      return read();
-    },
-    set_preferences: (a) => {
-      const write = () => {
-        const raw = sessionStorage.getItem("cuthulhu.preferences");
-        const parsed = raw ? (JSON.parse(raw) as { appearance?: string; units?: string }) : {};
-        const appearance = a.appearance == null ? (parsed.appearance ?? "system") : a.appearance;
-        const units = a.units == null ? (parsed.units === "in" || parsed.units === "mm" ? parsed.units : "mm") : a.units;
-        if (appearance !== "light" && appearance !== "dark" && appearance !== "system") {
-          throw new Error("appearance is not light, dark, or system");
-        }
-        if (units !== "in" && units !== "mm") throw new Error("units are not in or mm");
-        const prefs = { appearance, units };
-        sessionStorage.setItem("cuthulhu.preferences", JSON.stringify(prefs));
-        return prefs;
-      };
-      // The first unit write is the region default. Held, a click can land while it is in flight.
-      if (opts?.holdFirstUnitSave && a.units != null && !(window as unknown as { __heldUnitSave?: boolean }).__heldUnitSave) {
-        (window as unknown as { __heldUnitSave?: boolean }).__heldUnitSave = true;
-        return new Promise((resolve) => {
-          (window as unknown as { __releaseUnitSave?: () => void }).__releaseUnitSave = () => resolve(write());
-        });
-      }
-      return write();
-    },
-  } as Record<string, (args: Record<string, unknown>) => unknown>);
-
-  (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-    invoke: (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
-        return Promise.resolve("/mock/cuthulhu-project.cut");
-      }
-      if (cmd === "plugin:event|listen") {
-        const id = args.handler as number;
-        const event = args.event as string;
-        const ids = eventNameToIds.get(event) ?? [];
-        ids.push(id);
-        eventNameToIds.set(event, ids);
-        return Promise.resolve(id);
-      }
-      if (cmd === "plugin:event|unlisten") {
-        for (const ids of eventNameToIds.values()) {
-          const i = ids.indexOf(args.eventId as number);
-          if (i >= 0) ids.splice(i, 1);
-        }
-        return Promise.resolve(null);
-      }
-      // The wiring gate (#85): a command name or payload key the Rust side does not declare is
-      // refused here, rather than reaching an operator as an invalid-args error from a real
-      // backend. A missing inventory is this file's own setup failing, not a call to wave through.
-      // Installed by the beforeEach below, so nothing in the page's own types knows about it.
-      const injected = window as unknown as { __IPC_INVENTORY__?: Record<string, string[]> };
-      const inventory = injected.__IPC_INVENTORY__;
-      // Refusals are recorded as well as rejected. What the frontend does with a rejection is its
-      // own business — a dialog names it, a poll swallows it — and the afterEach below is what
-      // makes a mis-wired call fail the test that made it, saying which command and which key
-      // rather than leaving a missing element to be explained.
-      //
-      // In sessionStorage rather than on `window`, because a reload or a navigation gives the page
-      // a fresh `window` and a refusal from before it still has to fail the test. The key is
-      // spelled out at each use: this function is serialized into the page, so it can share no
-      // constant with the hooks that read it.
-      const refuse = (message: string) => {
-        const stored: unknown = JSON.parse(sessionStorage.getItem("__ipc_violations__") ?? "[]");
-        const seen = Array.isArray(stored) ? stored : [];
-        sessionStorage.setItem("__ipc_violations__", JSON.stringify([...seen, message]));
-        return Promise.reject(new Error(message));
-      };
-      if (!inventory) return refuse("ipc inventory was not installed");
-      // `__test_` names are this fake's own hooks, invoked over this channel because it is the only
-      // channel a test has. They have no Rust counterpart by design.
-      if (!cmd.startsWith("__test_")) {
-        // `inventory` carries no prototype (see the beforeEach), so a command named `toString` or
-        // `constructor` is absent rather than an inherited function that passes for declared.
-        const declared = inventory[cmd];
-        if (!declared) return refuse(`unregistered command: ${cmd}`);
-        const undeclared = Object.keys(args).filter((k) => !declared.includes(k));
-        if (undeclared.length > 0) return refuse(`undeclared argument for ${cmd}: ${undeclared.join(", ")}`);
-      }
-      const fn = commands[cmd];
-      if (!fn) return Promise.reject(new Error(`unmocked command: ${cmd}`));
-      try {
-        return Promise.resolve(fn(args));
-      } catch (e) {
-        return Promise.reject(e instanceof Error ? e.message : e);
-      }
-    },
-    transformCallback: (callback: (e: unknown) => void) => {
-      const id = nextCallbackId++;
-      callbacksById.set(id, callback);
-      return id;
-    },
-  };
-  // @tauri-apps/api/event's unlisten() path touches this directly; stub it so a
-  // listener cleanup (e.g. on unmount) doesn't throw.
-  (window as unknown as { __TAURI_EVENT_PLUGIN_INTERNALS__: unknown }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
-    unregisterListener: () => {},
-  };
 }
 
 // The inventory travels in its own init script because `addInitScript` passes one argument and
@@ -1632,10 +198,17 @@ test("a command or key the registered commands do not declare is refused", async
   await page.evaluate(() => sessionStorage.removeItem("__ipc_violations__"));
 });
 
+test("the demo state menu is absent unless the dev flag is set", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Rectangle", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Demo state/ })).toHaveCount(0);
+});
+
 test("new doc → add rect → save → reload keeps the rect", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
   await page.mouse.click(400, 300);
   await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
@@ -1669,13 +242,44 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // Start cut closes the sheet. The job stays, including across a reopen (C2).
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await expect(swap.getByText("Load #00ff00, then press Resume")).toBeVisible();
+  // §5.2 keeps Send as the one primary. The status-bar chip is still there while the bar is open.
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).not.toContainText("then press Resume");
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(swap).toBeVisible();
 
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("a disabled middle pass names the next vinyl the machine will cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedThreeVinyl: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Enabled" }).nth(1).uncheck();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText("#00ff00")).toHaveCount(0);
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
 });
 
 // The operator-facing half of #148: the picker, the replan it triggers, and a row named for
@@ -1764,7 +368,7 @@ test("a weed border and lines replan into the preview, and the cut carries the o
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 5 travel moves, 4 weed paths");
 
   await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   const request = await callFake(page, "__test_last_cut_request") as { weed: unknown };
   expect(request.weed).toEqual({ margin_mm: 3, lines: "Horizontal", spacing_mm: 5, clearance_mm: 1.5 });
 });
@@ -2247,6 +851,14 @@ const callFake = (page: Page, cmd: string) =>
     return internals.__TAURI_INTERNALS__.invoke(name);
   }, cmd);
 
+const callFakeWith = (page: Page, cmd: string, args: Record<string, unknown>) =>
+  page.evaluate(({ name, payload }) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke(name, payload);
+  }, { name: cmd, payload: args });
+
 /** Opens the Cut dialog on the local Cameo, which is the machine the presets below belong to. */
 const openDialogOnCameo = async (page: Page) => {
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
@@ -2274,7 +886,7 @@ test("a preset created in the cut dialog is offered to a pass and cut by its id"
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
   await page.getByLabel("Preset for pass 1").selectOption("preset:thick-card");
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Which pass carries it, not merely that some pass does: the dialog attaching the preset to the
   // wrong row is the regression this is here for, and the untouched row must still name none.
@@ -3070,7 +1682,7 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
   await goToSendStep(page, 2);
   await fillSendLevels(page);
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 });
 
 test("reordering passes asks the backend for travel in the new order", async ({ page }) => {
@@ -3412,7 +2024,7 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   await expect(page.getByText("Unknown")).toHaveCount(3);
   // Nothing has been refused yet, so the warning is nowhere — including over the two local
   // cutters, whose section has no host id at all for a refusal to match (#265).
-  const forceWarning = page.getByText(/A cut may still be running on this Cut Host/);
+  const forceWarning = page.getByText(/Forgetting this Cut Host discards the credentials/);
   await expect(forceWarning).toHaveCount(0);
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
@@ -3428,6 +2040,31 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   // A Pi that is gone for good must not become unforgettable — the row and its cutter both go.
   await expect(page.getByRole("button", { name: /^Forget/ })).toHaveCount(0);
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
+});
+
+// The sentence is the Rust side's, shown in the slot a connection error already uses. Both
+// directions: the host is the side to update, and this desktop is. The cutters stay listed and
+// not choosable, the same as any other host that cannot be asked.
+test("a protocol mismatch says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  // Not `{ exact: true }`: the sentence and the "How to update" link share this
+  // element, so the element's text is longer than the sentence.
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  // The chip and the sentence name the same fact. A timed-out host stays "Unknown".
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
 });
 
 // The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for
@@ -3467,7 +2104,7 @@ test("a desktop with no Cut Host paired shows no force-forget warning", async ({
   // The local cutters are listed — the dialog is populated, so the warning's absence is about the
   // guard rather than about an empty device section.
   await expect(page.getByTestId("device-badge")).toHaveCount(2);
-  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toHaveCount(0);
+  await expect(page.getByText(/Forgetting this Cut Host discards the credentials/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /anyway$/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^Keep / })).toHaveCount(0);
 });
@@ -3479,7 +2116,13 @@ test("pairing a Cut Host shows its fingerprint first, then lists it with its cut
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  const addHost = page.getByRole("button", { name: /Add a Cut Host/ });
+  await addHost.click();
+  const pair = page.getByRole("dialog", { name: "Pair a Cut Host" });
+  await pair.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(pair).toHaveCount(0);
+  await expect(addHost).toBeFocused();
+  await addHost.click();
 
   await page.getByLabel("Address").fill("pi.local:7878");
   await page.getByLabel("Token").fill("correct-horse");
@@ -3577,10 +2220,18 @@ const pollCount = (page: import("@playwright/test").Page) => () =>
       ) as Promise<number>,
   );
 
+const listCount = (page: import("@playwright/test").Page) => () =>
+  page.evaluate(
+    () =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "__test_list_count",
+      ) as Promise<number>,
+  );
+
 test("the dialog polls while it is open, and stops once it is closed", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   const opened = await polls();
@@ -3588,7 +2239,8 @@ test("the dialog polls while it is open, and stops once it is closed", async ({ 
 
   await page.getByRole("button", { name: "Close" }).click();
   // A tick already in flight when the dialog closed still lands, so settle past one full period
-  // before taking the reading that must not move.
+  // before taking the reading that must not move. Idle is ten seconds, and closing does not
+  // start a tick of its own, so this window stays still.
   await page.waitForTimeout(1500);
   const closed = await polls();
   await page.waitForTimeout(2500);
@@ -3625,16 +2277,185 @@ test("a desktop with no Cut Host paired does not poll at all", async ({ page }) 
 test("a tick whose last request is still in flight is skipped, not queued", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true, slowList: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const opened = await polls();
   await page.waitForTimeout(4500);
   // Four ticks have fired; at three seconds an answer, at most two of them can have started
   // requests. Without the skip the count tracks the tick rate instead, and every extra request
-  // is one more thing the host owes an answer to.
-  const seen = await polls();
+  // is one more thing the host owes an answer to. The mount read is already in `opened`.
+  const seen = (await polls()) - opened;
   expect(seen).toBeGreaterThanOrEqual(1);
   expect(seen).toBeLessThanOrEqual(2);
+});
+
+function devicesShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.DEVICES_SHOTS === "1";
+}
+
+/** Retry and Forget stay on the title row. The line under them uses the card. */
+async function hostCopySpansTheCard(page: Page, heading: string, copy: Locator) {
+  const card = page.locator("section").filter({ has: page.getByRole("heading", { name: heading, exact: true }) });
+  const cardBox = await card.boundingBox();
+  const copyBox = await copy.boundingBox();
+  const button = card.getByRole("button", { name: /^Forget / });
+  const buttonBox = await button.boundingBox();
+  expect(cardBox).not.toBeNull();
+  expect(copyBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  expect(copyBox!.width).toBeGreaterThan(cardBox!.width * 0.75);
+  expect(copyBox!.y).toBeGreaterThanOrEqual(buttonBox!.y + buttonBox!.height - 1);
+  expect(buttonBox!.x + buttonBox!.width).toBeGreaterThan(cardBox!.x + cardBox!.width - 28);
+  const titleBox = await card.getByRole("heading", { name: heading, exact: true }).boundingBox();
+  expect(titleBox).not.toBeNull();
+  const sharesRow = buttonBox!.y < titleBox!.y + titleBox!.height && titleBox!.y < buttonBox!.y + buttonBox!.height;
+  // A title beside the buttons stays one line. One that cannot fit takes the row.
+  if (sharesRow) expect(titleBox!.height).toBeLessThan(28);
+  else expect(titleBox!.width).toBeGreaterThan(cardBox!.width * 0.7);
+}
+
+test("two cutters on one host keep their own status, and cancel names that cutter", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const cameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  const puma = page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" });
+  await expect(cameo.getByText("Cutting", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toHaveCount(0);
+  await expect(cameo.getByText("40% of this pass")).toBeVisible();
+  await expect(page.getByText("Add to queue")).toHaveCount(0);
+  await expect(page.getByText("Up next")).toHaveCount(0);
+
+  await cameo.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_cancel_targets"),
+  )).toEqual([{ host: "host-4", instanceId: "usb:garage:cameo" }]);
+  await expect(cameo.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(cameo.getByText("Last cut cancelled")).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Last cut cancelled")).toHaveCount(0);
+  await expect(puma.getByRole("button", { name: /Reconnect/ })).toHaveCount(0);
+  await expect(page.getByRole("listitem").filter({ hasText: "USB on this computer" }).getByText("Not checked").first()).toBeVisible();
+  await expect(page.getByTestId("devices-panel").getByText("Unknown", { exact: true })).toHaveCount(0);
+  for (const list of await page.getByTestId("devices-panel").getByRole("list").all()) {
+    expect(await list.evaluate((el) => getComputedStyle(el).listStyleType)).toBe("none");
+  }
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+});
+
+test("an offline host keeps the cut frozen, then shows the reading from after it reconnects", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: "the host could not be reached (timed out)" });
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toBeVisible();
+  // After the card is up, the next reading is the one that will not stamp over this.
+  await callFakeWith(page, "__test_set_last_seen", { id: "host-4", at: Date.now() - 2 * 60 * 60 * 1000 });
+  await expect(page.getByText("Last seen 2 hours ago · garage.local:7878")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await expect(page.getByText(/Connection lost · last update/)).toHaveCount(0);
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+  // This desktop is not tracking the seeded cut, so Cancel is not a queue.
+  const offlineCameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toHaveCount(0);
+  await expect(offlineCameo.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+  await expect(page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" }).getByText("Unavailable")).toBeVisible();
+
+  const body = page.getByRole("heading", { name: "Can't reach Garage Pi" });
+  const muted = page.getByTestId("devices-muted");
+  const warning = page.getByTestId("devices-warning");
+  const lightBody = await paintContrast(page, body);
+  const lightMuted = await paintContrast(page, muted);
+  const lightWarning = await paintContrast(page, warning);
+  expect(lightBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-light.png" });
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const darkBody = await paintContrast(page, body);
+  const darkMuted = await paintContrast(page, muted);
+  const darkWarning = await paintContrast(page, warning);
+  expect(darkBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-dark.png" });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+
+  await callFakeWith(page, "__test_set_remote_sent", { host: "host-4", instanceId: "usb:garage:cameo", sent: 90 });
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: null });
+  await expect(page.getByText("90% of this pass")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toHaveCount(0);
+});
+
+test("a protocol mismatch on the devices host card says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  await expect(page.getByRole("heading", { name: "Workshop Pi needs an update" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Update Cuthulhu to use Office Pi" })).toBeVisible();
+  await expect(page.getByText("Can't reach", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("No successful reading yet")).toHaveCount(0);
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByText("Update needed")).toHaveCount(2);
+  const workshop = page.getByRole("listitem").filter({ hasText: "Workshop Pi" });
+  const office = page.getByRole("listitem").filter({ hasText: "Office Pi" });
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Workshop Pi needs an update");
+  await expect(office.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(office.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Update Cuthulhu to use Office Pi");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
+  await page.getByRole("button", { name: "Add cutter" }).focus();
+  await expect(page.getByRole("button", { name: "Add cutter" })).toBeFocused();
+  await expect.poll(() => page.getByRole("button", { name: "Add cutter" }).evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+  const active = page.getByRole("button", { name: "Set as active" }).first();
+  await active.focus();
+  await expect(active).toBeFocused();
+  await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+  await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+    await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-dark.png" });
+  }
 });
 
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
@@ -3646,10 +2467,11 @@ test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page })
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Cancel job", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
   await expectStartOffered(page);
 });
 
@@ -3662,12 +2484,12 @@ test("a cut that runs to the end reports completion, not a cancellation", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
 
   // The backend says which ending it was, so the two endings cannot be confused: this
   // is the case the mock could not express while a finished cut only rested on `Idle`.
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
   await expectStartOffered(page);
 });
@@ -3684,9 +2506,10 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   // pass has already parked for a colour swap, whose badge asks for a person.
   await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
   await startCut(page);
-  await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
-  await goToSendStep(page, 1);
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
   // has polled. `deviceBadge`'s unit tests assert on `tone` alone; this is what makes them
@@ -3695,6 +2518,32 @@ test("transmitting shows a Cancel button and progress so the GUI can cancel mid-
   await expect(page.getByTestId("device-badge").first()).toHaveAttribute("data-tone", "busy");
   await expect(page.getByTestId("device-badge").first()).toHaveText("Cutting");
   await expect(page.getByTestId("device-badge").nth(1)).toHaveAttribute("data-tone", "unknown");
+});
+
+test("a second cut replaces a finished job before its Sending event", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
+
+  await page.evaluate(() => (window as unknown as { __holdCutEvents: () => void }).__holdCutEvents());
+  await startCut(page);
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
+  // The host poll is 1s, and the first read is still the previous ending.
+  await page.waitForTimeout(1500);
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
+
+  await page.evaluate(() => (window as unknown as { __releaseCutEvents: () => void }).__releaseCutEvents());
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
 });
 
 test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {
@@ -3706,14 +2555,14 @@ test("second cut in the same dialog session also reaches waiting-for-swap", asyn
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
-  // Second cut in the same session: the dialog must take the new job's statuses as
-  // they arrive, with no per-job bookkeeping left over from the finished first cut.
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // Second cut in the same session: the sheet opens on step 1 again, and the new job's
+  // statuses replace the finished one. Nothing is remembered per job id.
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
 });
 
@@ -3758,13 +2607,10 @@ test("a connected cutter offers a disconnect, and choosing it clears the aim", a
   await expect(cut.getByRole("button", { name: /^Disconnect/ })).toHaveCount(0);
 });
 
-// Inverted deliberately. While the dialog latched its own outcome, "did the last cut
-// finish?" was answered by how long the dialog had been mounted, so a reopened dialog
-// had to show nothing — and this test asserted that. The outcome now comes from the
-// device, so a reopened dialog reports what the device actually last did, for the same
-// reason a freshly opened one does. The guard against a *false* completion is
-// "disconnecting mid-pause" below: there the job never ended, and no banner appears.
-test("a reopened dialog reports the ending the device actually last had", async ({ page }) => {
+// The ending lives on the job panel, which is what the device last did. Reopening the
+// sheet must not repeat it and must not clear it. The guard against a false completion
+// is "disconnecting mid-pause" below: there the job never ended, and no banner appears.
+test("a reopened sheet leaves the ending on the job panel", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
@@ -3773,13 +2619,18 @@ test("a reopened dialog reports the ending the device actually last had", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Close" }).click();
+  // The ending stays on the panel. Reopening the sheet must not repeat it, and must not clear it.
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog.getByText("Completed", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Job complete")).toHaveCount(0);
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
 });
 
@@ -3792,14 +2643,15 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Arm a one-shot async resume failure, then resume: the Failed phase must show
-  // "Cut failed" — never "Job complete", which a banner derived from "a job ended
+  // "Cut failed" — never a completion, which a banner derived from "a job ended
   // and the device is Idle" produced for a failed job whose state cache lagged.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 
   // Recover by reconnecting (the other listed device). The connect lifecycle events
@@ -3808,7 +2660,7 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // The first choice aimed the document at the Cameo, so this one asks before switching.
   // The aimed card is not a second connect: the Puma card is the other cutter.
   page.once("dialog", (dialog) => dialog.accept());
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
   await expectStartOffered(page);
 });
@@ -3825,7 +2677,8 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
   await startCut(page);
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
@@ -3842,22 +2695,63 @@ test("a reconnect clears the completed banner from the previous connection", asy
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
   await expectStartOffered(page);
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
 // Losing the device mid-pause abandons the job. The reconnect reports Idle — the same
 // phase a finished cut rests on — so a dialog that remembers "a cut was running" across
 // the disconnect declares a job that never finished complete.
+test("disconnecting a remote cutter mid-pause removes the swap", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"),
+  );
+  await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
+  await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("a cancel queued during an outage is dropped when the cut has already finished", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  await expect(swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  await swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await callFakeWith(page, "__test_set_status", {
+    phase: "Idle",
+    actions: { cut: true },
+    rest: { ended: "Completed" },
+  });
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
+});
+
 test("disconnecting mid-pause does not report the abandoned cut as complete", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -3867,17 +2761,177 @@ test("disconnecting mid-pause does not report the abandoned cut as complete", as
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await startCut(page);
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
-  await goToSendStep(page, 1);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
   await expectStartOffered(page);
   await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("an unreachable host freezes the pass, then shows the real status", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true, seedRemoteIdle: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  await expect(job.getByText(/Connection lost · last update \d+s ago/)).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 90 });
+
+  const ageOf = async () => {
+    const text = await job.getByText(/Connection lost · last update \d+s ago/).innerText();
+    return Number(text.match(/(\d+)s ago/)?.[1] ?? "0");
+  };
+  const before = await ageOf();
+  const started = Date.now();
+  if ((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1") {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-light.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+  const remaining = 5000 - (Date.now() - started);
+  if (remaining > 0) await page.waitForTimeout(remaining);
+
+  expect(await ageOf()).toBeGreaterThanOrEqual(before + 3);
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar")).toHaveAttribute("aria-valuenow", "40");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  await expect(job.getByText("bench.local:7878")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(job.getByTestId("pass-progress")).toHaveText("90% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+});
+
+test("resume is disabled while a colour swap's host is unreachable", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await startCut(page);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  const resume = swap.getByRole("button", { name: "Resume", exact: true });
+  await expect(resume).toBeDisabled();
+  await resume.locator("xpath=..").hover();
+  await expect(page.getByRole("tooltip")).toHaveText("Waiting for the host to reconnect");
+  await swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
+});
+
+function jobShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1";
+}
+
+async function shot(page: Page, name: string) {
+  if (!jobShots()) return;
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+test("the job panel, swap bar, confirm, cancel and failure states", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await shot(page, "panel-mid-pass");
+
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+  await shot(page, "swap-waiting");
+
+  await swap.getByRole("button", { name: "Collapse", exact: true }).click();
+  await expect(swap).toHaveCount(0);
+  const chip = page.getByTestId("swap-chip");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("aria-label", "Show colour swap: Load gold vinyl, then press Resume");
+  await shot(page, "swap-chip");
+  await chip.click();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByText("Gold vinyl")).toBeVisible();
+  await shot(page, "confirm-pass");
+
+  await job.getByRole("button", { name: "Cancel", exact: true }).click();
+  const alert = page.getByRole("alertdialog");
+  await expect(alert.getByRole("heading", { name: "Cancel this cut?" })).toBeVisible();
+  if (jobShots()) {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-light.png" });
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await job.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-dark.png" });
+    await page.getByRole("alertdialog").getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  } else {
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+  }
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "Failed",
+    rest: { error: "Timeout" },
+  });
+  await expect(job.getByText("Cut failed")).toBeVisible();
+  await expect(job.getByText("The cutter did not answer in time.")).toBeVisible();
+  await expect(job.getByRole("button", { name: "Start again", exact: true })).toBeVisible();
+  await shot(page, "failed");
+  await job.getByRole("button", { name: "Start again", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toBeVisible();
 });
 
 test("the send sheet walks machine, passes and preview, and withholds a blank level", async ({ page }) => {
@@ -4030,7 +3084,7 @@ test("the send sheet walks machine, passes and preview, and withholds a blank le
 test("trace dialog: preview appears and insert adds paths", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Trace image" })).toBeVisible();
   await expect(page.getByAltText("Traced preview")).toBeVisible();
   await expect(page.getByText("1 path")).toBeVisible();
@@ -4050,7 +3104,7 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
 test("trace dialog: a control table missing a control reports it instead of hanging", async ({ page }) => {
   await page.addInitScript(installMockTauri, { dropTraceControl: "detail" });
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Trace image" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(/detail/)).toBeVisible();
@@ -4061,7 +3115,7 @@ test("trace dialog: a control table missing a control reports it instead of hang
 test("text dialog: picking a family and Insert adds a shape", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await dialog.getByLabel("Font family").selectOption("Times New Roman");
@@ -4076,7 +3130,7 @@ test("text dialog: picking a family and Insert adds a shape", async ({ page }) =
 test("text dialog: an empty font list says so and disables Insert", async ({ page }) => {
   await page.addInitScript(installMockTauri, { noFonts: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("No fonts were found on this system")).toBeVisible();
@@ -4090,7 +3144,7 @@ test("text dialog: an empty font list says so and disables Insert", async ({ pag
 test("trace dialog: a failed source thumbnail surfaces instead of blanking", async ({ page }) => {
   await page.addInitScript(installMockTauri, { failImagePreview: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Trace image" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(/broken thumbnail/)).toBeVisible();
@@ -4354,6 +3408,65 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await expect.poll(async () => (await readView(page)).scale).toBeCloseTo(Math.min(availW / rollW, availH / rollH), 3);
 });
 
+test("Command-A selects every shape on the mat and leaves the chrome and a focused field alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedAlignExtras: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const rows = page.getByTestId("layer-row");
+  // Two loose rects, a group of two rects, and an empty group.
+  await expect(rows).toHaveCount(6);
+  await rows.first().click();
+  const selectedRows = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  await expect(selectedRows).toHaveCount(1);
+  await expect(page.getByText("10.0 × 10.0 mm")).toBeVisible();
+
+  // The chord belongs to the field. Stealing it would select the other three shapes.
+  await showTab(page, "Properties");
+  const x = page.getByLabel("X", { exact: true });
+  await x.focus();
+  // The platform chord: Ctrl+A on macOS moves the caret, so the field would keep its "0".
+  await page.keyboard.press("ControlOrMeta+A");
+  // Replacing the field's "0" commits x = 4. The other rect stays at the origin, so the
+  // union below is still 0..80 × 0..50.
+  await x.press("4");
+  await expect(x).toHaveValue("4");
+  await showTab(page, "Layers");
+  await expect(selectedRows).toHaveCount(1);
+  // Shift stays free. The one selected shape must not become every shape.
+  await page.keyboard.press("Shift+Meta+A");
+  await expect(selectedRows).toHaveCount(1);
+
+  // Focus stays on the toolbar button, the same way keyboard zoom is reached.
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  // The two grouped rects sit at 50,20 and 70,40, so the box is the whole mat, 0..80 × 0..50.
+  await expect(page.getByText("80.0 × 50.0 mm")).toBeVisible();
+  await expect(selectedRows).toHaveCount(4);
+  const groups = rows.filter({ hasText: "Group" });
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0)).toHaveAttribute("data-selected", "false");
+  await expect(groups.nth(1)).toHaveAttribute("data-selected", "false");
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+
+  await rows.first().click();
+  await expect(selectedRows).toHaveCount(1);
+  await page.keyboard.press("Control+A");
+  await expect(selectedRows).toHaveCount(4);
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
+test("Command-A on an empty mat leaves the chrome unselected", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Control+A");
+  await expect(page.getByText("No selection")).toBeVisible();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Select an object to edit its size and position.")).toBeVisible();
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
 test("keyboard zoom works after a toolbar click and leaves a focused field alone", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -4396,7 +3509,7 @@ test("Space-drag pans after a toolbar click without pressing the button, and so 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   const beforeAdd = await fittedView(page);
-  await page.getByRole("button", { name: "Rectangle" }).click(); // adds one; focus stays on it
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click(); // adds one; focus stays on it
   await showTab(page, "Layers");
   const rows = page.getByTestId("layer-row");
   await expect(rows).toHaveCount(3);
@@ -4887,15 +4000,15 @@ test("align and distribute are disabled when they cannot act", async ({ page }) 
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
   await page.goto("/");
   await showTab(page, "Properties");
-  const alignLeft = page.getByRole("button", { name: "Align left edges" });
-  await showTab(page, "Properties");
-  const distribute = page.getByRole("button", { name: "Distribute horizontal spacing" });
-  await expect(alignLeft).toBeDisabled();
-  await expect(distribute).toBeDisabled();
+  // Nothing selected is the document, not a disabled align row. The buttons come back with a selection.
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Align left edges" })).toHaveCount(0);
 
   // The Group, its own rect and red are two units, since the rect moves with the Group: still too
   // few to distribute.
   await selectRows(page, [0, 1, 2]);
+  const alignLeft = page.getByRole("button", { name: "Align left edges" });
+  const distribute = page.getByRole("button", { name: "Distribute horizontal spacing" });
   // Selecting rows shows Layers, which unmounts these buttons. They follow the selection once
   // Properties is showing again.
   await showTab(page, "Properties");
@@ -5956,6 +5069,10 @@ test("the boot script paints the cached theme before preferences answer", async 
 
 async function paintContrast(page: Page, locator: Locator) {
   const bytes = (await locator.screenshot()) as unknown as Uint8Array;
+  return contrastFromPng(page, bytes);
+}
+
+async function contrastFromPng(page: Page, bytes: Uint8Array) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   const rgba = await page.evaluate(async (png) => {
@@ -6073,6 +5190,24 @@ test("Import names Image, with Opens Trace beside it", async ({ page }) => {
   await expect(item).not.toContainText("Image…");
 });
 
+test("muted and faded button hovers still reach the foreground", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  const idle = page.getByRole("group", { name: "Units" }).locator("button[aria-pressed='false']");
+  await idle.hover();
+  const foreground = await page.evaluate(() => getComputedStyle(document.body).color);
+  await expect.poll(() => idle.evaluate((el) => getComputedStyle(el).color)).toBe(foreground);
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
+  const machine = page.getByRole("dialog", { name: "Send to cutter" }).getByRole("button", { name: "Machine", exact: true });
+  const faded = await machine.evaluate((el) => getComputedStyle(el).color);
+  expect(faded).not.toBe(foreground);
+  await machine.hover();
+  await expect.poll(() => machine.evaluate((el) => getComputedStyle(el).color)).toBe(foreground);
+});
+
 test("the Appearance glyph is a 16px icon", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
@@ -6144,7 +5279,7 @@ test("a history reply from an earlier refresh does not rewind Undo", async ({ pa
     page.evaluate(() => ((window as unknown as { __historyWaiters?: unknown[] }).__historyWaiters ?? []).length);
   // StrictMode runs the mount refresh twice. Both are queued before the edit's.
   await expect.poll(waiters).toBe(2);
-  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
   await page.mouse.click(400, 300);
   await expect.poll(waiters).toBe(3);
 
@@ -6188,4 +5323,581 @@ test("Option+S subtracts when the produced character is not s", async ({ page })
     );
   });
   await expect.poll(() => page.evaluate(() => (window as unknown as { __booleanOp?: string }).__booleanOp)).toBe("Subtract");
+});
+
+type InkBox = { name: string; box: { x: number; y: number; width: number; height: number } };
+
+/** Boxes first, then one full-page shot. A later clip is a different paint: the
+ *  screenshot walk captures the frame the theme click returns on. */
+async function contrastsOnPageShot(
+  page: Page,
+  items: { name: string; locator: Locator; inset?: number }[],
+) {
+  const regions: InkBox[] = [];
+  for (const item of items) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    regions.push({ name: item.name, box: insetBox(box, item.inset ?? 0) });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  return contrastsInPng(page, regions, bytes);
+}
+
+/** The control's own fill, not the bar it sits on. A white pill's box includes
+ *  the dark zoom bar at the edge, and that edge outranks the label. */
+function insetBox(box: InkBox["box"], inset: number): InkBox["box"] {
+  if (inset <= 0) return box;
+  return {
+    x: box.x + inset,
+    y: box.y + inset,
+    width: Math.max(1, box.width - inset * 2),
+    height: Math.max(1, box.height - inset * 2),
+  };
+}
+
+async function readPngRegions(page: Page, regions: InkBox[], bytes: Uint8Array) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return page.evaluate(
+    async (payload: { png: string; regions: InkBox[] }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${payload.png}`;
+      await img.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no canvas");
+      ctx.drawImage(img, 0, 0);
+      const scale = img.naturalWidth / window.innerWidth;
+      return payload.regions.map((region) => {
+        const width = Math.max(1, Math.round(region.box.width * scale));
+        const height = Math.max(1, Math.round(region.box.height * scale));
+        const data = ctx.getImageData(
+          Math.round(region.box.x * scale),
+          Math.round(region.box.y * scale),
+          width,
+          height,
+        ).data;
+        return { name: region.name, rgba: Array.from(data), width, height };
+      });
+    },
+    { png: btoa(binary), regions },
+  );
+}
+
+async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) {
+  const crops = await readPngRegions(page, regions, bytes);
+  return crops.map((crop) => ({ name: crop.name, hit: renderedContrastFromPixels(crop.rgba) }));
+}
+
+const JOB_INK = [
+  { name: "Cancel job", role: "button" as const, min: 4.5 },
+  { name: "Collapse", role: "button" as const, min: 4.5 },
+  { name: "Import", role: "button" as const, min: 4.5 },
+  { name: "File", role: "button" as const, min: 4.5 },
+  { name: "Fit mat", role: "button" as const, min: 4.5 },
+  { name: "Properties", role: "tab" as const, min: 4.5 },
+  { name: "Undo", role: "button" as const, min: 3 },
+];
+
+async function openSwap(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+}
+
+function jobInkLocators(page: Page) {
+  return JOB_INK.map((item) => ({
+    ...item,
+    locator: page.getByRole(item.role, { name: item.name, exact: true }),
+  }));
+}
+
+test("a cold dark boot paints job controls on the full-page shot", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await openSwap(page);
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const samples = await contrastsOnPageShot(page, [
+    ...jobInkLocators(page),
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ]);
+  assertDarkJobInk(samples.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(samples.filter((sample) => sample.name === "Rulers"));
+});
+
+test("a light-to-dark switch paints job controls on the screenshot the walk takes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await openSwap(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  const items = [
+    ...jobInkLocators(page),
+    { name: "Rulers", min: 4.5, locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ];
+  const hit = await flipDarkShot(page, items);
+  assertDarkJobInk(hit.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(hit.filter((sample) => sample.name === "Rulers"));
+});
+
+test("pressed, secondary and send-sheet buttons clear 4.5:1 on the full-page shot", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+
+  await page.emulateMedia({ colorScheme: "light" });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const light = await filledSurfaces(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  // Boxes before the click. Anything awaited after it lets a transition finish,
+  // which is the frame the full-page shot does not get. The sheet covers the
+  // top bar, so the menu is opened from the element rather than the pointer.
+  const confirmHit = await flipDarkShot(page, [
+    { name: "Cancel", locator: light.cancel, inset: 4 },
+    { name: "Rulers", locator: light.rulers, inset: 4 },
+  ]);
+  assertFilledInk(confirmHit);
+});
+
+test("a pressed pill's fill differs from its container in both themes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await assertPressedApart(page, "light");
+
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await assertPressedApart(page, "dark");
+});
+
+test("the send sheet secondary clears 4.5:1 on the theme-flip frame", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const host = await openSendHost(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  assertFilledInk(await flipDarkShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }], "class"));
+});
+
+async function openSendHost(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const host = page.getByRole("dialog", { name: "Send to cutter" }).getByRole("button", { name: "Add a Cut Host…", exact: true });
+  await expect(host).toBeVisible();
+  return host;
+}
+
+async function filledSurfaces(page: Page) {
+  const host = await openSendHost(page);
+  const hostInk = await contrastsOnPageShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }]);
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  const cancel = page.getByRole("region", { name: "Job" }).getByRole("button", { name: "Cancel", exact: true });
+  const rulers = page.getByRole("button", { name: "Rulers", exact: true });
+  await expect(cancel).toBeVisible();
+  const confirmInk = await contrastsOnPageShot(page, [
+    { name: "Cancel", locator: cancel, inset: 4 },
+    { name: "Rulers", locator: rulers, inset: 4 },
+  ]);
+  return { hostInk, confirmInk, cancel, rulers, all: [...hostInk, ...confirmInk] };
+}
+
+async function filledInkShot(page: Page) {
+  const surfaces = await filledSurfaces(page);
+  return surfaces.all;
+}
+
+async function flipDarkShot(
+  page: Page,
+  items: { name: string; locator: Locator; min?: number; inset?: number }[],
+  how: "menu" | "class" = "menu",
+) {
+  const boxed: { name: string; min?: number; box: InkBox["box"] }[] = [];
+  for (const item of items) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    boxed.push({ name: item.name, min: item.min, box: insetBox(box, item.inset ?? 0) });
+  }
+  if (how === "class") {
+    // The sheet is modal, so the top bar is hidden from the tree and the
+    // Appearance click cannot land. The menu's paint is this class change.
+    await page.evaluate(() => {
+      document.documentElement.classList.add("dark");
+      document.documentElement.style.colorScheme = "dark";
+    });
+  } else {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  const crops = await contrastsInPng(page, boxed, bytes);
+  return crops.map((crop, i) => ({ name: crop.name, min: boxed[i].min, hit: crop.hit }));
+}
+
+function assertDarkJobInk(samples: { name: string; min?: number; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    const min = sample.min ?? JOB_INK.find((item) => item.name === sample.name)?.min ?? 4.5;
+    console.log("job ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.background[0], `${sample.name} background`).toBeLessThan(80);
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(min);
+  }
+}
+
+function assertFilledInk(samples: { name: string; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    console.log("filled ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(4.5);
+  }
+}
+
+/** The padding band above the pill, inside the control that holds it. Skipping
+ *  the parent's own 1px border keeps that edge out of the container sample. */
+function containerBand(parent: InkBox["box"], pill: InkBox["box"]): InkBox["box"] {
+  const y = parent.y + 1;
+  return {
+    x: parent.x + 2,
+    y,
+    width: Math.max(1, parent.width - 4),
+    height: Math.max(1, pill.y - y),
+  };
+}
+
+/** The top of the pill, wide enough that a rounded corner is not the sample.
+ *  Two rows cover a 1px border when the box origin rounds onto the row above. */
+function edgeBand(pill: InkBox["box"]): InkBox["box"] {
+  return {
+    x: pill.x + pill.width * 0.25,
+    y: pill.y,
+    width: Math.max(1, pill.width * 0.5),
+    height: 2,
+  };
+}
+
+function rowRgb(rgba: number[], width: number, y: number): Rgb {
+  const start = y * width * 4;
+  return modeRgb(rgba.slice(start, start + width * 4));
+}
+
+async function assertPressedApart(page: Page, theme: "light" | "dark") {
+  const pills = [
+    { name: "mm", locator: page.getByRole("button", { name: "mm", exact: true }) },
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }) },
+    { name: "Layers", locator: page.getByRole("tab", { name: "Layers", exact: true }) },
+  ];
+  const regions: InkBox[] = [];
+  for (const pill of pills) {
+    const box = await pill.locator.boundingBox();
+    const parent = await pill.locator.locator("xpath=..").boundingBox();
+    if (!box || !parent) throw new Error(`no box for ${pill.name}`);
+    regions.push({ name: `${pill.name} fill`, box: insetBox(box, 4) });
+    regions.push({ name: `${pill.name} container`, box: containerBand(parent, box) });
+    regions.push({ name: `${pill.name} edge`, box: edgeBand(box) });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  const crops = await readPngRegions(page, regions, bytes);
+  for (let i = 0; i < pills.length; i++) {
+    const name = pills[i].name;
+    const fillCrop = crops[i * 3];
+    const containerCrop = crops[i * 3 + 1];
+    const edgeCrop = crops[i * 3 + 2];
+    const text = renderedContrastFromPixels(fillCrop.rgba);
+    const fill = modeRgb(fillCrop.rgba);
+    const container = modeRgb(containerCrop.rgba);
+    const edges = Array.from({ length: edgeCrop.height }, (_, y) => rowRgb(edgeCrop.rgba, edgeCrop.width, y));
+    const sep = edges.map((edge) => pillApart(fill, container, edge)).find((hit) => hit.apart) ?? pillApart(fill, container, edges[0]);
+    console.log(
+      theme,
+      name,
+      "text",
+      text.ratio.toFixed(2),
+      text.ink.join(","),
+      "fill",
+      sep.fillRatio.toFixed(2),
+      fill.join(","),
+      "on",
+      container.join(","),
+      "edge",
+      sep.edgeRatio.toFixed(2),
+    );
+    expect(text.ratio, `${theme} ${name} text`).toBeGreaterThanOrEqual(4.5);
+    expect(sep.apart, `${theme} ${name} fill ${sep.fillRatio.toFixed(2)} edge ${sep.edgeRatio.toFixed(2)}`).toBe(true);
+    if (theme === "dark") {
+      expect(Math.min(...fill), `${theme} ${name} stays a white pill`).toBeGreaterThanOrEqual(250);
+    } else {
+      expect(Math.min(...fill), `${theme} ${name} is not a white pill`).toBeLessThan(250);
+    }
+  }
+}
+
+// Emits an event the *backend* sends, once the page is actually listening for it.
+//
+// The wait is on the fake's own registration rather than on an element being visible: `goto`
+// resolves at load, `App` subscribes from a `useEffect`, and an emit that arrives before that has
+// no listener to reach — which is a test that fails for its timing rather than for the sentence it
+// is about. A rendered button is a proxy for the same commit having happened; the registration is
+// the thing itself.
+const emitBackendEvent = async (page: Page, event: string) => {
+  await expect
+    .poll(() =>
+      page.evaluate((e) => {
+        const internals = window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return internals.__TAURI_INTERNALS__.invoke("__test_backend_listeners", { event: e });
+      }, event),
+    )
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__close_guard_ready__")))
+    .toBe("true");
+  await page.evaluate((e) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: e });
+  }, event);
+};
+
+// The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
+// quitting stops what this process sends and leaves a Cut Host's Job cutting, so a prompt that
+// implies the quit stops everything would be telling the operator the opposite of what happens —
+// and `cancel` is cooperative, so even the local cutter finishes its buffered moves (the Silhouette
+// has no abort command; see apps/desktop/MANUAL-CHECKLIST.md).
+test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const prompts: string[] = [];
+  page.on("dialog", (d) => {
+    prompts.push(d.message());
+    d.accept().catch(() => {});
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  await expect.poll(() => prompts.length).toBe(1);
+  expect(prompts[0]).toContain("Sending to the cutter on this computer stops");
+  expect(prompts[0]).toContain("already buffered");
+  expect(prompts[0]).toContain("Cut Host keeps running there");
+  // Accepting it is what quits, and the fake records having been asked.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
+    .toBe("asked");
+
+  // The handshake's own ordering, which the prompt above cannot see: readiness is stood down
+  // before anything is subscribed, and never announced while nothing is listening. Rust emits on
+  // the strength of this flag and `emit` succeeds with zero listeners, so a `true` with no listener
+  // is a prevented close the operator cannot answer — and the leading `false` is the only thing
+  // that closes the window a reload leaves open, since no effect cleanup runs on unload.
+  //
+  // A filter over the log rather than an exact sequence: Playwright runs the dev build, whose
+  // `StrictMode` mounts, cleans up and mounts again, so more than two entries is correct here.
+  const readiness = (await page.evaluate(() => sessionStorage.getItem("__ready_log__")))!.split(",");
+  expect(readiness[0]).toBe("false@0");
+  expect(readiness).not.toContain("true@0");
+
+  // The teardown direction is not observable here — Playwright cannot unmount React — and is
+  // pinned instead by `closeGuard.test.ts`, over the same handshake this page runs.
+});
+
+test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+
+  const prompts: string[] = [];
+  page.on("dialog", (d) => {
+    prompts.push(d.message());
+    d.dismiss().catch(() => {});
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  // The prompt having been *seen* is the beat to wait on. The assertion below is safe because
+  // `page.evaluate` cannot run while the page is blocked in `window.confirm`, so it necessarily
+  // lands after the dismissal returned — not because recording the message implies that.
+  await expect.poll(() => prompts.length).toBe(1);
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+});
+
+function phase7Shots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.PHASE7_SHOTS === "1";
+}
+
+async function phaseShot(page: Page, name: string) {
+  if (!phase7Shots()) return;
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+const VINYL_BOARD = ["Gold vinyl", "Red vinyl", "Black vinyl", "White vinyl", "Navy vinyl", "Purple vinyl", "#f5e6a3"] as const;
+
+test("layers follow the colour passes and a cut toggle stays on the row", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedVinylBoard: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+
+  await expect(page.getByTestId("colour-layer")).toHaveCount(VINYL_BOARD.length);
+  for (const name of VINYL_BOARD) {
+    await expect(page.getByRole("button", { name: `Cut ${name}`, exact: true })).toHaveAttribute("aria-pressed", "true");
+  }
+  await expect(page.getByText("Colour layers", { exact: true })).toBeVisible();
+  await expect(page.getByText("Each colour is cut as its own pass. Drag a shape to reorder it among its siblings.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cut this shape", exact: true })).toHaveCount(0);
+
+  const red = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Red vinyl", exact: true }) });
+  const gold = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Gold vinyl", exact: true }) });
+  await red.getByRole("button").nth(1).click();
+  await expect(red.getByRole("button").nth(1)).toHaveAttribute("aria-current", "true");
+  await expect(red.getByRole("button").nth(1)).not.toHaveAttribute("aria-pressed");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "false");
+  await gold.getByRole("button").nth(1).click({ modifiers: ["Shift"] });
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+
+  for (const name of VINYL_BOARD) {
+    if (name === "Red vinyl") continue;
+    await page.getByRole("button", { name: `Collapse ${name}`, exact: true }).click();
+  }
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await expect(page.getByText("Ellipse 1", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "layers-one-open");
+
+  await page.getByRole("button", { name: "Cut Red vinyl", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await phaseShot(page, "layers-cut-off");
+});
+
+test("properties show one shape in millimetres and in inches", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Y", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("H", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "properties-mm");
+
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("0.394");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await phaseShot(page, "properties-in");
+});
+
+test("a mixed selection keeps align and does not pick a material", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("Material preset").locator("option").first()).toHaveText("Mixed");
+  await expect(page.getByLabel("Material preset")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Align left edges", exact: true })).toBeVisible();
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await phaseShot(page, "properties-mixed");
+});
+
+test("an empty selection shows the document, not a second units control", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Properties");
+
+  const section = page.getByRole("region", { name: "Document" });
+  await expect(section.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(section.getByText("Mat", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("12 × 12 in (305 × 305 mm)");
+  await expect(section.getByText("Units", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("mm");
+  await expect(section.getByText("Select an object to edit its size and position.")).toBeVisible();
+  await expect(section.getByText("Colour passes", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByText("Objects", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByLabel("Design for")).toBeVisible();
+  await expect(section.getByRole("button", { name: "mm", exact: true })).toHaveCount(0);
+  await expect(section.getByLabel("Mat size")).toHaveCount(0);
+  await expect(page.getByLabel("Mat size")).toHaveCount(1);
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "document");
+});
+
+test("a nearly invisible shape still says it cuts", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedFaint: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toBeVisible();
+  await page.getByTestId("layer-row").click();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Nearly invisible in the file. It still cuts.")).toBeVisible();
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "faint");
 });

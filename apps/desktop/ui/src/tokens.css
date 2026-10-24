@@ -94,22 +94,25 @@
   --warning: #9a5b00;
   --destructive: #c92324;
   --destructive-foreground: #ffffff;
-  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 clears about
-     3.4:1 on the light panel and 5.1:1 on the dark one, and still reads as off. */
+  /* 0.35 of the foreground was under 3:1 on both panels. 0.55 is about 3.4:1
+     on the light panel. Dark uses its own value: the same 0.55 is 5.1:1 there. */
   --disabled-opacity: 0.55;
   /* #f472b6 is 1.79:1 on the light mat. This is that magenta at OKLCH L 0.55
      (same chroma and hue), 3.60:1 on #d4d4d4. */
   --guide: #b73a80;
   --radius: 6px;
-
-  /* Names the screens already use. `--accent` is not aliased to `--accent-ink`:
-     that would paint teal behind `--text` on a selected row. `--muted` is the
-     quiet fill now; secondary text is `--muted-foreground`. */
-  --workspace: var(--canvas);
-  --text: var(--foreground);
-  --cut: var(--destructive);
-  --ready: var(--success);
-  --error: var(--destructive);
+  /* Modal veil. Ink, not black, so it belongs to the palette. Dark is black because the
+     dark foreground is light and would wash the scrim out. */
+  --scrim: rgb(1 47 54 / 0.45);
+  /* Pressed pill on a light surface. A white pill is the panel, so the unit
+     toggle and Rulers had no fill cue. `--subtle` is the fill those controls
+     used before that pill. It is under 1.2:1 on the panel (#f1f6f6, 1.09:1)
+     and on the unit track (#f8fbfb, 1.14:1), so the 1px brand edge is what
+     separates it. #106c72 on #e3eeee is 5.20:1. Brand is non-text chrome
+     here: 3.47:1 on the panel, 3.64:1 on the track. */
+  --btn-pressed: var(--subtle);
+  --btn-pressed-edge: var(--brand);
+  --btn-pressed-edge-width: 1px;
 }
 
 .dark {
@@ -145,6 +148,14 @@
   --destructive: #ff6b63;
   --destructive-foreground: #ffffff;
   --guide: #f472b6;
+  --scrim: rgb(0 0 0 / 0.55);
+  /* 0.42 of the dark foreground on the dark panel is about 3.6:1. 0.55 reads as body text. */
+  --disabled-opacity: 0.42;
+  /* White pill, no edge. #106c72 on white is 6.16:1, and white on the dark
+     panel (#10252a) is 15.9:1, so the fill itself is the cue. */
+  --btn-pressed: var(--primary-foreground);
+  --btn-pressed-edge: transparent;
+  --btn-pressed-edge-width: 0px;
 }
 
 html,
@@ -160,6 +171,15 @@ body {
   font-family: "Inter Variable", system-ui, sans-serif;
   font-size: 13px;
   line-height: 20px;
+  /* The window is a canvas. A drag, and a select-all the key handler did not catch, must not
+     highlight every label in the chrome. Fields keep a selection of their own. */
+  user-select: none;
+}
+
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
 }
 
 /* Unlayered, so it wins over Tailwind's reset and over a component outline.
@@ -171,27 +191,78 @@ body {
   box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
 }
 
-/* Tailwind's preflight sets `appearance: button` inside `@layer base`. Chromium
-   then paints ButtonText, and that used color stays the light foreground after
-   the page flips to dark — enabled labels render dark-on-dark while an explicit
-   `color` on a non-button updates. Unlayered so it wins over the preflight.
-   Checkboxes and radios keep their native appearance. `color` is left to the
-   utilities: an unlayered `color: inherit` would beat `text-foreground`. */
+/* Tailwind's preflight sets `appearance: button` and `color: inherit` inside
+   `@layer base`. Unlayered, so this wins. Checkboxes and radios keep their
+   native appearance. */
 button,
 input:where([type="button"], [type="reset"], [type="submit"]) {
   appearance: none;
+  --btn-ink: var(--foreground);
+  --btn-ink-hover: var(--btn-ink);
+  color: var(--btn-ink, var(--foreground));
+}
+button:hover,
+input:where([type="button"], [type="reset"], [type="submit"]):hover {
+  color: var(--btn-ink-hover, var(--btn-ink, var(--foreground)));
+}
+/* One channel per variant. A selector on a Tailwind class string is the previous
+   theme's ink, because the utility that set it lives in a layer and loses. */
+button[data-ink="fill"] {
+  --btn-ink: var(--primary-foreground);
+  --btn-ink-hover: var(--primary-foreground);
+}
+button[data-ink="muted"] {
+  --btn-ink: var(--muted-foreground);
+  --btn-ink-hover: var(--foreground);
+}
+button[data-ink="faded"] {
+  --btn-ink: color-mix(in oklab, var(--foreground) 80%, transparent);
+  --btn-ink-hover: var(--foreground);
+}
+button[data-ink="destructive"] {
+  --btn-ink: var(--destructive);
+  --btn-ink-hover: var(--destructive);
+}
+button[data-ink="accent"] {
+  --btn-ink: var(--accent-ink);
+  --btn-ink-hover: var(--accent-ink);
+}
+button[data-ink="warning"] {
+  --btn-ink: var(--warning);
+  --btn-ink-hover: var(--warning);
+}
+button[data-ink="success"] {
+  --btn-ink: var(--success);
+  --btn-ink-hover: var(--success);
+}
+/* One pressed rule. Ink stays on `--btn-ink` (`--primary`, #106c72 in both
+   themes). Fill and edge are tokens, so light is a bordered surface while
+   dark stays the white pill, without a second selector and without naming a
+   Tailwind class. The tool rail names accent ink and keeps its own fill.
+   A colour-block select is not a toggle: it uses `aria-current`, so it never
+   lands here. */
+button[aria-pressed="true"]:not([data-ink="accent"]),
+button[role="tab"][data-state="active"] {
+  --btn-ink: var(--primary);
+  --btn-ink-hover: var(--primary);
+  background: var(--btn-pressed);
+  color: var(--btn-ink, var(--foreground));
+  border-style: solid;
+  border-width: var(--btn-pressed-edge-width);
+  border-color: var(--btn-pressed-edge);
 }
 
-/* `color: inherit` on a button does not recompute when the theme class flips
-   `color-scheme`, so the used color stays the light foreground (`#012f36`)
-   even though `--foreground` on that button is already the dark one. A
-   variable on the control itself does recompute. `@layer base` so a utility
-   such as `text-primary-foreground` or `text-muted-foreground` still wins. */
-@layer base {
-  button,
-  input:where([type="button"], [type="reset"], [type="submit"]) {
-    color: var(--foreground);
-  }
+/* In-list toggles, the scissors on a colour row. The shared pressed rule is a
+   white pill in dark, and a column of them is louder than Send to cutter.
+   Dark uses the accent fill, a 1px brand edge, and foreground ink. Light
+   keeps the shared pressed fill and edge. */
+.dark button[data-toggle="quiet"][aria-pressed="true"] {
+  --btn-ink: var(--foreground);
+  --btn-ink-hover: var(--foreground);
+  background: var(--accent);
+  border-style: solid;
+  border-width: 1px;
+  border-color: var(--brand);
 }
 
 /* One opacity for every disabled control that used to repeat `opacity: 0.35`.
@@ -200,15 +271,6 @@ button:disabled,
 [role="menuitem"][data-disabled],
 [role="menuitemradio"][data-disabled] {
   opacity: var(--disabled-opacity);
-}
-
-/* Dark active tab. `--card` plus `--accent-ink` is teal on a dark pill; the light
-   pairing is a white pill and the dark teal, which is what the light theme already
-   shows and what stays above 4.5:1. Unlayered so it wins over the utility and over
-   a hover or focus that would put the teal back on the dark fill. */
-.dark [role="tab"][data-state="active"] {
-  background: var(--primary-foreground);
-  color: var(--primary);
 }
 
 /* Opening a menu with the pointer focuses the trigger and the popover, and
@@ -224,13 +286,13 @@ button:disabled,
   background: var(--accent);
 }
 
-/* Preflight zeroes every border and drops list markers. NumberField and AlignRow
-   set their own border inline, which wins over this. Controls that still relied
-   on the user-agent border or marker get them back in the same tokens. */
+/* Preflight zeroes every border and drops list markers. This rule is unlayered,
+   so it beats `border-input` and has to name `--input` itself. `--border` on a
+   field is 1.31:1 light and 1.52:1 dark. `--input` is 3.23:1 and 4.10:1. */
 input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="range"]),
 select,
 textarea {
-  border: 1px solid var(--border);
+  border: 1px solid var(--input);
 }
 
 /* That reset is unlayered and sets the whole border, so `border-destructive` never
@@ -250,6 +312,47 @@ ul {
   list-style: disc;
 }
 
+/* This rule is unlayered, same as the disc above, so it wins where Tailwind
+   `list-none` does not. The Devices cards stay a list; the marker would sit
+   beside every one of them. */
+.devices-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.devices-list > li {
+  list-style: none;
+}
+
+/* The title shares its row with Retry and Forget only while the whole title
+   fits. Past that, the minimum width is the row and the buttons wrap under it.
+   A flex basis of 0 would otherwise shrink the title to its longest word. */
+.devices-host-title {
+  flex: 1 1 auto;
+  min-width: min(100%, max-content);
+  max-width: 100%;
+}
+
 ol {
   list-style: decimal;
+}
+
+/* Stripes on a pass that is still moving. Tokens only: primary and tint, never a literal.
+   Frozen progress drops the class, so a lost host does not look like the blade is advancing. */
+@keyframes progress-live {
+  to {
+    background-position: 16px 0;
+  }
+}
+
+.progress-live {
+  background-image: linear-gradient(90deg, var(--primary) 0 8px, var(--tint) 8px 16px);
+  background-size: 16px 100%;
+  animation: progress-live 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-live {
+    animation: none;
+  }
 }

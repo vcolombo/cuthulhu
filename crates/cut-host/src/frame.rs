@@ -178,8 +178,9 @@ fn fill(r: &mut impl Read, buf: &mut [u8], deadline: Option<Instant>) -> Result<
 /// has a deadline, and a frame that may never come does not. A daemon's request loop reading the
 /// next request from an attached client owes nothing *before the first byte* — a desktop polling
 /// once a second is idle in between and must not be dropped for it — so that call site passes
-/// `None`. Everywhere else a frame was promised: a token after a connection was accepted, a
-/// greeting after a token was sent, a reply after a request was sent. A peer that goes silent
+/// `None`. Everywhere else a frame was promised: a protocol version after a connection was
+/// accepted, a token after that version was agreed, a greeting after a token was sent, a reply
+/// after a request was sent. A peer that goes silent
 /// there would otherwise hold this reader, and whatever lock is above it, forever.
 pub fn read_frame<R: Read, T: DeserializeOwned>(
     r: &mut R,

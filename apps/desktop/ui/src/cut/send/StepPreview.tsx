@@ -71,7 +71,7 @@ export function StepPreview({
             return (
               <div key={pass.key} className="flex items-start gap-2 text-xs">
                 <span className="tabular text-muted-foreground">{index + 1}.</span>
-                {swatch !== null ? <span className="mt-0.5 inline-block size-3 shrink-0 rounded-sm" style={{ background: swatch }} /> : null}
+                {swatch !== null ? <span className="mt-0.5 inline-block size-3 shrink-0 rounded-sm border border-input" style={{ background: swatch }} /> : null}
                 {/* min-w-0 and break-words: a name with no space is wider than this column, and the
                     column's min-content would otherwise widen the sheet until the name is clipped. */}
                 <span className="min-w-0">

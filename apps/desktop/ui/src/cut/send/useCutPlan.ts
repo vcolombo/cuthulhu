@@ -50,11 +50,16 @@ export function useCutPlan({
   onWeedChange,
   ranges,
   onError,
+  grouping: groupingProp,
+  onGroupingChange,
 }: {
   weed: WeedDraft | null;
   onWeedChange: (draft: WeedDraft) => void;
   ranges: ipc.SettingsRanges | null;
   onError: (msg: string) => void;
+  /** When set, the Layers panel and this sheet share one mode. Omitted, the sheet keeps its own. */
+  grouping?: ipc.Grouping;
+  onGroupingChange?: (grouping: ipc.Grouping) => void;
 }) {
   /** A plan and everything derived from it, installed as one value. The mode belongs here
    *  rather than beside it: rows keyed under one grouping must never be sent under another,
@@ -63,7 +68,12 @@ export function useCutPlan({
   /** The mode the operator has chosen, which is `plan.grouping` except while a replan is in
    *  flight. Cut and the row controls are unavailable in that window, because rows from the
    *  previous mode would otherwise be sendable under this one. */
-  const [grouping, setGrouping] = useState<ipc.Grouping>("Color");
+  const [ownGrouping, setOwnGrouping] = useState<ipc.Grouping>("Color");
+  const grouping = groupingProp ?? ownGrouping;
+  const setGrouping = (next: ipc.Grouping) => {
+    onGroupingChange?.(next);
+    if (groupingProp === undefined) setOwnGrouping(next);
+  };
   const [replanning, setReplanning] = useState(false);
   const weedDraft: WeedDraft = weed ?? (ranges ? weedDraftFrom(ranges.weedDefaults, false) : NO_WEED);
   const weedRead = readWeedDraft(weedDraft, ranges?.weed ?? null);

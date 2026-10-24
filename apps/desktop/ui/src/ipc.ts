@@ -109,9 +109,31 @@ export type PairedHostView = {
   id: string;
   name: string;
   address: string;
-  /** Why this host cannot be reached, or null when it can. */
+  /** Why this host cannot be reached, or null when it can. The row prints it. */
   unreachable: string | null;
+  /**
+   * Which program a protocol mismatch names. Null for every other failure.
+   * "host" is the Cut Host; "desktop" is this build of Cuthulhu.
+   */
+  protocol_side: "host" | "desktop" | null;
+  /** Unix millis of the last successful snapshot. Absent until one has landed, and unchanged by a failed dial. */
+  last_seen?: number | null;
 };
+
+/** One remote cutter's cached status. `instance_id` stays snake_case, like `DeviceInfo`. */
+export type CutterStatusView = {
+  host: string;
+  instance_id: string;
+  status: CutStatus;
+};
+
+/** A cutter named beside the aim. `host: null` is a cutter on this computer. */
+export type CutterTarget = { host: string | null; instanceId: string };
+
+function cutterArgs(target?: CutterTarget): Record<string, unknown> {
+  if (!target) return {};
+  return { host: target.host, instanceId: target.instanceId };
+}
 
 export type DeviceError =
   | "Disconnected"
@@ -133,8 +155,8 @@ export type Phase =
 
 /** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
  *  says how the last job finished, which no phase can — a finished cut and a
- *  cancelled one both rest on "Idle". Actions say which buttons are legal.
- *  Nothing here needs interpreting, and nothing needs remembering. */
+ *  cancelled one both rest on "Idle". `jobId` says whose cut it is. 0 is a
+ *  lifecycle report, not a job. Actions say which buttons are legal. */
 export type CutStatus = {
   phase: Phase;
   ended: "Completed" | "Cancelled" | null;
@@ -142,6 +164,7 @@ export type CutStatus = {
   pass: { index: number; total: number } | null;
   sent: { sent: number; total: number } | null;
   error: DeviceError | null;
+  jobId: number;
 };
 
 /** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
@@ -152,6 +175,7 @@ export const DISCONNECTED_STATUS: CutStatus = {
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 };
 
 // `StateChanged` carries no payload: the event's own `status` is what changed.
@@ -234,16 +258,25 @@ export async function disconnectDevice(): Promise<void> {
 
 /** Re-opens the aimed cutter's transport, locally or on its Cut Host. What clears a cancel whose
  *  stop nothing confirmed — there is no verb for declaring one confirmed. */
-export async function reconnectDevice(): Promise<void> {
-  return invoke("reconnect_device", {});
+export async function reconnectDevice(target?: CutterTarget): Promise<void> {
+  return invoke("reconnect_device", cutterArgs(target));
 }
 
-export async function getDeviceState(): Promise<CutStatus> {
-  return invoke("get_device_state", {});
+export async function getDeviceState(target?: CutterTarget): Promise<CutStatus> {
+  return invoke("get_device_state", cutterArgs(target));
+}
+
+/** Every remote cutter's last snapshot. The device list is what dials; this only reads the cache. */
+export async function cutterStatuses(): Promise<CutterStatusView[]> {
+  return invoke("cutter_statuses", {});
 }
 
 export async function getConnectedDevice(): Promise<DeviceInfo | null> {
   return invoke("get_connected_device", {});
+}
+
+export async function setCloseGuardReady(ready: boolean): Promise<void> {
+  return invoke("set_close_guard_ready", { ready });
 }
 
 export async function forceQuit(): Promise<void> {
@@ -279,16 +312,16 @@ export async function cut(request: Args): Promise<CutStarted> {
   return invoke("cut", { request });
 }
 
-export async function cancelCut(): Promise<void> {
-  return invoke("cancel_cut", {});
+export async function cancelCut(target?: CutterTarget): Promise<void> {
+  return invoke("cancel_cut", cutterArgs(target));
 }
 
-export async function resumeCut(): Promise<void> {
-  return invoke("resume_cut", {});
+export async function resumeCut(target?: CutterTarget): Promise<void> {
+  return invoke("resume_cut", cutterArgs(target));
 }
 
-export async function confirmPassDone(): Promise<void> {
-  return invoke("confirm_pass_done", {});
+export async function confirmPassDone(target?: CutterTarget): Promise<void> {
+  return invoke("confirm_pass_done", cutterArgs(target));
 }
 
 export async function listHosts(): Promise<PairedHostView[]> {

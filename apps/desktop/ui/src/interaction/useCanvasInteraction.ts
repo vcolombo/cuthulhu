@@ -76,7 +76,7 @@ export type SendTime = { expand: (ids: number[]) => number[]; artboard: Bounds |
 export type CommitOutcome = { kind: "refused" } | { kind: "applied"; snapshotRev: number | null };
 
 /** Which property field a queued edit came from: edits to one field supersede each other. */
-export type PropertyField = "x" | "y" | "w" | "h";
+export type PropertyField = "x" | "y" | "w" | "h" | "r";
 
 /** Why document edits are refused for now, or null; see `CanvasInteraction.editsLock`. */
 export type EditsLock = "loading" | "unread" | null;

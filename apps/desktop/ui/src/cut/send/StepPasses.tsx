@@ -284,7 +284,7 @@ export function StepPasses({
         </select>
         </div>
         {ranges !== null && presetsLoaded ? (
-          <button type="button" className="mb-0.5 shrink-0 text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
+          <button type="button" data-ink="accent" className="mb-0.5 shrink-0 text-sm font-medium text-accent-ink underline-offset-2 hover:underline" onClick={onToggleEditor}>
             Edit presets…
           </button>
         ) : null}
@@ -386,6 +386,7 @@ export function StepPasses({
                   aria-label={`Reorder pass ${i + 1}`}
                   draggable={!replanning}
                   disabled={replanning}
+                  data-ink="muted"
                   className="mt-1 cursor-grab text-muted-foreground disabled:cursor-not-allowed"
                   onDragStart={(event) => {
                     event.dataTransfer.setData("text/plain", String(i));
@@ -408,7 +409,7 @@ export function StepPasses({
                   <div className="flex h-8 min-w-0 items-center gap-2">
                     <div className="grid size-5 shrink-0 place-items-center rounded-full bg-subtle text-2xs tabular">{i + 1}</div>
                     {swatch !== null ? (
-                      <span className="inline-block size-4 shrink-0 rounded-sm border border-foreground/20" style={{ background: swatch }} />
+                      <span className="inline-block size-4 shrink-0 rounded-sm border border-input" style={{ background: swatch }} />
                     ) : null}
                     {label.text !== null ? <span className="min-w-0 truncate text-sm">{label.text}</span> : null}
                     <span className="shrink-0 text-xs text-muted-foreground">{row.shapeCount} shape{row.shapeCount === 1 ? "" : "s"}</span>
@@ -476,7 +477,7 @@ export function StepPasses({
           <div className="text-sm">
             <div className="flex items-center gap-2 font-medium">
               {shownLabel.swatch !== null ? (
-                <span className="inline-block size-3 rounded-sm" style={{ background: vinylDisplay(shownLabel.swatch, theme).swatch }} />
+                <span className="inline-block size-3 rounded-sm border border-input" style={{ background: vinylDisplay(shownLabel.swatch, theme).swatch }} />
               ) : null}
               {shownLabel.text ?? "This pass"}
             </div>

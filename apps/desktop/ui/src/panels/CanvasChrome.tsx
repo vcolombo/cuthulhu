@@ -105,17 +105,17 @@ type ZoomProps = {
 export function ZoomControls({ zoomPercent, rulers, onZoomOut, onZoomIn, onFitMat, onFitContent, onToggleRulers }: ZoomProps) {
   return (
     <div data-testid="zoom-controls" className="absolute bottom-3 right-3 z-[2] flex items-center gap-0.5 rounded-md border border-border bg-panel p-1 shadow-sm">
-      <Button variant="ghost" size="icon" aria-label="Zoom out" onClick={onZoomOut}>
+      <Button variant="ghost" size="icon" className="text-foreground" aria-label="Zoom out" onClick={onZoomOut}>
         −
       </Button>
       <span className="tabular min-w-12 px-1 text-center text-xs text-foreground">{zoomPercent}%</span>
-      <Button variant="ghost" size="icon" aria-label="Zoom in" onClick={onZoomIn}>
+      <Button variant="ghost" size="icon" className="text-foreground" aria-label="Zoom in" onClick={onZoomIn}>
         +
       </Button>
-      <Button variant="ghost" size="sm" onClick={onFitMat}>
+      <Button variant="ghost" size="sm" className="text-foreground" onClick={onFitMat}>
         Fit mat
       </Button>
-      <Button variant="ghost" size="sm" onClick={onFitContent}>
+      <Button variant="ghost" size="sm" className="text-foreground" onClick={onFitContent}>
         Fit content
       </Button>
       <Button
@@ -123,7 +123,6 @@ export function ZoomControls({ zoomPercent, rulers, onZoomOut, onZoomIn, onFitMa
         size="sm"
         aria-pressed={rulers}
         onClick={onToggleRulers}
-        className={rulers ? "bg-subtle text-foreground" : undefined}
       >
         Rulers
       </Button>

@@ -36,7 +36,7 @@
 - **SPDX header on every file** — `// SPDX-License-Identifier: GPL-3.0-or-later` (`<!-- -->` in Markdown, `//` in Rust and TypeScript). Every file this plan touches already has one; new files need one.
 - **`cargo test --workspace --locked` is the gate**, and `--locked` is mandatory. This change adds no dependency, so `Cargo.lock` must not change.
 - **`ui/dist` is committed.** Any task that edits `apps/desktop/ui/src` must end with `npm --prefix apps/desktop/ui run build` and commit `apps/desktop/ui/dist` in the same commit — CI rebuilds and fails on a stale bundle. Tasks 6, 7, 8 and 9 touch `ui/src`.
-- **`CONTEXT.md` is normative vocabulary**, and this change edits it (Task 10). **ColorPass is retired** and replaced by **DocumentPass** plus **PassKey**, **Grouping** and **PresetAssignment**; do not leave both names alive.
+- **`GLOSSARY.md` is normative vocabulary**, and this change edits it (Task 10). **ColorPass is retired** and replaced by **DocumentPass** plus **PassKey**, **Grouping** and **PresetAssignment**; do not leave both names alive.
 - **Comments explain why, not what.** Every comment specified below records a constraint, a trap, or a decision taken against an alternative.
 - **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path. One is specified here: the CLI's single settings pair for every pass.
 - **The e2e fake mirrors the real backend** (`CLAUDE.md:135-138`). `apps/desktop/ui/e2e/smoke.spec.ts` re-implements `plan_passes` at `:302-341`; a fake that ignores the grouping or skips the identity check makes the suite green on a frontend that cannot work.
@@ -65,7 +65,7 @@
 | `apps/desktop/ui/src/panels/{materialPreset.ts,PropertiesPanel.tsx}` | The three-state per-Node material control and the pure helpers behind it. |
 | `apps/desktop/ui/src/App.tsx` | Owns the preset list (today it is local to the cut dialog) so the panel and the dialog read one copy. |
 | `apps/desktop/ui/e2e/smoke.spec.ts` | The fake keys passes, honours the grouping, mirrors the exact-once identity check, and implements `set_material_preset`. |
-| `CONTEXT.md`, `CLAUDE.md`, `CHANGELOG.md`, `apps/desktop/MANUAL-CHECKLIST.md` | Vocabulary, cut-path prose, operator-visible changes, and the two live checks that name removed flags. |
+| `GLOSSARY.md`, `CLAUDE.md`, `CHANGELOG.md`, `apps/desktop/MANUAL-CHECKLIST.md` | Vocabulary, cut-path prose, operator-visible changes, and the two live checks that name removed flags. |
 
 **Task order is load-bearing.** Tasks 1 and 2 add things nothing reads yet. Task 3 is the cutover — planner *and* selection in one commit, because the type change cannot be split below that pair without leaving the workspace unbuildable (a Codex review confirmed even `cargo test -p cutplan --lib passes` cannot compile with `plan.rs` still on colours: Cargo compiles every library test module before filtering by name). Tasks 4 and 5 give the two binaries the choice. Tasks 6–8 are the UI in dependency order. Task 9 makes the e2e fake tell the truth. Task 10 updates the vocabulary the change contradicts. **Every task ends green on `cargo test --workspace --locked`**, and every task touching `ui/src` also ends green on `npm --prefix apps/desktop/ui test`.
 
@@ -2723,14 +2723,14 @@ hook renamed to __travelRequests and a rule that had become enabled-only."
 ### Task 10: The vocabulary and the checklists say what the code does
 
 **Files:**
-- Modify: `CONTEXT.md:40-47` (the ColorPass entry), `:59-62` (PassSelection), adding PassKey, Grouping and PresetAssignment
+- Modify: `GLOSSARY.md:40-47` (the ColorPass entry), `:59-62` (PassSelection), adding PassKey, Grouping and PresetAssignment
 - Modify: `CLAUDE.md:79-99` (the cut-path section), `:154-160` (the vocabulary list)
 - Modify: `apps/desktop/MANUAL-CHECKLIST.md:91`, `:102` (two live checks naming removed flags)
 - Modify: `CHANGELOG.md`
 
 **Interfaces:** consumes everything above; produces no code.
 
-- [ ] **Step 1: Update `CONTEXT.md`**
+- [ ] **Step 1: Update `GLOSSARY.md`**
 
 Replace the **ColorPass** entry with **DocumentPass**, and add the three new terms:
 
@@ -2800,17 +2800,17 @@ cargo test --workspace --locked && npm --prefix apps/desktop/ui test && npm --pr
 # Live source and normative docs only: historical plans and specs record the old names on
 # purpose, and CHANGELOG.md names the removed flags as removed. `!` because rg exits 1 when it
 # finds nothing, which is the passing case here.
-! rg -n 'ColorPass|--by-color|--skip-color|UnknownPassColor' crates apps CONTEXT.md CLAUDE.md \
+! rg -n 'ColorPass|--by-color|--skip-color|UnknownPassColor' crates apps GLOSSARY.md CLAUDE.md \
     --glob '!apps/desktop/ui/dist/**'
 ```
 
 Expected: tests PASS, and the `rg` line succeeds by finding nothing. A surviving `ColorPass` is a rename this plan missed.
 
 ```bash
-git add CONTEXT.md CLAUDE.md CHANGELOG.md apps/desktop/MANUAL-CHECKLIST.md
+git add GLOSSARY.md CLAUDE.md CHANGELOG.md apps/desktop/MANUAL-CHECKLIST.md
 git commit -m "Retire ColorPass from the vocabulary, since a pass is no longer a colour
 
-CONTEXT.md is normative, so a term the code no longer has cannot stay in it:
+GLOSSARY.md is normative, so a term the code no longer has cannot stay in it:
 DocumentPass, PassKey, Grouping and PresetAssignment replace it. The manual
 checklist had two live operator checks running flags this change removes, which
 is worse than having none."

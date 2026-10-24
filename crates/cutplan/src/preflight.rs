@@ -33,7 +33,7 @@ impl std::fmt::Display for PreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Not "no enabled pass": a colour nobody selected is simply not cut, so
-            // there is no flag for an operator to go looking for (CONTEXT.md).
+            // there is no flag for an operator to go looking for (GLOSSARY.md).
             PreflightError::NothingToCut =>
                 write!(f, "no pass selected for this cut has any geometry"),
             PreflightError::NonFiniteGeometry(node) =>

@@ -81,7 +81,7 @@ pub fn open_pass(d: &dyn Driver, job: &Job, index: usize) -> Result<Vec<u8>, Dri
 pub fn close_pass(d: &dyn Driver, index: usize, total: usize) -> Vec<u8>
 ```
 
-`open`/`close` rather than prologue/epilogue: `CONTEXT.md:102` already defines a **Driver** as what
+`open`/`close` rather than prologue/epilogue: `GLOSSARY.md:102` already defines a **Driver** as what
 produces the bytes "to open, park and close a cutting session".
 
 **They live in `crates/driver-core/src/lib.rs`, beside `write_all`.** Same kind of thing — a free

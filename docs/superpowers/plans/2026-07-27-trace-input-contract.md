@@ -19,7 +19,7 @@
 - `cargo test --workspace --locked` is what CI runs. `--locked` is mandatory.
 - **`Cargo.lock` changes in Task 1 and must be committed with it.** `tempfile` moves from `apps/desktop`'s dev-dependencies to `crates/trace`'s. This is the opposite of the machine-caps change — do not assume an unchanged lock means success here.
 - `apps/desktop/ui/dist/` is committed. Any change under `ui/src` requires `npm --prefix apps/desktop/ui run build` and committing the rebuilt `dist/` in the same change, or CI fails.
-- Vocabulary from `CONTEXT.md` is normative: **Trace**, **TraceControls** (added by Task 2), **Document**, **Node**. Never write "vectorize", "autotrace", or "raster conversion" for Trace, and never "options"/"params"/"settings" for TraceControls.
+- Vocabulary from `GLOSSARY.md` is normative: **Trace**, **TraceControls** (added by Task 2), **Document**, **Node**. Never write "vectorize", "autotrace", or "raster conversion" for Trace, and never "options"/"params"/"settings" for TraceControls.
 - Commit subjects: imperative with the reason attached.
 - **Never name a vtracer parameter outside `crates/trace/src/lib.rs`.** `filter_speckle`, `corner_threshold`, `length_threshold`, and `color_precision` must not appear in `crates/cli`, `apps/desktop`, or any `.ts`/`.tsx` file once Task 3 is done. That absence is the deliverable.
 
@@ -295,7 +295,7 @@ expected.
 - Modify: `crates/cli/tests/trace.rs`
 - Modify: `apps/desktop/src/ipc.rs` (the two trace commands), `apps/desktop/src/main.rs:62`
 - Create: `CHANGELOG.md`
-- Modify: `CONTEXT.md`
+- Modify: `GLOSSARY.md`
 
 **Interfaces:**
 - Consumes: `trace::read_image`, `TraceError::Input` (Task 1).
@@ -803,9 +803,9 @@ Nothing has been released yet, so there is no history before `Unreleased`.
   always happened; it was only ever visible in the desktop.
 ```
 
-- [ ] **Step 12: Add TraceControls to CONTEXT.md**
+- [ ] **Step 12: Add TraceControls to GLOSSARY.md**
 
-Insert after the **Trace** entry (`CONTEXT.md:25-28`), matching the file's existing format:
+Insert after the **Trace** entry (`GLOSSARY.md:25-28`), matching the file's existing format:
 
 ```markdown
 **TraceControls**:
@@ -819,7 +819,7 @@ names
 - [ ] **Step 13: Commit**
 
 ```sh
-git add crates/trace crates/cli apps/desktop/src CHANGELOG.md CONTEXT.md
+git add crates/trace crates/cli apps/desktop/src CHANGELOG.md GLOSSARY.md
 git commit -m "Give trace a contract in user units, so both callers stop translating it
 
 Ranges and defaults were stated three times each and the CLI and the dialog

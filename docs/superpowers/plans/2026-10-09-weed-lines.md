@@ -10,7 +10,7 @@
 
 ## Global constraints
 
-- SPDX headers. Comments explain why. `// ponytail:` carries a ceiling and an upgrade path. Use the vocabulary in `CONTEXT.md`.
+- SPDX headers. Comments explain why. `// ponytail:` carries a ceiling and an upgrade path. Use the vocabulary in `GLOSSARY.md`.
 - `cargo test --locked`, with no new dependency, so `Cargo.lock` does not move.
 - This container cannot build `desktop` (WebKit) or `cli` (libudev). Their Rust is checked by CI's `rust` job. Keep logic in `cutplan`, where it can be tested here, so those crates only pass values through.
 - **`ipc-inventory.json`**: add `weed` to `plan_cut`, `travel_for_order` and `cut` by hand. Its generating test needs the desktop crate, so CI is the check.

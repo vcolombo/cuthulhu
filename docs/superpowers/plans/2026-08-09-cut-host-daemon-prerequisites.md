@@ -26,7 +26,7 @@ Both changes here are daemon-side, testable without a desktop, and touch no file
 
 - **SPDX header on every file**: `// SPDX-License-Identifier: GPL-3.0-or-later`, `# ` for TOML, `<!-- -->` for Markdown.
 - **`cargo test --workspace --locked`** is what CI runs; `--locked` is mandatory. Neither task adds a dependency, so `Cargo.lock` must not change — if it does, something went wrong.
-- **`CONTEXT.md` is normative vocabulary.** Use **Pass**, **Job**, **Driver**, **Transport**, **Preflight**, **Cut Host**. Never "proxy", "server", "relay" or "bridge" for the Cut Host.
+- **`GLOSSARY.md` is normative vocabulary.** Use **Pass**, **Job**, **Driver**, **Transport**, **Preflight**, **Cut Host**. Never "proxy", "server", "relay" or "bridge" for the Cut Host.
 - **Comments explain why, not what.** Where a step below carries a comment, that comment is part of the deliverable. Do not add restating ones.
 - **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path.
 - **Commit subjects are imperative with the reason attached.** Keep the repo's `Co-Authored-By:` trailer. Prose — comments, docs, commit bodies — carries no process narration: no "as requested", no "per the plan", no agent names.

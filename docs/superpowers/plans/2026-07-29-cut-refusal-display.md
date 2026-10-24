@@ -16,7 +16,7 @@
 
 - **SPDX header on every file** — `// SPDX-License-Identifier: GPL-3.0-or-later`. All files here already have one; do not remove it.
 - **`cargo test --workspace --locked`** is the gate. `--locked` is mandatory; this change adds no dependency, so `Cargo.lock` must not change.
-- **`CONTEXT.md` is normative vocabulary.** Relevant here: *Preflight* (not "validation"), *Stale plan* (not "revision mismatch"), and the `_Avoid_` entry for **enabled pass** — a colour nobody lists in `PlanOptions::passes` is simply not cut, so no refusal text may name an enable flag.
+- **`GLOSSARY.md` is normative vocabulary.** Relevant here: *Preflight* (not "validation"), *Stale plan* (not "revision mismatch"), and the `_Avoid_` entry for **enabled pass** — a colour nobody lists in `PlanOptions::passes` is simply not cut, so no refusal text may name an enable flag.
 - **Comments explain why, not what.** Every comment specified below documents a constraint or a trap. Do not add comments that restate the code.
 - **No `ui/dist` or Node work.** This change is Rust-only; no `apps/desktop/ui` file is touched, so no `npm run build` and no `dist/` commit.
 - **Codes are the stable half of the contract.** Every `code()` string below is the exact string `apps/desktop/src/device.rs` emits today. `apps/desktop/ui/src/cut/CutDialog.tsx:165` branches on `"stale_plan"`. Changing a code breaks the frontend silently; changing a message does not.
@@ -134,7 +134,7 @@ impl std::fmt::Display for PreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Not "no enabled pass": a colour nobody selected is simply not cut, so
-            // there is no flag for an operator to go looking for (CONTEXT.md).
+            // there is no flag for an operator to go looking for (GLOSSARY.md).
             PreflightError::NothingToCut =>
                 write!(f, "no pass selected for this cut has any geometry"),
             PreflightError::NonFiniteGeometry(node) =>

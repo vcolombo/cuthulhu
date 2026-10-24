@@ -38,7 +38,7 @@ useful as evidence that a Pi drives a Cameo over USB from Linux, and as nothing 
 
 ## Naming
 
-With the Pi owning the cut it is not a proxy: it forwards nothing. `CONTEXT.md` gains an entry, since
+With the Pi owning the cut it is not a proxy: it forwards nothing. `GLOSSARY.md` gains an entry, since
 it is the normative vocabulary and has no word for this yet:
 
 > **Cut Host** — a machine that owns Transports to one or more cutters and runs Jobs on them on behalf
@@ -51,7 +51,7 @@ The daemon binary is `cuthulhu-cutd`.
 ## Scope
 
 In scope: one new crate holding the protocol, the host and the client; a daemon binary; the desktop
-changes needed to pair with a host, list its cutters and dispatch to them; `CONTEXT.md`; a Pi install
+changes needed to pair with a host, list its cutters and dispatch to them; `GLOSSARY.md`; a Pi install
 document.
 
 Out of scope, decided deliberately:
@@ -208,7 +208,7 @@ already present in the workspace.
 | `apps/desktop/src/device.rs` | `enum Cutters { Local { factory, manager }, Remote(HostClient) }` behind the existing mutex; each method becomes a two-arm match |
 | `apps/desktop/src/{ipc.rs,state.rs}` | Host add, remove and pair commands |
 | `apps/desktop/ui/src/ipc.ts` and its mirrors | The `DeviceInfo` field, per #70; the `e2e/smoke.spec.ts` fake moves with it |
-| `CONTEXT.md` | The Cut Host entry |
+| `GLOSSARY.md` | The Cut Host entry |
 
 `DeviceInfo.host` is `None` for a cutter attached to this computer. The alternative — namespacing
 `instance_id` strings as `host:name:usb:1:4` — would hide the distinction inside a format nothing

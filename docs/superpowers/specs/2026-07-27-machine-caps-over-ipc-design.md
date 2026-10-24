@@ -46,7 +46,7 @@ Out of scope, decided deliberately:
 
 ## Decisions
 
-**Caps are per machine *model*, not per device instance.** `CONTEXT.md:88` defines MachineCaps as
+**Caps are per machine *model*, not per device instance.** `GLOSSARY.md:88` defines MachineCaps as
 "What a machine model can be told and what it needs from the operator". `DeviceInfo` is per instance
 — `instance_id`, `transport`, `candidate`. This is what rules out the review's suggested shape.
 

@@ -75,9 +75,9 @@ without a color". Generalising the key is the one moment that costs nothing to f
 
 `ColorPass` is renamed **`DocumentPass`**: its container is already `DocumentPasses`
 (`passes.rs:30-38`), so the singular is free, and every alternative collides with vocabulary
-`CONTEXT.md` already spends — `Pass` is a run of the blade, `CutPass` is `driver-core`'s,
+`GLOSSARY.md` already spends — `Pass` is a run of the blade, `CutPass` is `driver-core`'s,
 `PlannedPass` is the post-preflight one, and "group"/"batch" are on ColorPass's own `_Avoid_` list.
-`CONTEXT.md`'s ColorPass entry becomes the DocumentPass entry and gains PassKey; the ColorPass name
+`GLOSSARY.md`'s ColorPass entry becomes the DocumentPass entry and gains PassKey; the ColorPass name
 is retired, not aliased.
 
 The rest of the rename follows mechanically: `PassSelection { key, settings }`,
@@ -396,7 +396,7 @@ Everything here is decided before a byte reaches a Transport, so nothing is adde
 **A colour-keyed slice first, generalising the key later.** Smaller, and it would have shipped
 `Stroke`/`Fill` without touching `PassSelection`. Rejected because the rename cascade is the
 expensive half either way, and doing it second means two passes over the same ten files, two sets
-of DTO churn, and an interim vocabulary in `CONTEXT.md` that is wrong the moment preset grouping
+of DTO churn, and an interim vocabulary in `GLOSSARY.md` that is wrong the moment preset grouping
 lands.
 
 **A tagged enum on the wire.** Structurally honest, and it forces a hand-written discriminated

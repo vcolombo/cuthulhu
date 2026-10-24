@@ -125,7 +125,7 @@ impl From<TransportError> for DeviceError {
             // a port the OS still lists (`driver-hpgl/src/serial.rs::classify_io_error`) — plus
             // the open-time failures (`list_devices`, `open`, `claim_interface`,
             // `serialport::open`). "Talking failed" is the one clause true of all of them, and
-            // it names no `Transport` synonym CONTEXT.md lists under `_Avoid_`.
+            // it names no `Transport` synonym GLOSSARY.md lists under `_Avoid_`.
             TransportError::Io(s) => DeviceError::Io(format!("talking to the cutter failed ({s})")),
         }
     }

@@ -3505,6 +3505,66 @@ fn a_window_close_prompt_leaves_no_terminate_reply_owed() {
     assert!(!dev.take_terminate_owed(), "a window close left the OS owed a reply it never asked for");
 }
 
+/// A warning is a question, not an answer the other door can act on.
+///
+/// Cmd-Q and the window's close button both call `decide_close`. The first one
+/// that finds a cut outstanding only asks. Treating that ask as permission to
+/// leave would close the window while the prompt is still up — the gap the Quit
+/// item was brought onto this function to close (#327). The ask is not sticky
+/// either: once the mark it was about is gone, or the press that held the gate
+/// has finished, the next request leaves without asking. A latch would raise
+/// the prompt for every later quit.
+#[test]
+fn a_warning_is_a_question_not_permission_to_leave() {
+    use super::CloseVerdict::{Proceed, Warn};
+    let can_start_a_press = |dev: &DeviceManagerHandle| dev.close_gate.permit().is_some();
+
+    let host = HostId("host-1".into());
+    let attempt = AttemptId::next();
+    let asked = test_device_setup();
+    asked.ledger.mark_dispatched(&host, cut_host::host::testing::CAMEO, attempt);
+    asked.set_close_guard_ready(true);
+    let asks = std::cell::Cell::new(0);
+    assert_eq!(
+        asked.decide_close(|| {
+            asks.set(asks.get() + 1);
+            Ok::<(), String>(())
+        }),
+        Warn,
+    );
+    assert_eq!(
+        asked.decide_close(|| {
+            asks.set(asks.get() + 1);
+            Ok::<(), String>(())
+        }),
+        Warn,
+        "the other door left while the prompt was still up",
+    );
+    assert_eq!(asks.get(), 2, "the second door did not ask again");
+    assert!(can_start_a_press(&asked), "the app stays open, so a press must still be able to start");
+
+    asked.ledger.unmark_dispatched(&host, cut_host::host::testing::CAMEO, attempt);
+    assert!(
+        !asked.a_cut_may_be_running(),
+        "clearing the mark left a cut the next quit would still see",
+    );
+    let verdict = asked.decide_close(|| -> Result<(), String> { panic!("the cut had finished") });
+    assert_eq!(verdict, Proceed);
+    assert!(!can_start_a_press(&asked), "leaving was decided but a press could still start");
+
+    // The permit is the cut: nothing has been marked yet, which is why the first
+    // request warns. Once that press is away and nothing was started, the warning
+    // must not still be in force.
+    let sending = test_device_setup();
+    sending.set_close_guard_ready(true);
+    let permit = sending.close_gate.permit().expect("an open gate grants a permit");
+    assert_eq!(sending.decide_close(|| Ok::<(), String>(())), Warn);
+    drop(permit);
+    let verdict = sending.decide_close(|| -> Result<(), String> { panic!("the press had finished") });
+    assert_eq!(verdict, Proceed);
+    assert!(!can_start_a_press(&sending), "leaving was decided but a press could still start");
+}
+
 /// An admitted dispatch is not free merely because the worker still publishes Idle. This is
 /// the one bit the host added to Snapshot for the accept-to-worker-publication gap.
 #[test]

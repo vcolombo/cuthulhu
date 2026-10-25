@@ -19,6 +19,9 @@ use crate::state::AppState;
 
 mod close_gate;
 mod ledger;
+mod window_events;
+
+pub use window_events::{on_close_requested, on_page_load};
 
 use close_gate::{CloseGate, SendPermit};
 use ledger::Ledger;

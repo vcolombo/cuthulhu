@@ -181,3 +181,15 @@ real network can confirm the swap end to end.
       sends; "Quit anyway" exits.
 - [ ] The same cut, Dock icon right-click > Quit: known not to be covered (it sends `terminate:`
       straight to the app, and tao has no `applicationShouldTerminate`). Record what happens.
+
+## Close-guard registrations (#326, unverified)
+The hooks themselves (`on_close_requested`, `on_page_load`) are run by unit tests. Tauri's mock
+runtime drops window-event registrations and never fires page loads, so the two one-line
+registrations in `main.rs` are the part no headless test reaches.
+- [ ] A cut outstanding with the page loaded: closing the window with its close button shows the "A
+      cut may still be running" prompt and the window stays open (the `.on_window_event`
+      registration).
+- [ ] Reload the page (Cmd-R in a dev build) with the same cut outstanding, then close the window
+      before the new page has finished loading, if that can be timed: the close proceeds rather than
+      raising a prompt nobody can answer. Once the page has loaded again, closing prompts as above
+      (the `.on_page_load` registration).

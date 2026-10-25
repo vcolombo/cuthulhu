@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
-use desktop::device::DeviceManagerHandle;
+use desktop::device::{CloseVerdict, DeviceManagerHandle};
 use desktop::hosts;
 use desktop::ipc;
 use desktop::preferences::ResolvedTheme;
@@ -37,6 +37,81 @@ fn chrome_color(theme: ResolvedTheme) -> tauri::webview::Color {
     match theme {
         ResolvedTheme::Light => tauri::webview::Color(0xF8, 0xFB, 0xFB, 0xFF),
         ResolvedTheme::Dark => tauri::webview::Color(0x0B, 0x1A, 0x1D, 0xFF),
+    }
+}
+
+/// Quit routed through the close guard. macOS only: it is the only platform whose default menu
+/// Tauri installs unasked, and the only one whose Quit this closes a gap in. Installing a menu
+/// elsewhere would add a File > Exit that skips the guard where there was no menu at all.
+#[cfg(target_os = "macos")]
+mod quit_menu {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+    use tauri::{Emitter, Manager};
+
+    use desktop::device::{CloseVerdict, DeviceManagerHandle};
+
+    /// The Quit item's id. Not a predefined item, because a predefined one is the OS's `terminate:`.
+    const QUIT_MENU_ID: &str = "quit";
+
+    pub fn install(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+        builder.menu(app_menu).on_menu_event(|app, event| {
+            if event.id() == QUIT_MENU_ID {
+                request_quit(app);
+            }
+        })
+    }
+
+    /// Tauri's default menu, with Quit replaced by an item of our own.
+    ///
+    /// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
+    /// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
+    /// so the guard that covers the window's close button was skipped (#327). An item of our own is
+    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
+    /// send `terminate:` and are not covered.
+    ///
+    /// The stock item is found by its label, which muda sets to `Quit {app name}` on macOS (About
+    /// and Hide carry their own prefixes), because muda keeps the item's type to itself and its
+    /// position is only an accident of Tauri's default layout. A miss leaves the stock Quit, so the
+    /// guard fails open here as it does when the webview cannot be reached — and, like that arm,
+    /// not silently: the log line is the only evidence an update to either crate disarmed it.
+    fn app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+        let menu = Menu::default(app)?;
+        let mut replaced = false;
+        if let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() {
+            for item in application.items()? {
+                let MenuItemKind::Predefined(stock) = &item else { continue };
+                if !stock.text()?.starts_with("Quit ") {
+                    continue;
+                }
+                application.remove(&item)?;
+                application.append(&MenuItem::with_id(
+                    app,
+                    QUIT_MENU_ID,
+                    format!("Quit {}", app.package_info().name),
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?)?;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            eprintln!("cuthulhu: the stock Quit item was not found, so Cmd-Q is not guarded");
+        }
+        // A packaged app has nowhere an operator would read that line, so a debug build, which
+        // is what `cargo tauri dev` and the tests run, stops instead: an update that relabels
+        // the item is found when the app is first run, not by a quit that skipped the prompt.
+        debug_assert!(replaced, "the stock Quit item was not found, so Cmd-Q is not guarded");
+        Ok(menu)
+    }
+
+    /// What the Quit item does: the same question the window's close button asks, and on a yes the
+    /// same exit `force_quit` takes once the operator has answered the prompt.
+    fn request_quit(app: &tauri::AppHandle) {
+        let dev = app.state::<DeviceManagerHandle>();
+        if dev.decide_close(|| app.emit("cut-in-progress", ())) == CloseVerdict::Proceed {
+            app.exit(0);
+        }
     }
 }
 
@@ -95,7 +170,10 @@ fn main() {
         dev_handle.add_host(host);
     }
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = quit_menu::install(builder);
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(AppState::new()))
         .manage(dev_handle)
@@ -194,48 +272,8 @@ fn main() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let dev = window.state::<DeviceManagerHandle>();
-                // Never blocking, local or remote. This callback is synchronous and runs on the
-                // main thread, and `status()` aimed at a host dials: its 2s budget starts only
-                // once that host's connection lock is in hand, and `list_devices` holds the same
-                // lock across a 30s call — so a close arriving during a device-list poll froze
-                // the window for the listing plus the poll plus an unbounded resolve (#115).
-                // What this asks is whether to warn, which a status alone cannot answer: a
-                // dispatch accepted a second ago has not been polled yet, so the newest status
-                // anyone holds is the `Idle` from before it. `a_cut_may_be_running` counts every
-                // dispatch this desktop sent and has not seen finish, on any cutter and whatever
-                // is aimed at now (#158); a warning about a Job that has since ended costs a
-                // dialog the operator dismisses.
-                // `commit_close` answers and commits in one step, so a press queued behind a poll
-                // for a host's connection cannot cross into its dispatch after the window has been
-                // let go: the Job it would start outlives the process that started it.
-                if dev.commit_close() {
-                    return;
-                }
-                if dev.close_guard_ready() {
-                    // Readiness is the delivery fact: `emit` only proves serialization and returns
-                    // success even with nobody listening. Once the webview has acknowledged its
-                    // listener, a successful emit and the refusal are one act.
-                    match window.emit("cut-in-progress", ()) {
-                        Ok(()) => api.prevent_close(),
-                        Err(e) => {
-                            // The window is going, so the close is a fact whatever the operator
-                            // was told: commit it, or a press queued behind a host's connection
-                            // would still send into a process on its way out.
-                            dev.commit_close_regardless();
-                            eprintln!(
-                                "cuthulhu: a cut may be running and the warning could not be shown: {e}"
-                            );
-                        }
-                    }
-                } else {
-                    // Fail open by design — a refused close with no listener has no escape — but
-                    // not silently: this is the only evidence a startup/listener failure disabled
-                    // the guard when an operator later reports a warning was missing. Committed
-                    // for the same reason as above: the window goes, so nothing new may start.
-                    dev.commit_close_regardless();
-                    eprintln!(
-                        "cuthulhu: a cut may be running but the warning listener is not ready; closing"
-                    );
+                if dev.decide_close(|| window.emit("cut-in-progress", ())) == CloseVerdict::Warn {
+                    api.prevent_close();
                 }
             }
         })

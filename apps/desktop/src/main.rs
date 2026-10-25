@@ -98,6 +98,10 @@ mod quit_menu {
         if !replaced {
             eprintln!("cuthulhu: the stock Quit item was not found, so Cmd-Q is not guarded");
         }
+        // A packaged app has nowhere an operator would read that line, so a debug build, which
+        // is what `cargo tauri dev` and the tests run, stops instead: an update that relabels
+        // the item is found when the app is first run, not by a quit that skipped the prompt.
+        debug_assert!(replaced, "the stock Quit item was not found, so Cmd-Q is not guarded");
         Ok(menu)
     }
 

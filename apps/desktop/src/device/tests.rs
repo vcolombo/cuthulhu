@@ -2498,13 +2498,14 @@ fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
 
 /// The same rule with the sibling where #290's failure actually happened: inside `on_host`,
 /// holding the host's connection, while a second press has begun and is inside `on_host` behind it.
-/// Staging the sibling with `begin_dispatch` alone (above) never has two presses in flight at once, so it
-/// cannot tell a refusal that settles by whoever is *registered* from one that settles by who is
-/// *answered*.
+/// The staged test above covers settlement with a live sibling registration — its guard is held
+/// across `execute_cut`, so both presses are in flight when the refusal settles. This one
+/// additionally establishes overlapping `on_host` calls before the connection is released.
 ///
-/// Deterministic, with no sleeps: the sibling parks inside `on_host` until released, and the test
-/// waits until the second press is both in flight in the ledger and counted inside its own
-/// `on_host`, between asking for the connection and holding it, while the sibling still holds it.
+/// Synchronised on observed state rather than timing assumptions: the sibling parks inside
+/// `on_host` until released, and the test waits until the second press is both in flight in the
+/// ledger and counted inside its own `on_host`, between asking for the connection and holding it,
+/// while the sibling still holds it.
 #[test]
 fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
     let host = start_loopback_host();

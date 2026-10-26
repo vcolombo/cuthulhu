@@ -1806,7 +1806,8 @@ test("an inch weed margin is a view of the millimetre draft", async ({ page }) =
   const before = await plans();
   // Keystrokes, not a filled value: a number input reports both `1` and `.` as "1".
   await margin.click();
-  await page.keyboard.press("Control+A");
+  // The platform chord: Control+A moves the caret on macOS, so "1." would land in front of the "0.12".
+  await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.type("1.");
   await expect(margin).toHaveValue("1.");
   await margin.blur();
@@ -1841,7 +1842,7 @@ test("escape commits a finished inch and drops a half-typed one", async ({ page 
   await expect(margin).toHaveValue("0.12");
 
   await margin.click();
-  await page.keyboard.press("Control+A");
+  await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.type("1.");
   await expect(margin).toHaveValue("1.");
   await page.keyboard.press("Escape");
@@ -1878,7 +1879,7 @@ test("a margin at the millimetre maximum is shown as an inch that margin still a
   const margin = page.getByLabel("Weed margin");
   await expect(margin).toHaveValue("1.96");
   await margin.click();
-  await page.keyboard.press("Control+A");
+  await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.type("1.96");
   await margin.blur();
   await expect(page.getByRole("alert").filter({ hasText: "Margin must be" })).toHaveCount(0);

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! The two native hooks the close guard hangs on. They are generic over the runtime and live here,
-//! not inline in `main`'s builder, so a test can register the very functions the app registers on
-//! Tauri's mock runtime (#326): inline closures were reachable from nothing but a real window.
+//! not inline in `main`'s builder, so a test can run the very functions the app registers against
+//! Tauri's mock runtime (#326). The mock cannot dispatch to a registered window-event handler, so
+//! the test hands the loop's own event to the hook: the registrations themselves stay unverified
+//! headless, and `MANUAL-CHECKLIST.md` says so.
 
 use tauri::webview::{PageLoadEvent, PageLoadPayload};
 use tauri::{Emitter, Manager, Runtime, Webview, Window, WindowEvent};

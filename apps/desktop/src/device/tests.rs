@@ -2503,8 +2503,8 @@ fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
 /// *answered*.
 ///
 /// Deterministic, with no sleeps: the sibling parks inside `on_host` until released, and the test
-/// waits for the ledger to show both presses in flight, which can only be so while the connection
-/// lock the second press needs is still held.
+/// waits until the second press is both in flight in the ledger and counted waiting on the
+/// connection lock inside its own `on_host`, which can only be so while the sibling still holds it.
 #[test]
 fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
     let host = start_loopback_host();
@@ -2545,9 +2545,17 @@ fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
         inside.recv().expect("the sibling never reached on_host");
 
         let second = s.spawn(|| dev.execute_cut(aimed.clone(), a_square(400.0)));
+        // Both facts, not either: a press can be registered and still be descheduled before it
+        // asks for the connection, in which case releasing the sibling would stage exactly what
+        // the test above already stages. `on_host_waiting` is counted across the connection lock
+        // acquisition, so it is the second press being *inside `on_host`*, waiting on the lock the
+        // sibling holds — the sibling's own count is back to nothing by the time `inside` arrived.
         wait_until(
-            || dev.ledger.presses_in_flight(&key) == 2,
-            "the second press never began while the sibling held the connection",
+            || {
+                dev.ledger.presses_in_flight(&key) == 2
+                    && dev.on_host_waiting.load(std::sync::atomic::Ordering::SeqCst) == 1
+            },
+            "the second press never queued on the connection while the sibling held it",
         );
         release.send(()).unwrap();
 

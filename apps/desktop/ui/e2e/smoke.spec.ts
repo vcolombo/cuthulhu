@@ -1776,8 +1776,9 @@ test("a machine the document was not set up for blocks the passes until it is co
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
   await page.goto("/");
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
-  // The cutter is aimed either way. Dismissing the switch leaves the document on the Cameo.
-  page.once("dialog", (dialog) => dialog.dismiss());
+  // The cutter is aimed either way. Dismissing the switch leaves the document on the Cameo, and
+  // the dismissal is the fake dialog plugin's answer: the plugin raises no native dialog.
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "cancel"));
   await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
   await goToSendStep(page, 2);
   await fillSendLevels(page);
@@ -2713,9 +2714,10 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
   // Recover by reconnecting (the other listed device). The connect lifecycle events
   // carry NO_JOB=0 and must still reach the dialog after a failed job — Start Cut
   // comes back only because the reconnect's Idle status was accepted.
-  // The first choice aimed the document at the Cameo, so this one asks before switching.
+  // The first choice aimed the document at the Cameo, so this one asks before switching. The
+  // answer is the fake dialog plugin's, scripted here: the plugin raises no native dialog.
   // The aimed card is not a second connect: the Puma card is the other cutter.
-  page.once("dialog", (dialog) => dialog.accept());
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "ok"));
   await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
   await expectStartOffered(page);

@@ -3428,6 +3428,22 @@ fn a_terminate_is_deferred_only_while_the_operator_is_being_asked() {
     assert!(armed.take_terminate_owed(), "a deferral owes the OS a reply");
     assert!(!armed.take_terminate_owed(), "the reply was owed twice: a confirm and a cancel could both send it");
 
+    // The answer can arrive while the prompt is still being raised: it is emitted to a webview
+    // that answers on another thread. The debt is therefore owed *inside* `warn`, not only once
+    // `answer_terminate` returns — marking it afterwards, on `Warn`, would let that answer find
+    // nothing owed and leave the deferral it answered still outstanding.
+    let early = outstanding();
+    early.set_close_guard_ready(true);
+    let answer = early.answer_terminate(|| {
+        assert!(early.take_terminate_owed(), "an answer during the warning found no reply owed");
+        Ok::<(), String>(())
+    });
+    assert_eq!(answer, Later);
+    assert!(!early.take_terminate_owed(), "that early answer did not settle the reply");
+    assert!(can_start_a_press(&early), "the app stays open, so a press must still be able to start");
+    assert_eq!(early.answer_terminate(|| Ok::<(), String>(())), Later);
+    assert!(early.take_terminate_owed(), "a deferral after an early answer owes no reply");
+
     // The prompt is already up: a second request joins it rather than raising another, and does
     // not make a second reply owed.
     let asked = std::cell::Cell::new(0);

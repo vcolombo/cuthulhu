@@ -1801,7 +1801,10 @@ for (const answer of ["cancel", "ok"] as const) {
   test(`picking the other machine ${answer === "ok" ? "switches" : "does not switch"} the design's machine`, async ({ page }) => {
     await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
     await page.goto("/");
-    await page.evaluate((a) => sessionStorage.setItem("__dialog_answer__", a), answer);
+    await page.evaluate((a) => {
+      sessionStorage.setItem("__dialog_answer__", a);
+      sessionStorage.setItem("__dialog_hold__", "1");
+    }, answer);
 
     await page.getByRole("tab", { name: "Devices" }).click();
     await page
@@ -1810,7 +1813,8 @@ for (const answer of ["cancel", "ok"] as const) {
       .getByRole("button", { name: "Set as active", exact: true })
       .click();
 
-    // The question is the beat to wait on: it is raised after the connect and read before the switch.
+    // The question is raised after the connect, and the fake holds its answer until released
+    // below, so what is read next is the document as it stood while the operator was being asked.
     await expect
       .poll(async () =>
         JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[],
@@ -1819,9 +1823,21 @@ for (const answer of ["cancel", "ok"] as const) {
         "This design is set up for Silhouette Cameo 5 Alpha. Switch it to GCC Puma IV? The page size changes with the machine.",
       ]);
 
-    // What the answer changed, read through the send dialog's own fact: its passes refuse a
-    // machine the design was not set up for, and the dialog above names that machine.
+    const designMachine = async () =>
+      (JSON.parse((await callFake(page, "snapshot")) as string) as { machine: { id: string } }).machine.id;
+    expect(await designMachine()).toBe("cameo5");
+
+    // Delivery is recorded in the same turn it resolves, so reading it afterwards is ordered
+    // after the page's continuation — for Cancel there is no later change to poll for, and this
+    // is what makes "still cameo5" a fact about the answer rather than about the timing.
+    await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem("__dialog_answered__"))).toBe("1");
+    await expect.poll(designMachine).toBe(answer === "ok" ? "puma" : "cameo5");
+
+    // The same fact as the operator meets it: the send dialog's passes refuse a machine the
+    // design was not set up for, with the dialog's own controls up before the absence is read.
     await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Next", exact: true })).toBeVisible();
     const blocked = page.getByText("Document is set up for a different machine than the connected device.");
     if (answer === "cancel") {
       await expect(blocked).toBeVisible();
@@ -5749,7 +5765,10 @@ const emitBackendEvent = async (page: Page, event: string) => {
 test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "ok"));
+  await page.evaluate(() => {
+    sessionStorage.setItem("__dialog_answer__", "ok");
+    sessionStorage.setItem("__dialog_hold__", "1");
+  });
 
   await emitBackendEvent(page, "cut-in-progress");
 
@@ -5760,9 +5779,12 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
   expect(prompt).toContain("Sending to the cutter on this computer stops");
   expect(prompt).toContain("already buffered");
   expect(prompt).toContain("Cut Host keeps running there");
-  // The answer comes late, as the plugin's does, and nothing may have happened before it: the
-  // prompt this replaced took a Promise for a yes.
+  // The answer is held by the fake until released below, so this is an ordering and not a race
+  // against a timer: nothing may have happened yet. The prompt this replaced took a Promise
+  // for a yes and quit here.
   expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
+  await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
   // Accepting it is what quits, and the fake records having been asked.
   await expect
     .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
@@ -5789,9 +5811,22 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
 test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "cancel"));
+  await page.evaluate(() => {
+    sessionStorage.setItem("__dialog_answer__", "cancel");
+    sessionStorage.setItem("__dialog_hold__", "1");
+  });
 
   await emitBackendEvent(page, "cut-in-progress");
+
+  // Held unanswered: neither door has been told anything yet.
+  await expect
+    .poll(async () =>
+      JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[],
+    )
+    .toHaveLength(1);
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
 
   // Dismissing is told to the backend, because on the Dock's Quit or a logout the OS is waiting on
   // the answer: a cancel that stayed in the page would leave a logout hanging on this app. It is

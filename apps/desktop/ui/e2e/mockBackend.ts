@@ -1672,10 +1672,16 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
         return Promise.resolve("/mock/cuthulhu-project.cut");
       }
-      // The dialog plugin's `confirm` is a `message` command, so this is the quit prompt. Answered
-      // late, as the real one is, and recorded: a test cannot tell a prompt that was asked from one
-      // that never was by what the page did next. The answer is the test's, defaulting to Cancel,
-      // and is the label of the button the page offered, which is what the plugin compares.
+      // The dialog plugin's `confirm` is a `message` command, so this is the quit and switch
+      // prompts. Recorded, because a test cannot tell a prompt that was asked from one that never
+      // was by what the page did next. The answer is the test's, defaulting to Cancel, and is the
+      // label of the button the page offered, which is what the plugin compares.
+      //
+      // Held behind an explicit release when the test asks for one (`__dialog_hold__`), delivered
+      // at once otherwise. A fixed delay would make "nothing happened yet" a race: the test
+      // reading the recorded message has no way to know the delay has not already elapsed, so a
+      // slow runner fails correct code. Delivery records `__dialog_answered__` in the same turn,
+      // so a later read of it is ordered after the page's own continuation.
       if (cmd === "plugin:dialog|message") {
         const log = JSON.parse(sessionStorage.getItem("__dialog_messages__") ?? "[]") as string[];
         log.push(String(args.message));
@@ -1683,8 +1689,21 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
         // The plugin's wire form for custom labels (`buttonsToRust`), not something to validate.
         const offered = args.buttons as { OkCancelCustom: [string, string] };
         const [okLabel, cancelLabel] = offered.OkCancelCustom;
-        const ok = sessionStorage.getItem("__dialog_answer__") === "ok";
-        return new Promise((resolve) => setTimeout(() => resolve(ok ? okLabel : cancelLabel), 250));
+        return new Promise((resolve) => {
+          const deliver = () => {
+            const held =
+              sessionStorage.getItem("__dialog_hold__") === "1" &&
+              sessionStorage.getItem("__dialog_released__") !== "1";
+            if (held) {
+              setTimeout(deliver, 10);
+              return;
+            }
+            const answered = Number(sessionStorage.getItem("__dialog_answered__") ?? 0) + 1;
+            sessionStorage.setItem("__dialog_answered__", String(answered));
+            resolve(sessionStorage.getItem("__dialog_answer__") === "ok" ? okLabel : cancelLabel);
+          };
+          deliver();
+        });
       }
       if (cmd === "plugin:event|listen") {
         const id = args.handler as number;

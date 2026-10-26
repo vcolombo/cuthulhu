@@ -25,12 +25,20 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-// `pickSavePath`/`pickOpenPath` reach the dialog plugin rather than a command of ours; stubbed so
-// calling them is harmless, and they record nothing to check.
+// The dialog plugin's own surface. The pickers are stubbed harmless; `confirm` records, because the
+// two prompt wrappers are checked against the plugin they call below, not against a command of ours.
+const dialog = vi.hoisted(() => ({
+  calls: [] as { message: string; options: unknown }[],
+  answer: false,
+  fails: false,
+}));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   save: () => Promise.resolve(null),
   open: () => Promise.resolve(null),
-  confirm: () => Promise.resolve(false),
+  confirm: (message: string, options: unknown) => {
+    dialog.calls.push({ message, options });
+    return dialog.fails ? Promise.reject(new Error("dialog unavailable")) : Promise.resolve(dialog.answer);
+  },
 }));
 
 const declared: Record<string, string[]> = inventory;
@@ -106,6 +114,45 @@ describe("a wrapper that forwards its caller's payload", () => {
   });
 });
 
+
+// Being no command of ours is not the same as being unchecked: these two wrappers are the whole
+// connection between a prompt decision and the dialog that shows it, and the loop above can only
+// see that they invoke nothing of ours. A wrapper that never asked, or asked and dropped the
+// answer, would pass that and make its affirmative unreachable.
+describe("the prompt wrappers ask the dialog plugin, and return its answer", () => {
+  const asking = () => {
+    dialog.calls.length = 0;
+    dialog.fails = false;
+    dialog.answer = false;
+    return dialog.calls as { message: string; options: { okLabel?: string; cancelLabel?: string } }[];
+  };
+
+  test("askToQuit", async () => {
+    const asked = asking();
+    dialog.answer = true;
+    await expect(ipc.askToQuit("Quit?")).resolves.toBe(true);
+    expect(asked).toEqual([
+      { message: "Quit?", options: { title: "Quit Cuthulhu?", kind: "warning", okLabel: "Quit anyway", cancelLabel: "Cancel" } },
+    ]);
+  });
+
+  test("confirmSwitch", async () => {
+    const asked = asking();
+    await expect(ipc.confirmSwitch("Switch?")).resolves.toBe(false);
+    expect(asked).toEqual([
+      {
+        message: "Switch?",
+        options: { title: "Switch design machine?", kind: "warning", okLabel: "Switch machine", cancelLabel: "Cancel" },
+      },
+    ]);
+  });
+
+  test("a dialog that fails to show rejects, rather than reading as an answer", async () => {
+    asking();
+    dialog.fails = true;
+    await expect(ipc.askToQuit("Quit?")).rejects.toThrow("dialog unavailable");
+  });
+});
 // Declared last on purpose: vitest runs a file's tests in order, so this reads what the tests above
 // recorded.
 //
@@ -113,6 +160,7 @@ describe("a wrapper that forwards its caller's payload", () => {
 // registered in Rust that no wrapper names at all. Nothing else here would notice it, and it is
 // worth failing over — `CLAUDE.md` has the UI reaching Rust only through `ui/src/ipc.ts`, so a
 // registered command with no wrapper there is one nothing can invoke.
+
 test("every registered command is witnessed by a wrapper", () => {
   expect([...observed].sort()).toEqual(Object.keys(declared).sort());
 });

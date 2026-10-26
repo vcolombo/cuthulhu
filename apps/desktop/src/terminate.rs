@@ -108,11 +108,9 @@ mod tests {
 
     fn ask(class: &AnyClass) -> usize {
         // Safety: `class` is a plain `NSObject` subclass this test registered, and the selector is
-        // the one `install_on` just added to it.
-        unsafe {
-            let object: *mut AnyObject = msg_send![class, new];
-            msg_send![object, applicationShouldTerminate: std::ptr::null_mut::<AnyObject>()]
-        }
+        // the one `install_on` just added to it. Retained, because `new` hands the caller +1.
+        let object: objc2::rc::Retained<AnyObject> = unsafe { msg_send![class, new] };
+        unsafe { msg_send![&object, applicationShouldTerminate: std::ptr::null_mut::<AnyObject>()] }
     }
 
     /// The runtime-added method answers what the decider says, and is not added over a class that

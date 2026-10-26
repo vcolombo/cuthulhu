@@ -85,7 +85,7 @@ describe("answerQuitPrompt", () => {
     expect(h.deps.log).toEqual(["cancel"]);
   });
 
-  it("reports a quit or cancel that fails, once", async () => {
+  it("reports a failed quit once, and does not also cancel", async () => {
     const h = harness();
     const done = answerQuitPrompt({
       ...h.deps,
@@ -98,6 +98,38 @@ describe("answerQuitPrompt", () => {
     await done;
 
     expect(h.deps.log).toEqual(["ask:warning", "error:exit refused"]);
+  });
+
+  it("reports a failed cancel without rejecting", async () => {
+    const h = harness();
+    const done = answerQuitPrompt({
+      ...h.deps,
+      cancelQuit: async () => {
+        h.deps.log.push("cancel-attempted");
+        throw "no backend";
+      },
+    });
+    await settle();
+    h.answer(false);
+    // Awaiting it is the assertion: App fires this and forgets it, so a rejection is unhandled.
+    await done;
+
+    expect(h.deps.log).toEqual(["ask:warning", "cancel-attempted", "error:no backend"]);
+  });
+
+  it("reports both failures when the question and the cancel both fail", async () => {
+    const h = harness();
+    const done = answerQuitPrompt({
+      ...h.deps,
+      cancelQuit: async () => {
+        throw "no backend";
+      },
+    });
+    await settle();
+    h.fail("dialog unavailable");
+    await done;
+
+    expect(h.deps.log).toEqual(["ask:warning", "error:dialog unavailable", "error:no backend"]);
   });
 });
 describe("confirmed", () => {

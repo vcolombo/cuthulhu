@@ -3399,6 +3399,37 @@ fn only_a_page_start_stands_down_the_previous_listener() {
     assert!(!dev.close_guard_ready(), "a reload left the previous page's acknowledgement standing");
 }
 
+/// A deferred terminate whose prompt page goes away: the start that replaces it claims the reply
+/// (for `main` to send as "no"), rather than leaving every later terminate joining a question
+/// nobody can answer.
+#[test]
+fn a_page_start_settles_a_deferred_terminate_whose_prompt_is_gone() {
+    use tauri::webview::PageLoadEvent::{Finished, Started};
+    let dev = test_device_setup();
+    dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+    dev.set_close_guard_ready(true);
+    let asked = std::cell::Cell::new(0);
+    let warn = || {
+        asked.set(asked.get() + 1);
+        Ok::<(), String>(())
+    };
+    assert_eq!(dev.answer_terminate(warn), TerminateAnswer::Later);
+
+    // A load finishing is the prompt's own page completing, not its replacement.
+    assert!(!window_events::note_page_load(&dev, Finished), "a finished load settled a live prompt");
+
+    assert!(window_events::note_page_load(&dev, Started), "the new page left the OS waiting on a gone prompt");
+    assert!(!dev.close_guard_ready(), "the new page inherited the old one's acknowledgement");
+    assert!(!dev.take_terminate_owed(), "the reply the start claimed was still owed to a second answer");
+    assert!(!window_events::note_page_load(&dev, Started), "a start with nothing deferred claimed a reply");
+
+    // Asking again prompts on the new page rather than joining the orphaned deferral.
+    dev.set_close_guard_ready(true);
+    assert_eq!(dev.answer_terminate(warn), TerminateAnswer::Later);
+    assert_eq!(asked.get(), 2, "the second terminate joined the orphaned prompt instead of asking again");
+    assert!(dev.take_terminate_owed());
+}
+
 /// The macOS terminate door (#336): the Dock's Quit and a logout ask the OS's question, and an
 /// answer of "later" puts a reply in the desktop's debt. Each arm is a different promise to the
 /// OS, and a reply sent twice or never is a logout that hangs or an app that quits on a cancel.

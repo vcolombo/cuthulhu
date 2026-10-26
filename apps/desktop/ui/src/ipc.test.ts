@@ -114,7 +114,6 @@ describe("a wrapper that forwards its caller's payload", () => {
   });
 });
 
-
 // Being no command of ours is not the same as being unchecked: these two wrappers are the whole
 // connection between a prompt decision and the dialog that shows it, and the loop above can only
 // see that they invoke nothing of ours. A wrapper that never asked, or asked and dropped the
@@ -127,32 +126,49 @@ describe("the prompt wrappers ask the dialog plugin, and return its answer", () 
     return dialog.calls as { message: string; options: { okLabel?: string; cancelLabel?: string } }[];
   };
 
-  test("askToQuit", async () => {
-    const asked = asking();
-    dialog.answer = true;
-    await expect(ipc.askToQuit("Quit?")).resolves.toBe(true);
-    expect(asked).toEqual([
-      { message: "Quit?", options: { title: "Quit Cuthulhu?", kind: "warning", okLabel: "Quit anyway", cancelLabel: "Cancel" } },
-    ]);
-  });
+  // Each wrapper's full contract, not one answer each between them: a wrapper that asks and then
+  // pins the answer either way — always yes for one, always no for the other — is what splitting
+  // the cases across them left open.
+  const wrappers = [
+    {
+      name: "askToQuit",
+      ask: () => ipc.askToQuit("Quit?"),
+      asked: [{ message: "Quit?", options: { title: "Quit Cuthulhu?", kind: "warning", okLabel: "Quit anyway", cancelLabel: "Cancel" } }],
+    },
+    {
+      name: "confirmSwitch",
+      ask: () => ipc.confirmSwitch("Switch?"),
+      asked: [
+        {
+          message: "Switch?",
+          options: { title: "Switch design machine?", kind: "warning", okLabel: "Switch machine", cancelLabel: "Cancel" },
+        },
+      ],
+    },
+  ];
 
-  test("confirmSwitch", async () => {
-    const asked = asking();
-    await expect(ipc.confirmSwitch("Switch?")).resolves.toBe(false);
-    expect(asked).toEqual([
-      {
-        message: "Switch?",
-        options: { title: "Switch design machine?", kind: "warning", okLabel: "Switch machine", cancelLabel: "Cancel" },
-      },
-    ]);
-  });
+  for (const wrapper of wrappers) {
+    test(`${wrapper.name} forwards its question and returns a yes`, async () => {
+      const asked = asking();
+      dialog.answer = true;
+      await expect(wrapper.ask()).resolves.toBe(true);
+      expect(asked).toEqual(wrapper.asked);
+    });
 
-  test("a dialog that fails to show rejects, rather than reading as an answer", async () => {
-    asking();
-    dialog.fails = true;
-    await expect(ipc.askToQuit("Quit?")).rejects.toThrow("dialog unavailable");
-  });
+    test(`${wrapper.name} returns a no`, async () => {
+      const asked = asking();
+      await expect(wrapper.ask()).resolves.toBe(false);
+      expect(asked).toEqual(wrapper.asked);
+    });
+
+    test(`${wrapper.name}: a dialog that fails to show rejects, rather than reading as an answer`, async () => {
+      asking();
+      dialog.fails = true;
+      await expect(wrapper.ask()).rejects.toThrow("dialog unavailable");
+    });
+  }
 });
+
 // Declared last on purpose: vitest runs a file's tests in order, so this reads what the tests above
 // recorded.
 //

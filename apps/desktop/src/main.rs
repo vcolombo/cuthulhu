@@ -165,6 +165,22 @@ fn settle_terminate(app: &tauri::AppHandle, dev: &DeviceManagerHandle, proceed: 
     let _ = (app, dev, proceed);
 }
 
+/// The close guard's page-load hook, plus what only this binary can do: answer the OS.
+///
+/// A load that starts under a deferred terminate has taken that prompt's page away, so the
+/// operator's answer can never arrive. The hook claims the reply in that case, and it is sent
+/// here as "no" — the quit or logout is cancelled rather than left waiting on nobody, and asking
+/// again prompts on the new page.
+fn on_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    let orphaned = device::on_page_load(webview, payload);
+    #[cfg(target_os = "macos")]
+    if orphaned {
+        terminate::reply(webview.app_handle(), false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = orphaned;
+}
+
 /// The webview's acknowledgement that its quit-warning listener is installed.
 ///
 /// Tauri's `emit` returns success with zero listeners, so delivery cannot be inferred from the
@@ -252,7 +268,7 @@ fn main() {
             cancel_quit,
         ])
         // The page-load hook is the close guard's too; its reasoning lives with it.
-        .on_page_load(device::on_page_load)
+        .on_page_load(on_page_load)
         .setup(|app| {
             // The window is created hidden. Theme and the colour behind the webview are set
             // before anything can show it; the page calls `show` only after it has painted

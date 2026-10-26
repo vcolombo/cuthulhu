@@ -184,6 +184,9 @@ real network can confirm the swap end to end.
       instead of quitting. Cancel leaves the app open and a new press still sends; "Quit anyway"
       exits. A real cut is needed, since only a real outstanding cut raises the prompt.
 - [ ] Dock icon right-click > Quit with nothing outstanding quits.
+- [ ] With that prompt up, reload the page before answering, then Dock Quit again: the first quit
+      is cancelled when the prompt's page goes away (its answer could never arrive), and the second
+      raises the prompt on the new page rather than joining the orphaned one.
 - [ ] A logout (Apple menu > Log Out) with a cut outstanding: the prompt appears in the app,
       "Cancel" cancels the logout rather than leaving the login window hanging on this app, and
       "Quit anyway" lets it continue. Record whether macOS shows its own "app interrupted logout"

@@ -2454,7 +2454,7 @@ fn a_dispatch_nothing_has_polled_yet_still_holds_the_window() {
 ///
 /// The sibling is staged here, because this pins the rule and not the interleaving: `begin_dispatch`
 /// is exactly what a press mid-dispatch holds. The interleaving itself, a sibling parked inside
-/// `on_host` with a second press queued behind it, is
+/// `on_host` with a second press inside `on_host` behind it, is
 /// `a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host`.
 #[test]
 fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
@@ -2497,14 +2497,14 @@ fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
 }
 
 /// The same rule with the sibling where #290's failure actually happened: inside `on_host`,
-/// holding the host's connection, while a second press has begun and queues behind it. Staging
-/// the sibling with `begin_dispatch` alone (above) never has two presses in flight at once, so it
+/// holding the host's connection, while a second press has begun and is inside `on_host` behind it.
+/// Staging the sibling with `begin_dispatch` alone (above) never has two presses in flight at once, so it
 /// cannot tell a refusal that settles by whoever is *registered* from one that settles by who is
 /// *answered*.
 ///
 /// Deterministic, with no sleeps: the sibling parks inside `on_host` until released, and the test
-/// waits until the second press is both in flight in the ledger and counted waiting on the
-/// connection lock inside its own `on_host`, which can only be so while the sibling still holds it.
+/// waits until the second press is both in flight in the ledger and counted inside its own
+/// `on_host`, between asking for the connection and holding it, while the sibling still holds it.
 #[test]
 fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
     let host = start_loopback_host();
@@ -2548,14 +2548,17 @@ fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
         // Both facts, not either: a press can be registered and still be descheduled before it
         // asks for the connection, in which case releasing the sibling would stage exactly what
         // the test above already stages. `on_host_waiting` is counted across the connection lock
-        // acquisition, so it is the second press being *inside `on_host`*, waiting on the lock the
-        // sibling holds — the sibling's own count is back to nothing by the time `inside` arrived.
+        // acquisition, so it is the second press *inside its own `on_host`*, between asking for
+        // the connection and holding it, while the sibling still holds it. That is overlapping
+        // `on_host` calls, not proof the second has attempted the lock: it may be descheduled on
+        // the way to it. What the assertions need is the overlap — the refusal settles while the
+        // sibling's press is in flight.
         wait_until(
             || {
                 dev.ledger.presses_in_flight(&key) == 2
                     && dev.on_host_waiting.load(std::sync::atomic::Ordering::SeqCst) == 1
             },
-            "the second press never queued on the connection while the sibling held it",
+            "the second press never reached the connection inside on_host while the sibling held it",
         );
         release.send(()).unwrap();
 

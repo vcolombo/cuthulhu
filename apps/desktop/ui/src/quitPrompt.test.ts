@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, expect, it } from "vitest";
-import { answerQuitPrompt, confirmed, QUIT_WARNING } from "./quitPrompt";
+import { answerQuitPrompt, QUIT_WARNING } from "./quitPrompt";
 
 /**
  * The question is answered later than it is asked, which is the whole difference from the
@@ -130,36 +130,5 @@ describe("answerQuitPrompt", () => {
     await done;
 
     expect(h.deps.log).toEqual(["ask:warning", "error:dialog unavailable", "error:no backend"]);
-  });
-});
-describe("confirmed", () => {
-  it("waits for the answer, and a delayed no is a no", async () => {
-    const h = harness();
-    const pending = confirmed(() => h.deps.ask("any"), h.deps.onError);
-    await settle();
-    h.answer(false);
-    await expect(pending).resolves.toBe(false);
-  });
-
-  it("a delayed yes is a yes", async () => {
-    const h = harness();
-    const pending = confirmed(() => h.deps.ask("any"), h.deps.onError);
-    await settle();
-    h.answer(true);
-    await expect(pending).resolves.toBe(true);
-  });
-
-  it("a question that could not be asked is a no, reported once", async () => {
-    const errors: string[] = [];
-    const pending = confirmed(async () => {
-      throw "dialog unavailable";
-    }, (e) => errors.push(String(e)));
-    await expect(pending).resolves.toBe(false);
-    expect(errors).toEqual(["dialog unavailable"]);
-  });
-
-  it("only a literal true confirms", async () => {
-    const pending = confirmed(async () => ({}) as unknown as boolean, () => {});
-    await expect(pending).resolves.toBe(false);
   });
 });

@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import { confirmed } from "./dialogAnswer";
+
 /**
  * What the operator is asked when the backend says a cut may still be running, and what each
  * answer does.
@@ -47,22 +49,5 @@ export async function answerQuitPrompt({ ask, forceQuit, cancelQuit, onError }: 
     await forceQuit();
   } catch (e) {
     onError(e);
-  }
-}
-
-/**
- * Whether a confirmation the operator could answer should be asked at all, and what an answer
- * that never arrived means.
- *
- * For retiring `window.confirm` anywhere else: it takes an asynchronous `ask` and returns
- * `false` for a rejected question, so the one shape a caller wants to guard against ("the
- * dialog did not show, so proceed") is unrepresentable at the call site.
- */
-export async function confirmed(ask: () => Promise<boolean>, onError: (e: unknown) => void): Promise<boolean> {
-  try {
-    return (await ask()) === true;
-  } catch (e) {
-    onError(e);
-    return false;
   }
 }

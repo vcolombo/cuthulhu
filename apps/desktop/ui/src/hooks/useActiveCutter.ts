@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { MachineProfile } from "../App";
 import * as ipc from "../ipc";
 import { sameCutter } from "../hosts/deviceList";
-import { confirmed } from "../quitPrompt";
+import { confirmed } from "../dialogAnswer";
 
 type Args = {
   profileId: string | null;

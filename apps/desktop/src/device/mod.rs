@@ -19,6 +19,7 @@ use crate::state::AppState;
 
 mod close_gate;
 mod ledger;
+mod terminate_reply;
 mod window_events;
 
 pub use window_events::{on_close_requested, on_page_load};
@@ -28,6 +29,7 @@ use ledger::Ledger;
 use ledger::JobKey;
 #[cfg(test)]
 use ledger::{AttemptId, MAX_JOBS_IN_DOUBT};
+use terminate_reply::TerminateReply;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct IpcError {
@@ -524,10 +526,9 @@ pub struct DeviceManagerHandle {
     close_guard_ready: std::sync::atomic::AtomicBool,
     /// The one barrier between a press starting a cut and a window that has been let go.
     close_gate: CloseGate,
-    /// Whether a macOS terminate has been deferred (`NSTerminateLater`) and the OS is still owed
-    /// its reply. Not part of `CloseGate`: it is not a fact about presses but about a question
-    /// asked of the OS, and only the operator's answer to the prompt clears it.
-    terminate_owed: std::sync::atomic::AtomicBool,
+    /// Whether the OS is owed a reply to a deferred macOS terminate. A type rather than a flag,
+    /// for the reason `close_gate` is: see `terminate_reply`.
+    terminate_reply: TerminateReply,
     /// How many callers are between asking for a host connection and holding it. Test-only: it is
     /// the difference between a press inside `on_host` at that lock and one merely registered.
     #[cfg(test)]
@@ -565,7 +566,7 @@ impl DeviceManagerHandle {
             ledger: Ledger::default(),
             last_remote_status: Mutex::new(HashMap::new()),
             close_gate: CloseGate::default(),
-            terminate_owed: std::sync::atomic::AtomicBool::new(false),
+            terminate_reply: TerminateReply::default(),
             #[cfg(test)]
             on_host_waiting: std::sync::atomic::AtomicUsize::new(0),
             close_guard_ready: std::sync::atomic::AtomicBool::new(false),
@@ -1551,34 +1552,19 @@ impl DeviceManagerHandle {
     /// `Later` is `NSTerminateLater`: the operator is being asked, and the OS is told to wait. A
     /// reply is then owed exactly once, through `take_terminate_owed`, from whichever of "Quit
     /// anyway" or "Cancel" the operator picks. Never replying leaves AppKit waiting, and a logout
-    /// with it.
-    ///
-    /// The reply is marked owed *before* the prompt can be raised, because the answer arrives on
-    /// another thread and may land before `decide_close` returns. Claiming it with a swap also
-    /// makes a second request while the first is pending join it, not raise a second prompt over
-    /// the first, and leaves exactly one reply to send.
+    /// with it. How the debt is claimed, joined and cleared is `TerminateReply`'s.
     pub fn answer_terminate<E: std::fmt::Display>(
         &self,
         warn: impl FnOnce() -> Result<(), E>,
     ) -> TerminateAnswer {
-        if self.terminate_owed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return TerminateAnswer::Later;
-        }
-        match self.decide_close(warn) {
-            CloseVerdict::Warn => TerminateAnswer::Later,
-            CloseVerdict::Proceed => {
-                // Nothing was asked, so nobody will answer: no reply is owed.
-                self.terminate_owed.store(false, std::sync::atomic::Ordering::SeqCst);
-                TerminateAnswer::Now
-            }
-        }
+        self.terminate_reply.answer(|| self.decide_close(warn))
     }
 
     /// Whether a reply to a deferred terminate was owed, clearing it. `true` at most once per
     /// deferral, so a confirm and a cancel racing each other cannot both reply. `false` for every
     /// other door: a window close or the Quit item has nothing pending to answer.
     pub fn take_terminate_owed(&self) -> bool {
-        self.terminate_owed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.terminate_reply.take()
     }
 
     pub fn set_close_guard_ready(&self, ready: bool) {

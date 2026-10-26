@@ -3459,6 +3459,27 @@ fn a_terminate_is_deferred_only_while_the_operator_is_being_asked() {
     assert!(armed.take_terminate_owed(), "a deferral owes the OS a reply");
     assert!(!armed.take_terminate_owed(), "the reply was owed twice: a confirm and a cancel could both send it");
 
+    // The handle must hand `answer` the decision, not its result: the debt is owed while `warn`
+    // runs, so an answer arriving from the webview inside it finds one, the app stays open, and a
+    // second request during the prompt joins it rather than raising another. The primitive's own
+    // tests cannot see a handle that decided first.
+    let asked = std::cell::Cell::new(0);
+    let early = outstanding();
+    early.set_close_guard_ready(true);
+    let answer = early.answer_terminate(|| {
+        asked.set(asked.get() + 1);
+        assert_eq!(
+            early.answer_terminate(|| -> Result<(), String> { panic!("a request during the prompt raised a second") }),
+            Later,
+        );
+        assert!(early.take_terminate_owed(), "an answer during the warning found no reply owed");
+        assert!(!early.take_terminate_owed(), "the join made a second reply owed");
+        Ok::<(), String>(())
+    });
+    assert_eq!(answer, Later);
+    assert_eq!(asked.get(), 1);
+    assert!(can_start_a_press(&early), "the app stays open, so a press must still be able to start");
+
     // The guard failing open is a "go", not a deferral nobody can answer: a warning that could
     // not be shown, and a page that never announced a listener.
     let undeliverable = outstanding();

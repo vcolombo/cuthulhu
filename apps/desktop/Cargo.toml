@@ -39,5 +39,5 @@ tempfile = "3"
 [dev-dependencies]
 syn = { version = "2", features = ["full", "visit"] }
 heck = "0.5"
-# `tauri::test`'s mock runtime is the only way to run the registered window hooks (#326).
+# `tauri::test`'s mock runtime runs the close hook against a real `CloseRequestApi` (#326).
 tauri = { version = "2", features = ["test"] }

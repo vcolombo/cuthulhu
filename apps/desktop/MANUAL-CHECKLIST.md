@@ -189,7 +189,10 @@ registrations in `main.rs` are the part no headless test reaches.
 - [ ] A cut outstanding with the page loaded: closing the window with its close button shows the "A
       cut may still be running" prompt and the window stays open (the `.on_window_event`
       registration).
-- [ ] Reload the page (Cmd-R in a dev build) with the same cut outstanding, then close the window
-      before the new page has finished loading, if that can be timed: the close proceeds rather than
-      raising a prompt nobody can answer. Once the page has loaded again, closing prompts as above
-      (the `.on_page_load` registration).
+- [ ] The `.on_page_load` registration, in a dev build where the load can be held open: start the
+      frontend with a pause in front of it (Web Inspector paused on the first script, or the Vite
+      dev server stopped after the shell loads), reload the page with a cut outstanding, and close
+      the window while the new page is still loading. The close proceeds rather than raising a
+      prompt nobody can answer.
+- [ ] The same, once the reloaded page has finished loading: closing prompts as in the item above,
+      so the stand-down did not disarm the listener the new page installed.

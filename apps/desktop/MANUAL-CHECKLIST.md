@@ -202,9 +202,11 @@ question that fails to show counts as a no. Unit-tested over delayed answers
 (`quitPrompt.test.ts`) and exercised once by hand, above.
 
 ## Close-guard registrations (#326, unverified)
-The hooks themselves (`on_close_requested`, `on_page_load`) are run by unit tests. Tauri's mock
+Unit tests run `on_close_requested` — the function `main` registers, called by hand with the mock
+loop's own event — and `note_page_load`, the helper `on_page_load` forwards to. Tauri's mock
 runtime drops window-event registrations and never fires page loads, so the two one-line
-registrations in `main.rs` are the part no headless test reaches.
+registrations in `main.rs`, and `on_page_load`'s own forwarding, are the part no headless test
+reaches.
 - [ ] A cut outstanding with the page loaded: closing the window with its close button shows the "A
       cut may still be running" prompt and the window stays open (the `.on_window_event`
       registration).

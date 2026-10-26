@@ -529,7 +529,7 @@ pub struct DeviceManagerHandle {
     /// asked of the OS, and only the operator's answer to the prompt clears it.
     terminate_owed: std::sync::atomic::AtomicBool,
     /// How many callers are between asking for a host connection and holding it. Test-only: it is
-    /// the difference between a press queued on the connection and one merely registered.
+    /// the difference between a press inside `on_host` at that lock and one merely registered.
     #[cfg(test)]
     on_host_waiting: std::sync::atomic::AtomicUsize,
     pub connected: Mutex<Option<DeviceInfo>>,
@@ -1062,8 +1062,9 @@ impl DeviceManagerHandle {
         f: impl FnOnce(&mut HostConnection) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
         let conn = self.host_conn(id)?;
-        // Counted across the lock acquisition so a test can tell a press *waiting on this
-        // connection* from one that has merely registered its dispatch (#326 review).
+        // Counted across the lock acquisition so a test can tell a press *inside `on_host`*,
+        // between asking for this connection and holding it, from one that has merely registered
+        // its dispatch (#326 review).
         #[cfg(test)]
         self.on_host_waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = conn.lock().unwrap();

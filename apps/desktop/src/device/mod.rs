@@ -291,6 +291,16 @@ pub enum CloseVerdict {
     Warn,
 }
 
+/// What the OS is told when it asks whether the app may terminate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminateAnswer {
+    /// `NSTerminateNow`: `decide_close` let the app go and committed the gate.
+    Now,
+    /// `NSTerminateLater`: the operator is being asked, and a reply is owed to the OS.
+    Later,
+}
+
+
 
 #[derive(Deserialize)]
 pub struct CutRequest {
@@ -514,6 +524,10 @@ pub struct DeviceManagerHandle {
     close_guard_ready: std::sync::atomic::AtomicBool,
     /// The one barrier between a press starting a cut and a window that has been let go.
     close_gate: CloseGate,
+    /// Whether a macOS terminate has been deferred (`NSTerminateLater`) and the OS is still owed
+    /// its reply. Not part of `CloseGate`: it is not a fact about presses but about a question
+    /// asked of the OS, and only the operator's answer to the prompt clears it.
+    terminate_owed: std::sync::atomic::AtomicBool,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -547,6 +561,7 @@ impl DeviceManagerHandle {
             ledger: Ledger::default(),
             last_remote_status: Mutex::new(HashMap::new()),
             close_gate: CloseGate::default(),
+            terminate_owed: std::sync::atomic::AtomicBool::new(false),
             close_guard_ready: std::sync::atomic::AtomicBool::new(false),
             connected: Mutex::new(None),
         };
@@ -1514,6 +1529,43 @@ impl DeviceManagerHandle {
         self.close_gate.commit_regardless();
         self.stop_local_motion();
         self.close_gate.wait_for_an_inflight_send();
+    }
+
+    /// Answer macOS's `applicationShouldTerminate:` — the Dock's Quit, and a logout, restart or
+    /// shutdown — with the decision every other door shares, `decide_close`, and say whether a
+    /// reply to the OS is now owed (#336).
+    ///
+    /// `Later` is `NSTerminateLater`: the operator is being asked, and the OS is told to wait. A
+    /// reply is then owed exactly once, through `take_terminate_owed`, from whichever of "Quit
+    /// anyway" or "Cancel" the operator picks. Never replying leaves AppKit waiting, and a logout
+    /// with it.
+    ///
+    /// The reply is marked owed *before* the prompt can be raised, because the answer arrives on
+    /// another thread and may land before `decide_close` returns. Claiming it with a swap also
+    /// makes a second request while the first is pending join it, not raise a second prompt over
+    /// the first, and leaves exactly one reply to send.
+    pub fn answer_terminate<E: std::fmt::Display>(
+        &self,
+        warn: impl FnOnce() -> Result<(), E>,
+    ) -> TerminateAnswer {
+        if self.terminate_owed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return TerminateAnswer::Later;
+        }
+        match self.decide_close(warn) {
+            CloseVerdict::Warn => TerminateAnswer::Later,
+            CloseVerdict::Proceed => {
+                // Nothing was asked, so nobody will answer: no reply is owed.
+                self.terminate_owed.store(false, std::sync::atomic::Ordering::SeqCst);
+                TerminateAnswer::Now
+            }
+        }
+    }
+
+    /// Whether a reply to a deferred terminate was owed, clearing it. `true` at most once per
+    /// deferral, so a confirm and a cancel racing each other cannot both reply. `false` for every
+    /// other door: a window close or the Quit item has nothing pending to answer.
+    pub fn take_terminate_owed(&self) -> bool {
+        self.terminate_owed.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_close_guard_ready(&self, ready: bool) {

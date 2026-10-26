@@ -3387,6 +3387,80 @@ fn only_a_page_start_stands_down_the_previous_listener() {
     assert!(!dev.close_guard_ready(), "a reload left the previous page's acknowledgement standing");
 }
 
+/// The macOS terminate door (#336): the Dock's Quit and a logout ask the OS's question, and an
+/// answer of "later" puts a reply in the desktop's debt. Each arm is a different promise to the
+/// OS, and a reply sent twice or never is a logout that hangs or an app that quits on a cancel.
+#[test]
+fn a_terminate_is_deferred_only_while_the_operator_is_being_asked() {
+    use super::TerminateAnswer::{Later, Now};
+    let outstanding = || {
+        let dev = test_device_setup();
+        dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        dev
+    };
+    let can_start_a_press = |dev: &DeviceManagerHandle| dev.close_gate.permit().is_some();
+
+    // Nothing outstanding: the OS is told to go, the gate is committed, and no reply is owed.
+    let idle = test_device_setup();
+    idle.set_close_guard_ready(true);
+    let answer = idle.answer_terminate(|| -> Result<(), String> { panic!("an idle desktop asked nothing") });
+    assert_eq!(answer, Now);
+    assert!(!idle.take_terminate_owed(), "nothing was deferred, so nothing is owed");
+    assert!(!can_start_a_press(&idle), "the OS was told to go but a press could still start");
+
+    // A cut outstanding and a listener: deferred, the prompt raised, one reply owed exactly once.
+    let armed = outstanding();
+    armed.set_close_guard_ready(true);
+    assert_eq!(armed.answer_terminate(|| Ok::<(), String>(())), Later);
+    assert!(can_start_a_press(&armed), "the app stays open, so a press must still be able to start");
+    assert!(armed.take_terminate_owed(), "a deferral owes the OS a reply");
+    assert!(!armed.take_terminate_owed(), "the reply was owed twice: a confirm and a cancel could both send it");
+
+    // The prompt is already up: a second request joins it rather than raising another, and does
+    // not make a second reply owed.
+    let asked = std::cell::Cell::new(0);
+    let pending = outstanding();
+    pending.set_close_guard_ready(true);
+    let warn = || {
+        asked.set(asked.get() + 1);
+        Ok::<(), String>(())
+    };
+    assert_eq!(pending.answer_terminate(warn), Later);
+    assert_eq!(pending.answer_terminate(warn), Later);
+    assert_eq!(asked.get(), 1, "a second request raised a second prompt over the first");
+    assert!(pending.take_terminate_owed());
+    assert!(!pending.take_terminate_owed());
+
+    // Once answered, the next request is decided afresh and can be deferred again.
+    assert_eq!(pending.answer_terminate(|| Ok::<(), String>(())), Later);
+    assert!(pending.take_terminate_owed());
+
+    // The guard failing open is a "go", not a deferral nobody can answer: a warning that could
+    // not be shown, and a page that never announced a listener.
+    let undeliverable = outstanding();
+    undeliverable.set_close_guard_ready(true);
+    assert_eq!(undeliverable.answer_terminate(|| Err("no webview".to_string())), Now);
+    assert!(!undeliverable.take_terminate_owed(), "a prompt that never appeared was waited on");
+    assert!(!can_start_a_press(&undeliverable), "the OS was told to go but a press could still start");
+
+    let unarmed = outstanding();
+    let answer = unarmed.answer_terminate(|| -> Result<(), String> { panic!("no listener, so nothing to warn") });
+    assert_eq!(answer, Now);
+    assert!(!unarmed.take_terminate_owed());
+    assert!(!can_start_a_press(&unarmed), "the OS was told to go but a press could still start");
+}
+
+/// The other doors have no OS reply pending, so the cancel the page sends after any prompt must
+/// find nothing owed: it is the same call whichever door raised the prompt.
+#[test]
+fn a_window_close_prompt_leaves_no_terminate_reply_owed() {
+    let dev = test_device_setup();
+    dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+    dev.set_close_guard_ready(true);
+    assert_eq!(dev.decide_close(|| Ok::<(), String>(())), CloseVerdict::Warn);
+    assert!(!dev.take_terminate_owed(), "a window close left the OS owed a reply it never asked for");
+}
+
 /// An admitted dispatch is not free merely because the worker still publishes Idle. This is
 /// the one bit the host added to Snapshot for the accept-to-worker-publication gap.
 #[test]

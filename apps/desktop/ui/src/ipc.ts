@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
-import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import { save as dialogSave, open as dialogOpen, confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
 import type { LengthUnit } from "./length";
 
 export type { LengthUnit };
@@ -283,6 +283,11 @@ export async function forceQuit(): Promise<void> {
   return invoke("force_quit", {});
 }
 
+/** The operator dismissed the quit prompt. Releases a macOS terminate the OS is waiting on. */
+export async function cancelQuit(): Promise<void> {
+  return invoke("cancel_quit", {});
+}
+
 export async function planCut(grouping: Grouping, weed: WeedOptions | null): Promise<PlanCutResponse> {
   return invoke("plan_cut", { grouping, weed });
 }
@@ -398,6 +403,29 @@ const CUT_FILTER = [{ name: "cuthulhu project", extensions: ["cut"] }];
 
 export async function pickSavePath(): Promise<string | null> {
   return dialogSave({ defaultPath: "cuthulhu-project.cut", filters: CUT_FILTER });
+}
+
+/**
+ * The quit prompt's question. Through the plugin rather than `window.confirm`, which the plugin
+ * replaces with an async function whose Promise is truthy whatever the operator presses.
+ */
+export async function askToQuit(message: string): Promise<boolean> {
+  return dialogConfirm(message, {
+    title: "Quit Cuthulhu?",
+    kind: "warning",
+    okLabel: "Quit anyway",
+    cancelLabel: "Cancel",
+  });
+}
+
+/** The machine-switch prompt's question, through the plugin for the same reason. */
+export async function confirmSwitch(message: string): Promise<boolean> {
+  return dialogConfirm(message, {
+    title: "Switch design machine?",
+    kind: "warning",
+    okLabel: "Switch machine",
+    cancelLabel: "Cancel",
+  });
 }
 
 export async function pickOpenPath(): Promise<string | null> {

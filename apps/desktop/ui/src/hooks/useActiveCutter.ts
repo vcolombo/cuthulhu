@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { MachineProfile } from "../App";
 import * as ipc from "../ipc";
 import { sameCutter } from "../hosts/deviceList";
+import { confirmed } from "../quitPrompt";
 
 type Args = {
   profileId: string | null;
@@ -81,17 +82,24 @@ export function useActiveCutter({ profileId, shapeCount, machines, designFor, re
       }
       if (info.machine_id === profileId) return false;
       // A document that was never aimed at a machine takes the cutter's. Confirming there would
-      // refuse every first connect: the test runner dismisses confirm, and so would a mis-click.
+      // refuse every first connect: the test runner dismisses the prompt, and so would a mis-click.
+      //
+      // The question is the dialog plugin's, awaited: `window.confirm` is replaced there by an async
+      // function, whose Promise is truthy whatever is pressed, so this guard always proceeded.
       if (profileId !== null && shapeCount > 0) {
-        const ok = window.confirm(
-          `This design is set up for ${nameOf(profileId)}. Switch it to ${nameOf(info.machine_id)}? The page size changes with the machine.`,
+        const ok = await confirmed(
+          () =>
+            ipc.confirmSwitch(
+              `This design is set up for ${nameOf(profileId)}. Switch it to ${nameOf(info.machine_id)}? The page size changes with the machine.`,
+            ),
+          (e) => onError(ipc.ipcErrorMessage(e)),
         );
         if (!ok) return false;
       }
       // True only when the document actually changed, so an open plan can be rebuilt against it.
       return designFor(info.machine_id);
     },
-    [profileId, shapeCount, nameOf, designFor, refreshDeviceState],
+    [profileId, shapeCount, nameOf, designFor, refreshDeviceState, onError],
   );
   const aimRef = useRef(aim);
   aimRef.current = aim;

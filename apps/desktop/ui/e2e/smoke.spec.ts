@@ -1791,6 +1791,46 @@ test("a machine the document was not set up for blocks the passes until it is co
   await expect(next).toBeEnabled();
 });
 
+/**
+ * The device list's own offer to retarget the document, over a document that has shapes and a
+ * machine already. The answer is the prompt's, late and scripted here, because the real one is the
+ * dialog plugin's — this guard used to read `window.confirm`, which the plugin replaces with an
+ * async function, so Cancel switched the design anyway.
+ */
+for (const answer of ["cancel", "ok"] as const) {
+  test(`picking the other machine ${answer === "ok" ? "switches" : "does not switch"} the design's machine`, async ({ page }) => {
+    await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+    await page.goto("/");
+    await page.evaluate((a) => sessionStorage.setItem("__dialog_answer__", a), answer);
+
+    await page.getByRole("tab", { name: "Devices" }).click();
+    await page
+      .getByRole("listitem")
+      .filter({ hasText: "GCC Puma IV" })
+      .getByRole("button", { name: "Set as active", exact: true })
+      .click();
+
+    // The question is the beat to wait on: it is raised after the connect and read before the switch.
+    await expect
+      .poll(async () =>
+        JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[],
+      )
+      .toEqual([
+        "This design is set up for Silhouette Cameo 5 Alpha. Switch it to GCC Puma IV? The page size changes with the machine.",
+      ]);
+
+    // What the answer changed, read through the send dialog's own fact: its passes refuse a
+    // machine the design was not set up for, and the dialog above names that machine.
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+    const blocked = page.getByText("Document is set up for a different machine than the connected device.");
+    if (answer === "cancel") {
+      await expect(blocked).toBeVisible();
+    } else {
+      await expect(blocked).toHaveCount(0);
+    }
+  });
+}
+
 test("an inch weed margin is a view of the millimetre draft", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
@@ -5709,23 +5749,26 @@ const emitBackendEvent = async (page: Page, event: string) => {
 test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-
-  const prompts: string[] = [];
-  page.on("dialog", (d) => {
-    prompts.push(d.message());
-    d.accept().catch(() => {});
-  });
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "ok"));
 
   await emitBackendEvent(page, "cut-in-progress");
 
-  await expect.poll(() => prompts.length).toBe(1);
-  expect(prompts[0]).toContain("Sending to the cutter on this computer stops");
-  expect(prompts[0]).toContain("already buffered");
-  expect(prompts[0]).toContain("Cut Host keeps running there");
+  const prompts = async () =>
+    JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[];
+  await expect.poll(async () => (await prompts()).length).toBe(1);
+  const [prompt] = await prompts();
+  expect(prompt).toContain("Sending to the cutter on this computer stops");
+  expect(prompt).toContain("already buffered");
+  expect(prompt).toContain("Cut Host keeps running there");
+  // The answer comes late, as the plugin's does, and nothing may have happened before it: the
+  // prompt this replaced took a Promise for a yes.
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
   // Accepting it is what quits, and the fake records having been asked.
   await expect
     .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
     .toBe("asked");
+  // Confirming is not a cancel: telling the backend both would reply to the OS twice.
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
 
   // The handshake's own ordering, which the prompt above cannot see: readiness is stood down
   // before anything is subscribed, and never announced while nothing is listening. Rust emits on
@@ -5746,19 +5789,16 @@ test("the quit prompt says what quitting stops and what it leaves running", asyn
 test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-
-  const prompts: string[] = [];
-  page.on("dialog", (d) => {
-    prompts.push(d.message());
-    d.dismiss().catch(() => {});
-  });
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "cancel"));
 
   await emitBackendEvent(page, "cut-in-progress");
 
-  // The prompt having been *seen* is the beat to wait on. The assertion below is safe because
-  // `page.evaluate` cannot run while the page is blocked in `window.confirm`, so it necessarily
-  // lands after the dismissal returned — not because recording the message implies that.
-  await expect.poll(() => prompts.length).toBe(1);
+  // Dismissing is told to the backend, because on the Dock's Quit or a logout the OS is waiting on
+  // the answer: a cancel that stayed in the page would leave a logout hanging on this app. It is
+  // also the beat that proves the answer was read, so the absence checks below mean something.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__quit_cancelled__")))
+    .toBe("asked");
   expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
   await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
 });

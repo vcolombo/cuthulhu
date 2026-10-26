@@ -32,6 +32,12 @@ base64 = "0.22"
 dirs = "6"
 tempfile = "3"
 
+# The Dock's Quit and a logout reach the app only through `applicationShouldTerminate:`, which tao
+# does not implement. `objc2` is already in `Cargo.lock` through tauri; this makes it a direct
+# dependency so `terminate.rs` can add the method (#336).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 # Both are already in `Cargo.lock` as build-time dependencies of `tauri-macros`, so this adds a
 # lockfile edit rather than a crate to the tree. `heck` is pinned to the same major the command
 # macro itself uses: `tests/ipc_inventory.rs` has to reproduce Tauri's argument casing exactly, and

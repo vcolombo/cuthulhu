@@ -14,6 +14,9 @@ use desktop::preferences::ResolvedTheme;
 use desktop::state::AppState;
 use driver_registry::HardwareBackendFactory;
 
+#[cfg(target_os = "macos")]
+mod terminate;
+
 fn resolved_theme(theme: tauri::Theme) -> ResolvedTheme {
     match theme {
         tauri::Theme::Dark => ResolvedTheme::Dark,
@@ -66,8 +69,8 @@ mod quit_menu {
     /// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
     /// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
     /// so the guard that covers the window's close button was skipped (#327). An item of our own is
-    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
-    /// send `terminate:` and are not covered.
+    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout
+    /// still send `terminate:` straight to the app, and are answered in `terminate.rs` (#336).
     ///
     /// The stock item is found by its label, which muda sets to `Quit {app name}` on macOS (About
     /// and Hide carry their own prefixes), because muda keeps the item's type to itself and its
@@ -136,7 +139,30 @@ mod quit_menu {
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     dev.commit_close_after_confirmation();
     dev.shutdown();
+    settle_terminate(&app, &dev, true);
     app.exit(0);
+}
+
+/// The operator dismissed the quit prompt: the app stays open.
+///
+/// For the window's close button and the Quit item that is the whole answer — the window was never
+/// let go. For the Dock's Quit or a logout the OS was told to wait (`NSTerminateLater`) and is
+/// owed a reply, without which a logout hangs on this app. The page cannot tell which door raised
+/// the prompt and need not: `settle_terminate` replies only when one is owed.
+#[tauri::command]
+fn cancel_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
+    settle_terminate(&app, &dev, false);
+}
+
+/// Answer the OS for a terminate that was deferred, if one was. Only macOS defers one, so
+/// everywhere else nothing is ever owed.
+fn settle_terminate(app: &tauri::AppHandle, dev: &DeviceManagerHandle, proceed: bool) {
+    #[cfg(target_os = "macos")]
+    if dev.take_terminate_owed() {
+        terminate::reply(app, proceed);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, dev, proceed);
 }
 
 /// The webview's acknowledgement that its quit-warning listener is installed.
@@ -223,6 +249,7 @@ fn main() {
             ipc::set_preferences,
             set_close_guard_ready,
             force_quit,
+            cancel_quit,
         ])
         // The page-load hook is the close guard's too; its reasoning lives with it.
         .on_page_load(device::on_page_load)
@@ -251,6 +278,17 @@ fn main() {
         .on_window_event(device::on_close_requested)
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
+
+    // After `build`, when tao has registered the delegate class, and before the loop runs, so no
+    // terminate request can arrive first. See `terminate.rs` for why the method is added here.
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.handle().clone();
+        terminate::install(move || {
+            let dev = handle.state::<DeviceManagerHandle>();
+            dev.answer_terminate(|| handle.emit("cut-in-progress", ()))
+        });
+    }
 
     // Event bridge: sole consumer of the device-event channel. Coalesces
     // `Progress` to <=10Hz (drop intermediate ticks) because each forward costs a

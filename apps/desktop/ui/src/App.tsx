@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Cpu, Layers, SlidersHorizontal } from "lucide-react";
 import * as ipc from "./ipc";
 import { armCloseGuard } from "./closeGuard";
+import { answerQuitPrompt } from "./quitPrompt";
 import { Toaster } from "./components/ui/sonner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -260,7 +261,10 @@ export function App() {
 
   // Backend refuses to close the window while a cut it started may still be running (main.rs's
   // on_window_event emits this and then calls prevent_close) — ask the operator, then force_quit
-  // if they confirm. No-op on cancel, so the window just stays open.
+  // if they confirm. The Dock's Quit and a logout raise the same prompt, and there the OS is
+  // waiting on an answer (`NSTerminateLater`), so a dismissal is told to the backend too:
+  // `cancel_quit` replies "stay" to the OS when one is owed and does nothing for the window close,
+  // which is why this does not need to know which door raised the prompt.
   //
   // The handshake itself lives in `closeGuard.ts`: its ordering is the invariant, and an effect
   // body is not something a test in this UI can observe.
@@ -270,12 +274,12 @@ export function App() {
         setReady: ipc.setCloseGuardReady,
         listen: (onWarning) => listen("cut-in-progress", onWarning),
         onWarning: () => {
-          const quit = window.confirm(
-            "A cut may still be running — quit anyway? Sending to the cutter on this computer " +
-              "stops, but it finishes whatever moves it has already buffered; a Job already sent " +
-              "to a Cut Host keeps running there.",
-          );
-          if (quit) ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
+          void answerQuitPrompt({
+            ask: ipc.askToQuit,
+            forceQuit: ipc.forceQuit,
+            cancelQuit: ipc.cancelQuit,
+            onError: (e) => setError(ipc.ipcErrorMessage(e)),
+          });
         },
         onError: (e) => setError(ipc.ipcErrorMessage(e)),
       }),

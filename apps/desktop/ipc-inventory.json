@@ -3,6 +3,7 @@
   "add_text": ["family", "parent", "sizeMm", "text"],
   "boolean_op": ["ids", "op"],
   "cancel_cut": ["host", "instanceId"],
+  "cancel_quit": [],
   "commit_transform": ["ids", "m"],
   "commit_transforms": ["moves"],
   "confirm_pass_done": ["host", "instanceId"],

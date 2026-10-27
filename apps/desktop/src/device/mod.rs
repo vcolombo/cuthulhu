@@ -514,10 +514,6 @@ pub struct DeviceManagerHandle {
     close_guard_ready: std::sync::atomic::AtomicBool,
     /// The one barrier between a press starting a cut and a window that has been let go.
     close_gate: CloseGate,
-    /// How many callers are between asking for a host connection and holding it. Test-only: it is
-    /// the difference between a press inside `on_host` at that lock and one merely registered.
-    #[cfg(test)]
-    on_host_waiting: std::sync::atomic::AtomicUsize,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -551,8 +547,6 @@ impl DeviceManagerHandle {
             ledger: Ledger::default(),
             last_remote_status: Mutex::new(HashMap::new()),
             close_gate: CloseGate::default(),
-            #[cfg(test)]
-            on_host_waiting: std::sync::atomic::AtomicUsize::new(0),
             close_guard_ready: std::sync::atomic::AtomicBool::new(false),
             connected: Mutex::new(None),
         };
@@ -1047,14 +1041,7 @@ impl DeviceManagerHandle {
         f: impl FnOnce(&mut HostConnection) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
         let conn = self.host_conn(id)?;
-        // Counted across the lock acquisition so a test can tell a press *inside `on_host`*,
-        // between asking for this connection and holding it, from one that has merely registered
-        // its dispatch (#326 review).
-        #[cfg(test)]
-        self.on_host_waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = conn.lock().unwrap();
-        #[cfg(test)]
-        self.on_host_waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         let host = &mut *guard;
         // Asked under the connection lock, which is where `forget` transitions it: a press that
         // queued here before the map entry went would otherwise dispatch onto a discarded token.

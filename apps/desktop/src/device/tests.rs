@@ -2452,10 +2452,11 @@ fn a_dispatch_nothing_has_polled_yet_still_holds_the_window() {
 /// under, and the only thing that can stop a lost reply from cutting the material twice
 /// (#290). The operator's advice inverts with it: a retry is still the thing to press.
 ///
-/// The sibling is staged here, because this pins the rule and not the interleaving: `begin_dispatch`
-/// is exactly what a press mid-dispatch holds. The interleaving itself, a sibling parked inside
-/// `on_host` with a second press inside `on_host` behind it, is
-/// `a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host`.
+/// The sibling is staged with `begin_dispatch`, which is exactly what a press mid-dispatch holds,
+/// and that is all there is to stage: the host connection is exclusive, so a second press cannot
+/// `dispatch` while another is inside `on_host`, and a refusal settles only after the sibling has
+/// left it, with the sibling's registration still live. A press held at the connection lock is
+/// `a_press_queued_for_a_host_connection_holds_the_window`.
 #[test]
 fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
     let host = start_loopback_host();
@@ -2493,91 +2494,6 @@ fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
     // Once that press is over and nothing settled it, the entry is still the retry's — and
     // this is what makes the assertion above about the sibling rather than about nothing.
     drop(sibling);
-    assert!(dev.ledger.holds(&key), "an unsettled press keeps its id");
-}
-
-/// The same rule with the sibling where #290's failure actually happened: inside `on_host`,
-/// holding the host's connection, while a second press has begun and is inside `on_host` behind it.
-/// The staged test above covers settlement with a live sibling registration — its guard is held
-/// across `execute_cut`, so both presses are in flight when the refusal settles. This one
-/// additionally establishes overlapping `on_host` calls before the connection is released.
-///
-/// Synchronised on observed state rather than timing assumptions: the sibling parks inside
-/// `on_host` until released, and the test waits until the second press is both in flight in the
-/// ledger and counted inside its own `on_host`, between asking for the connection and holding it,
-/// while the sibling still holds it.
-#[test]
-fn a_refusal_leaves_the_id_of_a_sibling_still_inside_on_host() {
-    let host = start_loopback_host();
-    let dir = tempfile::tempdir().unwrap();
-    let hosts_path = dir.path().join("hosts.json");
-    let dev = test_device_setup();
-    let id = dev
-        .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
-        .expect("pairing with the loopback host");
-    let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
-    let key = JobKey {
-        host: id.clone(),
-        device: aimed.instance_id.clone(),
-        digest: job_digest(&aimed.machine_id, &a_square(400.0)),
-    };
-
-    let (inside_tx, inside) = std::sync::mpsc::channel::<()>();
-    let (dev_ref, key_ref, id_ref) = (&dev, &key, &id);
-    std::thread::scope(|s| {
-        // Made inside the scope, so a failing `wait_until` drops it while unwinding: `scope`
-        // joins the sibling before it re-raises the panic, and a sender that outlived the scope
-        // would leave that join waiting on a release that never comes.
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let sibling = s.spawn(move || {
-            let (sibling, held, first) = dev_ref.ledger.begin_dispatch(key_ref);
-            assert!(first, "the sibling is what reserved the id this test is about");
-            dev_ref.on_host(id_ref, cut_host::client::CONNECT_TIMEOUT, |_| {
-                inside_tx.send(()).unwrap();
-                // `Err` is the test body unwinding with the sender dropped: let go, don't hang.
-                let _ = released.recv();
-                Ok(())
-            })
-            .expect("the sibling reaches its host");
-            // Still in flight: it left `on_host` without an answer, which is the reply that was lost.
-            (sibling, held)
-        });
-        inside.recv().expect("the sibling never reached on_host");
-
-        let second = s.spawn(|| dev.execute_cut(aimed.clone(), a_square(400.0)));
-        // Both facts, not either: a press can be registered and still be descheduled before it
-        // asks for the connection, in which case releasing the sibling would stage exactly what
-        // the test above already stages. `on_host_waiting` is counted across the connection lock
-        // acquisition, so it is the second press *inside its own `on_host`*, between asking for
-        // the connection and holding it, while the sibling still holds it. That is overlapping
-        // `on_host` calls, not proof the second has attempted the lock: it may be descheduled on
-        // the way to it. What the assertions need is the overlap — the refusal settles while the
-        // sibling's press is in flight.
-        wait_until(
-            || {
-                dev.ledger.presses_in_flight(&key) == 2
-                    && dev.on_host_waiting.load(std::sync::atomic::Ordering::SeqCst) == 1
-            },
-            "the second press never reached the connection inside on_host while the sibling held it",
-        );
-        release.send(()).unwrap();
-
-        let err = second.join().unwrap().expect_err("a cut off the bed is refused");
-        let (sibling, held) = sibling.join().unwrap();
-        assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
-        assert_eq!(
-            dev.ledger.held_id(&key),
-            Some(held),
-            "a refusal cleared the id a sibling inside on_host was dispatching under"
-        );
-        assert!(
-            err.message.contains("under the same id"),
-            "the retry that is still available was not offered: {}",
-            err.message
-        );
-        drop(sibling);
-    });
     assert!(dev.ledger.holds(&key), "an unsettled press keeps its id");
 }
 

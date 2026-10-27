@@ -2452,9 +2452,11 @@ fn a_dispatch_nothing_has_polled_yet_still_holds_the_window() {
 /// under, and the only thing that can stop a lost reply from cutting the material twice
 /// (#290). The operator's advice inverts with it: a retry is still the thing to press.
 ///
-/// The sibling is staged rather than raced, because what is being pinned is the rule and not
-/// the timing: `begin_dispatch` is exactly what a press mid-dispatch holds, and a thread parked
-/// inside `with_host` to reproduce it would pin the scheduler instead.
+/// The sibling is staged with `begin_dispatch`, which is exactly what a press mid-dispatch holds.
+/// `settle_dispatch` runs under the host's connection lock, so a second press cannot dispatch while
+/// another holds that connection; what it meets at settlement is a sibling that has left it with
+/// its registration still live, which is the arrangement staged here. A press held at the
+/// connection lock is `a_press_queued_for_a_host_connection_holds_the_window`.
 #[test]
 fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
     let host = start_loopback_host();
@@ -3124,10 +3126,11 @@ fn a_forgotten_host_id_is_not_recycled_while_its_marks_can_survive() {
 
 /// The rule the close path actually runs, asked of `commit_close`: whether the window may go.
 ///
-/// Readiness is the other half of `main.rs`'s decision and is a settable fact this asks for
-/// separately; the branch that consumes it is covered by inspection, since `on_window_event` is
-/// reachable from neither a unit test nor Playwright. What the e2e does pin is the webview end
-/// of the same handshake, through `emitBackendEvent`'s wait on `__close_guard_ready__`.
+/// Readiness is the other half of the decision and is a settable fact this asks for separately;
+/// the branch that consumes it is run through the real hook by
+/// `the_window_hook_refuses_a_close_only_over_an_outstanding_cut_it_can_warn_about`. What the e2e
+/// does pin is the webview end of the same handshake, through `emitBackendEvent`'s wait on
+/// `__close_guard_ready__`.
 ///
 /// A fresh handle per case, because committing is a state change rather than a question.
 #[test]
@@ -3199,6 +3202,224 @@ fn a_request_to_leave_is_decided_the_same_for_every_door() {
     assert_eq!(sending.decide_close(|| Ok::<(), String>(())), Warn);
     assert!(can_start_a_press(&sending), "the app stays open, so a press must still be able to start");
     drop(permit);
+}
+
+/// What a window close did, as far as a test can see it from outside the run loop.
+struct WindowClose {
+    /// The window was still there after the request, i.e. the hook refused.
+    refused: bool,
+    /// `cut-in-progress` was emitted, which is what raises the prompt in the webview.
+    warned: bool,
+    handle: tauri::AppHandle<tauri::test::MockRuntime>,
+}
+
+impl WindowClose {
+    fn a_press_can_still_start(&self) -> bool {
+        use tauri::Manager;
+        self.handle.state::<DeviceManagerHandle>().close_gate.permit().is_some()
+    }
+}
+
+/// Asks a window of Tauri's mock runtime to close and hands the resulting `CloseRequested` to
+/// `on_close_requested`, the function `main` registers, not a copy of its body.
+///
+/// The mock cannot dispatch to a registered window-event handler (its window dispatcher drops
+/// `on_window_event` registrations), so the loop's own event is passed to the hook by hand. The
+/// event carries the real `CloseRequestApi`, and the loop honours a `prevent_close` sent through
+/// it. What stays unproven here is the one-line `.on_window_event(...)` registration in `main`.
+///
+/// The loop reports nothing about a refusal, so the test observes it the only way the loop
+/// allows: a task queued behind the close request runs only if the loop is still going, and the
+/// loop ends by itself when the last window goes. A refused window is then destroyed to end it.
+fn close_the_window(dev: DeviceManagerHandle) -> WindowClose {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tauri::test::{mock_builder, mock_context, noop_assets};
+    use tauri::{Listener, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+    let app = mock_builder()
+        .manage(dev)
+        .build(mock_context(noop_assets()))
+        .expect("a mock app builds");
+    let handle = app.handle().clone();
+
+    let warned = Arc::new(AtomicBool::new(false));
+    let seen = warned.clone();
+    handle.listen("cut-in-progress", move |_| seen.store(true, Ordering::SeqCst));
+
+    let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::default())
+        .build()
+        .expect("a mock window builds");
+    let refused = Arc::new(AtomicBool::new(false));
+    let outlived = refused.clone();
+    app.run_return(move |app_handle, event| match event {
+        RunEvent::Ready => window.close().expect("the close request is queued"),
+        RunEvent::WindowEvent { label, event: event @ WindowEvent::CloseRequested { .. }, .. } => {
+            let asked = app_handle
+                .get_webview_window(&label)
+                .expect("the window being closed exists")
+                .as_ref()
+                .window();
+            on_close_requested(&asked, &event);
+            let outlived = outlived.clone();
+            app_handle
+                .run_on_main_thread(move || outlived.store(true, Ordering::SeqCst))
+                .expect("the marker is queued");
+            window.destroy().expect("the teardown is queued");
+        }
+        _ => {}
+    });
+    WindowClose { refused: refused.load(Ordering::SeqCst), warned: warned.load(Ordering::SeqCst), handle }
+}
+
+/// `main`'s window-close hook, run for real: the arm `a_close_is_let_go_only_with_nothing_outstanding`
+/// and `a_request_to_leave_is_decided_the_same_for_every_door` could only reach by their pieces.
+#[test]
+fn the_window_hook_refuses_a_close_only_over_an_outstanding_cut_it_can_warn_about() {
+    let outstanding = || {
+        let dev = test_device_setup();
+        dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        dev
+    };
+
+    let armed = outstanding();
+    armed.set_close_guard_ready(true);
+    let close = close_the_window(armed);
+    assert!(close.refused, "the window went while a cut may be running");
+    assert!(close.warned, "the refusal raised no prompt, so the operator had no way out");
+    assert!(close.a_press_can_still_start(), "the app stayed open but its presses were shut off");
+
+    let idle = test_device_setup();
+    idle.set_close_guard_ready(true);
+    let close = close_the_window(idle);
+    assert!(!close.refused, "an idle desktop was refused its close");
+    assert!(!close.warned, "an idle desktop raised the quit prompt");
+    assert!(!close.a_press_can_still_start(), "the window went but a press could still start");
+
+    let no_listener = close_the_window(outstanding());
+    assert!(!no_listener.refused, "a refusal with no listener behind it has no escape");
+    assert!(!no_listener.warned, "a prompt was emitted to a page that never acknowledged a listener");
+    assert!(!no_listener.a_press_can_still_start(), "the window went but a press could still start");
+}
+
+/// The native stand-down on a reload, through the function `on_page_load` calls rather than the
+/// predicate it once consulted: only a page *start* clears the previous page's acknowledgement.
+#[test]
+fn only_a_page_start_stands_down_the_previous_listener() {
+    let dev = test_device_setup();
+    dev.set_close_guard_ready(true);
+
+    window_events::note_page_load(&dev, tauri::webview::PageLoadEvent::Finished);
+    assert!(dev.close_guard_ready(), "a finished load disarmed a listener the new page had already installed");
+
+    window_events::note_page_load(&dev, tauri::webview::PageLoadEvent::Started);
+    assert!(!dev.close_guard_ready(), "a reload left the previous page's acknowledgement standing");
+}
+
+/// A deferred terminate whose prompt page goes away: the start that replaces it claims the reply
+/// (for `main` to send as "no"), rather than leaving every later terminate joining a question
+/// nobody can answer.
+#[test]
+fn a_page_start_settles_a_deferred_terminate_whose_prompt_is_gone() {
+    use tauri::webview::PageLoadEvent::{Finished, Started};
+    let dev = test_device_setup();
+    dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+    dev.set_close_guard_ready(true);
+    let asked = std::cell::Cell::new(0);
+    let warn = || {
+        asked.set(asked.get() + 1);
+        Ok::<(), String>(())
+    };
+    assert_eq!(dev.answer_terminate(warn), TerminateAnswer::Later);
+
+    // A load finishing is the prompt's own page completing, not its replacement.
+    assert!(!window_events::note_page_load(&dev, Finished), "a finished load settled a live prompt");
+
+    assert!(window_events::note_page_load(&dev, Started), "the new page left the OS waiting on a gone prompt");
+    assert!(!dev.close_guard_ready(), "the new page inherited the old one's acknowledgement");
+    assert!(!dev.take_terminate_owed(), "the reply the start claimed was still owed to a second answer");
+    assert!(!window_events::note_page_load(&dev, Started), "a start with nothing deferred claimed a reply");
+
+    // Asking again prompts on the new page rather than joining the orphaned deferral.
+    dev.set_close_guard_ready(true);
+    assert_eq!(dev.answer_terminate(warn), TerminateAnswer::Later);
+    assert_eq!(asked.get(), 2, "the second terminate joined the orphaned prompt instead of asking again");
+    assert!(dev.take_terminate_owed());
+}
+
+/// The macOS terminate door (#336): the Dock's Quit and a logout ask the OS's question, and an
+/// answer of "later" puts a reply in the desktop's debt. Each arm is a different promise to the
+/// OS, and a reply sent twice or never is a logout that hangs or an app that quits on a cancel.
+#[test]
+fn a_terminate_is_deferred_only_while_the_operator_is_being_asked() {
+    use super::TerminateAnswer::{Later, Now};
+    let outstanding = || {
+        let dev = test_device_setup();
+        dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+        dev
+    };
+    let can_start_a_press = |dev: &DeviceManagerHandle| dev.close_gate.permit().is_some();
+
+    // Nothing outstanding: the OS is told to go, the gate is committed, and no reply is owed.
+    let idle = test_device_setup();
+    idle.set_close_guard_ready(true);
+    let answer = idle.answer_terminate(|| -> Result<(), String> { panic!("an idle desktop asked nothing") });
+    assert_eq!(answer, Now);
+    assert!(!idle.take_terminate_owed(), "nothing was deferred, so nothing is owed");
+    assert!(!can_start_a_press(&idle), "the OS was told to go but a press could still start");
+
+    // A cut outstanding and a listener: deferred, the prompt raised, one reply owed exactly once.
+    let armed = outstanding();
+    armed.set_close_guard_ready(true);
+    assert_eq!(armed.answer_terminate(|| Ok::<(), String>(())), Later);
+    assert!(can_start_a_press(&armed), "the app stays open, so a press must still be able to start");
+    assert!(armed.take_terminate_owed(), "a deferral owes the OS a reply");
+    assert!(!armed.take_terminate_owed(), "the reply was owed twice: a confirm and a cancel could both send it");
+
+    // The handle must hand `answer` the decision, not its result: the debt is owed while `warn`
+    // runs, so an answer arriving from the webview inside it finds one, the app stays open, and a
+    // second request during the prompt joins it rather than raising another. The primitive's own
+    // tests cannot see a handle that decided first.
+    let asked = std::cell::Cell::new(0);
+    let early = outstanding();
+    early.set_close_guard_ready(true);
+    let answer = early.answer_terminate(|| {
+        asked.set(asked.get() + 1);
+        assert_eq!(
+            early.answer_terminate(|| -> Result<(), String> { panic!("a request during the prompt raised a second") }),
+            Later,
+        );
+        assert!(early.take_terminate_owed(), "an answer during the warning found no reply owed");
+        assert!(!early.take_terminate_owed(), "the join made a second reply owed");
+        Ok::<(), String>(())
+    });
+    assert_eq!(answer, Later);
+    assert_eq!(asked.get(), 1);
+    assert!(can_start_a_press(&early), "the app stays open, so a press must still be able to start");
+
+    // The guard failing open is a "go", not a deferral nobody can answer: a warning that could
+    // not be shown, and a page that never announced a listener.
+    let undeliverable = outstanding();
+    undeliverable.set_close_guard_ready(true);
+    assert_eq!(undeliverable.answer_terminate(|| Err("no webview".to_string())), Now);
+    assert!(!undeliverable.take_terminate_owed(), "a prompt that never appeared was waited on");
+    assert!(!can_start_a_press(&undeliverable), "the OS was told to go but a press could still start");
+
+    let unarmed = outstanding();
+    let answer = unarmed.answer_terminate(|| -> Result<(), String> { panic!("no listener, so nothing to warn") });
+    assert_eq!(answer, Now);
+    assert!(!unarmed.take_terminate_owed());
+    assert!(!can_start_a_press(&unarmed), "the OS was told to go but a press could still start");
+}
+
+/// The other doors have no OS reply pending, so the cancel the page sends after any prompt must
+/// find nothing owed: it is the same call whichever door raised the prompt.
+#[test]
+fn a_window_close_prompt_leaves_no_terminate_reply_owed() {
+    let dev = test_device_setup();
+    dev.ledger.mark_dispatched(&HostId("host-1".into()), cut_host::host::testing::CAMEO, AttemptId::next());
+    dev.set_close_guard_ready(true);
+    assert_eq!(dev.decide_close(|| Ok::<(), String>(())), CloseVerdict::Warn);
+    assert!(!dev.take_terminate_owed(), "a window close left the OS owed a reply it never asked for");
 }
 
 /// An admitted dispatch is not free merely because the worker still publishes Idle. This is

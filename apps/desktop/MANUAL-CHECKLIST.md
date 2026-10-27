@@ -179,5 +179,44 @@ real network can confirm the swap end to end.
 - [ ] A cut outstanding (local Cameo 5, then a Job on a Cut Host): Cmd-Q shows the "A cut may still
       be running" prompt instead of quitting. Cancel leaves the app open and a new press still
       sends; "Quit anyway" exits.
-- [ ] The same cut, Dock icon right-click > Quit: known not to be covered (it sends `terminate:`
-      straight to the app, and tao has no `applicationShouldTerminate`). Record what happens.
+- [ ] The same cut, Dock icon right-click > Quit (#336; `applicationShouldTerminate:` is added to
+      tao's delegate at runtime, `terminate.rs`): shows the "A cut may still be running" prompt
+      instead of quitting. Cancel leaves the app open and a new press still sends; "Quit anyway"
+      exits. A real cut is needed, since only a real outstanding cut raises the prompt.
+- [ ] Dock icon right-click > Quit with nothing outstanding quits.
+- [ ] With that prompt up, reload the page before answering, then Dock Quit again: the first quit
+      is cancelled when the prompt's page goes away (its answer could never arrive), and the second
+      raises the prompt on the new page rather than joining the orphaned one.
+- [ ] A logout (Apple menu > Log Out) with a cut outstanding: the prompt appears in the app,
+      "Cancel" cancels the logout rather than leaving the login window hanging on this app, and
+      "Quit anyway" lets it continue. Record whether macOS shows its own "app interrupted logout"
+      sheet in between. Restart and shutdown share the code path, but are worth one run each.
+      Not the same as running it: on 2026-10-25, on a `cargo tauri build --debug` bundle with the
+      deferral simulated (no cutter, a throwaway patch since removed), a Quit Apple Event reached the
+      added method and `NSTerminateLater` was honoured. The quit prompt then appeared as the dialog
+      plugin's sheet (buttons "Cancel" and "Quit anyway", read and clicked through System Events):
+      with nobody answering, the app stayed open; "Cancel" left it running and made the next Quit
+      Apple Event ask again; "Quit anyway" exited it. A real cut and a real logout are still
+      unticked above, as is whether the sheet is on screen in front of a logout.
+
+The quit prompt's answer used to be taken from `window.confirm`, which the dialog plugin replaces
+with an async function, so every Cancel quit. It now goes through the plugin's `confirm`, and a
+question that fails to show counts as a no. Unit-tested over delayed answers
+(`quitPrompt.test.ts`) and exercised once by hand, above.
+
+## Close-guard registrations (#326, unverified)
+Unit tests run `on_close_requested` — the function `main` registers, called by hand with the mock
+loop's own event — and `note_page_load`, the helper `on_page_load` forwards to. Tauri's mock
+runtime drops window-event registrations and never fires page loads, so the two one-line
+registrations in `main.rs`, and `on_page_load`'s own forwarding, are the part no headless test
+reaches.
+- [ ] A cut outstanding with the page loaded: closing the window with its close button shows the "A
+      cut may still be running" prompt and the window stays open (the `.on_window_event`
+      registration).
+- [ ] The `.on_page_load` registration, in a dev build where the load can be held open: start the
+      frontend with a pause in front of it (Web Inspector paused on the first script, or the Vite
+      dev server stopped after the shell loads), reload the page with a cut outstanding, and close
+      the window while the new page is still loading. The close proceeds rather than raising a
+      prompt nobody can answer.
+- [ ] The same, once the reloaded page has finished loading: closing prompts as in the item above,
+      so the stand-down did not disarm the listener the new page installed.

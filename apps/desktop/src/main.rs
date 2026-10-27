@@ -7,12 +7,15 @@ use std::time::{Duration, Instant};
 use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
-use desktop::device::{CloseVerdict, DeviceManagerHandle};
+use desktop::device::{self, DeviceManagerHandle};
 use desktop::hosts;
 use desktop::ipc;
 use desktop::preferences::ResolvedTheme;
 use desktop::state::AppState;
 use driver_registry::HardwareBackendFactory;
+
+#[cfg(target_os = "macos")]
+mod terminate;
 
 fn resolved_theme(theme: tauri::Theme) -> ResolvedTheme {
     match theme {
@@ -66,8 +69,8 @@ mod quit_menu {
     /// Cmd-Q and the application menu's Quit send `terminate:`, which tao turns straight into
     /// `RunEvent::Exit` — there is no `ExitRequested` to refuse, and `CloseRequested` never fires —
     /// so the guard that covers the window's close button was skipped (#327). An item of our own is
-    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout still
-    /// send `terminate:` and are not covered.
+    /// the one place the quit can be asked before it is decided. The Dock's Quit and a logout
+    /// still send `terminate:` straight to the app, and are answered in `terminate.rs` (#336).
     ///
     /// The stock item is found by its label, which muda sets to `Quit {app name}` on macOS (About
     /// and Hide carry their own prefixes), because muda keeps the item's type to itself and its
@@ -136,7 +139,46 @@ mod quit_menu {
 fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
     dev.commit_close_after_confirmation();
     dev.shutdown();
+    settle_terminate(&app, &dev, true);
     app.exit(0);
+}
+
+/// The operator dismissed the quit prompt: the app stays open.
+///
+/// For the window's close button and the Quit item that is the whole answer — the window was never
+/// let go. For the Dock's Quit or a logout the OS was told to wait (`NSTerminateLater`) and is
+/// owed a reply, without which a logout hangs on this app. The page cannot tell which door raised
+/// the prompt and need not: `settle_terminate` replies only when one is owed.
+#[tauri::command]
+fn cancel_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
+    settle_terminate(&app, &dev, false);
+}
+
+/// Answer the OS for a terminate that was deferred, if one was. Only macOS defers one, so
+/// everywhere else nothing is ever owed.
+fn settle_terminate(app: &tauri::AppHandle, dev: &DeviceManagerHandle, proceed: bool) {
+    #[cfg(target_os = "macos")]
+    if dev.take_terminate_owed() {
+        terminate::reply(app, proceed);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, dev, proceed);
+}
+
+/// The close guard's page-load hook, plus what only this binary can do: answer the OS.
+///
+/// A load that starts under a deferred terminate has taken that prompt's page away, so the
+/// operator's answer can never arrive. The hook claims the reply in that case, and it is sent
+/// here as "no" — the quit or logout is cancelled rather than left waiting on nobody, and asking
+/// again prompts on the new page.
+fn on_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    let orphaned = device::on_page_load(webview, payload);
+    #[cfg(target_os = "macos")]
+    if orphaned {
+        terminate::reply(webview.app_handle(), false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = orphaned;
 }
 
 /// The webview's acknowledgement that its quit-warning listener is installed.
@@ -147,14 +189,6 @@ fn force_quit(app: tauri::AppHandle, dev: tauri::State<DeviceManagerHandle>) {
 #[tauri::command]
 fn set_close_guard_ready(dev: tauri::State<DeviceManagerHandle>, ready: bool) {
     dev.set_close_guard_ready(ready);
-}
-
-/// Whether a page-load event invalidates the previous page's listener acknowledgement.
-///
-/// `Started`, not `Finished`: scripts can arm the new listener before the latter arrives, so
-/// clearing on completion disarms a listener that is already live.
-fn page_load_stands_down_close_guard(event: tauri::webview::PageLoadEvent) -> bool {
-    matches!(event, tauri::webview::PageLoadEvent::Started)
 }
 
 fn main() {
@@ -231,22 +265,10 @@ fn main() {
             ipc::set_preferences,
             set_close_guard_ready,
             force_quit,
+            cancel_quit,
         ])
-        // A reload replaces the page but not this process, and React runs no cleanup on unload — so
-        // readiness would still be `true` from the page before it, with nothing subscribed on the
-        // new one. A close in that gap is refused and the warning emitted to a page that is gone:
-        // no prompt, and a window the operator cannot shut. The webview's own leading stand-down
-        // races the same gap because it is an async command; this one is native and precedes any
-        // close the new page could see.
-        //
-        // `Started` only. `Finished` arrives after the page's scripts have run, so clearing there
-        // would disarm a listener the new page had already installed and acknowledged — the guard
-        // failing open, which is the one direction it must not fail in.
-        .on_page_load(|webview, payload| {
-            if page_load_stands_down_close_guard(payload.event()) {
-                webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
-            }
-        })
+        // The page-load hook is the close guard's too; its reasoning lives with it.
+        .on_page_load(on_page_load)
         .setup(|app| {
             // The window is created hidden. Theme and the colour behind the webview are set
             // before anything can show it; the page calls `show` only after it has painted
@@ -269,16 +291,20 @@ fn main() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let dev = window.state::<DeviceManagerHandle>();
-                if dev.decide_close(|| window.emit("cut-in-progress", ())) == CloseVerdict::Warn {
-                    api.prevent_close();
-                }
-            }
-        })
+        .on_window_event(device::on_close_requested)
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
+
+    // After `build`, when tao has registered the delegate class, and before the loop runs, so no
+    // terminate request can arrive first. See `terminate.rs` for why the method is added here.
+    #[cfg(target_os = "macos")]
+    {
+        let handle = app.handle().clone();
+        terminate::install(move || {
+            let dev = handle.state::<DeviceManagerHandle>();
+            dev.answer_terminate(|| handle.emit("cut-in-progress", ()))
+        });
+    }
 
     // Event bridge: sole consumer of the device-event channel. Coalesces
     // `Progress` to <=10Hz (drop intermediate ticks) because each forward costs a
@@ -308,17 +334,4 @@ fn main() {
             app_handle.state::<DeviceManagerHandle>().shutdown();
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn only_a_page_start_stands_down_the_previous_listener() {
-        assert!(super::page_load_stands_down_close_guard(
-            tauri::webview::PageLoadEvent::Started
-        ));
-        assert!(!super::page_load_stands_down_close_guard(
-            tauri::webview::PageLoadEvent::Finished
-        ));
-    }
 }

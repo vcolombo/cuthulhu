@@ -19,12 +19,17 @@ use crate::state::AppState;
 
 mod close_gate;
 mod ledger;
+mod terminate_reply;
+mod window_events;
+
+pub use window_events::{on_close_requested, on_page_load};
 
 use close_gate::{CloseGate, SendPermit};
 use ledger::Ledger;
 use ledger::JobKey;
 #[cfg(test)]
 use ledger::{AttemptId, MAX_JOBS_IN_DOUBT};
+use terminate_reply::TerminateReply;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct IpcError {
@@ -288,6 +293,16 @@ pub enum CloseVerdict {
     Warn,
 }
 
+/// What the OS is told when it asks whether the app may terminate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminateAnswer {
+    /// `NSTerminateNow`: `decide_close` let the app go and committed the gate.
+    Now,
+    /// `NSTerminateLater`: the operator is being asked, and a reply is owed to the OS.
+    Later,
+}
+
+
 
 #[derive(Deserialize)]
 pub struct CutRequest {
@@ -511,6 +526,9 @@ pub struct DeviceManagerHandle {
     close_guard_ready: std::sync::atomic::AtomicBool,
     /// The one barrier between a press starting a cut and a window that has been let go.
     close_gate: CloseGate,
+    /// Whether the OS is owed a reply to a deferred macOS terminate. A type rather than a flag,
+    /// for the reason `close_gate` is: see `terminate_reply`.
+    terminate_reply: TerminateReply,
     pub connected: Mutex<Option<DeviceInfo>>,
 }
 
@@ -544,6 +562,7 @@ impl DeviceManagerHandle {
             ledger: Ledger::default(),
             last_remote_status: Mutex::new(HashMap::new()),
             close_gate: CloseGate::default(),
+            terminate_reply: TerminateReply::default(),
             close_guard_ready: std::sync::atomic::AtomicBool::new(false),
             connected: Mutex::new(None),
         };
@@ -1511,6 +1530,28 @@ impl DeviceManagerHandle {
         self.close_gate.commit_regardless();
         self.stop_local_motion();
         self.close_gate.wait_for_an_inflight_send();
+    }
+
+    /// Answer macOS's `applicationShouldTerminate:` — the Dock's Quit, and a logout, restart or
+    /// shutdown — with the decision every other door shares, `decide_close`, and say whether a
+    /// reply to the OS is now owed (#336).
+    ///
+    /// `Later` is `NSTerminateLater`: the operator is being asked, and the OS is told to wait. A
+    /// reply is then owed exactly once, through `take_terminate_owed`, from whichever of "Quit
+    /// anyway" or "Cancel" the operator picks. Never replying leaves AppKit waiting, and a logout
+    /// with it. How the debt is claimed, joined and cleared is `TerminateReply`'s.
+    pub fn answer_terminate<E: std::fmt::Display>(
+        &self,
+        warn: impl FnOnce() -> Result<(), E>,
+    ) -> TerminateAnswer {
+        self.terminate_reply.answer(|| self.decide_close(warn))
+    }
+
+    /// Whether a reply to a deferred terminate was owed, clearing it. `true` at most once per
+    /// deferral, so a confirm and a cancel racing each other cannot both reply. `false` for every
+    /// other door: a window close or the Quit item has nothing pending to answer.
+    pub fn take_terminate_owed(&self) -> bool {
+        self.terminate_reply.take()
     }
 
     pub fn set_close_guard_ready(&self, ready: bool) {

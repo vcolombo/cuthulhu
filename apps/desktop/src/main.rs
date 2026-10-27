@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use driver_core::manager::DeviceEventKind;
 use tauri::{Emitter, Manager};
 
-use desktop::device::{CloseVerdict, DeviceManagerHandle};
+use desktop::device::{self, DeviceManagerHandle};
 use desktop::hosts;
 use desktop::ipc;
 use desktop::preferences::ResolvedTheme;
@@ -149,14 +149,6 @@ fn set_close_guard_ready(dev: tauri::State<DeviceManagerHandle>, ready: bool) {
     dev.set_close_guard_ready(ready);
 }
 
-/// Whether a page-load event invalidates the previous page's listener acknowledgement.
-///
-/// `Started`, not `Finished`: scripts can arm the new listener before the latter arrives, so
-/// clearing on completion disarms a listener that is already live.
-fn page_load_stands_down_close_guard(event: tauri::webview::PageLoadEvent) -> bool {
-    matches!(event, tauri::webview::PageLoadEvent::Started)
-}
-
 fn main() {
     let (dev_handle, events) =
         DeviceManagerHandle::new(std::sync::Arc::new(HardwareBackendFactory));
@@ -232,21 +224,8 @@ fn main() {
             set_close_guard_ready,
             force_quit,
         ])
-        // A reload replaces the page but not this process, and React runs no cleanup on unload — so
-        // readiness would still be `true` from the page before it, with nothing subscribed on the
-        // new one. A close in that gap is refused and the warning emitted to a page that is gone:
-        // no prompt, and a window the operator cannot shut. The webview's own leading stand-down
-        // races the same gap because it is an async command; this one is native and precedes any
-        // close the new page could see.
-        //
-        // `Started` only. `Finished` arrives after the page's scripts have run, so clearing there
-        // would disarm a listener the new page had already installed and acknowledged — the guard
-        // failing open, which is the one direction it must not fail in.
-        .on_page_load(|webview, payload| {
-            if page_load_stands_down_close_guard(payload.event()) {
-                webview.state::<DeviceManagerHandle>().set_close_guard_ready(false);
-            }
-        })
+        // The page-load hook is the close guard's too; its reasoning lives with it.
+        .on_page_load(device::on_page_load)
         .setup(|app| {
             // The window is created hidden. Theme and the colour behind the webview are set
             // before anything can show it; the page calls `show` only after it has painted
@@ -269,14 +248,7 @@ fn main() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let dev = window.state::<DeviceManagerHandle>();
-                if dev.decide_close(|| window.emit("cut-in-progress", ())) == CloseVerdict::Warn {
-                    api.prevent_close();
-                }
-            }
-        })
+        .on_window_event(device::on_close_requested)
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
@@ -308,17 +280,4 @@ fn main() {
             app_handle.state::<DeviceManagerHandle>().shutdown();
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn only_a_page_start_stands_down_the_previous_listener() {
-        assert!(super::page_load_stands_down_close_guard(
-            tauri::webview::PageLoadEvent::Started
-        ));
-        assert!(!super::page_load_stands_down_close_guard(
-            tauri::webview::PageLoadEvent::Finished
-        ));
-    }
 }

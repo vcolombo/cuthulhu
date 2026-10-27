@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # CodeRabbit review configuration for cuthulhu.
 #
-# Rust workspace (crates) + TypeScript apps. Root CLAUDE.md / AGENTS.md are
-# auto-ingested by CodeRabbit as review criteria; this file adds path
-# filters and per-area focus. Docs and lockfiles are excluded from review.
+# Rust workspace (crates, apps/desktop/src) + TypeScript UI
+# (apps/desktop/ui). Root CLAUDE.md is auto-ingested by CodeRabbit as
+# review criteria; this file adds path filters and per-area focus.
+# `docs/`, lockfiles, and the committed generated UI bundle are excluded.
 language: en-US
 reviews:
   auto_review:
@@ -13,15 +15,21 @@ reviews:
     - "!**/*.svg"
     - "!**/Cargo.lock"
     - "!**/package-lock.json"
+    - "!apps/desktop/ui/dist/**"
   path_instructions:
     - path: "crates/**"
       instructions: |
         Rust code. Focus on ownership/borrowing errors, unwrap/expect
         outside tests, and error propagation. Do not flag idiomatic
         Result/Option handling as style issues.
-    - path: "apps/**"
+    - path: "apps/desktop/src/**"
       instructions: |
-        TypeScript apps. Focus on null-safety, async error handling, and
+        Rust code (Tauri backend). Focus on ownership/borrowing errors,
+        unwrap/expect outside tests, and error propagation. Do not flag
+        idiomatic Result/Option handling as style issues.
+    - path: "apps/desktop/ui/**"
+      instructions: |
+        TypeScript UI. Focus on null-safety, async error handling, and
         type correctness. Do not comment on import order or formatting.
     - path: "tools/**"
       instructions: |

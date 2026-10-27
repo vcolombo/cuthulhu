@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { connectedControl, deviceBadge, forgetFrom, groupDevices, sameCutter, staleSection } from "./deviceList";
+import { connectedControl, deviceBadge, forgetFrom, groupDevices, hostCardTitle, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
 import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
@@ -18,12 +18,13 @@ const aStatus = (): CutStatus => ({
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 });
 
 describe("groupDevices", () => {
   it("keeps an unreachable host's cutters listed, with the reason", () => {
     const hosts: PairedHostView[] = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-                                       unreachable: "the host could not be reached (timed out)" }];
+                                       unreachable: "the host could not be reached (timed out)", protocol_side: null }];
     const devices: DeviceInfo[] = [{ ...aDevice(), instance_id: "usb:sn:A", host: "host-1" }];
     const sections = groupDevices(devices, hosts);
     const remote = sections.find(s => s.hostId === "host-1")!;
@@ -33,14 +34,14 @@ describe("groupDevices", () => {
 
   it("lists a paired host that has no cutters, rather than hiding it", () => {
     const sections = groupDevices([], [{ id: "host-1", name: "Workshop Pi",
-                                         address: "pi.local:7878", unreachable: null }]);
+                                         address: "pi.local:7878", unreachable: null, protocol_side: null }]);
     expect(sections.find(s => s.hostId === "host-1")).toBeDefined();
   });
 
   it("puts this computer's cutters first", () => {
     const sections = groupDevices(
       [{ ...aDevice(), host: "host-1" }, { ...aDevice(), instance_id: "usb:sn:L", host: null }],
-      [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null }],
+      [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null }],
     );
     expect(sections[0].hostId).toBeNull();
   });
@@ -65,7 +66,7 @@ describe("groupDevices", () => {
       { ...aDevice(), instance_id: "usb:sn:D", host: "host-1" },
     ];
     const sections = groupDevices(devices, [{ id: "host-1", name: "Workshop Pi",
-                                              address: "pi.local:7878", unreachable: null }]);
+                                              address: "pi.local:7878", unreachable: null, protocol_side: null }]);
     expect(sections.flatMap(s => s.devices)).toHaveLength(devices.length);
     expect(sections.filter(s => s.hostId === "host-gone")).toHaveLength(1);
     // A known host keeps its own section; only the unpaired ids get made up.
@@ -74,8 +75,8 @@ describe("groupDevices", () => {
 });
 
 const PAIRED: PairedHostView[] = [
-  { id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null },
-  { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null },
+  { id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null },
+  { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null, protocol_side: null },
 ];
 
 const runForget = (id: string, forget: (id: string, force: boolean) => Promise<void>, force = false) =>
@@ -85,6 +86,10 @@ const BUSY = { code: "host_busy", message: "a cut is active on this host; cancel
 const UNCONFIRMED = {
   code: "host_unconfirmed",
   message: "this Cut Host could not be asked whether it is cutting",
+};
+const OFFLINE_CUTTER = {
+  code: "host_cutter_unreachable",
+  message: "a cutter on this host is offline or faulted; reconnect it, or forget the host anyway",
 };
 
 describe("forgetFrom", () => {
@@ -98,9 +103,11 @@ describe("forgetFrom", () => {
     expect(s.message).toContain("cancel it before forgetting");
   });
 
-  // The two refusals drive different copy because the operator's next move differs: cancel the
-  // cut, versus decide whether an unreachable Pi is really idle. Only the second offers a force.
-  it("offers a force only for the refusal a force could get past", async () => {
+  // The refusals drive different copy because the operator's next move differs: cancel the cut,
+  // versus decide whether a Pi nobody can reach is really idle. Only the ones that would otherwise
+  // leave an unremovable row offer a force, and a code this list does not name never does — the
+  // safe direction for a refusal Rust adds later.
+  it("offers a force only for the refusals a force could get past", async () => {
     const busy = await runForget("host-1", async () => {
       throw BUSY;
     });
@@ -110,6 +117,27 @@ describe("forgetFrom", () => {
       throw UNCONFIRMED;
     });
     expect(unconfirmed.forceable).toBe(true);
+
+    // The host answered, and what it said was that a cutter is offline or faulted: nothing on
+    // either side recovers that, so refusing outright would leave a row nothing could remove.
+    const offline = await runForget("host-1", async () => {
+      throw OFFLINE_CUTTER;
+    });
+    expect(offline.forceable).toBe(true);
+
+    // Neither: the save failed after every state check passed, and no amount of forcing writes the
+    // file. A code this list does not name is a plain refusal — the direction that matters, since
+    // Rust can add one at any time and "Discard anyway" would discard the credentials over a
+    // problem the force cannot address.
+    const unwritable = await runForget("host-1", async () => {
+      throw { code: "hosts_unwritable", message: "permission denied" };
+    });
+    expect(unwritable.forceable).toBe(false);
+
+    const noCode = await runForget("host-1", async () => {
+      throw new Error("boom");
+    });
+    expect(noCode.forceable).toBe(false);
   });
 
   // The failed attempt is what tells the operator there is something to think about. A force
@@ -160,7 +188,7 @@ describe("forgetFrom", () => {
 describe("staleSection", () => {
   const section = () => groupDevices(
     [{ ...aDevice(), instance_id: "usb:sn:A", host: "host-1" }],
-    [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null }],
+    [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable: null, protocol_side: null }],
   ).find(s => s.hostId === "host-1")!;
 
   // The cut is still running on the Pi. A row that blanks or resets reads as "finished", which is
@@ -216,7 +244,7 @@ describe("deviceBadge", () => {
 
   it("shows a running job as busy when only cancel is legal", () => {
     const status: CutStatus = { ...aStatus(), phase: "Sending", actions: { ...aStatus().actions, cancel: true } };
-    expect(deviceBadge(status).tone).toBe("busy");
+    expect(deviceBadge(status)).toEqual({ label: "Cutting", tone: "busy" });
   });
 
   // Both rest on "Idle" and both report a cancelled ending, so only `actions.cut` separates a
@@ -231,6 +259,62 @@ describe("deviceBadge", () => {
     const unconfirmed: CutStatus = { ...confirmed, actions: { ...aStatus().actions, cut: false } };
     expect(deviceBadge(unconfirmed).tone).toBe("attention");
     expect(deviceBadge(unconfirmed).label).toMatch(/not confirmed/);
+  });
+});
+
+describe("protocol mismatch", () => {
+  it("accepts the side token, and ignores every other string", () => {
+    expect(protocolSide("host")).toBe("host");
+    expect(protocolSide("desktop")).toBe("desktop");
+    expect(protocolSide("This Cut Host is running an older version. Update your Cut Host to connect.")).toBeNull();
+    expect(protocolSide("the host could not be reached (timed out)")).toBeNull();
+    expect(protocolSide(null)).toBeNull();
+    expect(protocolSide(undefined)).toBeNull();
+  });
+
+  it("copies the side onto the section, and a sentence alone does not", () => {
+    const sections = groupDevices([], [
+      { id: "host-old", name: "Workshop Pi", address: "pi.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: "host" },
+      { id: "host-new", name: "Office Pi", address: "office.local:7878",
+        unreachable: "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.",
+        protocol_side: "desktop" },
+      { id: "host-words", name: "Spare Pi", address: "spare.local:7878",
+        unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+        protocol_side: null },
+    ]);
+    expect(sections.find(s => s.hostId === "host-old")!.protocolSide).toBe("host");
+    expect(sections.find(s => s.hostId === "host-new")!.protocolSide).toBe("desktop");
+    expect(sections.find(s => s.hostId === "host-words")!.protocolSide).toBeNull();
+  });
+
+  it("drops the side when a later poll error replaces the host's sentence", () => {
+    const previous = groupDevices([], [{
+      id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
+      unreachable: "This Cut Host is running an older version. Update your Cut Host to connect.",
+      protocol_side: "host",
+    }]).find(s => s.hostId === "host-1")!;
+    const s = staleSection(previous, { code: "host_unreachable", message: "the host could not be reached (timed out)" });
+    expect(s.protocolSide).toBeNull();
+    expect(s.unreachable).toBe("the host could not be reached (timed out)");
+  });
+
+  it("titles a mismatch by which side is older, and an outage as can't reach", () => {
+    expect(hostCardTitle("Workshop Pi", "host", true)).toBe("Workshop Pi needs an update");
+    expect(hostCardTitle("Office Pi", "desktop", true)).toBe("Update Cuthulhu to use Office Pi");
+    expect(hostCardTitle("Garage Pi", null, true)).toBe("Can't reach Garage Pi");
+    expect(hostCardTitle("Garage Pi", null, false)).toBe("Garage Pi · Pi Cut Host");
+  });
+
+  it("points the host at the daemon update and the desktop at the releases", () => {
+    expect(protocolUpdateUrl("host")).toBe("https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+    expect(protocolUpdateUrl("desktop")).toBe("https://github.com/vcolombo/cuthulhu/releases");
+  });
+
+  it("keeps Update needed on the unknown chip", () => {
+    expect(UPDATE_NEEDED_BADGE).toEqual({ label: "Update needed", tone: "unknown" });
+    expect(UPDATE_NEEDED_BADGE.tone).toBe(deviceBadge(null).tone);
   });
 });
 
@@ -254,6 +338,17 @@ describe("connectedControl", () => {
   it("asks a Cut Host to re-open its own cutter rather than dropping the aim", () => {
     const unconfirmed: CutStatus = { ...aStatus(), phase: "Idle", ended: "Cancelled" };
     expect(connectedControl(unconfirmed, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
+  });
+
+  // Ready means the transport is already open. Reconnect there is a second way to
+  // say the same thing, and it crowds the cutter's name. A local Ready still disconnects.
+  it("withholds Reconnect while a remote cutter can take a cut", () => {
+    const ready: CutStatus = { ...aStatus(), phase: "Idle", actions: { ...aStatus().actions, cut: true } };
+    expect(connectedControl(ready, true)).toBeNull();
+    expect(connectedControl({ ...ready, ended: "Cancelled" }, true)).toBeNull();
+    expect(connectedControl(ready, false)).toEqual({ label: "Disconnect", verb: "disconnect" });
+    const gone: CutStatus = { ...aStatus(), phase: "Disconnected" };
+    expect(connectedControl(gone, true)).toEqual({ label: "Reconnect", verb: "reconnect" });
   });
 
   // Read from `actions`, never the phase: a disconnect mid-Job drops the transport under a
@@ -289,5 +384,46 @@ describe("sameCutter", () => {
   it("matches nothing when either side is absent", () => {
     expect(sameCutter(null, { instance_id: "usb:1:4", host: null })).toBe(false);
     expect(sameCutter(undefined, undefined)).toBe(false);
+  });
+});
+
+describe("lastSeenLabel", () => {
+  const now = 1_700_000_000_000;
+
+  it("names a host that has never answered", () => {
+    expect(lastSeenLabel(null, now)).toBe("No successful reading yet");
+    expect(lastSeenLabel(undefined, now)).toBe("No successful reading yet");
+  });
+
+  it("counts seconds, minutes, hours and days", () => {
+    expect(lastSeenLabel(now - 5_000, now)).toBe("Last seen 5s ago");
+    expect(lastSeenLabel(now - 60_000, now)).toBe("Last seen 1 minute ago");
+    expect(lastSeenLabel(now - 2 * 3_600_000, now)).toBe("Last seen 2 hours ago");
+    expect(lastSeenLabel(now - 3 * 86_400_000, now)).toBe("Last seen 3 days ago");
+  });
+});
+
+describe("retainOffline", () => {
+  const host = (unreachable: string | null): PairedHostView => ({
+    id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable, protocol_side: null,
+  });
+  const remote = (id: string): DeviceInfo => ({ ...aDevice(), instance_id: id, host: "host-1" });
+
+  it("keeps the previous cutters of a host that can no longer be reached", () => {
+    const previous = [remote("usb:pi:A")];
+    const kept = retainOffline(previous, [], [], [host("timed out")], []);
+    expect(kept.devices.map((device) => device.instance_id)).toEqual(["usb:pi:A"]);
+  });
+
+  it("uses the first reading when there is nothing older to keep", () => {
+    const next = [remote("usb:pi:A")];
+    const kept = retainOffline([], [], next, [host("timed out")], []);
+    expect(kept.devices).toEqual(next);
+  });
+
+  it("takes the new snapshot once the host answers again", () => {
+    const next = [remote("usb:pi:B")];
+    const kept = retainOffline([remote("usb:pi:A")], [], next, [host(null)], []);
+    expect(kept.devices).toEqual(next);
   });
 });

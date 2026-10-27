@@ -251,7 +251,7 @@ mod tests {
     use driver_core::{Actions, Job, PassPosition, Settings};
 
     fn status(actions: Actions, phase: Phase, pass: Option<PassPosition>) -> CutStatus {
-        CutStatus { phase, ended: None, actions, pass, sent: None, error: None }
+        CutStatus { phase, ended: None, actions, pass, sent: None, error: None, job_id: 0 }
     }
 
     /// A plan of keyed passes. Takes keys because that is what a pass is named by since

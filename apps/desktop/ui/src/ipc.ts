@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { invoke } from "@tauri-apps/api/core";
-import { save as dialogSave, open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import { save as dialogSave, open as dialogOpen, confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
+import type { LengthUnit } from "./length";
+
+export type { LengthUnit };
 
 // ponytail: loose types for delta/snapshot payloads until Rust shape mirrors TS
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -16,6 +19,11 @@ export async function snapshot() {
 
 export async function commitTransform(args: Args) {
   return invoke("commit_transform", args);
+}
+
+/** Several moves, each with its own matrix, committed as one undo (align and distribute). */
+export async function commitTransforms(args: { moves: { ids: number[]; m: number[] }[] }) {
+  return invoke("commit_transforms", args);
 }
 
 export async function addPrimitive(args: Args) {
@@ -44,6 +52,13 @@ export async function setCutLineType(args: Args) {
 
 export async function setMaterialPreset(args: Args) {
   return invoke("set_material_preset", args);
+}
+
+export type HistoryFlags = { can_undo: boolean; can_redo: boolean };
+
+/** The editor's undo stacks. Kept off the document snapshot: that JSON is the project shape (#308). */
+export async function history(): Promise<HistoryFlags> {
+  return invoke("history", {});
 }
 
 export async function undo() {
@@ -94,9 +109,31 @@ export type PairedHostView = {
   id: string;
   name: string;
   address: string;
-  /** Why this host cannot be reached, or null when it can. */
+  /** Why this host cannot be reached, or null when it can. The row prints it. */
   unreachable: string | null;
+  /**
+   * Which program a protocol mismatch names. Null for every other failure.
+   * "host" is the Cut Host; "desktop" is this build of Cuthulhu.
+   */
+  protocol_side: "host" | "desktop" | null;
+  /** Unix millis of the last successful snapshot. Absent until one has landed, and unchanged by a failed dial. */
+  last_seen?: number | null;
 };
+
+/** One remote cutter's cached status. `instance_id` stays snake_case, like `DeviceInfo`. */
+export type CutterStatusView = {
+  host: string;
+  instance_id: string;
+  status: CutStatus;
+};
+
+/** A cutter named beside the aim. `host: null` is a cutter on this computer. */
+export type CutterTarget = { host: string | null; instanceId: string };
+
+function cutterArgs(target?: CutterTarget): Record<string, unknown> {
+  if (!target) return {};
+  return { host: target.host, instanceId: target.instanceId };
+}
 
 export type DeviceError =
   | "Disconnected"
@@ -118,8 +155,8 @@ export type Phase =
 
 /** Mirrors driver_core::CutStatus. The phase says what is happening now; `ended`
  *  says how the last job finished, which no phase can — a finished cut and a
- *  cancelled one both rest on "Idle". Actions say which buttons are legal.
- *  Nothing here needs interpreting, and nothing needs remembering. */
+ *  cancelled one both rest on "Idle". `jobId` says whose cut it is. 0 is a
+ *  lifecycle report, not a job. Actions say which buttons are legal. */
 export type CutStatus = {
   phase: Phase;
   ended: "Completed" | "Cancelled" | null;
@@ -127,6 +164,7 @@ export type CutStatus = {
   pass: { index: number; total: number } | null;
   sent: { sent: number; total: number } | null;
   error: DeviceError | null;
+  jobId: number;
 };
 
 /** Mirrors CutStatus::disconnected() — what to show before the first status arrives. */
@@ -137,6 +175,7 @@ export const DISCONNECTED_STATUS: CutStatus = {
   pass: null,
   sent: null,
   error: null,
+  jobId: 0,
 };
 
 // `StateChanged` carries no payload: the event's own `status` is what changed.
@@ -158,6 +197,14 @@ export type PassKey = string;
 /** How the planner splits shapes into passes. Mirrors `cutplan::Grouping`. */
 export type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
 
+/** Mirrors `cutplan::weed::WeedLines`. */
+export type WeedLines = "None" | "Horizontal" | "Vertical" | "Both";
+
+/** Mirrors `cutplan::weed::WeedOptions`, in millimetres. Sent with the plan, the travel and the
+ *  cut, like the grouping: rows previewed with one border and cut with another would send
+ *  geometry nobody saw. */
+export type WeedOptions = { margin_mm: number; lines: WeedLines; spacing_mm: number; clearance_mm: number };
+
 /** Mirrors `document::PresetAssignment`'s adjacently-tagged JSON. */
 export type PresetAssignmentJson =
   | { state: "inherit" }
@@ -171,6 +218,8 @@ export type PlanCutPassSummary = {
   /** Each shape's first world-space point, parallel to node_ids — where the blade lands.
    *  null is a shape whose outline flattened to nothing. */
   starts: ([number, number] | null)[];
+  /** The pass's weed lines then its border, in world mm. Empty without weed options. */
+  weed: [number, number][][];
 };
 
 export type PlanCutResponse = {
@@ -209,24 +258,38 @@ export async function disconnectDevice(): Promise<void> {
 
 /** Re-opens the aimed cutter's transport, locally or on its Cut Host. What clears a cancel whose
  *  stop nothing confirmed — there is no verb for declaring one confirmed. */
-export async function reconnectDevice(): Promise<void> {
-  return invoke("reconnect_device", {});
+export async function reconnectDevice(target?: CutterTarget): Promise<void> {
+  return invoke("reconnect_device", cutterArgs(target));
 }
 
-export async function getDeviceState(): Promise<CutStatus> {
-  return invoke("get_device_state", {});
+export async function getDeviceState(target?: CutterTarget): Promise<CutStatus> {
+  return invoke("get_device_state", cutterArgs(target));
+}
+
+/** Every remote cutter's last snapshot. The device list is what dials; this only reads the cache. */
+export async function cutterStatuses(): Promise<CutterStatusView[]> {
+  return invoke("cutter_statuses", {});
 }
 
 export async function getConnectedDevice(): Promise<DeviceInfo | null> {
   return invoke("get_connected_device", {});
 }
 
+export async function setCloseGuardReady(ready: boolean): Promise<void> {
+  return invoke("set_close_guard_ready", { ready });
+}
+
 export async function forceQuit(): Promise<void> {
   return invoke("force_quit", {});
 }
 
-export async function planCut(grouping: Grouping): Promise<PlanCutResponse> {
-  return invoke("plan_cut", { grouping });
+/** The operator dismissed the quit prompt. Releases a macOS terminate the OS is waiting on. */
+export async function cancelQuit(): Promise<void> {
+  return invoke("cancel_quit", {});
+}
+
+export async function planCut(grouping: Grouping, weed: WeedOptions | null): Promise<PlanCutResponse> {
+  return invoke("plan_cut", { grouping, weed });
 }
 
 /** A pass as the dialog has it configured: where it sits in the order, and whether it is cut. */
@@ -239,9 +302,10 @@ export type TravelPass = { key: PassKey; enabled: boolean };
 export async function travelForOrder(
   docRevision: string,
   grouping: Grouping,
+  weed: WeedOptions | null,
   passes: TravelPass[],
 ): Promise<[number, number, number, number][]> {
-  return invoke("travel_for_order", { docRevision, grouping, passes });
+  return invoke("travel_for_order", { docRevision, grouping, weed, passes });
 }
 
 /** What a press of Cut did. `duplicate` is the Cut Host saying it had already accepted this
@@ -253,16 +317,16 @@ export async function cut(request: Args): Promise<CutStarted> {
   return invoke("cut", { request });
 }
 
-export async function cancelCut(): Promise<void> {
-  return invoke("cancel_cut", {});
+export async function cancelCut(target?: CutterTarget): Promise<void> {
+  return invoke("cancel_cut", cutterArgs(target));
 }
 
-export async function resumeCut(): Promise<void> {
-  return invoke("resume_cut", {});
+export async function resumeCut(target?: CutterTarget): Promise<void> {
+  return invoke("resume_cut", cutterArgs(target));
 }
 
-export async function confirmPassDone(): Promise<void> {
-  return invoke("confirm_pass_done", {});
+export async function confirmPassDone(target?: CutterTarget): Promise<void> {
+  return invoke("confirm_pass_done", cutterArgs(target));
 }
 
 export async function listHosts(): Promise<PairedHostView[]> {
@@ -310,7 +374,16 @@ export async function machineCaps(machineId: string) {
  *  `traceControls` is: `cutplan::preflight` is what refuses a cut whose settings sit outside
  *  these, so the preset editor asks it for the bounds instead of keeping a second copy to drift. */
 export type SettingRange = { min: number; max: number };
-export type SettingsRanges = { speed: SettingRange; force: SettingRange; repeatCount: SettingRange };
+/** Mirrors `cutplan::weed::WeedRanges`; same reason as the settings ranges. */
+export type WeedRanges = { margin_mm: SettingRange; spacing_mm: SettingRange; clearance_mm: SettingRange };
+export type SettingsRanges = {
+  speed: SettingRange;
+  force: SettingRange;
+  repeatCount: SettingRange;
+  weed: WeedRanges;
+  /** `cutplan::weed::WEED_DEFAULTS`: where the weed controls start. */
+  weedDefaults: WeedOptions;
+};
 
 export async function settingsRanges(): Promise<SettingsRanges> {
   return invoke("settings_ranges", {});
@@ -330,6 +403,29 @@ const CUT_FILTER = [{ name: "cuthulhu project", extensions: ["cut"] }];
 
 export async function pickSavePath(): Promise<string | null> {
   return dialogSave({ defaultPath: "cuthulhu-project.cut", filters: CUT_FILTER });
+}
+
+/**
+ * The quit prompt's question. Through the plugin rather than `window.confirm`, which the plugin
+ * replaces with an async function whose Promise is truthy whatever the operator presses.
+ */
+export async function askToQuit(message: string): Promise<boolean> {
+  return dialogConfirm(message, {
+    title: "Quit Cuthulhu?",
+    kind: "warning",
+    okLabel: "Quit anyway",
+    cancelLabel: "Cancel",
+  });
+}
+
+/** The machine-switch prompt's question, through the plugin for the same reason. */
+export async function confirmSwitch(message: string): Promise<boolean> {
+  return dialogConfirm(message, {
+    title: "Switch design machine?",
+    kind: "warning",
+    okLabel: "Switch machine",
+    cancelLabel: "Cancel",
+  });
 }
 
 export async function pickOpenPath(): Promise<string | null> {
@@ -382,4 +478,17 @@ export async function loadImagePreview(args: { path: string }): Promise<string> 
 // picked and refuses to trace anything else, so choosing the file here is what grants access.
 export async function pickImagePath(): Promise<string | null> {
   return invoke("pick_image", {});
+}
+
+export type Appearance = "light" | "dark" | "system";
+/** `units` is null until a choice has been saved. The UI resolves the region once and writes it. */
+export type Preferences = { appearance: Appearance; units: LengthUnit | null };
+
+export async function getPreferences(): Promise<Preferences> {
+  return invoke("get_preferences", {});
+}
+
+/** Either field may be omitted. A save merges onto the file, so naming one does not drop the other. */
+export async function setPreferences(appearance?: Appearance, units?: LengthUnit): Promise<Preferences> {
+  return invoke("set_preferences", { appearance, units });
 }

@@ -8,7 +8,7 @@ import {
 const panelStyle: CSSProperties = {
   position: "fixed",
   inset: 0,
-  background: "rgba(0,0,0,0.5)",
+  background: "var(--scrim)",
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
@@ -18,7 +18,6 @@ const panelStyle: CSSProperties = {
 const dialogStyle: CSSProperties = {
   background: "var(--panel)",
   border: "1px solid var(--border)",
-  color: "var(--text)",
   padding: 16,
   width: 640,
   maxHeight: "85vh",
@@ -30,7 +29,6 @@ const dialogStyle: CSSProperties = {
 
 const btn: CSSProperties = {
   background: "var(--panel)",
-  color: "var(--text)",
   border: "1px solid var(--border)",
   padding: "4px 10px",
   cursor: "pointer",
@@ -44,7 +42,7 @@ const previewPane: CSSProperties = {
   alignItems: "center",
   justifyContent: "center",
   fontSize: 12,
-  color: "var(--muted)",
+  color: "var(--muted-foreground)",
   overflow: "hidden",
 };
 
@@ -121,18 +119,18 @@ export function TraceDialog({ path, onInsert, onClose }: {
         <div style={{ display: "flex", gap: 10 }}>
           <div style={previewPane}>
             {sourceUrl ? <img src={sourceUrl} alt="Source" style={{ maxWidth: "100%", maxHeight: 200 }} /> : null}
-            {sourceError !== null ? <span style={{ color: "var(--cut)" }}>{sourceError}</span> : null}
+            {sourceError !== null ? <span className="text-destructive">{sourceError}</span> : null}
           </div>
           <div style={previewPane}>
             {preview.kind === "ready" && <img src={svgDataUrl(preview.svg)} alt="Traced preview" style={{ maxWidth: "100%", maxHeight: 200 }} />}
             {preview.kind === "tracing" && <span>Tracing…</span>}
             {preview.kind === "empty" && <span>{preview.message}</span>}
-            {preview.kind === "error" && <span style={{ color: "var(--cut)" }}>{preview.message}</span>}
+            {preview.kind === "error" && <span className="text-destructive">{preview.message}</span>}
           </div>
         </div>
 
         {preview.kind === "ready" ? (
-          <div style={{ fontSize: 12, color: "var(--muted)" }}>
+          <div className="text-xs text-muted-foreground">
             {preview.pathCount} {preview.pathCount === 1 ? "path" : "paths"}
             {preview.downscaled ? ` — large image reduced to ${specs?.maxDim} px for tracing` : ""}
           </div>

@@ -91,6 +91,20 @@ bounds, and non-degenerate; Settings inside the machine's range; a Document mean
 machine that is plugged in; an output that fits in memory.
 _Avoid_: validation, checks, linting
 
+**Weed border**:
+A rectangle cut around a DocumentPass's shapes, a margin outside their bounds, so that pass's
+sheet comes off the roll in one piece. Each DocumentPass gets its own, because each is its own
+sheet of material, and it is cut last in that pass.
+_Avoid_: weed box, frame, bounding box (that is what it is drawn from, not what it is)
+
+**Weed lines**:
+Straight cuts across the waste inside a Weed border, kept a clearance away from the design and
+never through it, so the waste lifts off in strips. Cut after the pass's shapes and before its
+border. The border and lines together are a pass's weed; **WeedOptions** says what to generate
+and travels with the plan, the travel and the cut, like the Grouping. Generated, never stored in
+the Document.
+_Avoid_: hatch, fill lines, weeding grid
+
 **Stale plan**:
 A cut requested against a Document that has since changed. Refused rather than cut, because the
 operator approved geometry that no longer exists.
@@ -145,6 +159,12 @@ _Avoid_: connection, channel, port, link
 A machine that owns Transports to one or more cutters and runs Jobs on them on behalf of remote
 clients. A Cut Host owns the cut: a client may detach mid-Job and the Job continues.
 _Avoid_: proxy, server, relay, bridge — all four name something that forwards, which this does not.
+
+**Protocol version**:
+The one version a desktop and a Cut Host agree before any authenticated request. Independent of
+the application's version. A peer that speaks a different one is refused and the connection
+closes; nothing is negotiated.
+_Avoid_: app version, API version, feature flag
 
 **Job**:
 The geometry for one pass, as flat polylines in millimetres, together with the Settings to cut it

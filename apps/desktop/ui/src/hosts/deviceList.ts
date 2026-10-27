@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { ipcErrorCode, ipcErrorMessage, type CutStatus, type DeviceInfo, type PairedHostView } from "../ipc";
+import { ipcErrorCode, ipcErrorMessage, type CutStatus, type CutterStatusView, type DeviceInfo, type PairedHostView } from "../ipc";
 
 /**
  * Whether these are the same cutter — the id *and* the host, never the id alone.
@@ -29,6 +29,8 @@ export type DeviceSection = {
   address: string | null;
   /** Why this section is not normal — unreachable, or naming a host nobody is paired with. */
   unreachable: string | null;
+  /** Which program a protocol mismatch names. Null when the row is some other failure. */
+  protocolSide: ProtocolSide | null;
   devices: DeviceInfo[];
   /** These are the last values a poll managed to read, not what is true now. */
   stale: boolean;
@@ -42,11 +44,12 @@ export function groupDevices(
   devices: DeviceInfo[], hosts: PairedHostView[],
 ): DeviceSection[] {
   const local: DeviceSection = {
-    hostId: null, title: "This computer", address: null, unreachable: null, stale: false,
-    devices: devices.filter(d => d.host === null),
+    hostId: null, title: "This computer", address: null, unreachable: null, protocolSide: null,
+    stale: false, devices: devices.filter(d => d.host === null),
   };
   const known = hosts.map(h => ({
-    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable, stale: false,
+    hostId: h.id, title: h.name, address: h.address, unreachable: h.unreachable,
+    protocolSide: protocolSide(h.protocol_side), stale: false,
     devices: devices.filter(d => d.host === h.id),
   }));
   // A cutter whose host is in neither list matches no section above — not local, since its `host`
@@ -59,7 +62,7 @@ export function groupDevices(
     devices.flatMap(d => (d.host !== null && !paired.has(d.host) ? [d.host] : [])),
   )];
   return [local, ...known, ...orphaned.map(id => ({
-    hostId: id, title: id, address: null, stale: false,
+    hostId: id, title: id, address: null, stale: false, protocolSide: null,
     unreachable: "this Cut Host is not paired with this computer",
     devices: devices.filter(d => d.host === id),
   }))];
@@ -71,6 +74,9 @@ export function groupDevices(
  */
 export type ForgetResult = { hosts: PairedHostView[]; message: string | null; forceable: boolean };
 
+/** The refusals a force may get past — the two that would otherwise leave an unremovable row. */
+const FORCEABLE = ["host_unconfirmed", "host_cutter_unreachable"];
+
 /**
  * Forget a Cut Host, all or nothing.
  *
@@ -81,11 +87,15 @@ export type ForgetResult = { hosts: PairedHostView[]; message: string | null; fo
  * refusal would show that host as gone, however briefly, at the one moment it most needs to be
  * reachable.
  *
- * Only the second refusal is `forceable`, and only after it has happened: a Pi that is gone for
- * good must not become unforgettable, but the failed attempt is what tells the operator there is
- * something to think about. A force offered before they have tried teaches them to take it by
- * reflex. A host that answered "busy" is reachable, so `cancel` still works there and no force is
- * offered at all.
+ * Two refusals are `forceable`, and only after they have happened: the host that could not be
+ * asked (`host_unconfirmed`), and the one that answered with a cutter nothing can recover
+ * (`host_cutter_unreachable`). Both would otherwise leave a row that can never be removed. A
+ * force offered before the operator has tried teaches them to take it by reflex, and a host that
+ * answered "busy" is reachable — `cancel` still works there, so no force is offered at all.
+ *
+ * Every other code is a plain refusal. A code Rust adds later is therefore unforceable until this
+ * list names it, which is the safe direction: the operator is told what happened and nothing is
+ * discarded.
  *
  * A refusal leaves the list untouched rather than partly erased. Nothing here clears a stored
  * token on its own: re-pairing replaces it, and a host that plainly needs attention is better
@@ -101,7 +111,10 @@ export async function forgetFrom(
     await forget(id, force);
     return { hosts: hosts.filter(h => h.id !== id), message: null, forceable: false };
   } catch (e) {
-    return { hosts, message: ipcErrorMessage(e), forceable: !force && ipcErrorCode(e) === "host_unconfirmed" };
+    // A throw with no code at all is not one of these two, so it is a plain refusal.
+    const code = ipcErrorCode(e);
+    const forceable = !force && code !== null && FORCEABLE.includes(code);
+    return { hosts, message: ipcErrorMessage(e), forceable };
   }
 }
 
@@ -113,14 +126,113 @@ export async function forgetFrom(
  * idle reads as "finished", which is the one wrong thing to tell someone whose material is still
  * moving under a blade. The cutters stay listed with whatever status each already had.
  */
+/**
+ * How long ago a host last answered, in the offline card's own words.
+ * `null` is a host this desktop has never read a snapshot from.
+ */
+export function lastSeenLabel(at: number | null | undefined, now: number): string {
+  if (at == null) return "No successful reading yet";
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  if (seconds < 60) return `Last seen ${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes === 1 ? "Last seen 1 minute ago" : `Last seen ${minutes} minutes ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return hours === 1 ? "Last seen 1 hour ago" : `Last seen ${hours} hours ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "Last seen 1 day ago" : `Last seen ${days} days ago`;
+}
+
+/**
+ * An unreachable host keeps the cutters and statuses from the last reading that named them.
+ *
+ * A live snapshot of a host that cannot be reached is empty, and substituting it would drop the
+ * rows or replace a frozen cut with `Disconnected`. The first reading, which has nothing older
+ * to keep, uses whatever the list returned.
+ */
+export function retainOffline(
+  previousDevices: DeviceInfo[],
+  previousStatuses: CutterStatusView[],
+  nextDevices: DeviceInfo[],
+  nextHosts: PairedHostView[],
+  nextStatuses: CutterStatusView[],
+): { devices: DeviceInfo[]; statuses: CutterStatusView[] } {
+  const offline = nextHosts.filter((host) => host.unreachable !== null).map((host) => host.id);
+  if (offline.length === 0) return { devices: nextDevices, statuses: nextStatuses };
+  const held = new Set(offline);
+  const devices = nextDevices.filter((device) => device.host === null || !held.has(device.host));
+  const statuses = nextStatuses.filter((row) => !held.has(row.host));
+  for (const id of offline) {
+    const keptDevices = previousDevices.filter((device) => device.host === id);
+    const keptStatuses = previousStatuses.filter((row) => row.host === id);
+    devices.push(...(keptDevices.length > 0 ? keptDevices : nextDevices.filter((device) => device.host === id)));
+    statuses.push(...(keptStatuses.length > 0 ? keptStatuses : nextStatuses.filter((row) => row.host === id)));
+  }
+  return { devices, statuses };
+}
+
 export function staleSection(previous: DeviceSection, e: unknown): DeviceSection {
-  return { ...previous, stale: true, unreachable: ipcErrorMessage(e) };
+  // The list error replaces the host's sentence, so the chip and the link must not
+  // keep a side that belonged to the sentence that just left the row.
+  return { ...previous, stale: true, unreachable: ipcErrorMessage(e), protocolSide: null };
 }
 
 // A caller is told about a cut through one value, `CutStatus.actions` — never `phase`. Two
 // cutters can share the same phase (e.g. "Disconnected") while one is legal to cut and the
 // other isn't; only `actions` tells them apart. `phase` may still end up in UI copy as
 // descriptive text, but nothing below branches on it.
+/** Which program a protocol mismatch names. The Rust side decides; this only accepts the token. */
+export type ProtocolSide = "host" | "desktop";
+
+export function protocolSide(side: string | null | undefined): ProtocolSide | null {
+  switch (side) {
+    case "host":
+    case "desktop":
+      return side;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The host card's title. A protocol mismatch is a host that answered, so it is
+ * not "can't reach", and it is not a reading that never succeeded.
+ */
+export function hostCardTitle(name: string, side: ProtocolSide | null, unreachable: boolean): string {
+  switch (side) {
+    case "host":
+      return `${name} needs an update`;
+    case "desktop":
+      return `Update Cuthulhu to use ${name}`;
+    case null:
+      return unreachable ? `Can't reach ${name}` : `${name} · Pi Cut Host`;
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
+  }
+}
+
+/** Where "How to update" goes. The host page is the binary swap; the desktop page is the releases. */
+export function protocolUpdateUrl(side: ProtocolSide): string {
+  switch (side) {
+    case "host":
+      return "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update";
+    case "desktop":
+      return "https://github.com/vcolombo/cuthulhu/releases";
+    default: {
+      const neverSide: never = side;
+      return neverSide;
+    }
+  }
+}
+
+/** The unpolled chip, with the words the mismatch message already used. Same tone: this is
+ *  not a cutter that wants a person at the machine, it is a row we cannot ask. */
+export const UPDATE_NEEDED_BADGE: { label: string; tone: "unknown" } = {
+  label: "Update needed",
+  tone: "unknown",
+};
+
 export function deviceBadge(status: CutStatus | null): { label: string; tone: "idle" | "busy" | "attention" | "unknown" | "gone" } {
   if (status === null) {
     // No status has arrived for this cutter yet (distinct from DISCONNECTED_STATUS, which is a
@@ -185,5 +297,8 @@ export function connectedControl(
   if (status === null || status.actions.cancel || status.actions.resume || status.actions.confirm) {
     return null;
   }
+  // A remote cutter that can take a cut is already open. Reconnect is the way back
+  // when it is disconnected or the last cut errored — every other state left here.
+  if (onHost && status.actions.cut) return null;
   return onHost ? { label: "Reconnect", verb: "reconnect" } : { label: "Disconnect", verb: "disconnect" };
 }

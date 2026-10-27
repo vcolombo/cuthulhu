@@ -40,6 +40,12 @@ impl AppState {
         Ok(self.editor.commit(d))
     }
 
+    /// Every move in one undo, all or nothing: align and distribute give each unit its own matrix.
+    pub fn commit_transforms(&mut self, moves: Vec<(Vec<NodeId>, Affine)>) -> Result<Delta, CmdError> {
+        let d = commands::transform_each(&self.editor.doc, &moves)?;
+        Ok(self.editor.commit(d))
+    }
+
     pub fn add_primitive(&mut self, parent: NodeId, kind: ShapeKind) -> Result<Delta, CmdError> {
         let d = commands::add_primitive(&mut self.editor.doc.ids, parent, kind)?;
         Ok(self.editor.commit(d))
@@ -87,6 +93,14 @@ impl AppState {
 
     pub fn redo(&mut self) -> Option<Delta> {
         self.editor.redo()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.editor.can_undo()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.editor.can_redo()
     }
 
     /// Imports SVG paths under `parent`, committed as one undoable step. Returns the
@@ -145,6 +159,35 @@ mod tests {
         let id = app.add_rect(10.0, 10.0);
         app.commit_transform(vec![id], geometry::Affine::translate(3.0, 0.0)).unwrap();
         assert_eq!(app.editor.doc.get(id).unwrap().transform.apply(0.0, 0.0), (3.0, 0.0));
+    }
+
+    #[test]
+    fn app_state_commit_transforms_is_one_undo() {
+        let mut app = AppState::new();
+        let a = app.add_rect(10.0, 10.0);
+        let b = app.add_rect(10.0, 10.0);
+        app.commit_transforms(vec![
+            (vec![a], geometry::Affine::translate(3.0, 0.0)),
+            (vec![b], geometry::Affine::translate(0.0, 4.0)),
+        ]).unwrap();
+        app.undo().unwrap();
+        assert_eq!(app.editor.doc.get(a).unwrap().transform.apply(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(app.editor.doc.get(b).unwrap().transform.apply(0.0, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn app_state_commit_transforms_refused_changes_nothing() {
+        // Refused before anything is committed: no half-aligned document and no undo entry.
+        let mut app = AppState::new();
+        let a = app.add_rect(10.0, 10.0);
+        let r = app.commit_transforms(vec![
+            (vec![a], geometry::Affine::translate(3.0, 0.0)),
+            (vec![NodeId(9_999)], geometry::Affine::translate(1.0, 0.0)),
+        ]);
+        assert!(r.is_err());
+        assert_eq!(app.editor.doc.get(a).unwrap().transform.apply(0.0, 0.0), (0.0, 0.0));
+        app.undo().unwrap(); // the undo is the rect's own add, so the rect goes
+        assert!(app.editor.doc.get(a).is_none());
     }
 
     #[test]

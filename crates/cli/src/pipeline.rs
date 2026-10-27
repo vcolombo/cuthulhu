@@ -131,11 +131,12 @@ pub fn plan_cut_from_svg(
     skip_passes: &[String],
     order: &[String],
     allow_out_of_bounds: bool,
+    weed: Option<&cutplan::weed::WeedOptions>,
 ) -> Result<cutplan::CutPlan, String> {
     let doc = doc_from_svg(svg)?;
     // Planned once: the flags name passes, so the keys have to be known before a selection
     // can be built, and `plan_cut` cuts the very passes handed to it here.
-    let planned = cutplan::plan_passes_with(&doc, grouping).map_err(|e| e.to_string())?;
+    let planned = cutplan::plan_passes_for(&doc, grouping, weed).map_err(|e| e.to_string())?;
     // Two different empty cuts, told apart here because only this caller knows an SVG was
     // imported and what the operator asked to skip. Left to `plan_cut`, both would arrive as
     // an unmatched selection or `NothingToCut`, and one sentence would have to cover both.
@@ -168,10 +169,38 @@ fn describe_cut_error(e: cutplan::CutError) -> String {
     use cutplan::preflight::PreflightError as P;
     match e {
         cutplan::CutError::Preflight(P::NothingToCut) => "no cuttable paths in SVG".into(),
-        cutplan::CutError::Preflight(P::OutOfBounds { .. }) =>
+        cutplan::CutError::Preflight(P::OutOfBounds { .. } | P::WeedOutOfBounds { .. }) =>
             format!("{e} — pass --allow-out-of-bounds to send it anyway"),
         e => e.to_string(),
     }
+}
+
+/// The `--weed-*` flags as options for `plan_passes_for`, or none without `--weed-margin`. A flag
+/// that would do nothing is refused rather than ignored: line flags without a margin (lines
+/// without a border would stop in the open sheet, which is why the dialog does not offer them
+/// either), and spacing or clearance without `--weed-lines`. Ranges are `cutplan`'s to check.
+pub fn weed_options(
+    margin_mm: Option<f64>,
+    lines: Option<cutplan::weed::WeedLines>,
+    spacing_mm: Option<f64>,
+    clearance_mm: Option<f64>,
+) -> Result<Option<cutplan::weed::WeedOptions>, String> {
+    let defaults = cutplan::weed::WEED_DEFAULTS;
+    let Some(margin_mm) = margin_mm else {
+        if lines.is_some() || spacing_mm.is_some() || clearance_mm.is_some() {
+            return Err("--weed-lines, --weed-spacing and --weed-clearance need --weed-margin, since weed lines run to the border".into());
+        }
+        return Ok(None);
+    };
+    if lines.is_none() && (spacing_mm.is_some() || clearance_mm.is_some()) {
+        return Err("--weed-spacing and --weed-clearance shape weed lines, so they need --weed-lines".into());
+    }
+    Ok(Some(cutplan::weed::WeedOptions {
+        margin_mm,
+        lines: lines.unwrap_or(defaults.lines),
+        spacing_mm: spacing_mm.unwrap_or(defaults.spacing_mm),
+        clearance_mm: clearance_mm.unwrap_or(defaults.clearance_mm),
+    }))
 }
 
 /// `--skip-pass` and `--order` name passes, which only a grouped cut has more than one of. A
@@ -225,17 +254,58 @@ mod tests {
 
 
     #[test]
+    fn weed_flags_build_options_from_the_defaults_and_need_a_margin() {
+        use cutplan::weed::{WeedLines, WeedOptions, WEED_DEFAULTS};
+        assert_eq!(weed_options(None, None, None, None), Ok(None));
+        assert_eq!(weed_options(Some(5.0), None, None, None), Ok(Some(WeedOptions { margin_mm: 5.0, ..WEED_DEFAULTS })));
+        assert_eq!(
+            weed_options(Some(5.0), Some(WeedLines::Both), Some(40.0), Some(2.0)),
+            Ok(Some(WeedOptions { margin_mm: 5.0, lines: WeedLines::Both, spacing_mm: 40.0, clearance_mm: 2.0 })),
+        );
+        for (lines, spacing, clearance) in [(Some(WeedLines::Horizontal), None, None), (None, Some(30.0), None), (None, None, Some(1.0))] {
+            let err = weed_options(None, lines, spacing, clearance).unwrap_err();
+            assert!(err.contains("need --weed-margin"), "{err}");
+        }
+        for (spacing, clearance) in [(Some(30.0), None), (None, Some(1.0))] {
+            let err = weed_options(Some(3.0), None, spacing, clearance).unwrap_err();
+            assert!(err.contains("need --weed-lines"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_weeded_cut_ends_each_pass_with_its_border() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
+            <rect x="50" y="50" width="10" height="10" stroke="#ff0000" fill="none"/></svg>"##;
+        let weed = cutplan::weed::WEED_DEFAULTS;
+        let plain = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, None).unwrap();
+        let weeded = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, Some(&weed)).unwrap();
+        let (plain, weeded) = (&plain.passes[0].job.polylines, &weeded.passes[0].job.polylines);
+        assert_eq!(weeded.len(), plain.len() + 1);
+        assert_eq!(&weeded[..plain.len()], &plain[..], "the shapes first, unchanged");
+        assert_eq!(weeded.last().unwrap().len(), 5, "then the closed border");
+    }
+
+    /// A border is the refusal an operator meets near the mat's edge, so it gets the same escape.
+    #[test]
+    fn a_weed_border_off_the_mat_names_the_flag_that_overrules_it() {
+        let weed = cutplan::weed::WEED_DEFAULTS;
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, Some(&weed))
+            .unwrap_err();
+        assert!(err.contains("weed border") && err.ends_with("pass --allow-out-of-bounds to send it anyway"), "{err}");
+    }
+
+    #[test]
     fn out_of_bounds_geometry_is_refused_unless_allowed() {
         // 1512px @96dpi = 400mm wide, past the Cameo's 330mm bed.
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
             <rect width="1512" height="10" stroke="#ff0000" fill="none"/>
         </svg>"##;
 
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap_err();
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, None).unwrap_err();
         assert!(err.contains("outside"), "expected an out-of-bounds refusal, got: {err}");
 
         assert!(
-            plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], true).is_ok(),
+            plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], true, None).is_ok(),
             "--allow-out-of-bounds must let it through",
         );
     }
@@ -243,7 +313,7 @@ mod tests {
     #[test]
     fn settings_out_of_range_are_refused_before_reaching_the_machine() {
         let bad = Settings { speed: Some(99), force: None, repeat_count: 1 };
-        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &bad, Grouping::Color, &[], &[], false).unwrap_err();
+        let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &bad, Grouping::Color, &[], &[], false, None).unwrap_err();
         assert!(err.contains("speed"), "expected a settings-range refusal, got: {err}");
     }
 
@@ -256,7 +326,7 @@ mod tests {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg">
             <rect width="5" height="5" fill="#ff0000"/>
         </svg>"##;
-        let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap();
+        let plan = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, None).unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert_eq!(plan.passes[0].key, cutplan::PassKey::Color(Some(0xFF0000FF)));
     }
@@ -268,7 +338,7 @@ mod tests {
     #[test]
     fn by_color_cut_of_an_svg_with_no_geometry_is_refused_by_name() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false)
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, None)
             .expect_err("an SVG with no geometry has nothing to cut");
         assert_eq!(err, "no cuttable paths in SVG");
     }
@@ -281,12 +351,12 @@ mod tests {
         let two_fills = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#ff0000"/><rect x="6" width="5" height="5" fill="#00ff00"/></svg>"##;
 
-        let plain = plan_cut_from_svg(two_fills, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).unwrap();
+        let plain = plan_cut_from_svg(two_fills, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false, None).unwrap();
         assert_eq!(plain.passes.len(), 1);
         assert_eq!(plain.passes[0].key, cutplan::PassKey::All, "one pass by request, named for that");
 
         let by_color =
-            plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false).unwrap();
+            plan_cut_from_svg(two_fills, cameo5().as_ref(), &cut_settings(), Grouping::Color, &[], &[], false, None).unwrap();
         assert_eq!(by_color.passes.len(), 2, "the fixture's two fills survived the import");
         assert!(by_color.passes.iter().all(|p| p.key != cutplan::PassKey::Color(Some(0x000000FF))),
             "keyed on the fills, not on the black stroke a plain cut used to stamp");
@@ -300,7 +370,7 @@ mod tests {
         let transparent_fill = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm">
             <rect width="5" height="5" fill="#00ff00" fill-opacity="0"/></svg>"##;
 
-        let plan = plan_cut_from_svg(transparent_fill, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).unwrap();
+        let plan = plan_cut_from_svg(transparent_fill, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false, None).unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert_eq!(plan.passes[0].key, cutplan::PassKey::All);
     }
@@ -311,11 +381,11 @@ mod tests {
     fn plain_cut_refuses_out_of_bounds_geometry() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10000mm" height="10mm">
             <rect x="9000" width="500" height="5" fill="#000000"/></svg>"##;
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false)
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false, None)
             .expect_err("out of bounds must be refused");
         assert!(err.contains("outside"), "unexpected message: {err}");
         // ...and the escape hatch works, now that there is a check to overrule.
-        assert!(plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], true).is_ok());
+        assert!(plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], true, None).is_ok());
     }
 
     /// With no paths at all there are no passes, so the early check reports the file rather
@@ -323,7 +393,7 @@ mod tests {
     #[test]
     fn plain_cut_of_an_empty_svg_says_nothing_to_cut() {
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10mm" height="10mm"></svg>"##;
-        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false).expect_err("empty");
+        let err = plan_cut_from_svg(svg, cameo5().as_ref(), &Settings::default(), Grouping::Single, &[], &[], false, None).expect_err("empty");
         assert_eq!(err, "no cuttable paths in SVG");
     }
 
@@ -420,7 +490,7 @@ mod tests {
     #[test]
     fn an_empty_file_and_an_emptied_selection_read_differently() {
         let err = plan_cut_from_svg(two_color_svg(), cameo5().as_ref(), &cut_settings(),
-            Grouping::Color, &["color:ff0000ff".into(), "color:0000ffff".into()], &[], false)
+            Grouping::Color, &["color:ff0000ff".into(), "color:0000ffff".into()], &[], false, None)
             .unwrap_err();
         assert_eq!(err, "every pass in this file was skipped; nothing is left to cut");
     }

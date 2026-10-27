@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cuthulhu",
+  "productName": "Cuthulhu",
   "version": "0.1.0",
   "identifier": "dev.cuthulhu.desktop",
   "build": {
@@ -11,9 +11,13 @@
   "app": {
     "windows": [
       {
-        "title": "cuthulhu",
+        "title": "Cuthulhu",
         "width": 1200,
-        "height": 800
+        "height": 800,
+        "minWidth": 1180,
+        "minHeight": 760,
+        "visible": false,
+        "backgroundColor": [248, 251, 251, 255]
       }
     ],
     "security": {

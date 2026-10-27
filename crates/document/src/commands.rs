@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use geometry::{boolean, ellipse_path, rect_path, text_to_path, Affine, BoolOp, Path};
 use crate::{node::*, delta::*};
 
@@ -51,21 +51,36 @@ pub fn add_primitive(ids: &mut IdGen, parent: NodeId, kind: ShapeKind) -> Result
 /// Converts the world-space matrix into the node's parent space so that new_world = old_world.then(m)
 /// holds under transformed ancestors.
 pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delta, CmdError> {
-    if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let selected: HashSet<NodeId> = ids.iter().copied().collect();
+    transform_nodes_in(doc, &parent_index(doc), &selected, &HashMap::new(), ids, m).map(Delta)
+}
+
+/// `transform_nodes` against a parent index built once by the caller. `parent_of` scans the whole
+/// document, and a transform asks it once per ancestor of every node, so a batch of thousands of
+/// units did quadratic work under the state lock (Copilot on #301). Moves never change the tree, so
+/// one index serves every entry of a batch. `selected` is every id the command moves, which a node
+/// beneath any of them is left to; `moved` holds the transforms earlier entries of a batch gave.
+fn transform_nodes_in(
+    doc: &Document, parents: &HashMap<NodeId, NodeId>, selected: &HashSet<NodeId>,
+    moved: &HashMap<NodeId, Affine>, ids: &[NodeId], m: Affine,
+) -> Result<Vec<NodeOp>, CmdError> {
+    if ids.is_empty() { return Err(CmdError::EmptySelection); }
     let mut ops = vec![];
     let mut seen = HashSet::new();
     for &id in ids {
         let node = doc.get(id).ok_or(CmdError::NotFound)?;
         // A selected ancestor already carries this node along; updating it too
         // would move its world position by `m` twice.
-        if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
-        let before = node.clone();
+        if !seen.insert(id) || ancestor_selected(parents, selected, id) { continue; }
+        let mut before = node.clone();
+        if let Some(&t) = moved.get(&id) { before.transform = t; }
         // Convert the world-space matrix into this node's parent space so that
         // new_world = old_world.then(m) holds under transformed ancestors:
         // new_local = old_local.then(pw).then(m).then(pw⁻¹)
-        let pw = match parent_of(doc, id) {
-            Some(pid) => world_transform(doc, pid).ok_or(CmdError::NotFound)?,
+        // Read from `doc` even mid-batch: an ancestor in `selected` would have skipped this node,
+        // so no entry has moved one.
+        let pw = match parents.get(&id) {
+            Some(&pid) => world_via(doc, parents, pid).ok_or(CmdError::NotFound)?,
             None => Affine::identity(),
         };
         // "something in the selection", not "this shape": `transform_nodes` acts on whole
@@ -76,7 +91,7 @@ pub fn transform_nodes(doc: &Document, ids: &[NodeId], m: Affine) -> Result<Delt
         after.transform = before.transform.then(&pw).then(&m).then(&pw_inv);
         ops.push(NodeOp::Update { id, before, after });
     }
-    Ok(Delta(ops))
+    Ok(ops)
 }
 
 /// Mark every shape in `ids` — and every shape beneath a container in `ids` — with `value`.
@@ -166,8 +181,9 @@ pub fn delete_nodes(doc: &Document, ids: &[NodeId]) -> Result<Delta, CmdError> {
     }
     let mut ops = vec![];
     let mut seen = HashSet::new();
+    let parents = parent_index(doc);
     for &id in ids {
-        if !seen.insert(id) || has_selected_ancestor(doc, &selected, id) { continue; }
+        if !seen.insert(id) || ancestor_selected(&parents, &selected, id) { continue; }
         // Existence first: an id that names nothing has no parent either, so asking `parent_of`
         // about it would answer `NoParent` for what is really a stale selection.
         doc.get(id).ok_or(CmdError::NotFound)?;
@@ -188,32 +204,73 @@ pub fn reorder(doc: &Document, id: NodeId, new_index: usize) -> Result<Delta, Cm
     ]))
 }
 
-fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
-    doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
+/// Several moves, each with its own world-space matrix, committed as one Delta and so one undo.
+/// Align and distribute need a translation per unit, which `transform_nodes`' single matrix cannot
+/// express. All or nothing: one refused entry refuses the batch, so a half-aligned selection is
+/// never saved. Each entry runs against the document as the earlier ones left it, so an id listed
+/// in two entries moves by both, in order. A node whose ancestor any entry selects is skipped, as
+/// within one `transform_nodes` call: it moves only with that ancestor, by the ancestor's matrix,
+/// not by its own entry's too. Align's units never overlap (`outermost`), so neither case arises
+/// from it; the frontend's preview composes repeated ids the same way.
+pub fn transform_each(doc: &Document, moves: &[(Vec<NodeId>, Affine)]) -> Result<Delta, CmdError> {
+    if moves.is_empty() { return Err(CmdError::EmptySelection); }
+    let selected: HashSet<NodeId> = moves.iter().flat_map(|(ids, _)| ids.iter().copied()).collect();
+    let parents = parent_index(doc);
+    // What the earlier entries left, kept as the transforms they wrote rather than a copy of the
+    // whole document: a move changes only the moved node's transform, and the ancestors a later
+    // entry reads are never moved (one in `selected` would have skipped the node beneath it). A copy
+    // cloned every path's data on every drag and field edit, since all of them come through here.
+    let mut moved: HashMap<NodeId, Affine> = HashMap::new();
+    let mut ops = Vec::new();
+    for (ids, m) in moves {
+        // An empty entry or a missing id is refused inside, as `transform_nodes` refuses it.
+        for op in transform_nodes_in(doc, &parents, &selected, &moved, ids, *m)? {
+            if let NodeOp::Update { id, after, .. } = &op { moved.insert(*id, after.transform); }
+            ops.push(op);
+        }
+    }
+    if ops.is_empty() { return Err(CmdError::EmptySelection); }
+    Ok(Delta(ops))
 }
 
-/// True when any ancestor of `id` is also in `selected`. Commands that act on a
-/// selection per-subtree (transform, delete) skip such nodes so that exactly one
-/// operation applies per selected subtree — the ancestor carries them along.
-fn has_selected_ancestor(doc: &Document, selected: &HashSet<NodeId>, id: NodeId) -> bool {
+/// Child → parent for every node, in one pass over the document.
+fn parent_index(doc: &Document) -> HashMap<NodeId, NodeId> {
+    doc.nodes.iter().flat_map(|(&pid, n)| n.children.iter().map(move |&c| (c, pid))).collect()
+}
+
+/// True when any ancestor of `id` is also in `selected`. Commands that act on a selection
+/// per-subtree (transform, delete) skip such nodes so that exactly one operation applies per
+/// selected subtree: the ancestor carries them along. Takes an index built once by the caller,
+/// since `parent_of` scans the whole document per level.
+fn ancestor_selected(parents: &HashMap<NodeId, NodeId>, selected: &HashSet<NodeId>, id: NodeId) -> bool {
     let mut cur = id;
-    while let Some(pid) = parent_of(doc, cur) {
+    while let Some(&pid) = parents.get(&cur) {
         if selected.contains(&pid) { return true; }
         cur = pid;
     }
     false
 }
 
-/// World transform of `id`: its local transform composed through every ancestor
-/// (node world = local.then(parent world)). None if `id` is not in the document.
-pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
+/// `world_transform` against a parent index built once by the caller; transforms are read from
+/// `doc` as it stands.
+fn world_via(doc: &Document, parents: &HashMap<NodeId, NodeId>, id: NodeId) -> Option<Affine> {
     let mut m = doc.get(id)?.transform.clone();
     let mut cur = id;
-    while let Some(pid) = parent_of(doc, cur) {
+    while let Some(&pid) = parents.get(&cur) {
         m = m.then(&doc.get(pid)?.transform);
         cur = pid;
     }
     Some(m)
+}
+
+fn parent_of(doc: &Document, id: NodeId) -> Option<NodeId> {
+    doc.nodes.iter().find(|(_, n)| n.children.contains(&id)).map(|(pid, _)| *pid)
+}
+
+/// World transform of `id`: its local transform composed through every ancestor
+/// (node world = local.then(parent world)). None if `id` is not in the document.
+pub fn world_transform(doc: &Document, id: NodeId) -> Option<Affine> {
+    world_via(doc, &parent_index(doc), id)
 }
 
 /// Shape's outline in its own local space (node's own transform NOT applied), in mm,
@@ -971,5 +1028,101 @@ mod tests {
             Err(CmdError::EmptySelection));
         assert_eq!(set_material_preset(&doc, &[NodeId(9999)], PresetAssignment::Inherit),
             Err(CmdError::NotFound));
+    }
+
+    // Two rects at the root and a Group holding a third, for transform_each.
+    fn batch_doc() -> (Editor, NodeId, NodeId, NodeId, NodeId) {
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+        let add = |ed: &mut Editor, parent: NodeId, node: crate::Node| {
+            ed.commit(crate::Delta(vec![crate::NodeOp::Add { parent, node, index: usize::MAX }]));
+        };
+        let a = ed.doc.ids.next();
+        add(&mut ed, root, crate::Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }));
+        let b = ed.doc.ids.next();
+        add(&mut ed, root, crate::Node::shape(b, ShapeKind::Rect { w: 10.0, h: 10.0 }));
+        let g = ed.doc.ids.next();
+        add(&mut ed, root, crate::Node::container(g, crate::NodeKind::Group));
+        let c = ed.doc.ids.next();
+        add(&mut ed, g, crate::Node::shape(c, ShapeKind::Rect { w: 10.0, h: 10.0 }));
+        (ed, a, b, g, c)
+    }
+
+    #[test]
+    fn transform_each_commits_every_move_as_one_undo() {
+        // Align gives each unit its own translation; one click must still be one undo.
+        let (mut ed, a, b, _, _) = batch_doc();
+        let d = transform_each(&ed.doc, &[(vec![a], Affine::translate(5.0, 0.0)), (vec![b], Affine::translate(0.0, 7.0))]).unwrap();
+        ed.commit(d);
+        assert_eq!(ed.doc.get(a).unwrap().transform.apply(0.0, 0.0), (5.0, 0.0));
+        assert_eq!(ed.doc.get(b).unwrap().transform.apply(0.0, 0.0), (0.0, 7.0));
+        ed.undo().unwrap();
+        assert_eq!(ed.doc.get(a).unwrap().transform.apply(0.0, 0.0), (0.0, 0.0));
+        assert_eq!(ed.doc.get(b).unwrap().transform.apply(0.0, 0.0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn transform_each_refuses_the_whole_batch_for_one_bad_entry() {
+        // A half-aligned selection is never saved.
+        let (ed, a, _, _, _) = batch_doc();
+        let r = transform_each(&ed.doc, &[(vec![a], Affine::translate(5.0, 0.0)), (vec![NodeId(9_999)], Affine::translate(1.0, 0.0))]);
+        assert!(matches!(r, Err(CmdError::NotFound)));
+    }
+
+    #[test]
+    fn transform_each_refuses_a_later_entry_the_geometry_cannot_take() {
+        // The first entry is fine on its own; the refusal still covers the batch.
+        let (mut ed, a, _, _, _) = batch_doc();
+        let outer = ed.doc.ids.next();
+        let mut collapsed = Node::container(outer, NodeKind::Group);
+        collapsed.transform = singular();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: collapsed, index: 0 }]));
+        let inner = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: outer, node: Node::container(inner, NodeKind::Group), index: 0 }]));
+        let r = transform_each(&ed.doc, &[(vec![a], Affine::translate(5.0, 0.0)), (vec![inner], Affine::translate(1.0, 0.0))]);
+        assert!(matches!(r, Err(CmdError::Geometry(_))));
+    }
+
+    #[test]
+    fn transform_each_moves_in_world_space_under_a_scaled_parent() {
+        // The parent index stands in for `parent_of`; a node under a 2x Group must still move by
+        // the world-space translation, not twice it.
+        let mut ed = Editor::new();
+        let g = ed.doc.ids.next();
+        let mut group = Node::container(g, NodeKind::Group);
+        group.transform = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: group, index: 0 }]));
+        let c = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: g, node: Node::shape(c, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 0 }]));
+        let a = ed.doc.ids.next();
+        ed.commit(Delta(vec![NodeOp::Add { parent: ed.doc.root, node: Node::shape(a, ShapeKind::Rect { w: 10.0, h: 10.0 }), index: 1 }]));
+        ed.commit(transform_each(&ed.doc, &[(vec![c], Affine::translate(4.0, 0.0)), (vec![a], Affine::translate(0.0, 3.0))]).unwrap());
+        assert_eq!(world_transform(&ed.doc, c).unwrap().apply(0.0, 0.0), (4.0, 0.0));
+        assert_eq!(world_transform(&ed.doc, a).unwrap().apply(0.0, 0.0), (0.0, 3.0));
+    }
+
+    #[test]
+    fn transform_each_refuses_an_entry_with_no_ids() {
+        let (ed, a, _, _, _) = batch_doc();
+        let r = transform_each(&ed.doc, &[(vec![a], Affine::translate(5.0, 0.0)), (vec![], Affine::translate(1.0, 0.0))]);
+        assert!(matches!(r, Err(CmdError::EmptySelection)));
+        assert!(matches!(transform_each(&ed.doc, &[]), Err(CmdError::EmptySelection)));
+    }
+
+    #[test]
+    fn transform_each_runs_each_entry_on_what_the_earlier_ones_left() {
+        // Translate then scale about the origin: (1, 0) → (6, 0) → (12, 0).
+        let (mut ed, a, _, _, _) = batch_doc();
+        let scale2 = Affine([2.0, 0.0, 0.0, 2.0, 0.0, 0.0]);
+        ed.commit(transform_each(&ed.doc, &[(vec![a], Affine::translate(5.0, 0.0)), (vec![a], scale2)]).unwrap());
+        assert_eq!(ed.doc.get(a).unwrap().transform.apply(1.0, 0.0), (12.0, 0.0));
+    }
+
+    #[test]
+    fn transform_each_moves_a_node_once_when_another_entry_selects_its_ancestor() {
+        // The Group carries its child; the child's own entry would move it a second time.
+        let (mut ed, _, _, g, c) = batch_doc();
+        ed.commit(transform_each(&ed.doc, &[(vec![g], Affine::translate(5.0, 0.0)), (vec![c], Affine::translate(5.0, 0.0))]).unwrap());
+        assert_eq!(world_transform(&ed.doc, c).unwrap().apply(0.0, 0.0), (5.0, 0.0));
     }
 }

@@ -2452,11 +2452,11 @@ fn a_dispatch_nothing_has_polled_yet_still_holds_the_window() {
 /// under, and the only thing that can stop a lost reply from cutting the material twice
 /// (#290). The operator's advice inverts with it: a retry is still the thing to press.
 ///
-/// The sibling is staged with `begin_dispatch`, which is exactly what a press mid-dispatch holds,
-/// and that is all there is to stage: the host connection is exclusive, so a second press cannot
-/// `dispatch` while another is inside `on_host`, and a refusal settles only after the sibling has
-/// left it, with the sibling's registration still live. A press held at the connection lock is
-/// `a_press_queued_for_a_host_connection_holds_the_window`.
+/// The sibling is staged with `begin_dispatch`, which is exactly what a press mid-dispatch holds.
+/// `settle_dispatch` runs under the host's connection lock, so a second press cannot dispatch while
+/// another holds that connection; what it meets at settlement is a sibling that has left it with
+/// its registration still live, which is the arrangement staged here. A press held at the
+/// connection lock is `a_press_queued_for_a_host_connection_holds_the_window`.
 #[test]
 fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
     let host = start_loopback_host();

@@ -144,11 +144,15 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   everything else immediately. The bridge keeps no state of its own. `get_device_state` reads
   `driver-core`'s published `CutStatus`, which never blocks.
 - The window-close handler and, on macOS, the application Quit item (Cmd-Q) both call
-  `DeviceManagerHandle::decide_close`. That question is not the aimed cutter's `CutStatus`.
+  `DeviceManagerHandle::decide_close`. The Dock's Quit and a logout send `terminate:` to
+  `NSApp` instead, so `apps/desktop/src/terminate.rs` adds `applicationShouldTerminate:` to
+  tao's app delegate at runtime and maps that same decision onto `NSTerminateLater` /
+  `NSTerminateNow`; `TerminateReply` owns the reply the OS is owed while the prompt is up.
+  That question is not the aimed cutter's `CutStatus`.
   `a_cut_may_be_running` counts a local cut, a non-dialling status, every dispatch mark this
   desktop has not seen finish, and a press that has started and not returned — on any cutter,
   with none aimed. It does not dial. Quitting stops what this process sends and leaves a Cut
-  Host's Job running. The Dock's Quit and a logout still send `terminate:` and skip the guard.
+  Host's Job running.
   The contract is
   `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`; the webview
   handshake is `ui/src/closeGuard.ts`.

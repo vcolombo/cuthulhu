@@ -104,11 +104,11 @@ once each, and does not run inside a field, a dialog, or a menu.
 
 Closing the window asks before it goes if any cut this desktop started may
 still be running, on any cutter, including one the top bar is no longer aimed
-at. On macOS, Cmd-Q and the application menu's Quit ask the same question.
+at. On macOS, Cmd-Q, the application menu's Quit, the Dock's Quit, and a
+logout all ask the same question first.
 The prompt's answer is the contract: sending to the cutter on this computer
 stops, but that cutter finishes moves it has already buffered; a Job already
-sent to a Cut Host keeps running there. The Dock's Quit and a logout are not
-covered — they still terminate the process without the prompt. See
+sent to a Cut Host keeps running there. See
 `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`.
 
 ## Develop

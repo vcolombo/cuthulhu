@@ -17,6 +17,12 @@ pub const CAMEO: &str = "usb:1:4";
 pub struct TestHost {
     pub addr: String,
     pub fingerprint: String,
+    /// The host the listener is serving. Admission tests read claims and snapshots
+    /// off it. The other integration tests compile this module into their own
+    /// crate and only talk through `HostClient`, so the field is unread there
+    /// and the warning is that split, not a spare host.
+    #[allow(dead_code)]
+    pub host: Arc<Host>,
     /// Held so the certificate outlives the host. Dropping it deletes the
     /// directory `serve_on` reads its key from.
     _dir: tempfile::TempDir,
@@ -39,11 +45,12 @@ pub fn start_test_host() -> TestHost {
     // pin before the server has accepted anything.
     let fingerprint = fingerprint_of_cert_dir(&config.cert_dir).unwrap();
     let host = Host::start(Arc::new(cut_host::host::testing::TwoCutterFactory));
+    let serve_host = host.clone();
 
     std::thread::spawn(move || {
-        let _ = serve_on(listener, host, config);
+        let _ = serve_on(listener, serve_host, config);
     });
-    TestHost { addr, fingerprint, _dir: dir }
+    TestHost { addr, fingerprint, host, _dir: dir }
 }
 
 pub fn square_pass() -> CutPass {

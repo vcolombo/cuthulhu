@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { marqueeHits, marqueeSelection, normalizeRect, shapesUnder, toggleId } from "./marquee";
+import { marqueeHits, marqueeSelection, normalizeRect, outermost, shapesUnder, toggleId } from "./marquee";
 
 describe("marquee", () => {
   it("normalizes a band dragged in any direction", () => {
@@ -53,5 +53,31 @@ describe("shapesUnder", () => {
 
   it("drops ids the document no longer has", () => {
     expect(shapesUnder(nodes, [99, 6])).toEqual([6]);
+  });
+});
+
+describe("outermost", () => {
+  const shape = { Shape: { Rect: { w: 1, h: 1 } } };
+  const nodes = {
+    1: { kind: "Layer", children: [2, 6] },
+    2: { kind: "Group", children: [3, 4] },
+    3: { kind: shape, children: [] },
+    4: { kind: "Group", children: [5] },
+    5: { kind: shape, children: [] },
+    6: { kind: shape, children: [] },
+  };
+
+  it("drops an id beneath another selected id, keeping selection order", () => {
+    // The backend moves such a node with its ancestor only, so it is not a unit of its own.
+    expect(outermost(nodes, [5, 6, 2, 3])).toEqual([6, 2]);
+  });
+
+  it("keeps siblings and unrelated ids", () => {
+    expect(outermost(nodes, [3, 4, 6])).toEqual([3, 4, 6]);
+  });
+
+  it("lists an id once even when the selection names it twice", () => {
+    // transform_each applies an id listed in two entries twice; the preview would show it once.
+    expect(outermost(nodes, [6, 3, 6])).toEqual([6, 3]);
   });
 });

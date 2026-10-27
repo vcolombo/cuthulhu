@@ -7,9 +7,29 @@ export type Matrix = Affine6; // a b c d e f
 /** Previews `m` on the selected nodes with no round trip. Any affine, not only a translation:
  *  handles scale and rotate through here, and the preview has to be the matrix the commit sends. */
 export function applyOptimistic(scene: Scene, ids: number[], m: Matrix): Scene {
-  // A Set, because this runs every drag frame and a marquee can select thousands.
-  const moving = new Set(ids);
-  return { nodes: scene.nodes.map((n) => (moving.has(n.id) ? transformNode(n, m) : n)) };
+  return applyMoves(scene, [{ shapes: ids, m }]);
+}
+
+/** Several previews at once, in one pass over the scene: each entry's matrix on its shapes.
+ *  Folding `applyOptimistic` over the entries copied the whole scene once per entry, so aligning a
+ *  few thousand separate pieces blocked the UI before anything was sent (Copilot on #301). A shape
+ *  listed twice gets both matrices in order, as `transform_each` moves an id listed twice by both;
+ *  keeping only the last had the preview disagree with the commit (type-design review on #301). */
+export function applyMoves(scene: Scene, entries: { shapes: number[]; m: Matrix }[]): Scene {
+  // A Map, because this runs every drag frame and a marquee can select thousands.
+  const by = new Map<number, Matrix>();
+  for (const { shapes, m } of entries) {
+    for (const id of shapes) {
+      const earlier = by.get(id);
+      by.set(id, earlier ? compose(earlier, m) : m);
+    }
+  }
+  return {
+    nodes: scene.nodes.map((n) => {
+      const m = by.get(n.id);
+      return m ? transformNode(n, m) : n;
+    }),
+  };
 }
 
 /** A commit's preview, standing in for the committed scene until the snapshot that includes the

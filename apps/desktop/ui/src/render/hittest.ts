@@ -10,8 +10,32 @@ export type ShapeGeom =
 /** `bounds` is the world-space axis-aligned box — what a marquee tests, and all a node without
  *  geometry has. `local` is the shape's own box before `world`: what a click is tested against,
  *  so a rotated shape is hit where it is drawn rather than across its whole bounding box. */
-export type SceneNode = { id: number; bounds: Bounds; local?: Bounds; shape?: ShapeGeom; world?: Affine6 };
+export type SceneNode = {
+  id: number;
+  bounds: Bounds;
+  local?: Bounds;
+  shape?: ShapeGeom;
+  world?: Affine6;
+  /** Colour-mode vinyl, 0xRRGGBBAA. Null when neither channel is visible. Absent on fixtures that predate it. */
+  vinyl?: number | null;
+  /** False when the shape is NoCut. Absent means it cuts, so older scenes still fill. */
+  cut?: boolean;
+};
 export type Scene = { nodes: SceneNode[] };
+
+/** The box around every one of `boxes`, which must not be empty. Align's units, the selection
+ *  box and App's unit bounds all come from here, so they cannot disagree about an edge, and a loop
+ *  rather than spread `Math.min` keeps a selection of thousands under the engine's argument limit. */
+export function unionBounds(boxes: Bounds[]): Bounds {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const b of boxes) {
+    x0 = Math.min(x0, b.x);
+    y0 = Math.min(y0, b.y);
+    x1 = Math.max(x1, b.x + b.w);
+    y1 = Math.max(y1, b.y + b.h);
+  }
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
 
 /** Topmost node under (x, y). Everything is world mm, `tol` included: the caller divides a CSS-px
  *  constant by the view scale, so a thin line is as easy to click zoomed out as zoomed in. */

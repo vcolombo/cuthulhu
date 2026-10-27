@@ -156,7 +156,11 @@ pub fn plan_cut(
             .map(|c| PlannedPass {
                 key: c.pass.key.clone(),
                 job: Job {
-                    polylines: c.pass.shapes.iter().flat_map(|s| s.polylines.iter().cloned()).collect(),
+                    // Weed after the shapes: the border frees the sheet, so it is cut last.
+                    polylines: c.pass.shapes.iter().flat_map(|s| s.polylines.iter())
+                        .chain(c.pass.weed.iter())
+                        .cloned()
+                        .collect(),
                     settings: c.settings.clone(),
                 },
             })
@@ -208,6 +212,29 @@ mod tests {
 
     fn opts(passes: Vec<PassSelection>) -> PlanOptions {
         PlanOptions { passes, expect_revision: None, allow_out_of_bounds: false }
+    }
+
+    /// Weed is cut in the pass it belongs to, after its shapes, so the border comes last.
+    #[test]
+    fn a_pass_job_is_its_shapes_then_its_weed() {
+        let weed = crate::weed::WeedOptions {
+            margin_mm: 2.0, lines: crate::weed::WeedLines::None, spacing_mm: 25.0, clearance_mm: 1.0,
+        };
+        let mut ed = Editor::new();
+        let root = ed.doc.root;
+        let id = ed.doc.ids.next();
+        let mut node = Node::shape(id, ShapeKind::Rect { w: 5.0, h: 5.0 });
+        node.style = Style { stroke: Some(RED), fill: None };
+        node.transform = Affine::translate(10.0, 10.0);
+        ed.commit(Delta(vec![NodeOp::Add { parent: root, node, index: usize::MAX }]));
+        let planned = crate::passes::plan_passes_for(&ed.doc, crate::Grouping::Color, Some(&weed)).unwrap();
+
+        let plan = plan_cut(&planned, &profile(100.0, 100.0), &caps(), &opts(select(&[RED]))).unwrap();
+        let pass = &planned.passes[0];
+        let mut want: Vec<geometry::Polyline> = pass.shapes.iter().flat_map(|s| s.polylines.clone()).collect();
+        want.extend(pass.weed.clone());
+        assert_eq!(pass.weed.len(), 1, "the border");
+        assert_eq!(plan.passes[0].job.polylines, want);
     }
 
     #[test]

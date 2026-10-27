@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
-import { applyOptimistic, reconcile, gestureScene } from "./transform";
+import { applyMoves, applyOptimistic, reconcile, gestureScene } from "./transform";
 import { rotateAbout } from "../render/affine";
 import type { Affine6 } from "../render/hittest";
 
@@ -57,5 +57,41 @@ describe("gestureScene", () => {
 
   it("uses the committed scene when nothing is pending", () => {
     expect(gestureScene(null, committed, 0)).toBe(committed);
+  });
+});
+
+describe("applyMoves", () => {
+  const box = (id: number) => ({ id, bounds: { x: 0, y: 0, w: 4, h: 4 } });
+
+  it("moves each entry's shapes by its own matrix in one pass, leaving the rest", () => {
+    const scene = { nodes: [box(1), box(2), box(3)] };
+    const out = applyMoves(scene, [
+      { shapes: [1], m: [1, 0, 0, 1, 5, 0] },
+      { shapes: [3], m: [1, 0, 0, 1, 0, 7] },
+    ]);
+    expect(out.nodes.map((n) => [n.bounds.x, n.bounds.y])).toEqual([[5, 0], [0, 0], [0, 7]]);
+  });
+
+  it("matches applying the moves one at a time when they share no shape", () => {
+    // Align's units are disjoint (`outermost`), which is what lets one pass stand in for many.
+    const scene = { nodes: Array.from({ length: 50 }, (_, i) => box(i)) };
+    const moves = Array.from({ length: 25 }, (_, i) => ({ shapes: [2 * i], m: [1, 0, 0, 1, i, -i] as Affine6 }));
+    const oneByOne = moves.reduce((s, mv) => applyOptimistic(s, mv.shapes, mv.m), scene);
+    expect(applyMoves(scene, moves)).toEqual(oneByOne);
+  });
+});
+
+describe("applyMoves with a shape listed twice", () => {
+  it("composes the entries in order, as transform_each moves an id listed twice by both", () => {
+    // Type-design review on #301: the preview kept only the last matrix, so it disagreed with the
+    // backend until the snapshot replaced it. Translate then scale about the origin: 1 → 6 → 12.
+    const scene = { nodes: [{ id: 1, bounds: { x: 1, y: 0, w: 2, h: 2 } }] };
+    const moves = [
+      { shapes: [1], m: [1, 0, 0, 1, 5, 0] as Affine6 },
+      { shapes: [1], m: [2, 0, 0, 2, 0, 0] as Affine6 },
+    ];
+    const oneByOne = moves.reduce((s, mv) => applyOptimistic(s, mv.shapes, mv.m), scene);
+    expect(applyMoves(scene, moves)).toEqual(oneByOne);
+    expect(applyMoves(scene, moves).nodes[0].bounds.x).toBe(12);
   });
 });

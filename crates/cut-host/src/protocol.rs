@@ -11,6 +11,44 @@ use driver_core::manager::{CutPass, DeviceError, DeviceEvent};
 use driver_core::{CutStatus, DeviceInfo};
 use serde::{Deserialize, Serialize};
 
+/// The only protocol version this build speaks.
+///
+/// Not the crate version and not the desktop's version: those move when the
+/// program does, and a frame means the same thing either way. This number moves
+/// when a version-specific payload (`Request`, `Response`, `Event`, and the
+/// types they carry) changes shape or meaning. A peer that does not speak it is
+/// refused before any of those types is decoded. The rules are
+/// `docs/adr/0003-the-cut-host-protocol-version-is-explicit.md`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// How large the version offer and its reply may be.
+///
+/// A version is a handful of bytes. The cap a dispatch is allowed is megabytes,
+/// and spending that before the version is known would decode — or at least
+/// allocate — the payload the check exists to refuse. 128 bytes holds the
+/// largest reply this preamble can honestly be (`Unsupported` of two `u32::MAX`)
+/// and nothing that could be a Job.
+pub const VERSION_FRAME_MAX: usize = 128;
+
+/// The server's answer to a version offer, and the only frame decoded before one
+/// is agreed.
+///
+/// `Agreed` names the single version both sides will speak. `Unsupported` names
+/// both numbers and nothing else: a refusal that carried a `Request` would
+/// decode the payload it exists to refuse. `Unreadable` carries no number,
+/// because the offer was not a version and was not decoded as one.
+///
+/// `deny_unknown_fields` is the preamble staying frozen. A field added here
+/// cannot ride along under the old shape — a peer has to decode *this* frame in
+/// order to learn that it must refuse, so the frame is not itself versioned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VersionReply {
+    Agreed { version: u32 },
+    Unsupported { offered: u32, supported: u32 },
+    Unreadable,
+}
+
 /// A client's own name for one dispatch, so a retry after a dropped reply cannot
 /// cut the same material twice. The host, not the client, decides what it means:
 /// an id it has already seen starts nothing.
@@ -18,13 +56,20 @@ use serde::{Deserialize, Serialize};
 pub struct DispatchId(pub String);
 
 /// Everything a reattaching client needs about one cutter in a single value.
-/// `job_id` rides alongside `CutStatus` because the status alone cannot say
-/// *whose* finished Job it is describing.
+///
+/// `job_id` is the id recorded when `cut()` returned. `CutStatus::job_id` is the
+/// id the worker published with that status, which is what a poll matches a job
+/// by. The slot's copy can still be `None` before that return.
+///
+/// `claimed` is true while a cut is in flight and also across the fact status cannot
+/// publish: a dispatch admitted and on its way to `manager.cut`, before the worker has changed
+/// `actions`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub info: DeviceInfo,
     pub status: CutStatus,
     pub job_id: Option<u64>,
+    pub claimed: bool,
 }
 
 /// `device` is always a `DeviceInfo::instance_id`.
@@ -199,6 +244,7 @@ mod tests {
             pass: Some(PassPosition { index: 2, total: 5 }),
             sent: Some(ByteProgress { sent: 4096, total: 20480 }),
             error: Some(DeviceError::Timeout),
+            job_id: 9,
         }
     }
 
@@ -212,6 +258,7 @@ mod tests {
             info: a_device(),
             status: a_populated_status(),
             job_id: Some(7),
+            claimed: true,
         }]);
         let json = serde_json::to_string(&sent).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -227,7 +274,9 @@ mod tests {
                 assert_eq!(s[0].status.pass, Some(PassPosition { index: 2, total: 5 }));
                 assert_eq!(s[0].status.sent, Some(ByteProgress { sent: 4096, total: 20480 }));
                 assert_eq!(s[0].status.error, Some(DeviceError::Timeout));
+                assert_eq!(s[0].status.job_id, 9);
                 assert_eq!(s[0].job_id, Some(7));
+                assert!(s[0].claimed);
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }
@@ -242,6 +291,7 @@ mod tests {
             info: a_device(),
             status: CutStatus::disconnected(),
             job_id: None,
+            claimed: false,
         }]);
         let json = serde_json::to_string(&sent).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -249,9 +299,85 @@ mod tests {
             Response::Snapshots(s) => {
                 assert_eq!(s[0].status, CutStatus::disconnected());
                 assert_eq!(s[0].job_id, None);
+                assert!(!s[0].claimed);
             }
             other => panic!("round trip changed the variant: {other:?}"),
         }
+    }
+
+    /// A host built before `CutStatus::job_id` omits the field. The desktop still
+    /// has to read the snapshot and the event; 0 is the no-job value the field
+    /// defaults to, which is what a lifecycle report already publishes.
+    #[test]
+    fn a_status_that_omits_job_id_reads_as_no_job() {
+        let snapshot = Response::Snapshots(vec![DeviceSnapshot {
+            info: a_device(),
+            status: a_populated_status(),
+            job_id: Some(7),
+            claimed: false,
+        }]);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json["Snapshots"][0]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Response = serde_json::from_value(json).unwrap();
+        match back {
+            Response::Snapshots(s) => {
+                assert_eq!(s[0].status.job_id, 0);
+                assert_eq!(s[0].status.phase, Phase::Sending);
+                assert_eq!(s[0].job_id, Some(7));
+            }
+            other => panic!("omitted job id changed the variant: {other:?}"),
+        }
+
+        let event = Event {
+            device: "usb:1:4".into(),
+            event: DeviceEvent {
+                job_id: 3,
+                kind: DeviceEventKind::StateChanged,
+                status: a_populated_status(),
+            },
+        };
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["event"]["status"].as_object_mut().unwrap().remove("jobId");
+        let back: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(back.event.job_id, 3);
+        assert_eq!(back.event.status.job_id, 0);
+        assert_eq!(back.event.status.phase, Phase::Sending);
+    }
+
+    /// The agreement frame is the one a peer decodes before it knows the version,
+    /// so its own round trip is not allowed to grow a field silently. The cap is
+    /// what keeps a refusal from being a place to hide a payload.
+    #[test]
+    fn a_version_reply_round_trips_and_stays_inside_its_cap() {
+        for reply in [
+            VersionReply::Agreed {
+                version: PROTOCOL_VERSION,
+            },
+            VersionReply::Unsupported {
+                offered: u32::MAX,
+                supported: PROTOCOL_VERSION,
+            },
+            VersionReply::Unreadable,
+        ] {
+            let json = serde_json::to_vec(&reply).unwrap();
+            assert!(
+                json.len() <= VERSION_FRAME_MAX,
+                "{} bytes: {reply:?}",
+                json.len()
+            );
+            assert_eq!(
+                serde_json::from_slice::<VersionReply>(&json).unwrap(),
+                reply
+            );
+        }
+    }
+
+    /// An extra field is not a compatible preamble. A peer that stuffed a payload
+    /// into the agreement frame must fail here, not be read as `Agreed`.
+    #[test]
+    fn a_version_reply_with_an_unknown_field_is_not_an_agreement() {
+        let stuffed = r#"{"protocol":"agreed","version":1,"passes":[]}"#;
+        assert!(serde_json::from_str::<VersionReply>(stuffed).is_err());
     }
 
     #[test]

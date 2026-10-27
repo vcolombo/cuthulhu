@@ -8,6 +8,7 @@ const aHostView = (): PairedHostView => ({
   name: "Workshop Pi",
   address: "pi.local:7878",
   unreachable: null,
+  protocol_side: null,
 });
 
 // Each test records the order the effects ran in, because the order *is* the requirement:

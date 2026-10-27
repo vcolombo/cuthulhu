@@ -6,7 +6,7 @@ export type Pt = { x: number; y: number };
 export const IDENTITY: Affine6 = [1, 0, 0, 1, 0, 0];
 
 /** Mirrors crates/geometry/src/affine.rs's `Affine::then`: apply `self`, then `other`. The Rust
- *  order on purpose — a matrix built here crosses IPC as `commit_transform`'s `m` and is composed
+ *  order on purpose — a matrix built here crosses IPC as a `commit_transforms` move's `m` and is composed
  *  there by the same rule, so the two sides cannot disagree about what a gesture meant.
  *
  *  Not named `then` like its Rust twin: a module exporting `then` is a thenable, so any dynamic

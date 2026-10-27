@@ -1,1065 +1,136 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "@playwright/test";
+import { modeRgb, pillApart, renderedContrastFromPixels, type Rgb } from "./renderedContrast";
 // Generated from the desktop's own generate_handler! registry by
 // apps/desktop/tests/ipc_inventory.rs. Nothing else here calls a real #[tauri::command], so this
-// is what the fake below checks command and argument names against (#85).
+// is what the fake in mockBackend.ts checks command and argument names against (#85).
 // The attribute is not decoration: Playwright loads this file as ESM, where a JSON import without
 // one is a TypeError before any test is collected.
 import ipcInventory from "../../ipc-inventory.json" with { type: "json" };
+import { installMockTauri } from "./mockBackend";
 
-// Minimal in-memory fake Tauri backend. Runs inside the page (via addInitScript, so it
-// can't close over anything outside itself) and mirrors the JSON shape produced by
-// crates/document's Document::snapshot_json() — see App.tsx's DocSnapshot/buildScene,
-// which is what actually parses this on the JS side.
-function installMockTauri(opts?: { seedTwoColorRects?: boolean; failImagePreview?: boolean; dropTraceControl?: string; seedBusyHost?: boolean; seedRemoteConnected?: boolean; slowList?: boolean; failList?: boolean; noFonts?: boolean; seedMachine?: boolean; seedUserPreset?: boolean; seedEmptyPresetAssignment?: boolean; seedGroup?: boolean }) {
-  type Style = { stroke: number | null; fill: number | null };
-  type PresetAssignment = { state: "inherit" } | { state: "unassigned" } | { state: "preset"; id: string };
-  type Node = { id: number; kind: unknown; transform: number[]; style: Style; children: number[]; cut_line_type: "Cut" | "NoCut"; material_preset: PresetAssignment };
-  type Grouping = "Single" | "Color" | "Stroke" | "Fill" | "Preset";
-  type Doc = {
-    nodes: Record<number, Node>;
-    root: number;
-    artboard: { x: number; y: number; w: number; h: number };
-    machine: { id: string; name: string; width_mm: number; height_mm: number } | null;
-  };
+/** The right column shows one panel. Open the tab a locator lives in, and leave it when it is already open. */
+async function showTab(page: Page, name: "Layers" | "Properties" | "Devices") {
+  const tab = page.getByRole("tab", { name, exact: true });
+  if ((await tab.getAttribute("data-state")) !== "active") await tab.click();
+}
 
-  const machines = [
-    { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 },
-    { id: "puma", name: "GCC Puma IV", width_mm: 600, height_mm: 5000 },
-  ];
+/** Save, Open and Revert live in the File menu. Clicking the menu is a pointer event; the drag test does not use this. */
+async function fileAction(page: Page, name: string) {
+  await page.getByRole("button", { name: "File", exact: true }).click();
+  await page.getByRole("menuitem", { name, exact: true }).click();
+}
 
-  // Mirrors document::Style::default() — a freshly-added shape has an opaque black stroke.
-  const DEFAULT_STYLE: Style = { stroke: 0x000000ff, fill: null };
-  // Every Node below carries `cut_line_type: "Cut"`, the import default. It comes from the two
-  // constructors, `Node::shape` and `Node::container` (crates/document/src/node.rs) — there is no
-  // `CutLineType::default()` to mirror, and the planner reads the attribute rather than defaulting
-  // it. That attribute, not the paint, is what makes a shape cuttable. Containers carry it inertly.
+const SEND_STEPS = ["Machine", "Material & passes", "Preview & cut"] as const;
 
-  let nextId = 1;
-  const freshDoc = (): Doc => {
-    const rootId = nextId++;
-    return {
-      nodes: { [rootId]: { id: rootId, kind: "Layer", transform: [1, 0, 0, 1, 0, 0], style: { stroke: null, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } } },
-      root: rootId,
-      artboard: { x: 0, y: 0, w: 330, h: 3000 },
-      // Presets are machine-scoped, so a test that needs the Material control to offer anything
-      // has to name a machine: App reads the list for the document's machine.
-      machine: opts?.seedMachine
-        ? { id: "cameo5", name: "Silhouette Cameo 5 Alpha", width_mm: 330, height_mm: 3000 }
-        : null,
-    };
-  };
-  let doc = freshDoc();
-  let saved: Doc | null = null;
-
-  // Seed two differently-stroked rects synchronously (bypassing invoke) so the doc is
-  // already populated by the time App.tsx's mount effect calls snapshot() — avoids a
-  // race between an async seed and React's first fetch.
-  // A Group 30 mm right of the origin holding one 10 × 10 mm rect: a selected container commits as
-  // its whole subtree, which the canvas has to preview and box the same way (Copilot on #298).
-  if (opts?.seedGroup) {
-    const groupId = nextId++;
-    const childId = nextId++;
-    doc.nodes[groupId] = { id: groupId, kind: "Group", transform: [1, 0, 0, 1, 30, 0], style: { stroke: null, fill: null }, children: [childId], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[childId] = { id: childId, kind: { Shape: { Rect: { w: 10, h: 10 } } }, transform: [1, 0, 0, 1, 0, 0], style: { stroke: 0xff0000ff, fill: null }, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-    doc.nodes[doc.root].children.push(groupId);
+/** Blank speed and force on a pass that names no preset. An unread or unknown preset is left
+ *  alone: the backend resolves it, and filling it would hide the case a test is proving. */
+async function fillSendLevels(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  const speeds = dialog.getByLabel(/Speed for pass /);
+  const n = await speeds.count();
+  for (let i = 0; i < n; i++) {
+    const speed = speeds.nth(i);
+    if (!(await speed.isVisible()) || !(await speed.isEnabled())) continue;
+    if ((await speed.inputValue()) !== "") continue;
+    const preset = dialog.getByLabel(`Preset for pass ${i + 1}`);
+    if ((await preset.inputValue()) !== "no-preset") continue;
+    await speed.fill("10");
+    const force = dialog.getByLabel(`Force for pass ${i + 1}`);
+    if ((await force.isEnabled()) && (await force.inputValue()) === "") await force.fill("10");
   }
+}
 
-  if (opts?.seedTwoColorRects) {
-    const redId = nextId++;
-    doc.nodes[redId] = {
-      id: redId,
-      kind: { Shape: { Rect: { x: 0, y: 0, w: 10, h: 10 } } },
-      transform: [1, 0, 0, 1, 0, 0],
-      style: { stroke: 0xff0000ff, fill: null },
-      children: [],
-      cut_line_type: "Cut",
-      material_preset: opts?.seedEmptyPresetAssignment
-        ? { state: "preset", id: "" }
-        : { state: "inherit" },
-    };
-    const greenId = nextId++;
-    doc.nodes[greenId] = {
-      id: greenId,
-      kind: { Shape: { Rect: { x: 20, y: 0, w: 10, h: 10 } } },
-      transform: [1, 0, 0, 1, 0, 0],
-      style: { stroke: 0x00ff00ff, fill: null },
-      children: [],
-      cut_line_type: "Cut",
-      material_preset: { state: "inherit" },
-    };
-    doc.nodes[doc.root].children.push(redId, greenId);
-  }
-
-  const unimplemented = (cmd: string): never => {
-    throw new Error(`${cmd}: mocked command the e2e fake does not perform; implement it here to test it`);
-  };
-
-  const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
-    new_doc: () => {
-      doc = freshDoc();
-      return JSON.stringify(doc);
-    },
-    snapshot: () => {
-      // One-shot, armed by a test: a refresh that fails after a commit already landed is the case
-      // whose repair is the opposite of a refusal (silent-failure-hunter on #298).
-      if (failNextSnapshot) {
-        failNextSnapshot = false;
-        throw new Error("snapshot unavailable");
+/** Step 1 is the machine list, step 2 the passes, step 3 the preview and Start cut.
+ *  Leaving step 2 fills the blanks a no-preset pass would otherwise refuse. A step already
+ *  opened stays on the stepper when Next is gated, which is how a dropped aim is still readable. */
+async function goToSendStep(page: Page, step: 1 | 2 | 3) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  for (let i = 0; i < 4; i++) {
+    const current = Number(await dialog.getAttribute("data-send-step"));
+    if (current === step) return;
+    if (current === 2 && step > current) await fillSendLevels(page);
+    if (current < step) {
+      const next = dialog.getByRole("button", { name: "Next", exact: true });
+      if (await next.isEnabled()) {
+        await next.click();
+        continue;
       }
-      return JSON.stringify(doc);
-    },
-    add_primitive: (a) => {
-      const id = nextId++;
-      const style = a.stroke !== undefined ? { stroke: a.stroke as number | null, fill: null } : DEFAULT_STYLE;
-      // Same test-only override as `a.stroke`: no UI control sets cuttability at creation, so
-      // this is the only way to seed a NoCut shape without going through set_cut_line_type.
-      const cutLineType = a.cut_line_type !== undefined ? (a.cut_line_type as "Cut" | "NoCut") : "Cut";
-      doc.nodes[id] = { id, kind: { Shape: a.kind }, transform: [1, 0, 0, 1, 0, 0], style, children: [], cut_line_type: cutLineType, material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return {};
-    },
-    add_text: (a) => {
-      // The real command rejects on the backend's terms; the fake can at least refuse a
-      // caller that stopped forwarding the arguments, so the picker test proves the
-      // selected family actually crosses the IPC boundary.
-      if (typeof a.family !== "string" || a.family.length === 0) throw new Error("add_text: missing family");
-      if (typeof a.sizeMm !== "number" || typeof a.text !== "string") throw new Error("add_text: missing sizeMm/text");
-      const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return {};
-    },
-    commit_transform: (a) => {
-      // Composed in full: handles send scale and rotation, and a fake that kept only the
-      // translation passes a frontend whose preview and commit disagree. Recorded so a test can
-      // read the matrix.
-      if (failNextCommit) {
-        failNextCommit = false;
-        throw new Error("transform refused");
+      const via = dialog.getByRole("button", { name: SEND_STEPS[step - 1] });
+      if (await via.isEnabled()) {
+        await via.click();
+        continue;
       }
-      const m = a.m as number[];
-      const hooks = window as unknown as { __commitTransforms?: { ids: number[]; m: number[] }[] };
-      hooks.__commitTransforms ??= [];
-      hooks.__commitTransforms.push({ ids: a.ids as number[], m });
-      // Mirrors crates/document/src/commands.rs transform_nodes (L53-77): `m` is world-space, so
-      // each node's local transform becomes local · parentWorld · m · parentWorld⁻¹, and a node
-      // whose ancestor is also selected is skipped, since the ancestor already carries it.
-      // Composing `m` straight onto a nested node's local transform lands it where the real
-      // backend never would (Copilot on #298).
-      const cmp = (p: number[], q: number[]) => [
-        q[0] * p[0] + q[2] * p[1], q[1] * p[0] + q[3] * p[1],
-        q[0] * p[2] + q[2] * p[3], q[1] * p[2] + q[3] * p[3],
-        q[0] * p[4] + q[2] * p[5] + q[4], q[1] * p[4] + q[3] * p[5] + q[5],
-      ];
-      const inv = (p: number[]) => {
-        const det = p[0] * p[3] - p[1] * p[2];
-        const [ia, ib, ic, id] = [p[3] / det, -p[1] / det, -p[2] / det, p[0] / det];
-        return [ia, ib, ic, id, -(ia * p[4] + ic * p[5]), -(ib * p[4] + id * p[5])];
-      };
-      const parentOf = (id: number) => Object.values(doc.nodes).find((n) => n.children.includes(id))?.id;
-      const worldOf = (id: number | undefined): number[] =>
-        id === undefined ? [1, 0, 0, 1, 0, 0] : cmp(doc.nodes[id].transform, worldOf(parentOf(id)));
-      const selectedIds = new Set(a.ids as number[]);
-      const hasSelectedAncestor = (id: number) => {
-        for (let p = parentOf(id); p !== undefined; p = parentOf(p)) if (selectedIds.has(p)) return true;
-        return false;
-      };
-      const applyIt = () => {
-        for (const id of selectedIds) {
-          const node = doc.nodes[id];
-          if (!node || hasSelectedAncestor(id)) continue;
-          const pw = worldOf(parentOf(id));
-          node.transform = cmp(cmp(cmp(node.transform, pw), m), inv(pw));
-        }
-        return {};
-      };
-      // Answered on a later task, as a real IPC round trip is: resolving in the same microtask burst
-      // let a whole chain of queued commits finish before React rendered between them, which hid
-      // the window where an intermediate snapshot renders while the next commit is on the wire.
-      if (!holdingCommits) return new Promise((resolve) => setTimeout(() => resolve(applyIt()), 0));
-      return new Promise((resolve) => heldCommits.push(() => resolve(applyIt())));
-    },
-    delete: (a) => {
-      for (const id of a.ids as number[]) {
-        delete doc.nodes[id];
-        for (const n of Object.values(doc.nodes)) n.children = n.children.filter((c) => c !== id);
-      }
-      return {};
-    },
-    // Mirrors commands::set_cut_line_type: descends into containers, because the attribute is
-    // read only on the shape that carries it — setting it on a Group alone would do nothing.
-    set_cut_line_type: (a) => {
-      const value = a.value as "Cut" | "NoCut";
-      const ids = a.ids as number[];
-      if (ids.length === 0) throw new Error("set_cut_line_type: EmptySelection");
-      const seen = new Set<number>();
-      const stack = [...ids];
-      while (stack.length > 0) {
-        const id = stack.pop()!;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const n = doc.nodes[id];
-        if (!n) throw new Error("set_cut_line_type: NotFound");
-        if (typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object)) n.cut_line_type = value;
-        else stack.push(...n.children);
-      }
-      return {};
-    },
-    // Mirrors commands::set_material_preset: writes the selection and nothing else, because a
-    // material inherits and the planner resolves it. Descending here would be the bug the real
-    // command was written to avoid.
-    set_material_preset: (a) => {
-      const value = a.value as PresetAssignment;
-      const ids = a.ids as number[];
-      if (ids.length === 0) throw new Error("set_material_preset: EmptySelection");
-      for (const id of ids) {
-        const n = doc.nodes[id];
-        if (!n) throw new Error("set_material_preset: NotFound");
-        n.material_preset = value;
-      }
-      return {};
-    },
-    // Four commands the fake has never performed. They used to answer "ok" while leaving
-    // `doc` untouched, which is the false green this file exists to avoid: each one edits
-    // the document in the real backend, so a plan made before it goes stale and `plan_cut`
-    // refuses the cut. Refuse here too, loudly, rather than silently permitting one.
-    reorder: () => unimplemented("reorder"),
-    undo: () => unimplemented("undo"),
-    redo: () => unimplemented("redo"),
-    boolean_op: () => unimplemented("boolean_op"),
-    import_svg: (a) => {
-      const id = nextId++;
-      doc.nodes[id] = { id, kind: { Shape: { Path: { d: "" } } }, transform: [1, 0, 0, 1, 0, 0], style: DEFAULT_STYLE, children: [], cut_line_type: "Cut", material_preset: { state: "inherit" } };
-      doc.nodes[a.parent as number].children.push(id);
-      return [{}, []];
-    },
-    save_project: () => {
-      saved = JSON.parse(JSON.stringify(doc));
-      return null;
-    },
-    load_project: () => {
-      if (saved) doc = JSON.parse(JSON.stringify(saved));
-      return JSON.stringify(doc);
-    },
-    set_machine: (a) => {
-      const m = machines.find((p) => p.id === a.machineId);
-      if (!m) throw new Error("unknown machine");
-      doc.machine = m;
-      doc.artboard = { x: 0, y: 0, w: m.width_mm, h: m.height_mm };
-      return null;
-    },
-    list_machines: () => machines,
-    // A fixture, not a claim: the real list comes from geometry::list_font_families and is
-    // whatever the OS has installed. This exists only so the dialog has options to render.
-    list_fonts: () => (opts?.noFonts ? [] : ["Arial", "Comic Sans MS", "Times New Roman"]),
-    trace_image: () => ({
-      svg: '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><path d="M0 0 L10 0 L10 10 L0 10 Z" fill="#000000"/></svg>',
-      pathCount: 1, widthPx: 10, heightPx: 10, downscaled: false,
-    }),
-    // A fixture, not a claim: the real table lives in trace::CONTROLS and is what ships. This
-    // exists only so the dialog has sliders to render.
-    trace_controls: () => ({
-      controls: [
-        { name: "speckle", label: "Ignore speckles", help: "", min: 0, max: 16, step: 1, default: 4, colorOnly: false },
-        { name: "smoothing", label: "Smoothing", help: "", min: 0, max: 180, step: 1, default: 60, colorOnly: false },
-        { name: "detail", label: "Detail", help: "", min: 3.5, max: 10, step: 0.5, default: 9.5, colorOnly: false },
-        { name: "colors", label: "Colors", help: "", min: 1, max: 8, step: 1, default: 6, colorOnly: true },
-      ].filter((c) => c.name !== opts?.dropTraceControl),
-      defaultMode: "binary",
-      maxDim: 2048,
-    }),
-    load_image_preview: () => {
-      if (opts?.failImagePreview) throw new Error("could not read image: broken thumbnail");
-      return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    },
-  };
-
-  // --- device / cut / preset mock: mirrors apps/desktop/src/device.rs's validation
-  // order and driver-core::manager's DeviceEvent shape closely enough to drive the cut
-  // dialog through a real state machine. The statuses below are transcribed from
-  // driver-core/src/status.rs's status_of table — phase and the four action booleans
-  // per internal state — so a frontend that re-derives permissions has nothing to
-  // re-derive them from. ---
-
-  type DeviceInfo = { instance_id: string; machine_id: string; transport: unknown; candidate: boolean; host: string | null };
-  type Actions = { cut: boolean; cancel: boolean; resume: boolean; confirm: boolean };
-  type CutStatus = {
-    phase: string;
-    ended: string | null;
-    actions: Actions;
-    pass: { index: number; total: number } | null;
-    sent: { sent: number; total: number } | null;
-    error: unknown;
-  };
-  type DeviceEvent = { job_id: number; kind: unknown; status: CutStatus };
-
-  const NO_ACTIONS: Actions = { cut: false, cancel: false, resume: false, confirm: false };
-  const statusOf = (phase: string, actions: Partial<Actions> = {}, rest: Partial<CutStatus> = {}): CutStatus => ({
-    phase,
-    ended: null,
-    actions: { ...NO_ACTIONS, ...actions },
-    pass: null,
-    sent: null,
-    error: null,
-    ...rest,
-  });
-  const DISCONNECTED = statusOf("Disconnected");
-  const CONNECTING = statusOf("Connecting");
-  // `Idle` alone is a device that has cut nothing; a job that ran to the end rests on
-  // the same phase and says so through `ended`, which is the whole of the difference.
-  const IDLE = statusOf("Idle", { cut: true });
-  const COMPLETED = statusOf("Idle", { cut: true }, { ended: "Completed" });
-
-  const devices: DeviceInfo[] = [
-    { instance_id: "usb:mock", machine_id: "cameo5", transport: { Usb: { locator: "mock" } }, candidate: false, host: null },
-    { instance_id: "serial:/dev/mock0", machine_id: "puma", transport: { Serial: { path: "/dev/mock0", baud: 9600 } }, candidate: true, host: null },
-  ];
-
-  // A paired host that cannot be reached, with a cutter on it. Both halves matter: the row has
-  // to stay listed with its reason (#42), and `forget_host` has to be refusable while it does.
-  let hosts: { id: string; name: string; address: string; unreachable: string | null }[] = [];
-  if (opts?.seedBusyHost) {
-    hosts = [{ id: "host-1", name: "Workshop Pi", address: "pi.local:7878",
-               unreachable: "the host could not be reached (timed out)" }];
-    devices.push({ instance_id: "usb:pi:A", machine_id: "cameo5",
-                   transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-1" });
-  }
-
-  // The host a pairing reaches. One fingerprint, one token it accepts, one cutter behind it —
-  // enough for the dialog's pairing flow to be driven end to end rather than stubbed out.
-  const HOST_FINGERPRINT = "AB:CD:EF:01:23:45";
-  const HOST_TOKEN = "correct-horse";
-  const PAIRED_CUTTER: DeviceInfo = {
-    instance_id: "usb:pi:B", machine_id: "cameo5",
-    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-2",
-  };
-
-  // A reachable Cut Host with a cutter aimed at and stuck: cancelled, with nothing the operator
-  // may do next. That is the state the Reconnect control exists for, and nothing in this suite
-  // exercised a *remote* connected cutter at all — so the one line joining `connectedControl`'s
-  // answer to `reconnect_device` was covered by neither half's tests (#123).
-  const REMOTE_CUTTER: DeviceInfo = {
-    instance_id: "usb:pi:C", machine_id: "cameo5",
-    transport: { Usb: { locator: "pi" } }, candidate: false, host: "host-3",
-  };
-  if (opts?.seedRemoteConnected) {
-    hosts.push({ id: "host-3", name: "Bench Pi", address: "bench.local:7878", unreachable: null });
-    devices.push(REMOTE_CUTTER);
-  }
-
-  let connected: DeviceInfo | null = opts?.seedRemoteConnected ? REMOTE_CUTTER : null;
-  // A cancel whose stop nothing confirmed: the Job is over, and `driver-core` still refuses a cut
-  // until the transport is re-opened. `Idle` on both sides of the reconnect, which is exactly why
-  // the control is derived from `actions` and not from the phase.
-  let status: CutStatus = opts?.seedRemoteConnected
-    ? { phase: "Idle", ended: "Cancelled", actions: { ...NO_ACTIONS }, pass: null, sent: null, error: null }
-    : DISCONNECTED;
-  let deviceStateCalls = 0;
-  let listDeviceCalls = 0;
-  let nextJobId = 1;
-  let jobId: number | null = null;
-  let planPasses: { key: string; enabled: boolean }[] = [];
-  type CutRequest = {
-    device_instance_id: string;
-    doc_revision: string;
-    grouping: Grouping;
-    passes: {
-      key: string;
-      enabled: boolean;
-      // Optional on the wire, not merely nullable: `ConfiguredPassDto::preset_id` is an
-      // `Option<String>`, and serde reads a field the caller left out as `None`.
-      preset_id?: string | null;
-      speed: number | null;
-      force: number | null;
-      repeat_count: number | null;
-    }[];
-  };
-  let lastCutRequest: CutRequest | null = null;
-  let failNextResume = false;
-  let failNextCut = false;
-  let failNextPlan = false;
-  // Presets as `cutplan::presets` keeps them: builtins ship per machine, the operator's own
-  // entries live in one file beside them, and an entry replaces a builtin only when the whole pair
-  // `(machine_id, id)` matches — an id is the operator's own string, so `my-vinyl` names one
-  // material on a Cameo and another on a Puma (#153).
-  type MaterialPreset = {
-    id: string; name: string; machine_id: string;
-    settings: { speed: number | null; force: number | null; repeat_count: number };
-    builtin: boolean;
-  };
-  const BUILTIN_PRESETS: MaterialPreset[] = [
-    { id: "cameo5-htv", name: "HTV", machine_id: "cameo5",
-      settings: { speed: 5, force: 20, repeat_count: 1 }, builtin: true },
-    // The Puma takes speed and force from its own panel, so its builtins name a material and
-    // nothing else — the state the editor's preview has to read back as the panel's.
-    { id: "puma-htv", name: "HTV", machine_id: "puma",
-      settings: { speed: null, force: null, repeat_count: 1 }, builtin: true },
-  ];
-  let userPresets: MaterialPreset[] = opts?.seedUserPreset
-    ? [{ id: "card-stock", name: "Card Stock", machine_id: "cameo5",
-        settings: { speed: 6, force: 18, repeat_count: 1 }, builtin: false }]
-    : [];
-  const effectivePresets = (machineId: string): MaterialPreset[] => {
-    const mine = userPresets.filter((p) => p.machine_id === machineId);
-    const shipped = BUILTIN_PRESETS.filter(
-      (b) => b.machine_id === machineId && !mine.some((p) => p.id === b.id),
-    );
-    return [...shipped, ...mine];
-  };
-  let failNextPresetSave = false;
-  let failNextPresetList = false;
-  // Parked responses for the reorder/replan race, released from the test in the order it
-  // wants to prove. Exposed on `window` rather than driven by timers: the defect is about
-  // which reply lands last, and a sleep that guesses that is a flaky test, not a proof.
-  // Armed by the test rather than by a call count — StrictMode plans twice on mount, so
-  // "hold from the second call" holds the dialog's own opening plan and it never gets rows.
-  let holding = false;
-  const heldPlans: (() => void)[] = [];
-  const heldTravel: (() => void)[] = [];
-  const release = (queue: (() => void)[]) => {
-    queue.splice(0).forEach((f) => f());
-    // One macrotask, so the settled promises' handlers have run by the time the test's
-    // `evaluate` resolves and it can assert on what they did (or did not) change.
-    return new Promise((r) => setTimeout(r, 0));
-  };
-  // Presets hold on their own switch. The race they exist for is a list read for one cutter landing
-  // after the operator aimed at another, and arming the plan hold with it would leave the dialog
-  // without rows for the whole test.
-  let holdingPresets = false;
-  const heldPresets: (() => void)[] = [];
-  // Transforms hold on their own switch too: the race they exist for is a second gesture pressed
-  // while the first one's commit is still on the wire.
-  let holdingCommits = false;
-  const heldCommits: (() => void)[] = [];
-  let failNextCommit = false;
-  let failNextSnapshot = false;
-  Object.assign(window, {
-    __failNextCommit: () => { failNextCommit = true; },
-    __failNextSnapshot: () => { failNextSnapshot = true; },
-    __holdCommits: () => { holdingCommits = true; },
-    __releaseCommits: () => { holdingCommits = false; return release(heldCommits); },
-    __armHold: () => { holding = true; },
-    __releasePlans: () => release(heldPlans),
-    __releaseTravel: () => release(heldTravel),
-  });
-
-  function ipcError(code: string, message: string) {
-    return { code, message };
-  }
-
-  function planFromDoc(grouping: Grouping = "Color") {
-    // Mirrors crates/cutplan/src/passes.rs's plan_passes_with: preorder walk, skip Shape leaf
-    // nodes whose CutLineType is NoCut, and key the rest as the grouping asks — a colour
-    // (stroke where visible, else fill; strict under Stroke and Fill, with 0-alpha counting as
-    // absent), the resolved material, or `all` for one pass. Absence is its own token
-    // (`no-color`, `no-preset`) because a preset id may be any string, so a preset called
-    // `none` must not write what no preset at all writes.
-    const byKey = new Map<string, { key: string; node_ids: number[] }>();
-    let skipped = 0;
-    const visible = (c: number | null | undefined) => (((c ?? 0) & 0xff) !== 0 ? c! : null);
-    const colorKey = (n: Node) => {
-      const stroke = visible(n.style.stroke);
-      const fill = visible(n.style.fill);
-      const c = grouping === "Stroke" ? stroke : grouping === "Fill" ? fill : stroke ?? fill;
-      return c === null ? "no-color" : `color:${(c >>> 0).toString(16).padStart(8, "0")}`;
-    };
-    const walk = (id: number, inherited: string | null) => {
-      const n = doc.nodes[id];
-      if (!n) return;
-      const a = n.material_preset;
-      const material = a.state === "preset" ? a.id : a.state === "unassigned" ? null : inherited;
-      const isShape = typeof n.kind === "object" && n.kind !== null && "Shape" in (n.kind as object);
-      if (isShape) {
-        if (n.cut_line_type === "NoCut") {
-          skipped++;
-        } else {
-          const key =
-            grouping === "Single" ? "all"
-            : grouping === "Preset" ? (material === null ? "no-preset" : `preset:${material}`)
-            : colorKey(n);
-          const existing = byKey.get(key);
-          if (existing) existing.node_ids.push(id);
-          else byKey.set(key, { key, node_ids: [id] });
-        }
-      }
-      for (const c of n.children) walk(c, material);
-    };
-    walk(doc.root, null);
-    // starts is all-null on purpose: the fake carries no geometry to flatten, and null
-    // is the real backend's no-outline case — so e2e renders exercise the preview's
-    // bounds-corner badge fallback rather than a fixture pretending to be a blade path.
-    const passes = [...byKey.values()].map((p) => ({
-      key: p.key,
-      shape_count: p.node_ids.length,
-      node_ids: p.node_ids,
-      starts: p.node_ids.map(() => null),
-    }));
-    // The snapshot itself is the revision, mirroring cutplan::doc_revision hashing
-    // snapshot_json: a doc edited back to a previous state is not stale. A counter
-    // bumped per command diverges on that, and silently goes stale-blind for any
-    // command that mutates `doc` and forgets to bump (commit_transform did).
-    // Travel by the same rule `travel_for_order` uses below - one segment per adjacent pair of
-    // passes to be cut - because the real `plan_cut` returns the travel for the order it just
-    // planned, and a fake that plans passes but never any travel between them cannot show a
-    // preview going empty. Every pass a fresh plan produces is enabled.
-    const travel = passes.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
-    return { passes, skipped_not_cut: skipped, doc_revision: JSON.stringify(doc), travel };
-  }
-
-  // Mirrors @tauri-apps/api/event's listen()/transformCallback() plumbing: listen()
-  // calls transformCallback(handler) to get a numeric id (stored in callbacksById),
-  // then invoke("plugin:event|listen", {event, handler: id}) associates that id with
-  // an event name (eventNameToIds). Emitting calls the stored callback directly, like
-  // the real event bridge thread does via window["_" + id](payload).
-  const callbacksById = new Map<number, (e: unknown) => void>();
-  const eventNameToIds = new Map<string, number[]>();
-  let nextCallbackId = 1;
-
-  // Mirrors Reporter::emit: the event carries the status that held when it was sent, so
-  // a listener renders from what it received rather than polling for a newer value.
-  function emit(kind: unknown) {
-    const ev: DeviceEvent = { job_id: jobId ?? 0, kind, status };
-    for (const id of eventNameToIds.get("device-event") ?? []) {
-      callbacksById.get(id)?.({ event: "device-event", id, payload: ev });
+      await next.click();
+    } else {
+      await dialog.getByRole("button", { name: "Back", exact: true }).click();
     }
   }
+  throw new Error(`send sheet did not reach step ${step}`);
+}
 
-  // Drives the scripted pass sequence for one pass, then either pauses at
-  // WaitingForColorSwap (more enabled passes remain) or completes the job — matching
-  // execute_cut's documented behavior of blocking until the next pause point.
-  //
-  // The initial Transmitting(0 bytes) StateChanged fires synchronously (matches real
-  // execute_cut, which enters Transmitting immediately) but everything after it is
-  // deferred a tick: in production, event delivery crosses real async Tauri IPC (worker
-  // thread -> event bridge -> window.emit/listen), giving React's setJobId(null)/
-  // jobIdRef sync effect time to commit before any event arrives. This mock's invoke()
-  // used to run every command fully synchronously in the same call stack as the click
-  // handler, so a second cut's events could arrive before React had committed the new
-  // jobId — a mock-fidelity gap, not a production bug. The setTimeout also makes
-  // Transmitting observable to Playwright's polling assertions instead of being
-  // superseded within the same synchronous burst.
-  function runPass(passIndex: number, enabledIndices: number[]) {
-    const total = 100;
-    const sending = (sent: number) =>
-      statusOf("Sending", { cancel: true }, { pass: { index: passIndex, total: enabledIndices.length }, sent: { sent, total } });
-    status = sending(0);
-    emit("StateChanged");
-    setTimeout(() => {
-      status = sending(total);
-      emit({ Progress: { pass_index: passIndex, submitted_bytes: total, total_bytes: total } });
-      emit({ PassComplete: passIndex });
+/** The card is the connect action. The local Cameo is the first radio of that model. */
+async function chooseCutter(page: Page, model: "Silhouette Cameo 5 Alpha" | "GCC Puma IV") {
+  await page.getByRole("dialog", { name: "Send to cutter" }).getByRole("radio", { name: model, exact: true }).first().click();
+}
 
-      const pos = enabledIndices.indexOf(passIndex);
-      const isLast = pos === enabledIndices.length - 1;
-      if (isLast) {
-        // finish_pass emits JobComplete *before* the state becomes Idle, so this event's
-        // status still reads Sending. A frontend that treats the JobComplete kind as
-        // "finished" would show a completed job as still cutting; only the Idle status
-        // below says the job is over.
-        emit("JobComplete");
-        status = COMPLETED;
-        emit("StateChanged");
-        // Production releases the job id once the job is over: all later lifecycle
-        // events (reconnects, state refreshes) carry NO_JOB=0. Mirror that, or the
-        // mock keeps stamping finished-job ids on lifecycle events production
-        // would never stamp.
-        jobId = null;
-      } else {
-        const next = enabledIndices[pos + 1];
-        status = statusOf(
-          "AwaitingColorSwap",
-          { cancel: true, resume: true },
-          { pass: { index: next, total: enabledIndices.length } },
-        );
-        emit("StateChanged");
-      }
-    }, 50);
+/** Pass rows, grouping and weeding live on step 2, which needs a cutter that can cut. */
+async function showPasses(page: Page) {
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog).toBeVisible();
+  if (Number(await dialog.getAttribute("data-send-step")) !== 2) {
+    const next = dialog.getByRole("button", { name: "Next", exact: true });
+    if (await next.isDisabled()) await chooseCutter(page, "Silhouette Cameo 5 Alpha");
+    await goToSendStep(page, 2);
   }
+}
 
-  Object.assign(commands, {
-    // A copy, as a Rust `Vec<DeviceInfo>` crossing the IPC boundary is. Handing out the live
-    // array let a later mutation here reach into React's own state and repair a list the
-    // frontend had not re-read — a fake that quietly fixes the frontend's bugs for it.
-    //
-    // Slow from the second call on when asked, so the first read (the one that puts a host in
-    // the list at all) does not itself eat the window a test is trying to observe.
-    list_devices: () => {
-      if (opts?.failList) throw ipcError("device_error", "the device list could not be read");
-      const slow = opts?.slowList && listDeviceCalls++ > 0;
-      return slow ? new Promise((r) => setTimeout(() => r([...devices]), 3000)) : [...devices];
-    },
-    connect_device: (a) => {
-      const info = a.info as DeviceInfo;
-      // Mirrors `DeviceManager`'s worker: a Connect is refused unless the manager is disconnected
-      // or failed (`crates/driver-core/src/manager.rs`), so aiming at a second *local* cutter means
-      // letting go of the first — while a failed one, which holds nothing, can be aimed away from
-      // directly. A fake that switched outright let tests exercise a sequence production refuses
-      // (Codex on PR #264). A cutter on a Cut Host is not that sequence:
-      // `DeviceManagerHandle::connect` releases the local manager and records the aim, with no
-      // transport of its own to open.
-      const holdsATransport = status.phase !== "Disconnected" && status.phase !== "Failed";
-      if (connected && connected.host === null && info.host === null
-          && connected.instance_id !== info.instance_id && holdsATransport) {
-        throw ipcError("device_busy", "the cutter cannot do that right now");
-      }
-      connected = info;
-      // Production emits connect lifecycle StateChanged events with NO_JOB=0 —
-      // emitting them here (instead of silently mutating the status) is what lets
-      // these tests catch a frontend that filters lifecycle events out.
-      status = CONNECTING;
-      emit("StateChanged");
-      status = IDLE;
-      emit("StateChanged");
-      return null;
-    },
-    disconnect_device: () => {
-      connected = null;
-      status = DISCONNECTED;
-      emit("StateChanged");
-      return null;
-    },
-    // Keeps the aim, unlike `disconnect_device`: the cutter is still there and still aimed at, it
-    // has simply had its transport re-opened. On a Cut Host this is the host's own verb — this
-    // desktop never opened that transport, so a disconnect here would leave it exactly as stuck.
-    reconnect_device: () => {
-      if (!connected) throw ipcError("device_error", "no device is connected");
-      status = IDLE;
-      emit("StateChanged");
-      return null;
-    },
-    get_device_state: () => {
-      // Counted because the dialog's poll is only observable as a call rate: what has to be
-      // proven is that it stops, and a stopped interval leaves no other trace.
-      deviceStateCalls++;
-      return status;
-    },
-    get_connected_device: () => connected,
-    plan_cut: (a) => {
-      // A planner that refuses is an ordinary outcome — a font that will not resolve, a shape
-      // with no outline — and the dialog has to survive one without lying about what it will
-      // cut next.
-      if (failNextPlan) {
-        failNextPlan = false;
-        throw ipcError("plan_error", "shape #2: no fonts are installed on this system");
-      }
-      // Answered from the document as it is *now*, like the real command, then parked if
-      // the test has armed the hold: which of a replan and an older reorder settles first
-      // is the whole subject of the race test, and a timing race cannot state it.
-      const plan = planFromDoc(a.grouping as Grouping);
-      if (!holding) return plan;
-      return new Promise((resolve) => heldPlans.push(() => resolve(plan)));
-    },
-    // Mirrors device::travel_for_order's contract, not its geometry: the same stale-plan
-    // refusal, the same exact-once identity check over the requested keys, then synthetic
-    // segments (one per adjacent pair of *enabled* passes, x encoding the position in the
-    // order) — the real command does not route the head to a pass that will not be cut.
-    // Received lists are recorded on `window.__travelRequests` so a test can assert what the
-    // dialog asked for; travel itself lands on a canvas Playwright cannot read.
-    travel_for_order: (a) => {
-      const passes = a.passes as { key: string; enabled: boolean }[];
-      const grouping = a.grouping as Grouping;
-      // The page's own hook object, which only this fake and the tests reading it touch. Named
-      // rather than cast inline at each use: `window` genuinely has no type for a property the
-      // test harness invents, and one reason beats two identical assertions.
-      const hooks = window as unknown as { __travelRequests?: typeof passes[] };
-      hooks.__travelRequests ??= [];
-      hooks.__travelRequests.push(passes);
-      const settle = () => {
-        // Decided at settle time, like the real command — a request issued before a replan is
-        // stale even if it settles after one.
-        const plan = planFromDoc(grouping);
-        if (plan.doc_revision !== a.docRevision) {
-          throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-        }
-        // The list must name each planned pass exactly once. Without this the fake accepts
-        // rows from a previous grouping and the suite stays green on a frontend that cannot
-        // work — which is the whole reason the dialog installs a plan atomically.
-        const remaining = plan.passes.map((p) => p.key);
-        for (const pass of passes) {
-          const i = remaining.indexOf(pass.key);
-          if (i === -1) {
-            throw plan.passes.some((p) => p.key === pass.key)
-              ? ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once")
-              : ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
-          }
-          remaining.splice(i, 1);
-        }
-        if (remaining.length > 0) {
-          throw ipcError("plan_mismatch", "the requested pass list does not name every planned pass exactly once");
-        }
-        const cut = passes.filter((p) => p.enabled);
-        return cut.slice(1).map((_, i) => [i, 0, i + 1, 0] as [number, number, number, number]);
-      };
-      if (!holding) return settle();
-      return new Promise((resolve, reject) => heldTravel.push(() => {
-        try { resolve(settle()); } catch (e) { reject(e); }
-      }));
-    },
-    cut: (a) => {
-      const request = a.request as CutRequest;
-      if (!connected) throw ipcError("not_connected", "no device connected");
-      if (connected.instance_id !== request.device_instance_id) {
-        throw ipcError("device_mismatch", "connected device changed since planning");
-      }
-      // Refused before the revision, machine and pass-key checks below, mirroring `prepare_cut`,
-      // which resolves an enabled pass's preset before it parses the revision or plans. Named is
-      // spelled out rather than tested for truth, in both directions: an empty id names a preset
-      // and must be refused, while an omitted field is the `None` serde reads and must not be —
-      // a fake that diverges either way is a green test for a cut the backend does not make.
-      const available = effectivePresets(connected.machine_id);
-      for (const pass of request.passes) {
-        const named = pass.preset_id;
-        if (pass.enabled && named !== null && named !== undefined
-          && !available.some((p) => p.id === named)) {
-          throw ipcError("unknown_preset",
-            `this cut uses the material preset \`${named}\`, which is not available for this machine; pick another for that pass`);
-        }
-      }
-      const plan = planFromDoc(request.grouping);
-      if (plan.doc_revision !== request.doc_revision) {
-        throw ipcError("stale_plan", "document changed since the cut was planned; replan");
-      }
-      if (doc.machine && doc.machine.id !== connected.machine_id) {
-        throw ipcError("machine_mismatch", "document is set up for a different machine");
-      }
-      // A key this plan does not have is refused here too, so rows from a previous grouping
-      // cannot cut the wrong shapes just because the fake was more forgiving than Rust.
-      for (const pass of request.passes) {
-        if (!plan.passes.some((p) => p.key === pass.key)) {
-          throw ipcError("unknown_pass", `no planned pass is called ${pass.key}`);
-        }
-      }
-      planPasses = request.passes;
-      jobId = nextJobId++;
-      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
-      if (enabledIndices.length === 0) throw ipcError("nothing_to_cut", "no enabled passes");
-      // Recorded once nothing can still refuse the request, so the hook answers the cut that was
-      // accepted rather than the last one attempted.
-      lastCutRequest = request;
-      if (failNextCut) {
-        // The opening write dies: Sending and then Failed both go out in this same
-        // synchronous burst, so the only status the frontend ever commits is the failed
-        // one — the mid-flight status it faulted from never reaches a render.
-        failNextCut = false;
-        const id = jobId;
-        status = statusOf("Sending", { cancel: true }, { pass: { index: enabledIndices[0], total: enabledIndices.length }, sent: { sent: 0, total: 100 } });
-        emit("StateChanged");
-        emit({ Failed: "Timeout" });
-        status = statusOf("Failed", {}, { error: "Timeout" });
-        emit("StateChanged");
-        jobId = null;
-        return { job_id: id, duplicate: false };
-      }
-      runPass(enabledIndices[0], enabledIndices);
-      // `duplicate` is the Cut Host's own answer — it is the only party that knows whether it had
-      // already accepted this dispatch id. This fake stands in for a local cutter, which has no
-      // dedupe to be caught by, so it is always false here.
-      return { job_id: jobId, duplicate: false };
-    },
-    cancel_cut: () => {
-      // Mirrors driver-core::manager: cancel is unconditional and lands on the
-      // Cancelled resting state — nothing is happening, so the phase is Idle, but
-      // `ended` names the cancel. Cut is legal again only because this fake stands in
-      // for a pollable cutter whose stop was confirmed; a Puma's never is, and
-      // status.rs's Cancelled arm then withholds `actions.cut`.
-      const sent = status.sent?.sent ?? 0;
-      const pass = status.pass;
-      // CancelRequested then Stopping — two distinct internal states that both report
-      // phase Cancelling with *no* actions at all. The dialog has to survive losing
-      // every button for a moment, so the mock must not skip them.
-      status = statusOf("Cancelling");
-      emit("StateChanged");
-      status = statusOf("Cancelling");
-      emit("StateChanged");
-      // The worker only rests on Cancelled once it has woken and stopped, so the
-      // resting state lands a tick later, as it does in production.
-      setTimeout(() => {
-        status = statusOf("Idle", { cut: true }, { ended: "Cancelled", pass, sent: { sent, total: sent } });
-        emit("StateChanged");
-        jobId = null; // job over — later lifecycle events are NO_JOB=0, as in production
-      }, 50);
-      return null;
-    },
-    resume_cut: () => {
-      // Production's own refusal, verbatim: the worker answers a `Resume` outside
-      // `WaitingForColorSwap` with `DeviceError::Busy`, which the desktop reports as
-      // `device_busy` (#73). It used to read `device_error` with an invented message.
-      if (status.phase !== "AwaitingColorSwap") throw ipcError("device_busy", "the cutter cannot do that right now");
-      const nextIndex = status.pass?.index ?? 0;
-      if (failNextResume) {
-        // Async failure, as in production: resume_cut returns Ok and the failure
-        // arrives via the event stream (Failed carries the job's id, then the
-        // device rests in Error). Job over — id released so later lifecycle
-        // events go out as NO_JOB=0.
-        failNextResume = false;
-        setTimeout(() => {
-          emit({ Failed: "Timeout" });
-          status = statusOf("Failed", {}, { error: "Timeout" });
-          emit("StateChanged");
-          jobId = null;
-        }, 50);
-        return null;
-      }
-      const enabledIndices = planPasses.map((p, i) => (p.enabled ? i : -1)).filter((i) => i >= 0);
-      runPass(nextIndex, enabledIndices);
-      return null;
-    },
-    // Test hook (no production counterpart): arms a one-shot failure for the next
-    // resume_cut so tests can drive the failed-job → reconnect recovery path.
-    __test_fail_next_resume: () => {
-      failNextResume = true;
-      return null;
-    },
-    // Same, for a fault during the first pass of the next cut.
-    __test_fail_next_plan: () => {
-      failNextPlan = true;
-      return {};
-    },
-    __test_fail_next_cut: () => {
-      failNextCut = true;
-      return null;
-    },
-    // Test hook (no production counterpart): how many times the dialog has asked for a status.
-    __test_poll_count: () => deviceStateCalls,
-    confirm_pass_done: () => {
-      status = COMPLETED;
-      emit("StateChanged");
-      return null;
-    },
-    // Mirrors `desktop::device::list_presets`: this machine's builtins, minus any the operator's
-    // own entries shadow by pair, plus those entries. The cut handler resolves against this same
-    // list so a preset the dialog just saved can be cut.
-    list_presets: (a) => {
-      // Test hook: a read that fails *after* a write that did not is the interleaving the write and
-      // the refresh are held apart for.
-      if (failNextPresetList) {
-        failNextPresetList = false;
-        // Production's own words and code: `cutplan::presets::PresetError::Unreadable` through
-        // `From<PresetError> for IpcError`. Invented prose here (it used to throw
-        // `Corrupt("the presets file could not be read")`) meant the two assertions on this
-        // banner matched a string production never sends (#278).
-        throw ipcError("presets_unreadable",
-          "the presets file could not be read (Permission denied (os error 13))");
-      }
-      const list = effectivePresets(a.machineId as string);
-      if (!holdingPresets) return list;
-      // Executor form, like the parked plan and travel replies above: the UI's `lib` is older than
-      // `Promise.withResolvers`, and widening it for a fake is the wrong end of the trade.
-      return new Promise<MaterialPreset[]>((resolve) => heldPresets.push(() => resolve(list)));
-    },
-    // The bounds `cutplan::preflight::SETTINGS_RANGES` publishes, restated here because a fake has
-    // to answer something; the casing and the numbers are pinned on the Rust side.
-    settings_ranges: () => ({
-      speed: { min: 1, max: 30 },
-      force: { min: 1, max: 33 },
-      repeatCount: { min: 1, max: 10 },
-    }),
-    // Every refusal `desktop::device::save_preset` makes, because the editor is what must never
-    // send one: an entry under a builtin's pair shadows a shipped material with no way back, an
-    // id-less entry is dropped on load (a save the operator never gets back), and a setting out of
-    // range is refused at cut time instead. A fake more forgiving than Rust would let the editor
-    // ship any of those green.
-    save_preset: (a) => {
-      const p = a.p as MaterialPreset;
-      // In the backend's order: what the entry *is* before what it holds, so a test cannot pass
-      // against a precedence production does not use (CodeRabbit on PR #264).
-      if (p.id === "" || p.machine_id === "") {
-        throw ipcError("invalid_preset", "a material preset needs an id and the machine it is for");
-      }
-      if (BUILTIN_PRESETS.some((b) => b.machine_id === p.machine_id && b.id === p.id)) {
-        throw ipcError("builtin_preset",
-          `\`${p.id}\` is a material preset that ships with the app; save your own under a different id`);
-      }
-      if (p.name.trim() === "") {
-        throw ipcError("invalid_preset", "a material preset needs a name");
-      }
-      const range = { speed: [1, 30], force: [1, 33], repeat_count: [1, 10] } as const;
-      for (const field of ["speed", "force", "repeat_count"] as const) {
-        const v = p.settings[field];
-        if (v !== null && (v < range[field][0] || v > range[field][1])) {
-          throw ipcError("invalid_preset", `${field} must be ${range[field][0]}..=${range[field][1]}`);
-        }
-      }
-      // Last, because the file is the last thing production touches: every refusal above is
-      // decided without writing, so none of them may lose the race to a disk fault
-      // (`what_a_preset_is_refuses_it_before_the_file_is_touched`). Production's own words and
-      // code, as on the read side above.
-      if (failNextPresetSave) {
-        failNextPresetSave = false;
-        throw ipcError("presets_unwritable",
-          "the presets file could not be written (Permission denied (os error 13))");
-      }
-      userPresets = [
-        ...userPresets.filter((u) => !(u.machine_id === p.machine_id && u.id === p.id)),
-        { ...p, builtin: false },
-      ];
-      return null;
-    },
-    // Named rather than silent when it removed nothing, as Rust is: a delete that reports success
-    // having deleted nothing is how the editor would come to show a preset that is still there.
-    delete_preset: (a) => {
-      const machineId = a.machineId as string;
-      const id = a.id as string;
-      const before = userPresets.length;
-      userPresets = userPresets.filter((u) => !(u.machine_id === machineId && u.id === id));
-      if (userPresets.length === before) {
-        if (BUILTIN_PRESETS.some((b) => b.machine_id === machineId && b.id === id)) {
-          throw ipcError("builtin_preset", `\`${id}\` ships with the app, so there is nothing of yours to delete`);
-        }
-        throw ipcError("unknown_preset", `no material preset \`${id}\` is saved for \`${machineId}\``);
-      }
-      return null;
-    },
-    // Test hook (no production counterpart): arms a one-shot failure for the next preset write, so
-    // a test can prove a refused save keeps the operator's edit on screen.
-    __test_fail_next_preset_save: () => {
-      failNextPresetSave = true;
-      return null;
-    },
-    __test_fail_next_preset_list: () => {
-      failNextPresetList = true;
-      return null;
-    },
-    // Test hook (no production counterpart): the request the last accepted cut arrived with, so a
-    // test can state which preset id the dialog sent rather than which one it displayed.
-    __test_last_cut_request: () => lastCutRequest,
-    // Test hooks (no production counterpart): park every `list_presets` reply from here, then let
-    // them all land — the only way to state that a list read for one cutter arrives after the
-    // operator has aimed at another.
-    __test_hold_presets: () => {
-      holdingPresets = true;
-      return null;
-    },
-    // Releasing ends the window as well as draining it: a test that carries on aiming at cutters
-    // afterwards wants their lists answered, not parked behind a switch nobody turned off.
-    __test_release_presets: () => {
-      holdingPresets = false;
-      return release(heldPresets);
-    },
-    // Deliberately one constant, not a per-machine table: that mapping is pinned in
-    // Rust by each Driver's own caps test, and restating it here would recreate the
-    // copy this change removed — in a file nobody thinks of as production code.
-    machine_caps: () => ({ supportsSpeed: true, supportsForce: true, needsOperatorPassConfirm: false }),
-    // Empty unless a test asks for a host, so existing assertions (device list, connect flow)
-    // are unaffected.
-    list_hosts: () => hosts,
-    // Sends no token, so it answers whatever the address is — mirroring a TLS handshake that
-    // has vouched for nothing yet.
-    probe_host: () => HOST_FINGERPRINT,
-    // Whether this address is already paired, asked between the probe and the confirm. Mirrors
-    // `DeviceManagerHandle::existing_pairing`: matched on the address as typed.
-    existing_pairing: (a) => {
-      const already = hosts.find((h) => h.address === a.address);
-      if (!already) return null;
-      return { id: already.id, name: already.name, sameFingerprint: a.fingerprint === HOST_FINGERPRINT };
-    },
-    // Refuses the token rather than the address: a host that answers but does not accept this
-    // token is the failure the pairing flow exists to catch before anything is saved.
-    test_host: (a) => {
-      if (a.fingerprint !== HOST_FINGERPRINT) throw ipcError("host_unreachable", "the host's fingerprint changed");
-      if (a.token !== HOST_TOKEN) throw ipcError("host_unreachable", "the token was refused");
-      return [PAIRED_CUTTER];
-    },
-    pair_host: (a) => {
-      const host = { id: "host-2", name: a.name as string, address: a.address as string, unreachable: null };
-      hosts.push(host);
-      // The cutter is only in `list_devices` once the host is paired, which is what the dialog
-      // re-reads for: the Test listed it to prove the token, not to populate the device list.
-      devices.push(PAIRED_CUTTER);
-      return host;
-    },
-    // Mirrors `DeviceManagerHandle::forget`: a host that cannot be asked whether it is cutting
-    // refuses like one that answered "busy" — the Pi keeps cutting when the network drops, and
-    // the desktop must keep the row rather than discard the token for a Job it could no longer
-    // cancel. Distinct code, because only this one can be forced past.
-    forget_host: (a) => {
-      if (!a.force && hosts.some((h) => h.id === a.id && h.unreachable !== null))
-        throw ipcError(
-          "host_unconfirmed",
-          "this Cut Host could not be asked whether it is cutting (timed out); if it is, forgetting it discards the only way to stop it",
-        );
-      hosts = hosts.filter((h) => h.id !== a.id);
-      // Its cutters go with it, as they do in Rust: `list_devices` reaches a host through the
-      // pairing that was just discarded, so it cannot still be reporting what is attached to it.
-      for (let i = devices.length - 1; i >= 0; i--) if (devices[i].host === a.id) devices.splice(i, 1);
-      return null;
-    },
-    // The picker now lives in Rust so the backend, not the caller, decides what is readable.
-    pick_image: () => "/tmp/fake.png",
-  } as Record<string, (args: Record<string, unknown>) => unknown>);
+/** Weeding starts closed unless a border is already on, and the controls are not in the page until then. */
+async function openWeeding(page: Page) {
+  const toggle = page.getByRole("button", { name: "Weeding", exact: true });
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+}
 
-  (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-    invoke: (cmd: string, args: Record<string, unknown> = {}) => {
-      if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
-        return Promise.resolve("/mock/cuthulhu-project.cut");
-      }
-      if (cmd === "plugin:event|listen") {
-        const id = args.handler as number;
-        const event = args.event as string;
-        const ids = eventNameToIds.get(event) ?? [];
-        ids.push(id);
-        eventNameToIds.set(event, ids);
-        return Promise.resolve(id);
-      }
-      if (cmd === "plugin:event|unlisten") {
-        for (const ids of eventNameToIds.values()) {
-          const i = ids.indexOf(args.eventId as number);
-          if (i >= 0) ids.splice(i, 1);
-        }
-        return Promise.resolve(null);
-      }
-      // The wiring gate (#85): a command name or payload key the Rust side does not declare is
-      // refused here, rather than reaching an operator as an invalid-args error from a real
-      // backend. A missing inventory is this file's own setup failing, not a call to wave through.
-      // Installed by the beforeEach below, so nothing in the page's own types knows about it.
-      const injected = window as unknown as { __IPC_INVENTORY__?: Record<string, string[]> };
-      const inventory = injected.__IPC_INVENTORY__;
-      // Refusals are recorded as well as rejected. What the frontend does with a rejection is its
-      // own business — a dialog names it, a poll swallows it — and the afterEach below is what
-      // makes a mis-wired call fail the test that made it, saying which command and which key
-      // rather than leaving a missing element to be explained.
-      //
-      // In sessionStorage rather than on `window`, because a reload or a navigation gives the page
-      // a fresh `window` and a refusal from before it still has to fail the test. The key is
-      // spelled out at each use: this function is serialized into the page, so it can share no
-      // constant with the hooks that read it.
-      const refuse = (message: string) => {
-        const stored: unknown = JSON.parse(sessionStorage.getItem("__ipc_violations__") ?? "[]");
-        const seen = Array.isArray(stored) ? stored : [];
-        sessionStorage.setItem("__ipc_violations__", JSON.stringify([...seen, message]));
-        return Promise.reject(new Error(message));
-      };
-      if (!inventory) return refuse("ipc inventory was not installed");
-      // `__test_` names are this fake's own hooks, invoked over this channel because it is the only
-      // channel a test has. They have no Rust counterpart by design.
-      if (!cmd.startsWith("__test_")) {
-        // `inventory` carries no prototype (see the beforeEach), so a command named `toString` or
-        // `constructor` is absent rather than an inherited function that passes for declared.
-        const declared = inventory[cmd];
-        if (!declared) return refuse(`unregistered command: ${cmd}`);
-        const undeclared = Object.keys(args).filter((k) => !declared.includes(k));
-        if (undeclared.length > 0) return refuse(`undeclared argument for ${cmd}: ${undeclared.join(", ")}`);
-      }
-      const fn = commands[cmd];
-      if (!fn) return Promise.reject(new Error(`unmocked command: ${cmd}`));
-      try {
-        return Promise.resolve(fn(args));
-      } catch (e) {
-        return Promise.reject(e instanceof Error ? e.message : e);
-      }
-    },
-    transformCallback: (callback: (e: unknown) => void) => {
-      const id = nextCallbackId++;
-      callbacksById.set(id, callback);
-      return id;
-    },
-  };
-  // @tauri-apps/api/event's unlisten() path touches this directly; stub it so a
-  // listener cleanup (e.g. on unmount) doesn't throw.
-  (window as unknown as { __TAURI_EVENT_PLUGIN_INTERNALS__: unknown }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
-    unregisterListener: () => {},
-  };
+/** The grip replaces Up and Down. Alt+Arrow is the keyboard half of the same move. */
+async function reorderPass(page: Page, index: number, dir: -1 | 1) {
+  await page.getByRole("button", { name: `Reorder pass ${index + 1}` }).press(dir < 0 ? "Alt+ArrowUp" : "Alt+ArrowDown");
+}
+
+/** Start cut exists only on step 3. Calling this from an earlier step is the walk there.
+ *  A closed sheet is the job panel's doing: Start cut closes it, and a later cut opens a fresh one. */
+async function startCut(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
+  await goToSendStep(page, 3);
+  await page.getByRole("button", { name: "Start Cut" }).click();
+}
+
+/** The preview is step 3. Next waits out a replan, so the name is the plan that landed. */
+async function showPreview(page: Page) {
+  await goToSendStep(page, 3);
+  return page.getByRole("img", { name: /Cut preview/ });
+}
+
+/** Cutting stays available: step 3's Start cut is enabled, then the passes are on screen again.
+ *  The sheet closes when a cut starts, so a check after a job opens it again. */
+async function expectStartOffered(page: Page) {
+  if ((await page.getByRole("dialog", { name: "Send to cutter" }).count()) === 0) {
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  }
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  const back = Number(await dialog.getAttribute("data-send-step")) < 3;
+  await goToSendStep(page, 3);
+  await expect(dialog.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  if (back) await goToSendStep(page, 2);
+}
+
+/** The preset editor is closed until asked, and a reopened sheet starts on the machine step. */
+async function showPresetEditor(page: Page) {
+  await showPasses(page);
+  const manage = page.getByLabel("Preset to manage");
+  if (!(await manage.isVisible())) await page.getByRole("button", { name: "Edit presets…" }).click();
+  await expect(manage).toBeVisible();
 }
 
 // The inventory travels in its own init script because `addInitScript` passes one argument and
@@ -1127,22 +198,33 @@ test("a command or key the registered commands do not declare is refused", async
   await page.evaluate(() => sessionStorage.removeItem("__ipc_violations__"));
 });
 
+test("the demo state menu is absent unless the dev flag is set", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Rectangle", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Demo state/ })).toHaveCount(0);
+});
+
 test("new doc → add rect → save → reload keeps the rect", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Rectangle" }).click();
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
   await page.mouse.click(400, 300);
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
-  await page.getByRole("button", { name: "Save" }).click();
+  await fileAction(page, "Save");
 
   // Discriminating step: delete the rect after Save so Reload can only pass by genuinely
   // restoring the saved copy, not by leaving live state untouched (a no-op load_project
   // would otherwise pass the final assertion below for free).
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").click();
   await page.getByRole("button", { name: "Delete" }).click();
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Reload" }).click();
+  await fileAction(page, "Revert to saved");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
 });
 
@@ -1151,20 +233,53 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
   // picker exists in the UI) so App.tsx's initial snapshot() already sees them.
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  // Start cut closes the sheet. The job stays, including across a reopen (C2).
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await expect(swap.getByText("Load #00ff00, then press Resume")).toBeVisible();
+  // §5.2 keeps Send as the one primary. The status-bar chip is still there while the bar is open.
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).not.toContainText("then press Resume");
+  await page.getByRole("button", { name: "Close" }).click();
+  await expect(swap).toBeVisible();
 
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
-
-  await page.getByRole("button", { name: "Close" }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("a disabled middle pass names the next vinyl the machine will cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedThreeVinyl: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(3);
+  await page.getByRole("checkbox", { name: "Enabled" }).nth(1).uncheck();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText("#00ff00")).toHaveCount(0);
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
 });
 
 // The operator-facing half of #148: the picker, the replan it triggers, and a row named for
@@ -1173,12 +288,13 @@ test("two-color doc cuts through swap and resume", async ({ page }) => {
 test("changing the grouping replans and renames the passes", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByLabel("Group passes by").selectOption("Single");
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-  await expect(page.getByText("Every cut shape")).toBeVisible();
+  await expect(page.getByTestId("cut-pass-row").getByText("Every cut shape")).toBeVisible();
 
   // And back again: switching modes replans each time rather than keeping the first answer.
   await page.getByLabel("Group passes by").selectOption("Stroke");
@@ -1192,20 +308,259 @@ test("changing the grouping replans and renames the passes", async ({ page }) =>
 test("a cut cannot be sent with rows from the previous grouping", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
 
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
   await page.getByLabel("Group passes by").selectOption("Single");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  await expect(next).toBeDisabled();
   // Still showing the old mode's rows, which is exactly why Cut is unavailable.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // The new plan's pass is a new row, so its speed and force start blank and have to be set.
+  await fillSendLevels(page);
+  await expect(next).toBeEnabled();
+  await expectStartOffered(page);
+
+  // The cut that then goes out names the grouping on screen, not the colour passes it replaced.
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { grouping: string; passes: { key: string }[] };
+  expect(request.grouping).toBe("Single");
+  expect(request.passes.map((pass) => pass.key)).toEqual(["all"]);
+});
+
+test("a weed border and lines replan into the preview, and the cut carries the options", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  // Lines wait for a border: without one their ends would stop in the open sheet.
+  await openWeeding(page);
+  await expect(page.getByLabel("Weed lines")).toBeDisabled();
+  await expect(page.getByLabel("Weed margin")).toBeDisabled();
+  let preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
+
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  // One border per pass, each its own sheet, and the blade travels to each after its shapes.
+  await expect(page.getByLabel("Weed lines")).toBeEnabled();
+  await expect(page.getByLabel("Weed spacing")).toBeDisabled();
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await goToSendStep(page, 2);
+
+  await page.getByLabel("Weed lines").selectOption("Horizontal");
+  await page.getByLabel("Weed spacing").fill("5");
+  // Each 10 mm rect's border runs -3..13 on y; lines at y = 2 and 7 cross the rect and are cut off
+  // within the clearance, leaving stubs under 2 mm, so only y = 12 survives: one line per pass.
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 5 travel moves, 4 weed paths");
+
+  await page.getByRole("button", { name: "Start Cut" }).click();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+  const request = await callFake(page, "__test_last_cut_request") as { weed: unknown };
+  expect(request.weed).toEqual({ margin_mm: 3, lines: "Horizontal", spacing_mm: 5, clearance_mm: 1.5 });
+});
+
+test("a weed field out of range disables Cut and says why", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await fillSendLevels(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+
+  await page.getByLabel("Weed margin").fill("60");
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.5–50 mm" })).toBeVisible();
+  await expect(next).toBeDisabled();
+  // Not cut without its border: the last plan still holds the old margin, so Cut waits.
+  await page.getByLabel("Weed margin").fill("4");
+  await expect(next).toBeEnabled();
+
+  await page.getByLabel("Weed lines").selectOption("Both");
+  await page.getByLabel("Weed clearance").fill("4");
+  await expect(page.getByRole("alert").filter({ hasText: "Clearance must be less than the margin" })).toBeVisible();
+  await expect(next).toBeDisabled();
+});
+
+// What a replan for a weed edit does to the rows: the operator's arrangement (which passes are cut,
+// in what order, with what settings) stays, since the weed changes none of the passes.
+test("a weed edit keeps the passes as the operator arranged them, and their travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  const rows = page.getByTestId("cut-pass-row");
+  await expect(rows).toHaveCount(2);
+  await reorderPass(page, 1, -1); // green first
+  await rows.nth(1).getByRole("checkbox").uncheck(); // and red not cut
+  let preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
+  await goToSendStep(page, 2);
+
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  await expect(rows.nth(0).locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(rows.nth(1).getByRole("checkbox")).not.toBeChecked();
+  // Travel for the list as arranged: only green is cut, so one move, to its border. The plan's
+  // own travel (both passes, in planned order) would read 3.
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+// Reordering asks the backend for travel again, and that request must carry the weed the plan was
+// made with: without it the replanned travel drops the moves to each border.
+test("reordering passes keeps the weed in the replanned travel", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  let preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await goToSendStep(page, 2);
+  await reorderPass(page, 1, -1);
+  await expect(page.getByTestId("cut-pass-row").first().locator("span").first()).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+});
+
+test("Cut waits while a weed replan is out, so a border nobody has previewed cannot be cut", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(next).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+  await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  await expect(next).toBeDisabled();
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(next).toBeEnabled();
+  await expectStartOffered(page);
+});
+
+test("a refused weed replan puts the controls back to the plan still installed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  let preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await goToSendStep(page, 2);
+
+  await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
+  await page.getByLabel("Weed lines").selectOption("Both");
+  // The controls say what the installed plan holds, so Cut is offered for what the preview shows.
+  await expect(page.getByLabel("Weed lines")).toHaveValue("None");
+  preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
+  await expectStartOffered(page);
+});
+
+// A refusal arriving after the operator has typed on must not put back over what they typed.
+test("a refused weed replan does not overwrite what was typed after it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName(/2 weed paths/);
+  await goToSendStep(page, 2);
+  await page.evaluate(() => {
+    const w = window as unknown as { __armHold: () => void; __refuseHeldPlans: () => void };
+    w.__armHold();
+    w.__refuseHeldPlans();
+  });
+  await page.getByLabel("Weed margin").fill("5"); // replan out, held
+  await page.getByLabel("Weed margin").fill(""); // mid-edit: reads as nothing, plans nothing
+  await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<void> }).__releasePlans());
+  await expect(page.getByLabel("Weed margin")).toHaveValue("");
+});
+
+test("changing the grouping keeps the weed", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Group passes by").selectOption("Single");
+  // One pass over both rects, so one border around both.
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move, 1 weed path");
+});
+
+test("Border waits for the weed defaults, and says why while it waits or when they fail", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.evaluate(() => (window as unknown as { __holdRanges: () => void }).__holdRanges());
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  const border = page.getByLabel("Weed border");
+  // Ticked now it would start from an empty margin.
+  await expect(border).toBeDisabled();
+  await expect(border).toHaveAttribute("title", "Waiting for the weed defaults");
+  await page.evaluate(() => (window as unknown as { __releaseRanges: () => Promise<void> }).__releaseRanges());
+  await expect(border).not.toHaveAttribute("title");
+  await border.check();
+  await expect(page.getByLabel("Weed margin")).toHaveValue("3");
+
+  await page.getByRole("button", { name: "Close" }).click();
+  await page.reload();
+  await page.evaluate(() => (window as unknown as { __failRanges: () => void }).__failRanges());
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  await expect(page.getByLabel("Weed border")).toBeDisabled();
+  await expect(page.getByLabel("Weed border")).toHaveAttribute("title", /Weeding is unavailable: settings ranges could not be read/);
+});
+
+test("reopening the cut dialog keeps the weed controls as they were left", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Weed margin").fill("4");
+  await page.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByLabel("Weed border")).toBeChecked();
+  await expect(page.getByLabel("Weed margin")).toHaveValue("4");
+  // And the first plan of the reopened dialog is made with them.
+  const preview = await showPreview(page);
+  await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 3 travel moves, 2 weed paths");
 });
 
 // Greptile's P1 on this PR, with its own Playwright repro: a replan that fails leaves the previous
@@ -1216,12 +571,14 @@ test("a cut cannot be sent with rows from the previous grouping", async ({ page 
 test("a rejected replan keeps the travel it was showing", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   // Two passes means one move between them - the travel this test is about.
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_plan"));
   await page.getByLabel("Group passes by").selectOption("Single");
@@ -1229,7 +586,8 @@ test("a rejected replan keeps the travel it was showing", async ({ page }) => {
   // The plan failed, so the previous one is still in force: same rows, same mode, still cuttable.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  preview = await showPreview(page);
+  await expectStartOffered(page);
   // ...and the preview still describes the arrangement that cut would use.
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
@@ -1247,10 +605,11 @@ test("a rejected replan keeps the travel it was showing", async ({ page }) => {
 test("a replan failing while another is parked keeps the installed plan's travel", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 
   // Stale the plan so the banner - and its Replan - are on screen.
@@ -1261,7 +620,7 @@ test("a replan failing while another is parked keeps the installed plan's travel
     ),
   );
   await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await expect(page.getByText("Your design changed.")).toBeVisible();
 
   // First Replan is parked in flight: the window in which travel used to be cleared.
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
@@ -1275,12 +634,16 @@ test("a replan failing while another is parked keeps the installed plan's travel
 
   // Nothing was ever replaced, so the original plan is still the installed one - and the preview
   // must still describe it rather than showing a cut with no travel at all.
+  await goToSendStep(page, 2);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 
   // The parked reply lands last and is superseded, so it changes nothing either.
+  await goToSendStep(page, 2);
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
 });
 
@@ -1293,17 +656,21 @@ test("a replan failing while another is parked keeps the installed plan's travel
 test("a travel reply owed to a row edit still lands when a replan fails", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
-  const preview = page.getByRole("img", { name: /Cut preview/ });
+  let preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 2 passes, 1 travel move");
+  await goToSendStep(page, 2);
 
   // Disable a pass and park the travel reply it asks for: one pass left to cut means no travel
   // between passes, which is the answer this plan is owed.
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 1 travel move");
+  await goToSendStep(page, 2);
 
   // Now a replan fails. The edited rows stay installed - so the parked reply is still the right
   // answer for them, and discarding it would leave the count above standing for good.
@@ -1313,6 +680,7 @@ test("a travel reply owed to a row edit still lands when a replan fails", async 
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __releaseTravel: () => void }).__releaseTravel());
+  preview = await showPreview(page);
   await expect(preview).toHaveAccessibleName("Cut preview: 1 pass, 0 travel moves");
 });
 
@@ -1327,15 +695,21 @@ test("a pass whose assigned preset was deleted is refused, not cut", async ({ pa
     seedUserPreset: true,
   });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   await expect(page.getByLabel("Material preset")).toBeVisible();
+  await showTab(page, "Properties");
   await page.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showTab(page, "Properties");
   await expect(page.getByLabel("Material preset")).toHaveValue("preset:card-stock");
 
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPresetEditor(page);
   await page.getByLabel("Group passes by").selectOption("Preset");
   // One pass for the assigned material, one for everything that resolves to none.
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
@@ -1345,7 +719,7 @@ test("a pass whose assigned preset was deleted is refused, not cut", async ({ pa
   await page.getByLabel("Delete preset").click();
   await expect(page.getByTestId("cut-pass-row").first()).toContainText("card-stock (unknown preset)");
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText(/not available for this machine/)).toBeVisible();
 });
 
@@ -1359,8 +733,9 @@ test("an empty preset id is still named and refused", async ({ page }) => {
     seedEmptyPresetAssignment: true,
   });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await page.getByLabel("Group passes by").selectOption("Preset");
 
   // Copilot on PR #272: the picker keys its options in the pass-key grammar, so the pass keyed on a
@@ -1368,7 +743,7 @@ test("an empty preset id is still named and refused", async ({ page }) => {
   // not express, since it had to spend the empty string on the absence.
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:");
   await expect(page.getByTestId("cut-pass-row").first()).toContainText("(unknown preset)");
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  await startCut(page);
   await expect(page.getByText(/material preset ``.*not available for this machine/)).toBeVisible();
 });
 
@@ -1412,8 +787,8 @@ const cutDirect = (
 test("an unavailable preset is refused before later cut request checks", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
 
   const error = await cutDirect(page, {
     doc_revision: "stale",
@@ -1431,8 +806,8 @@ test("an unavailable preset is refused before later cut request checks", async (
 test("a preset belonging to another cutter is not available to this one", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
 
   const error = await cutDirect(page, {
     grouping: "Single",
@@ -1451,8 +826,8 @@ test("a preset belonging to another cutter is not available to this one", async 
 test("a pass that carries no preset id at all is cut, not refused", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
 
   const outcome = await cutDirect(page, {
     grouping: "Single",
@@ -1476,11 +851,19 @@ const callFake = (page: Page, cmd: string) =>
     return internals.__TAURI_INTERNALS__.invoke(name);
   }, cmd);
 
+const callFakeWith = (page: Page, cmd: string, args: Record<string, unknown>) =>
+  page.evaluate(({ name, payload }) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke(name, payload);
+  }, { name: cmd, payload: args });
+
 /** Opens the Cut dialog on the local Cameo, which is the machine the presets below belong to. */
 const openDialogOnCameo = async (page: Page) => {
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByLabel("Preset to manage")).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPresetEditor(page);
 };
 
 test("a preset created in the cut dialog is offered to a pass and cut by its id", async ({ page }) => {
@@ -1502,8 +885,8 @@ test("a preset created in the cut dialog is offered to a pass and cut by its id"
   // And a pass can now be cut with it, which is the whole point of managing them here.
   await expect(page.getByLabel("Preset for pass 1").locator("option")).toContainText(["No preset", "HTV", "Thick Card"]);
   await page.getByLabel("Preset for pass 1").selectOption("preset:thick-card");
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Which pass carries it, not merely that some pass does: the dialog attaching the preset to the
   // wrong row is the regression this is here for, and the untouched row must still name none.
@@ -1600,7 +983,8 @@ test("a write that landed is not reported as refused when the re-read after it f
 
   // And 18 is in the file: a fresh dialog reads the list again — no Connect, the cutter is still
   // connected — and the failure the section was showing is answered by that read.
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("force 18");
 
@@ -1612,7 +996,8 @@ test("a write that landed is not reported as refused when the re-read after it f
   await page.getByLabel("Save preset and continue").click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("force 19");
 });
@@ -1710,7 +1095,8 @@ test("an unsaved preset edit has to be decided before the dialog closes", async 
   // Reopening proves the save reached the backend rather than the dialog's own memory. No Connect
   // this time: the cutter is still connected, and the dialog seeds itself from the manager's cache
   // — pressing the first Connect on screen would aim at the *other* local cutter.
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPresetEditor(page);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 9");
 });
@@ -1751,14 +1137,18 @@ test("a preset belongs to one cutter: aiming at another shows that machine's ent
   // Connect while it holds a transport, so the dialog's Disconnect is the way across. The Puma's
   // list is its own — an id is the operator's own string, so one machine's entry must not appear,
   // or be editable, under another (#153).
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await goToSendStep(page, 2);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
 
   // And the Cameo's entry is untouched by the trip, settings and all.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 7");
 });
@@ -1789,8 +1179,10 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Preset to manage").selectOption("my-vinyl");
   await page.getByLabel("Delete preset").click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await goToSendStep(page, 2);
   await callFake(page, "__test_release_presets");
 
   // The Cameo's reply is inert: no draft of its material, and none of its entries in the picker.
@@ -1800,8 +1192,10 @@ test("a preset list still owed to the previous cutter is not shown against this 
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "HTV (built-in)" })).toHaveCount(1);
 
   // And the delete that was in flight did reach the Cameo's file, where it belonged.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "My Vinyl" })).toHaveCount(0);
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Card" })).toHaveCount(1);
 });
@@ -1828,8 +1222,10 @@ test("a preset list owed to a previous connection to the same cutter is not take
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Preset speed").fill("16");
   await page.getByLabel("Save preset", { exact: true }).click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
 
   // This aim has read nothing yet: the editor is withheld, whatever the previous connection left
   // behind. Rendered from that cached list, New would mint an id against entries nobody re-read.
@@ -1868,8 +1264,10 @@ test("a save's continuation is dropped when the cutter changed before it could r
   await page.getByLabel("Preset to manage").selectOption("vinyl");
   await callFake(page, "__test_hold_presets");
   await page.getByLabel("Save preset and continue").click();
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await goToSendStep(page, 2);
   await callFake(page, "__test_release_presets");
 
   // Nothing of the Cameo's arrives on the Puma: no draft, and no Cameo entry in its picker. The
@@ -1880,8 +1278,10 @@ test("a save's continuation is dropped when the cutter changed before it could r
   await expect(page.getByLabel("Preset to manage").locator("option", { hasText: "Vinyl" })).toHaveCount(0);
 
   // And the save that carried the continuation did land on the Cameo, where it was aimed.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect serial:/dev/mock0").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await page.getByLabel("Preset to manage").selectOption("card");
   await expect(page.getByTestId("preset-preview")).toContainText("speed 13");
 });
@@ -1914,8 +1314,10 @@ test("an unsaved edit withholds the actions that would discard it, and an unread
   // With every list reply parked, aiming at the Puma leaves nothing to create against: no picker,
   // no New, and a line saying why.
   await callFake(page, "__test_hold_presets");
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
-  await page.getByRole("button", { name: "Connect", exact: true }).nth(1).click();
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await goToSendStep(page, 2);
   await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
   await expect(page.getByLabel("New preset")).toHaveCount(0);
 
@@ -1935,15 +1337,19 @@ test("a pass whose preset list has not arrived is named as unread, not as having
     seedUserPreset: true,
   });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   await page.getByLabel("Material preset").selectOption("preset:card-stock");
 
   // Parked before the connect that asks for it, so every row below is rendered against a list
   // nobody has answered for — the seconds after a connect, held open.
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await callFake(page, "__test_hold_presets");
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
   await expect(page.getByText("Reading this cutter's presets…")).toBeVisible();
   await page.getByLabel("Group passes by").selectOption("Preset");
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
@@ -1955,9 +1361,15 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
   // And the repeat says nothing rather than one pass, which is a claim about the blade.
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  // Cutting stays available throughout: the backend resolves the material from the presets file,
-  // and refuses by name when it cannot, so nothing here is a gate.
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // The unread preset is not a blank the form can fill. The other pass names no preset, and
+  // that blank still holds Next until it is set — filling it is what expectStartOffered does.
+  await expect(page.getByLabel("Speed for pass 1")).not.toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByLabel("Speed for pass 2")).toHaveAttribute("aria-invalid", "true");
+  await expect(page.getByText("Use 1–30").first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+  // Cutting stays available once that blank is filled: the backend resolves the material from
+  // the presets file, and refuses by name when it cannot.
+  await expectStartOffered(page);
 
   // The name and its settings arrive together, under the aim that asked for them.
   await callFake(page, "__test_release_presets");
@@ -1969,7 +1381,9 @@ test("a pass whose preset list has not arrived is named as unread, not as having
   // machine-scoped, so from here nothing can resolve the name — not "reading", which is why the
   // marker does not say so. What must not come back is `(unknown preset)`: the material is not gone,
   // and the file the backend would resolve it from is untouched by a disconnect.
+  await goToSendStep(page, 1);
   await page.getByLabel("Disconnect usb:mock").click();
+  await goToSendStep(page, 2);
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("unknown preset");
   await expect(page.getByLabel("Preset for pass 1")).toHaveValue("preset:card-stock");
@@ -1986,8 +1400,11 @@ test("a written preset's previous name and settings leave the pass row when the 
     seedUserPreset: true,
   });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   await page.getByLabel("Material preset").selectOption("preset:card-stock");
 
   await openDialogOnCameo(page);
@@ -2013,7 +1430,7 @@ test("a written preset's previous name and settings leave the pass row when the 
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
   // Cutting stays available throughout: the backend resolves the material from the presets file,
   // and refuses by name when it cannot, so nothing here is a gate.
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   // And the editor above the rows does not go with them. It is withheld only until *some* list for
   // this aim has arrived, because what is stored is what a new entry's id and name must avoid —
   // withholding it here would take it off screen on every save.
@@ -2032,7 +1449,7 @@ test("a written preset's previous name and settings leave the pass row when the 
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Heavy Card");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // The delete half of the same window, which is its own branch of the dialog and can regress on its
@@ -2046,8 +1463,11 @@ test("a deleted preset's name and settings leave the pass row when the delete la
     seedUserPreset: true,
   });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   await page.getByLabel("Material preset").selectOption("preset:card-stock");
 
   await openDialogOnCameo(page);
@@ -2065,7 +1485,7 @@ test("a deleted preset's name and settings leave the pass row when the delete la
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Card Stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
   // The editor stays, for the same reason it stays across a save: it is what the held entries are
   // kept for.
   await expect(page.getByLabel("Preset to manage")).toBeVisible();
@@ -2094,7 +1514,7 @@ test("a deleted preset's name and settings leave the pass row when the delete la
   await expect(row).toContainText("card-stock (name unread)");
   await expect(row).not.toContainText("Card Stock");
   await expect(page.getByLabel("Repeat count for pass 1")).toHaveValue("");
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("the whole editor is operable from the keyboard alone", async ({ page }) => {
@@ -2127,7 +1547,8 @@ test("the whole editor is operable from the keyboard alone", async ({ page }) =>
 test("a grouping whose plan fails does not stay on the picker", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Group passes by")).toHaveValue("Color");
 
@@ -2148,7 +1569,8 @@ test("a grouping whose plan fails does not stay on the picker", async ({ page })
 test("row controls are unavailable while a replacement plan is in flight", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByLabel("Speed for pass 1")).toBeEnabled();
 
@@ -2162,7 +1584,7 @@ test("row controls are unavailable while a replacement plan is in flight", async
   await expect(page.getByLabel("Repeat count for pass 1")).toBeDisabled();
   await expect(page.getByLabel("Preset for pass 1")).toBeDisabled();
   await expect(page.getByRole("checkbox", { name: "Enabled" }).first()).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Down" }).first()).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeDisabled();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => void }).__releasePlans());
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
@@ -2177,22 +1599,28 @@ test("row controls are unavailable while a replacement plan is in flight", async
 test("marking a shape No Cut drops its pass, and the dialog says why", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(2);
 
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   const cuttable = page.getByRole("checkbox", { name: "Cut this shape" });
   await expect(cuttable).toBeChecked();
   await cuttable.uncheck();
 
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(1);
   await expect(page.getByText("Not cut: 1 shape marked No Cut")).toBeVisible();
 
   // Discriminating step: a command that ignored `value` and only ever wrote NoCut would pass
   // everything above. Marking it back has to restore the pass and empty the readout.
   await page.getByRole("button", { name: "Close" }).click();
+  await showTab(page, "Properties");
   await cuttable.check();
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
 
@@ -2202,11 +1630,14 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
   // selection and shapes silently stop cutting — with every other assertion here still green.
   await page.getByRole("button", { name: "Close" }).click();
   await cuttable.uncheck();
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
   await expect(cuttable).toBeChecked({ indeterminate: true });
 
   await cuttable.click();
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
   await expect(page.getByText("Not cut: 0 shapes marked No Cut")).toBeVisible();
 });
@@ -2218,12 +1649,14 @@ test("marking a shape No Cut drops its pass, and the dialog says why", async ({ 
 test("a doc edited after planning refuses the cut until replan", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  // Reaches past the UI on purpose: the canvas drag that issues this command is behind
-  // the open dialog, and the backend contract under test is the same either way.
+  // Reaches past the UI on purpose: the canvas drag that would edit the document (through
+  // commit_transforms) is behind the open dialog, and the backend contract under test, geometry
+  // that changes with no node added or removed, is the same either way.
   await page.evaluate(() =>
     (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
       "commit_transform",
@@ -2231,26 +1664,42 @@ test("a doc edited after planning refuses the cut until replan", async ({ page }
     ),
   );
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByText("Your design changed.")).toBeVisible();
+
+  // Stale blocks the next Start. It does not freeze the order: the grip stays usable and the
+  // move still lands, which is what a later Replan has to carry.
+  await goToSendStep(page, 2);
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeEnabled();
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  await reorderPass(page, 0, 1);
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(page.getByRole("button", { name: "Reorder pass 1" })).toBeEnabled();
 
   await page.getByRole("button", { name: "Replan" }).click();
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // A replan starts the rows again, so the blanks a no-preset pass refuses have to be filled once more.
+  await goToSendStep(page, 2);
+  await fillSendLevels(page);
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 });
 
 test("reordering passes asks the backend for travel in the new order", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Seeded first-seen order is red (0xff0000ff) then green (0x00ff00ff).
   const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
   await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
 
-  await page.getByRole("button", { name: "Down" }).first().click();
+  await reorderPass(page, 0, 1);
   await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+  await expect(page.getByRole("button", { name: "Up", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Down", exact: true })).toHaveCount(0);
 
   // The wire is the contract under test: the replan request names the swapped order.
   const requests = await page.evaluate(
@@ -2262,12 +1711,247 @@ test("reordering passes asks the backend for travel in the new order", async ({ 
   ]]);
 });
 
+test("dragging a pass asks the backend for travel in the new order", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
+
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  await page.getByRole("button", { name: "Reorder pass 2" }).dragTo(page.getByTestId("cut-pass-row").first());
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(0, 255, 0)");
+
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: { key: string; enabled: boolean }[][] }).__travelRequests,
+  );
+  expect(requests).toEqual([[
+    { key: "color:00ff00ff", enabled: true },
+    { key: "color:ff0000ff", enabled: true },
+  ]]);
+});
+
+test("a drop that is not a pass index leaves the order alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const chip = (i: number) => page.getByTestId("cut-pass-row").nth(i).locator("span").first();
+  await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  const row = page.getByTestId("cut-pass-row").nth(1);
+
+  for (const payload of ["foo", "1.", "", " "]) {
+    await row.evaluate((target, text) => {
+      const data = new DataTransfer();
+      data.setData("text/plain", text);
+      target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: data }));
+      target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: data }));
+    }, payload);
+    await expect(row).toHaveAttribute("data-drop-payload", payload);
+    await expect(chip(0)).toHaveCSS("background-color", "rgb(255, 0, 0)");
+  }
+
+  const requests = await page.evaluate(
+    () => (window as unknown as { __travelRequests?: unknown[] }).__travelRequests,
+  );
+  expect(requests ?? []).toEqual([]);
+});
+
+test("the mini mat names the pass under the pointer and dims the others", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const shapes = page.getByRole("img", { name: "Shapes in this pass" }).locator("rect[opacity]");
+  await expect(shapes).toHaveCount(2);
+  await expect(shapes.nth(0)).toHaveAttribute("opacity", "0.9");
+  await expect(shapes.nth(1)).toHaveAttribute("opacity", "0.18");
+  await page.getByTestId("cut-pass-row").nth(1).hover();
+  await expect(shapes.nth(0)).toHaveAttribute("opacity", "0.18");
+  await expect(shapes.nth(1)).toHaveAttribute("opacity", "0.9");
+});
+
+test("a machine the document was not set up for blocks the passes until it is converted", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  // The cutter is aimed either way. Dismissing the switch leaves the document on the Cameo, and
+  // the dismissal is the fake dialog plugin's answer: the plugin raises no native dialog.
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "cancel"));
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await goToSendStep(page, 2);
+  await fillSendLevels(page);
+  const next = page.getByRole("button", { name: "Next", exact: true });
+  await expect(page.getByText("Document is set up for a different machine than the connected device.")).toBeVisible();
+  await expect(next).toBeDisabled();
+  await page.getByRole("button", { name: "Convert to puma" }).click();
+  await expect(page.getByText("Document is set up for a different machine than the connected device.")).toHaveCount(0);
+  // Converting replans, and the new row's speed and force start blank.
+  await fillSendLevels(page);
+  await expect(next).toBeEnabled();
+});
+
+/**
+ * The device list's own offer to retarget the document, over a document that has shapes and a
+ * machine already. The answer is the prompt's, late and scripted here, because the real one is the
+ * dialog plugin's — this guard used to read `window.confirm`, which the plugin replaces with an
+ * async function, so Cancel switched the design anyway.
+ */
+for (const answer of ["cancel", "ok"] as const) {
+  test(`picking the other machine ${answer === "ok" ? "switches" : "does not switch"} the design's machine`, async ({ page }) => {
+    await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+    await page.goto("/");
+    await page.evaluate((a) => {
+      sessionStorage.setItem("__dialog_answer__", a);
+      sessionStorage.setItem("__dialog_hold__", "1");
+    }, answer);
+
+    await page.getByRole("tab", { name: "Devices" }).click();
+    await page
+      .getByRole("listitem")
+      .filter({ hasText: "GCC Puma IV" })
+      .getByRole("button", { name: "Set as active", exact: true })
+      .click();
+
+    // The question is raised after the connect, and the fake holds its answer until released
+    // below, so what is read next is the document as it stood while the operator was being asked.
+    await expect
+      .poll(async () =>
+        JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[],
+      )
+      .toEqual([
+        "This design is set up for Silhouette Cameo 5 Alpha. Switch it to GCC Puma IV? The page size changes with the machine.",
+      ]);
+
+    const designMachine = async () =>
+      (JSON.parse((await callFake(page, "snapshot")) as string) as { machine: { id: string } }).machine.id;
+    expect(await designMachine()).toBe("cameo5");
+
+    // Delivery is recorded in the same turn it resolves, so reading it afterwards is ordered
+    // after the page's continuation — for Cancel there is no later change to poll for, and this
+    // is what makes "still cameo5" a fact about the answer rather than about the timing.
+    await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem("__dialog_answered__"))).toBe("1");
+    await expect.poll(designMachine).toBe(answer === "ok" ? "puma" : "cameo5");
+
+    // The same fact as the operator meets it: the send dialog's passes refuse a machine the
+    // design was not set up for, with the dialog's own controls up before the absence is read.
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Next", exact: true })).toBeVisible();
+    const blocked = page.getByText("Document is set up for a different machine than the connected device.");
+    if (answer === "cancel") {
+      await expect(blocked).toBeVisible();
+    } else {
+      await expect(blocked).toHaveCount(0);
+    }
+  });
+}
+
+test("an inch weed margin is a view of the millimetre draft", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("0.12");
+  const plans = () => page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0);
+  const before = await plans();
+  // Keystrokes, not a filled value: a number input reports both `1` and `.` as "1".
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.");
+  await expect(margin).toHaveValue("1.");
+  await margin.blur();
+  await expect(margin).toHaveValue("1.");
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+  expect(await plans()).toBe(before);
+
+  await margin.fill("2");
+  await expect(margin).toHaveValue("2");
+  await margin.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be 0.02–1.96 in" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+  await margin.fill("1");
+  await margin.blur();
+  await expect(margin).toHaveValue("1.00");
+  await fillSendLevels(page);
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };
+  expect(request.weed.margin_mm).toBe(25.4);
+});
+
+test("escape commits a finished inch and drops a half-typed one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("0.12");
+
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.");
+  await expect(margin).toHaveValue("1.");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByLabel("Weed margin")).toHaveValue("0.12");
+
+  await page.getByLabel("Weed margin").fill("1");
+  await expect(page.getByLabel("Weed margin")).toHaveValue("1");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toHaveCount(0);
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  await expect(page.getByLabel("Weed margin")).toHaveValue("1.00");
+  await fillSendLevels(page);
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeEnabled();
+});
+
+test("a margin at the millimetre maximum is shown as an inch that margin still allows", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  await openWeeding(page);
+  await page.getByLabel("Weed border").check();
+  await page.getByLabel("Weed margin").fill("50");
+  await page.getByRole("button", { name: "Close" }).click();
+
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
+  const margin = page.getByLabel("Weed margin");
+  await expect(margin).toHaveValue("1.96");
+  await margin.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.type("1.96");
+  await margin.blur();
+  await expect(page.getByRole("alert").filter({ hasText: "Margin must be" })).toHaveCount(0);
+  await fillSendLevels(page);
+  await startCut(page);
+  const request = await callFake(page, "__test_last_cut_request") as { weed: { margin_mm: number } };
+  expect(request.weed.margin_mm).toBe(50);
+});
+
 // The head does not travel to a pass that will not be cut, so switching one off is a travel
 // edit too — a preview that kept routing through it would draw motion the machine won't make.
 test("disabling a pass replans travel without it", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.getByTestId("cut-pass-row").first().getByRole("checkbox").uncheck();
@@ -2286,7 +1970,8 @@ test("disabling a pass replans travel without it", async ({ page }) => {
 test("reordering after a doc edit surfaces the stale plan instead of stale travel", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   // Same off-screen edit as the stale-cut test above: the dialog covers the canvas.
@@ -2297,8 +1982,8 @@ test("reordering after a doc edit surfaces the stale plan instead of stale trave
     ),
   );
 
-  await page.getByRole("button", { name: "Down" }).first().click();
-  await expect(page.getByText("Document changed since this plan was made.")).toBeVisible();
+  await reorderPass(page, 0, 1);
+  await expect(page.getByText("Your design changed.")).toBeVisible();
 });
 
 // The order these two settle in is the whole defect: a reorder issued before Replan carries
@@ -2308,8 +1993,9 @@ test("reordering after a doc edit surfaces the stale plan instead of stale trave
 test("a reorder refused for the old revision does not re-mark a freshly replanned document", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() =>
@@ -2318,16 +2004,17 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
       { ids: [2], m: [1, 0, 0, 1, 5, 0] },
     ),
   );
-  const banner = page.getByText("Document changed since this plan was made.");
-  await page.getByRole("button", { name: "Start Cut" }).click();
+  const banner = page.getByText("Your design changed.");
+  await startCut(page);
   await expect(banner).toBeVisible();
+  await goToSendStep(page, 2);
 
   // The interleaving, without editing a row during a replan — which the dialog now refuses,
   // because rows belonging to a plan being replaced must not accept edits the arriving plan
   // discards. The reorder goes out *first* and is held, which is what the defect's own story
   // says anyway: "a reorder issued before Replan carries the old revision".
   await page.evaluate(() => (window as unknown as { __armHold: () => void }).__armHold());
-  await page.getByRole("button", { name: "Down" }).first().click();
+  await reorderPass(page, 0, 1);
   await page.getByRole("button", { name: "Replan" }).click();
 
   await page.evaluate(() => (window as unknown as { __releasePlans: () => Promise<unknown> }).__releasePlans());
@@ -2338,30 +2025,69 @@ test("a reorder refused for the old revision does not re-mark a freshly replanne
   await expect(banner).toHaveCount(0);
 });
 
+// The sheet's own material control, not the per-row picker and not the properties panel
+// (those share the accessible name). One choice is every pass, and a typed speed would
+// otherwise hide the preset's own.
+test("a material preset applies to every pass and clears a typed level", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedUserPreset: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await fillSendLevels(page);
+  await expect(dialog.getByLabel("Speed for pass 1")).toHaveValue("10");
+
+  await dialog.getByLabel("Material preset").selectOption("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 1")).toHaveValue("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 2")).toHaveValue("preset:cameo5-htv");
+  // The typed 10 is gone; the field shows the preset's own speed.
+  await expect(dialog.getByLabel("Speed for pass 1")).toHaveValue("5");
+  await expect(dialog.getByLabel("Force for pass 1")).toHaveValue("20");
+
+  await dialog.getByLabel("Preset for pass 2").selectOption("no-preset");
+  await expect(dialog.getByLabel("Material preset")).toHaveValue("mixed");
+  await dialog.getByLabel("Material preset").evaluate((el) => {
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(dialog.getByLabel("Preset for pass 1")).toHaveValue("preset:cameo5-htv");
+  await expect(dialog.getByLabel("Preset for pass 2")).toHaveValue("no-preset");
+
+  await dialog.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showPresetEditor(page);
+  await page.getByLabel("Preset to manage").selectOption("card-stock");
+  await page.getByLabel("Delete preset").click();
+  // The id is no longer in the list. The select keeps it, rather than falling through to No preset.
+  await expect(dialog.getByLabel("Material preset")).toHaveValue("preset:card-stock");
+});
+
 // The one test that drives the Cut Host surface end to end. It is here rather than in a unit
 // test because the parts it checks are exactly the ones a unit test cannot: that the grouped
 // list reaches the dialog at all, and that a refusal from the backend leaves the row on screen.
 test("an unreachable host keeps its cutters listed, and refusing to be forgotten keeps its row", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // Listed with the reason, not hidden — a cutter that vanishes looks exactly like one that was
-  // never paired (#42).
-  await expect(page.getByText("Workshop Pi")).toBeVisible();
+  // never paired (#42). The name is also the card's connection line, so the first match is enough.
+  await expect(page.getByText("Workshop Pi").first()).toBeVisible();
   await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  // Listed, and not choosable: the card is the connect action, and it stays off until the host answers.
+  const hostCutters = page.getByRole("radiogroup", { name: "Workshop Pi" });
+  await expect(hostCutters.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true })).toBeDisabled();
   // Its cutter is still a row: two local cutters plus this one. None has been polled, so every
   // badge says so rather than offering a cut for a status nobody has asked for.
   await expect(page.getByText("Unknown")).toHaveCount(3);
   // Nothing has been refused yet, so the warning is nowhere — including over the two local
   // cutters, whose section has no host id at all for a refusal to match (#265).
-  const forceWarning = page.getByText(/A cut may still be running on this Cut Host/);
+  const forceWarning = page.getByText(/Forgetting this Cut Host discards the credentials/);
   await expect(forceWarning).toHaveCount(0);
 
   await page.getByRole("button", { name: "Forget Workshop Pi" }).click();
   // The Rust side's own words, and the row still there (#94).
   await expect(page.getByText("this Cut Host could not be asked whether it is cutting")).toBeVisible();
-  await expect(page.getByText("Workshop Pi")).toBeVisible();
+  await expect(page.getByText("Workshop Pi").first()).toBeVisible();
 
   // Only now is the force on screen, and it says what is being accepted rather than asking
   // whether the operator is sure. Once, against the host that refused: the local section is still
@@ -2373,18 +2099,69 @@ test("an unreachable host keeps its cutters listed, and refusing to be forgotten
   expect(await page.getByText("Workshop Pi").count()).toBe(0);
 });
 
+// The sentence is the Rust side's, shown in the slot a connection error already uses. Both
+// directions: the host is the side to update, and this desktop is. The cutters stay listed and
+// not choosable, the same as any other host that cannot be asked.
+test("a protocol mismatch says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  // Not `{ exact: true }`: the sentence and the "How to update" link share this
+  // element, so the element's text is longer than the sentence.
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByRole("radio")).toBeDisabled();
+  // The chip and the sentence name the same fact. A timed-out host stays "Unknown".
+  await expect(page.getByRole("radiogroup", { name: "Workshop Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  await expect(page.getByRole("radiogroup", { name: "Office Pi", exact: true }).getByTestId("device-badge")).toHaveText("Update needed");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
+});
+
+// The list poll also calls `list_hosts` once a second, so a Retry test that merely waits for
+// the counter to move stays green when the button does nothing. Time is frozen here, and the
+// click is the only thing that can ask again.
+test("Retry on an unreachable host asks for the list again", async ({ page }) => {
+  // `install()` alone leaves the fake clock running, and the sheet polls `list_hosts` every
+  // second while a host is paired. `expect.poll` waits five seconds, so that tick alone reaches
+  // `listed + 1` and a Retry that does nothing still passes. `pauseAt` is what stops the tick.
+  // The pause is after the row is on screen: pausing through load stalls the timers the page
+  // needs to finish opening. Jumping to the pause fires a timer that was already due at most
+  // once, so the count is read after that jump, not before it.
+  await page.clock.install();
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Retry Workshop Pi" })).toBeVisible();
+  const pageNow = await page.evaluate(() => Date.now());
+  await page.clock.pauseAt(pageNow + 1000);
+  const listed = await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0);
+  await page.getByRole("button", { name: "Retry Workshop Pi" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBe(listed + 1);
+  // Wall time, with the page clock still paused. A tick that was only quiet for the click
+  // would land inside this wait and the count would move.
+  await page.waitForTimeout(1500);
+  expect(await page.evaluate(() => (window as unknown as { __hostListCalls?: number }).__hostListCalls ?? 0)).toBe(listed + 1);
+});
+
 // The absence is its own test because every path to the warning goes through a host, and a desktop
 // with none paired has no Forget to press: the defect it covers (#265) needed no interaction at all,
 // so a test that starts by pairing something can never see it.
 test("a desktop with no Cut Host paired shows no force-forget warning", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // The local cutters are listed — the dialog is populated, so the warning's absence is about the
   // guard rather than about an empty device section.
   await expect(page.getByTestId("device-badge")).toHaveCount(2);
-  await expect(page.getByText(/A cut may still be running on this Cut Host/)).toHaveCount(0);
+  await expect(page.getByText(/Forgetting this Cut Host discards the credentials/)).toHaveCount(0);
   await expect(page.getByRole("button", { name: /anyway$/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /^Keep / })).toHaveCount(0);
 });
@@ -2395,8 +2172,14 @@ test("a desktop with no Cut Host paired shows no force-forget warning", async ({
 test("pairing a Cut Host shows its fingerprint first, then lists it with its cutters", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: /Add a Cut Host/ }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const addHost = page.getByRole("button", { name: /Add a Cut Host/ });
+  await addHost.click();
+  const pair = page.getByRole("dialog", { name: "Pair a Cut Host" });
+  await pair.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(pair).toHaveCount(0);
+  await expect(addHost).toBeFocused();
+  await addHost.click();
 
   await page.getByLabel("Address").fill("pi.local:7878");
   await page.getByLabel("Token").fill("correct-horse");
@@ -2409,7 +2192,7 @@ test("pairing a Cut Host shows its fingerprint first, then lists it with its cut
   // The host is in the device list with the cutter the Test proved, and it can be forgotten —
   // the whole affordance, from an empty list to a usable remote cutter.
   await expect(page.getByRole("button", { name: "Forget Workshop Pi" })).toBeVisible();
-  await expect(page.getByText("pi.local:7878")).toBeVisible();
+  await expect(page.getByText("pi.local:7878").first()).toBeVisible();
 });
 
 // A wrong token must not leave a host saved. `pair_host` is what persists, and it is never
@@ -2417,7 +2200,7 @@ test("pairing a Cut Host shows its fingerprint first, then lists it with its cut
 test("a refused token pairs nothing and says so in the host's own words", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: /Add a Cut Host/ }).click();
 
   await page.getByLabel("Address").fill("pi.local:7878");
@@ -2437,7 +2220,7 @@ test("a refused token pairs nothing and says so in the host's own words", async 
 test("forgetting a host takes its cutters with it, instead of renaming the row to a raw id", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.getByRole("button", { name: /Add a Cut Host/ }).click();
   await page.getByLabel("Address").fill("pi.local:7878");
   await page.getByLabel("Token").fill("correct-horse");
@@ -2463,12 +2246,15 @@ test("forgetting a host takes its cutters with it, instead of renaming the row t
 test("a stuck cutter on a Cut Host offers Reconnect, and reconnecting makes it cuttable again", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteConnected: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // The cancel nobody could confirm: the badge asks for a person, and Start Cut is withheld.
-  await expect(page.getByText("Bench Pi")).toBeVisible();
+  // Scoped to the dialog: the pill and the status bar name the same host.
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog.getByText("Bench Pi").first()).toBeVisible();
   await expect(page.getByText(/Cancelled — stop not confirmed/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
 
   // Reconnect, not Disconnect: this desktop never opened that transport, and dropping the aim
   // would leave the cutter exactly as stuck.
@@ -2476,7 +2262,7 @@ test("a stuck cutter on a Cut Host offers Reconnect, and reconnecting makes it c
   await page.getByRole("button", { name: "Reconnect usb:pi:C" }).click();
 
   await expect(page.getByText("Ready", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 // The teardown is the deliverable, not the interval. A leaked interval keeps a Cut Host
@@ -2491,18 +2277,27 @@ const pollCount = (page: import("@playwright/test").Page) => () =>
       ) as Promise<number>,
   );
 
+const listCount = (page: import("@playwright/test").Page) => () =>
+  page.evaluate(
+    () =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "__test_list_count",
+      ) as Promise<number>,
+  );
+
 test("the dialog polls while it is open, and stops once it is closed", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   const opened = await polls();
   await expect.poll(polls, { timeout: 5000 }).toBeGreaterThan(opened);
 
   await page.getByRole("button", { name: "Close" }).click();
   // A tick already in flight when the dialog closed still lands, so settle past one full period
-  // before taking the reading that must not move.
+  // before taking the reading that must not move. Idle is ten seconds, and closing does not
+  // start a tick of its own, so this window stays still.
   await page.waitForTimeout(1500);
   const closed = await polls();
   await page.waitForTimeout(2500);
@@ -2515,7 +2310,7 @@ test("the dialog polls while it is open, and stops once it is closed", async ({ 
 test("a device list that cannot be read keeps its heading, so the failure has something to name", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failList: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   await expect(page.getByText("This computer")).toBeVisible();
   await expect(page.getByText("last known")).toBeVisible();
@@ -2529,7 +2324,7 @@ test("a device list that cannot be read keeps its heading, so the failure has so
 test("a desktop with no Cut Host paired does not poll at all", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
   await page.waitForTimeout(2500);
   expect(await pollCount(page)()).toBe(0);
 });
@@ -2539,169 +2334,393 @@ test("a desktop with no Cut Host paired does not poll at all", async ({ page }) 
 test("a tick whose last request is still in flight is skipped, not queued", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedBusyHost: true, slowList: true });
   await page.goto("/");
-  const polls = pollCount(page);
+  const polls = listCount(page);
 
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const opened = await polls();
   await page.waitForTimeout(4500);
   // Four ticks have fired; at three seconds an answer, at most two of them can have started
   // requests. Without the skip the count tracks the tick rate instead, and every extra request
-  // is one more thing the host owes an answer to.
-  const seen = await polls();
+  // is one more thing the host owes an answer to. The mount read is already in `opened`.
+  const seen = (await polls()) - opened;
   expect(seen).toBeGreaterThanOrEqual(1);
   expect(seen).toBeLessThanOrEqual(2);
+});
+
+function devicesShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.DEVICES_SHOTS === "1";
+}
+
+/** Retry and Forget stay on the title row. The line under them uses the card. */
+async function hostCopySpansTheCard(page: Page, heading: string, copy: Locator) {
+  const card = page.locator("section").filter({ has: page.getByRole("heading", { name: heading, exact: true }) });
+  const cardBox = await card.boundingBox();
+  const copyBox = await copy.boundingBox();
+  const button = card.getByRole("button", { name: /^Forget / });
+  const buttonBox = await button.boundingBox();
+  expect(cardBox).not.toBeNull();
+  expect(copyBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  expect(copyBox!.width).toBeGreaterThan(cardBox!.width * 0.75);
+  expect(copyBox!.y).toBeGreaterThanOrEqual(buttonBox!.y + buttonBox!.height - 1);
+  expect(buttonBox!.x + buttonBox!.width).toBeGreaterThan(cardBox!.x + cardBox!.width - 28);
+  const titleBox = await card.getByRole("heading", { name: heading, exact: true }).boundingBox();
+  expect(titleBox).not.toBeNull();
+  const sharesRow = buttonBox!.y < titleBox!.y + titleBox!.height && titleBox!.y < buttonBox!.y + buttonBox!.height;
+  // A title beside the buttons stays one line. One that cannot fit takes the row.
+  if (sharesRow) expect(titleBox!.height).toBeLessThan(28);
+  else expect(titleBox!.width).toBeGreaterThan(cardBox!.width * 0.7);
+}
+
+test("two cutters on one host keep their own status, and cancel names that cutter", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const cameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  const puma = page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" });
+  await expect(cameo.getByText("Cutting", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toHaveCount(0);
+  await expect(cameo.getByText("40% of this pass")).toBeVisible();
+  await expect(page.getByText("Add to queue")).toHaveCount(0);
+  await expect(page.getByText("Up next")).toHaveCount(0);
+
+  await cameo.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_cancel_targets"),
+  )).toEqual([{ host: "host-4", instanceId: "usb:garage:cameo" }]);
+  await expect(cameo.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(cameo.getByText("Last cut cancelled")).toBeVisible();
+  await expect(puma.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(puma.getByText("Last cut cancelled")).toHaveCount(0);
+  await expect(puma.getByRole("button", { name: /Reconnect/ })).toHaveCount(0);
+  await expect(page.getByRole("listitem").filter({ hasText: "USB on this computer" }).getByText("Not checked").first()).toBeVisible();
+  await expect(page.getByTestId("devices-panel").getByText("Unknown", { exact: true })).toHaveCount(0);
+  for (const list of await page.getByTestId("devices-panel").getByRole("list").all()) {
+    expect(await list.evaluate((el) => getComputedStyle(el).listStyleType)).toBe("none");
+  }
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-two-cutters-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+});
+
+test("an offline host keeps the cut frozen, then shows the reading from after it reconnects", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedTwoCutters: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: "the host could not be reached (timed out)" });
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toBeVisible();
+  // After the card is up, the next reading is the one that will not stamp over this.
+  await callFakeWith(page, "__test_set_last_seen", { id: "host-4", at: Date.now() - 2 * 60 * 60 * 1000 });
+  await expect(page.getByText("Last seen 2 hours ago · garage.local:7878")).toBeVisible();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeVisible();
+  await page.getByTestId("devices-panel").locator("details").getByText("Details").click();
+  await expect(page.getByText("the host could not be reached (timed out)")).toBeHidden();
+  await expect(page.getByText(/Connection lost · last update/)).toHaveCount(0);
+  await expect(page.getByText("Reconnecting. The cut keeps going on the host.")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(page.getByText("40% of this pass")).toBeVisible();
+  // This desktop is not tracking the seeded cut, so Cancel is not a queue.
+  const offlineCameo = page.getByRole("listitem").filter({ hasText: "Silhouette Cameo 5 Alpha" }).filter({ hasText: "Garage Pi" });
+  await expect(page.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toHaveCount(0);
+  await expect(offlineCameo.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled();
+  await expect(page.getByRole("listitem").filter({ hasText: "GCC Puma IV" }).filter({ hasText: "Garage Pi" }).getByText("Unavailable")).toBeVisible();
+
+  const body = page.getByRole("heading", { name: "Can't reach Garage Pi" });
+  const muted = page.getByTestId("devices-muted");
+  const warning = page.getByTestId("devices-warning");
+  const lightBody = await paintContrast(page, body);
+  const lightMuted = await paintContrast(page, muted);
+  const lightWarning = await paintContrast(page, warning);
+  expect(lightBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(lightWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-light.png" });
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const darkBody = await paintContrast(page, body);
+  const darkMuted = await paintContrast(page, muted);
+  const darkWarning = await paintContrast(page, warning);
+  expect(darkBody.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkMuted.ratio).toBeGreaterThanOrEqual(4.5);
+  expect(darkWarning.ratio).toBeGreaterThanOrEqual(4.5);
+  await hostCopySpansTheCard(page, "Can't reach Garage Pi", warning);
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-offline-dark.png" });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+
+  await callFakeWith(page, "__test_set_remote_sent", { host: "host-4", instanceId: "usb:garage:cameo", sent: 90 });
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-4", unreachable: null });
+  await expect(page.getByText("90% of this pass")).toBeVisible();
+  await expect(page.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "Can't reach Garage Pi" })).toHaveCount(0);
+});
+
+test("a protocol mismatch on the devices host card says which side to update", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedProtocolMismatch: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Devices" }).click();
+
+  const hostOlder = "This Cut Host is running an older version. Update your Cut Host to connect.";
+  const desktopOlder = "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect.";
+  await expect(page.getByRole("heading", { name: "Workshop Pi needs an update" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Update Cuthulhu to use Office Pi" })).toBeVisible();
+  await expect(page.getByText("Can't reach", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("No successful reading yet")).toHaveCount(0);
+  await expect(page.getByText(hostOlder)).toBeVisible();
+  await expect(page.getByText(desktopOlder)).toBeVisible();
+  await expect(page.getByText("Update needed")).toHaveCount(2);
+  const workshop = page.getByRole("listitem").filter({ hasText: "Workshop Pi" });
+  const office = page.getByRole("listitem").filter({ hasText: "Office Pi" });
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(workshop.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Workshop Pi needs an update");
+  await expect(office.getByRole("button", { name: "Set as active" })).toBeDisabled();
+  await expect(office.getByRole("button", { name: "Set as active" })).toHaveAccessibleDescription("Update Cuthulhu to use Office Pi");
+  const how = page.getByRole("link", { name: "How to update" });
+  await expect(how).toHaveCount(2);
+  await expect(how.nth(0)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/blob/main/docs/cut-host.md#update");
+  await expect(how.nth(1)).toHaveAttribute("href", "https://github.com/vcolombo/cuthulhu/releases");
+  await page.getByRole("button", { name: "Add cutter" }).focus();
+  await expect(page.getByRole("button", { name: "Add cutter" })).toBeFocused();
+  await expect.poll(() => page.getByRole("button", { name: "Add cutter" }).evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+  const active = page.getByRole("button", { name: "Set as active" }).first();
+  await active.focus();
+  await expect(active).toBeFocused();
+  await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+  await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+  if (devicesShots()) await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-light.png" });
+  if (devicesShots()) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await hostCopySpansTheCard(page, "Workshop Pi needs an update", page.getByText(hostOlder));
+    await hostCopySpansTheCard(page, "Update Cuthulhu to use Office Pi", page.getByText(desktopOlder));
+    await page.screenshot({ path: "/opt/cursor/artifacts/devices-mismatch-dark.png" });
+  }
 });
 
 test("cancel mid-cut shows Cancelled and re-enables Start Cut", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await expect(page.getByText("Cancelled", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await page.getByRole("button", { name: "Cancel job", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
+  await expectStartOffered(page);
 });
 
 test("a cut that runs to the end reports completion, not a cancellation", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
 
   // The backend says which ending it was, so the two endings cannot be confused: this
   // is the case the mock could not express while a finished cut only rested on `Idle`.
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await expectStartOffered(page);
 });
 
 test("transmitting shows a Cancel button and progress so the GUI can cancel mid-cut", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText(/sending \d+ \/ \d+ bytes/)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Cancel" })).toBeVisible();
+  // Sending lasts 50ms unless held, and the badge is on step 1. Without the hold the
+  // pass has already parked for a colour swap, whose badge asks for a person.
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // The tone reaches the row, so the cutting one is not the same flat grey as the cutter nobody
   // has polled. `deviceBadge`'s unit tests assert on `tone` alone; this is what makes them
   // describe the product instead of a field it threw away. The unpolled row is `unknown`, not
   // `attention` — nothing is wrong with it, and red is how this UI says something is.
   await expect(page.getByTestId("device-badge").first()).toHaveAttribute("data-tone", "busy");
+  await expect(page.getByTestId("device-badge").first()).toHaveText("Cutting");
   await expect(page.getByTestId("device-badge").nth(1)).toHaveAttribute("data-tone", "unknown");
+});
+
+test("a second cut replaces a finished job before its Sending event", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+  await page.getByRole("button", { name: "Resume" }).click();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Completed", { exact: true })).toBeVisible();
+
+  await page.evaluate(() => (window as unknown as { __holdCutEvents: () => void }).__holdCutEvents());
+  await startCut(page);
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
+  // The host poll is 1s, and the first read is still the previous ending.
+  await page.waitForTimeout(1500);
+  await expect(job.getByRole("button", { name: "Cancel", exact: true })).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
+
+  await page.evaluate(() => (window as unknown as { __releaseCutEvents: () => void }).__releaseCutEvents());
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
 });
 
 test("second cut in the same dialog session also reaches waiting-for-swap", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText(/complete/i)).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
-  // Second cut in the same session: the dialog must take the new job's statuses as
-  // they arrive, with no per-job bookkeeping left over from the finished first cut.
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  // Second cut in the same session: the sheet opens on step 1 again, and the new job's
+  // statuses replace the finished one. Nothing is remembered per job id.
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Resume" })).toBeVisible();
 });
 
 test("reopening the dialog after connect recovers the connected device", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByText("connected")).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  const cut = page.getByRole("dialog", { name: "Send to cutter" });
+  const cameo = cut.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first();
+  await expect(cameo).toHaveAttribute("aria-checked", "true");
+  await expect(cut.getByTestId("device-badge").first()).toHaveText("Ready");
 
   await page.getByRole("button", { name: "Close" }).click();
-  await page.getByRole("button", { name: "Cut" }).click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
 
   // Without get_connected_device seeding this on mount, the reopened dialog's local
   // `connected` state comes back null even though the backend is still connected,
-  // leaving Start Cut stuck disabled and the device row stuck on "Connect".
-  await expect(page.getByText("connected")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // leaving Start Cut stuck disabled and the card unchecked.
+  const reopened = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(reopened.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first()).toHaveAttribute("aria-checked", "true");
+  await expect(reopened.getByTestId("device-badge").first()).toHaveText("Ready");
+  await expectStartOffered(page);
 });
 
 // The exit from a cancel whose stop nothing confirmed. `driver-core` refuses both a cut and a
 // connect from that state, so with no Disconnect in the dialog the operator's only way back to
 // their own cutter is restarting the app — the workaround being "never cancel". This drives the
 // control rather than the command behind it, because the control is what was missing.
-test("a connected cutter offers a disconnect, and the row goes back to offering Connect", async ({ page }) => {
+test("a connected cutter offers a disconnect, and choosing it clears the aim", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByText("connected")).toBeVisible();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  const cut = page.getByRole("dialog", { name: "Send to cutter" });
+  const cameo = cut.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first();
+  await expect(cameo).toHaveAttribute("aria-checked", "true");
+  await expect(cut.getByTestId("device-badge").first()).toHaveText("Ready");
 
   await page.getByRole("button", { name: "Disconnect", exact: false }).first().click();
-  await expect(page.getByText("connected")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Connect", exact: true }).first()).toBeVisible();
+  await expect(cameo).toHaveAttribute("aria-checked", "false");
+  await expect(cut.getByRole("button", { name: /^Disconnect/ })).toHaveCount(0);
 });
 
-// Inverted deliberately. While the dialog latched its own outcome, "did the last cut
-// finish?" was answered by how long the dialog had been mounted, so a reopened dialog
-// had to show nothing — and this test asserted that. The outcome now comes from the
-// device, so a reopened dialog reports what the device actually last did, for the same
-// reason a freshly opened one does. The guard against a *false* completion is
-// "disconnecting mid-pause" below: there the job never ended, and no banner appears.
-test("a reopened dialog reports the ending the device actually last had", async ({ page }) => {
+// The ending lives on the job panel, which is what the device last did. Reopening the
+// sheet must not repeat it and must not clear it. The guard against a false completion
+// is "disconnecting mid-pause" below: there the job never ended, and no banner appears.
+test("a reopened sheet leaves the ending on the job panel", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
 
+  // The ending stays on the panel. Reopening the sheet must not repeat it, and must not clear it.
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+  await expect(dialog.getByText("Completed", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("Job complete")).toHaveCount(0);
   await page.getByRole("button", { name: "Close" }).click();
-  await page.getByRole("button", { name: "Cut" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
   await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
 });
 
 test("failed cut shows Cut failed and a reconnect recovers the device", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Arm a one-shot async resume failure, then resume: the Failed phase must show
-  // "Cut failed" — never "Job complete", which a banner derived from "a job ended
+  // "Cut failed" — never a completion, which a banner derived from "a job ended
   // and the device is Idle" produced for a failed job whose state cache lagged.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_resume"));
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 
   // Recover by reconnecting (the other listed device). The connect lifecycle events
   // carry NO_JOB=0 and must still reach the dialog after a failed job — Start Cut
   // comes back only because the reconnect's Idle status was accepted.
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  // The first choice aimed the document at the Cameo, so this one asks before switching. The
+  // answer is the fake dialog plugin's, scripted here: the plugin raises no native dialog.
+  // The aimed card is not a second connect: the Puma card is the other cutter.
+  await page.evaluate(() => sessionStorage.setItem("__dialog_answer__", "ok"));
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "GCC Puma IV", exact: true }).click();
+  await expectStartOffered(page);
 });
 
 // A fault whose mid-flight status never reaches a render: a banner that waits to be
@@ -2709,13 +2728,15 @@ test("failed cut shows Cut failed and a reconnect recovers the device", async ({
 test("a cut that faults immediately still shows Cut failed", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("__test_fail_next_cut"));
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Cut failed")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cut failed")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
@@ -2726,50 +2747,402 @@ test("a cut that faults immediately still shows Cut failed", async ({ page }) =>
 test("a reconnect clears the completed banner from the previous connection", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
   await page.getByRole("button", { name: "Resume" }).click();
-  await expect(page.getByText("Job complete")).toBeVisible();
+  await expect(page.getByText("Completed", { exact: true })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await expectStartOffered(page);
+  await expect(page.getByText("Completed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Job complete")).toHaveCount(0);
 });
 
 // Losing the device mid-pause abandons the job. The reconnect reports Idle — the same
 // phase a finished cut rests on — so a dialog that remembers "a cut was running" across
 // the disconnect declares a job that never finished complete.
+test("disconnecting a remote cutter mid-pause removes the swap", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"),
+  );
+  await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
+  await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("a cancel queued during an outage is dropped when the cut has already finished", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await showPasses(page);
+  await startCut(page);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  await expect(swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  await swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await callFakeWith(page, "__test_set_status", {
+    phase: "Idle",
+    actions: { cut: true },
+    rest: { ended: "Completed" },
+  });
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Completed", { exact: true })).toBeVisible();
+  await expect(page.getByText("Cancelled", { exact: true })).toHaveCount(0);
+});
+
 test("disconnecting mid-pause does not report the abandoned cut as complete", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Cut" }).click();
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await showPasses(page);
   await expect(page.getByTestId("cut-pass-row")).toHaveCount(2);
 
-  await page.getByRole("button", { name: "Start Cut" }).click();
-  await expect(page.getByText("Waiting for color swap")).toBeVisible();
+  await startCut(page);
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
 
   // Driven through the IPC surface rather than the dialog's own Disconnect button: this is
   // about the device dropping out, not about the operator asking it to.
   await page.evaluate(() => (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"));
   await expect(page.getByRole("button", { name: "Resume" })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Connect", exact: true }).first().click();
-  await expect(page.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await expectStartOffered(page);
   await expect(page.getByText(/complete/i)).toHaveCount(0);
+});
+
+test("an unreachable host freezes the pass, then shows the real status", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true, seedRemoteIdle: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await expect(job.getByTestId("pass-progress")).toHaveText("0% of this pass");
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  await expect(job.getByText(/Connection lost · last update \d+s ago/)).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 90 });
+
+  const ageOf = async () => {
+    const text = await job.getByText(/Connection lost · last update \d+s ago/).innerText();
+    return Number(text.match(/(\d+)s ago/)?.[1] ?? "0");
+  };
+  const before = await ageOf();
+  const started = Date.now();
+  if ((globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1") {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-light.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-offline-dark.png" });
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  }
+  const remaining = 5000 - (Date.now() - started);
+  if (remaining > 0) await page.waitForTimeout(remaining);
+
+  expect(await ageOf()).toBeGreaterThanOrEqual(before + 3);
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar")).toHaveAttribute("aria-valuenow", "40");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Cancel (when reconnected)", exact: true })).toBeVisible();
+  await expect(job.getByText("bench.local:7878")).toBeVisible();
+
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(job.getByTestId("pass-progress")).toHaveText("90% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+});
+
+test("resume is disabled while a colour swap's host is unreachable", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedRemoteIdle: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radiogroup", { name: "Bench Pi" }).getByRole("radio", { name: "Silhouette Cameo 5 Alpha" }).click();
+  await startCut(page);
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap).toBeVisible();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: "the host could not be reached (timed out)" });
+  const resume = swap.getByRole("button", { name: "Resume", exact: true });
+  await expect(resume).toBeDisabled();
+  await resume.locator("xpath=..").hover();
+  await expect(page.getByRole("tooltip")).toHaveText("Waiting for the host to reconnect");
+  await swap.getByRole("button", { name: "Cancel (when reconnected)", exact: true }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel the cut", exact: true }).click();
+  await callFakeWith(page, "__test_host_unreachable", { id: "host-3", unreachable: null });
+  await expect(page.getByRole("region", { name: "Job" }).getByText("Cancelled", { exact: true })).toBeVisible();
+});
+
+function jobShots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.JOB_PANEL_SHOTS === "1";
+}
+
+async function shot(page: Page, name: string) {
+  if (!jobShots()) return;
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/job-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+test("the job panel, swap bar, confirm, cancel and failure states", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+
+  const job = page.getByRole("region", { name: "Job" });
+  await expect(job.getByText("Pass 1 of 2")).toBeVisible();
+  await expect(job.getByText("Red vinyl")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+  await callFakeWith(page, "__test_set_progress", { sent: 40 });
+  await expect(job.getByTestId("pass-progress")).toHaveText("40% of this pass");
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(1);
+  await shot(page, "panel-mid-pass");
+
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  const swap = page.getByRole("region", { name: "Colour swap" });
+  await expect(swap.getByText("Load gold vinyl, then press Resume")).toBeVisible();
+  await expect(swap.getByText(/pass 2 of 2 · 1 shape/)).toBeVisible();
+  await expect(page.getByTestId("job-chip")).toBeVisible();
+  await shot(page, "swap-waiting");
+
+  await swap.getByRole("button", { name: "Collapse", exact: true }).click();
+  await expect(swap).toHaveCount(0);
+  const chip = page.getByTestId("swap-chip");
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveAttribute("aria-label", "Show colour swap: Load gold vinyl, then press Resume");
+  await shot(page, "swap-chip");
+  await chip.click();
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+  await expect(job.getByTestId("pass-bar").locator(".progress-live")).toHaveCount(0);
+  await expect(job.getByText("Gold vinyl")).toBeVisible();
+  await shot(page, "confirm-pass");
+
+  await job.getByRole("button", { name: "Cancel", exact: true }).click();
+  const alert = page.getByRole("alertdialog");
+  await expect(alert.getByRole("heading", { name: "Cancel this cut?" })).toBeVisible();
+  if (jobShots()) {
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-light.png" });
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+    await job.getByRole("button", { name: "Cancel", exact: true }).click();
+    await page.screenshot({ path: "/opt/cursor/artifacts/job-cancel-confirm-dark.png" });
+    await page.getByRole("alertdialog").getByRole("button", { name: "Keep cutting", exact: true }).click();
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+  } else {
+    await alert.getByRole("button", { name: "Keep cutting", exact: true }).click();
+  }
+  await expect(page.getByRole("alertdialog")).toHaveCount(0);
+  await expect(job.getByRole("button", { name: "Confirm pass done", exact: true })).toBeVisible();
+
+  await callFakeWith(page, "__test_set_status", {
+    phase: "Failed",
+    rest: { error: "Timeout" },
+  });
+  await expect(job.getByText("Cut failed")).toBeVisible();
+  await expect(job.getByText("The cutter did not answer in time.")).toBeVisible();
+  await expect(job.getByRole("button", { name: "Start again", exact: true })).toBeVisible();
+  await shot(page, "failed");
+  await job.getByRole("button", { name: "Start again", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Send to cutter" })).toBeVisible();
+});
+
+test("the send sheet walks machine, passes and preview, and withholds a blank level", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+
+  const shots = (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.SEND_SHEET_SHOTS === "1";
+  const shot = async (name: string) => {
+    if (!shots) return;
+    await page.getByRole("dialog", { name: "Send to cutter" }).screenshot({ path: `/opt/cursor/artifacts/${name}.png` });
+  };
+  const move = (id: number, dx: number) =>
+    page.evaluate(([node, x]) =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke(
+        "commit_transform",
+        { ids: [node], m: [1, 0, 0, 1, x, 0] },
+      ), [id, dx] as [number, number]);
+  // The seeded rects share an origin. Parting the green one is what lets one shot show both passes.
+  await move(3, 30);
+
+  const walk = async (theme: "light" | "dark", dx: number) => {
+    // The light walk leaves the Cameo aimed, and a reopened sheet shows that. Step 1 of each
+    // theme is the list before a choice.
+    await page.evaluate(() =>
+      (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__.invoke("disconnect_device"),
+    );
+    // A pointer click on Send lands again on the card once the sheet covers that button, and the
+    // card is the connect action. Opening from the element itself leaves every cutter unchosen.
+    await page.getByRole("button", { name: "Send to cutter", exact: true }).evaluate((el: HTMLElement) => el.click());
+    const dialog = page.getByRole("dialog", { name: "Send to cutter" });
+    await expect(dialog).toHaveAttribute("data-send-step", "1");
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+    await expect(dialog.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first()).toBeVisible();
+    await expect(dialog.getByText("USB on this computer").first()).toBeVisible();
+    await expect(dialog.getByTestId("device-badge").first()).toHaveText("Unknown");
+    await shot(`send-step1-${theme}`);
+
+    await showPasses(page);
+    await expect(dialog.getByTestId("cut-pass-row")).toHaveCount(2);
+    const speed = dialog.getByLabel("Speed for pass 1");
+    await expect(speed).toHaveAttribute("aria-invalid", "true");
+    const describedBy = await speed.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    await expect(dialog.locator(`[id="${describedBy}"]`)).toHaveText("Use 1–30");
+    await expect(speed).toHaveCSS("border-color", theme === "light" ? "rgb(201, 35, 36)" : "rgb(255, 107, 99)");
+    await expect(dialog.getByText("Red vinyl").first()).toBeVisible();
+    // The name track used to be min-content, which for a nowrap label is the whole string.
+    // That row then grew past the header. Restoring the text before the next paint keeps
+    // the shot and the later "Red vinyl" lookup on the real name.
+    const nameTrack = await dialog.evaluate((root) => {
+      const name = [...root.querySelectorAll("span")].find((node) => node.textContent === "Red vinyl");
+      const scroller = root.querySelector(".overflow-auto");
+      const header = [...root.querySelectorAll("span")].find((node) => node.textContent?.startsWith("Speed ("));
+      if (!name || !scroller || !header) return null;
+      const original = name.textContent;
+      name.textContent = "SupercalifragilisticexpialidociousHeatTransferVinyl";
+      const row = name.closest("[data-testid='cut-pass-row']");
+      const field = row?.querySelector("input");
+      const headerBox = header.getBoundingClientRect();
+      const fieldBox = field?.getBoundingClientRect();
+      const measured = {
+        scrollWidth: scroller.scrollWidth,
+        clientWidth: scroller.clientWidth,
+        headerX: headerBox.x,
+        fieldX: fieldBox?.x ?? Number.NaN,
+      };
+      name.textContent = original;
+      return measured;
+    });
+    expect(nameTrack).not.toBeNull();
+    expect(nameTrack!.scrollWidth).toBeLessThanOrEqual(nameTrack!.clientWidth + 1);
+    expect(Math.abs(nameTrack!.headerX - nameTrack!.fieldX)).toBeLessThanOrEqual(2);
+    // A 0 minimum collapsed this column once the fixed tracks filled a narrow sheet.
+    // The shot stays at the desktop width either way.
+    await page.setViewportSize({ width: 390, height: 800 });
+    let narrow: { cell: number; headerX: number; fieldX: number } | null = null;
+    try {
+      narrow = await dialog.evaluate((root) => {
+        const name = [...root.querySelectorAll("span")].find((node) => node.textContent === "Red vinyl");
+        const header = [...root.querySelectorAll("span")].find((node) => node.textContent?.startsWith("Speed ("));
+        const cell = name?.parentElement?.parentElement;
+        const field = name?.closest("[data-testid='cut-pass-row']")?.querySelector("input");
+        if (!name || !header || !cell || !field) return null;
+        return {
+          cell: cell.getBoundingClientRect().width,
+          headerX: header.getBoundingClientRect().x,
+          fieldX: field.getBoundingClientRect().x,
+        };
+      });
+    } finally {
+      await page.setViewportSize({ width: 1440, height: 1000 });
+    }
+    expect(narrow).not.toBeNull();
+    expect(narrow!.cell).toBeGreaterThan(100);
+    expect(Math.abs(narrow!.headerX - narrow!.fieldX)).toBeLessThanOrEqual(2);
+    // A shape that starts on the mat's edge used to be the edge of this picture.
+    const matBox = (await dialog.getByRole("img", { name: "Shapes in this pass" }).getAttribute("viewBox"))?.split(/[ ,]/).map(Number);
+    expect(matBox?.[0]).toBeLessThan(0);
+    expect(matBox?.[1]).toBeLessThan(0);
+    await expect(dialog.getByRole("button", { name: "Weeding", exact: true })).toHaveAttribute("aria-expanded", "false");
+    await expect(dialog.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toHaveCount(0);
+    await shot(`send-step2-${theme}-invalid`);
+
+    await fillSendLevels(page);
+    await goToSendStep(page, 3);
+    await expect(dialog.getByRole("img", { name: /Cut preview/ })).toBeVisible();
+    await expect(dialog.getByText("Silhouette Cameo 5 Alpha").first()).toBeVisible();
+    const redName = dialog.getByText("Red vinyl", { exact: true });
+    const greenName = dialog.getByText("#00ff00", { exact: true });
+    await expect(redName).toBeVisible();
+    await expect(greenName).toBeVisible();
+    // The settings used to share the name's line, and the name ellipsized to "Red …".
+    // These two fit the column, so width alone would stay green with truncate put back.
+    for (const name of [redName, greenName]) {
+      expect(await name.evaluate((node) => node.scrollWidth > node.clientWidth + 1)).toBe(false);
+      expect(await name.evaluate((node) => {
+        const style = getComputedStyle(node);
+        return style.textOverflow === "ellipsis" || style.whiteSpace === "nowrap";
+      })).toBe(false);
+    }
+    const nameBox = await redName.boundingBox();
+    const speedLine = dialog.getByText(/Speed 10 · force 10 · 1×/).first();
+    await expect(speedLine).toBeVisible();
+    const speedBox = await speedLine.boundingBox();
+    if (!nameBox || !speedBox) throw new Error("pass name or its settings have no box");
+    expect(speedBox.y).toBeGreaterThan(nameBox.y);
+    await expect(dialog.getByRole("button", { name: "Start Cut" })).toBeEnabled();
+    await shot(`send-step3-${theme}`);
+
+    await move(2, dx);
+    await dialog.getByRole("button", { name: "Start Cut" }).click();
+    await expect(dialog.getByText("Your design changed.")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Replan" })).toBeEnabled();
+    // The banner is the refusal. A toast of the same one used to cover the summary card.
+    await expect(page.locator("[data-sonner-toast]")).toHaveCount(0);
+    await shot(`send-stale-replan-${theme}`);
+    await dialog.getByRole("button", { name: "Close" }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  };
+
+  await walk("light", 5);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await walk("dark", 12);
 });
 
 test("trace dialog: preview appears and insert adds paths", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Trace image" })).toBeVisible();
   await expect(page.getByAltText("Traced preview")).toBeVisible();
   await expect(page.getByText("1 path")).toBeVisible();
@@ -2777,6 +3150,7 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
   await expect(page.getByRole("dialog", { name: "Trace image" })).not.toBeVisible();
   // import_svg mock was invoked — it adds a node to doc, so the layer list reflects the
   // insert, same observable-effect assertion the "new doc → add rect" test above uses.
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
 });
 
@@ -2788,7 +3162,7 @@ test("trace dialog: preview appears and insert adds paths", async ({ page }) => 
 test("trace dialog: a control table missing a control reports it instead of hanging", async ({ page }) => {
   await page.addInitScript(installMockTauri, { dropTraceControl: "detail" });
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Trace image" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(/detail/)).toBeVisible();
@@ -2799,7 +3173,7 @@ test("trace dialog: a control table missing a control reports it instead of hang
 test("text dialog: picking a family and Insert adds a shape", async ({ page }) => {
   await page.addInitScript(installMockTauri);
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await dialog.getByLabel("Font family").selectOption("Times New Roman");
@@ -2807,13 +3181,14 @@ test("text dialog: picking a family and Insert adds a shape", async ({ page }) =
   await expect(dialog).not.toBeVisible();
   // add_text mock was invoked — it adds a node to doc, same observable-effect assertion
   // the trace-insert test above uses.
+  await showTab(page, "Layers");
   await expect(page.getByTestId("layer-row")).toHaveCount(1);
 });
 
 test("text dialog: an empty font list says so and disables Insert", async ({ page }) => {
   await page.addInitScript(installMockTauri, { noFonts: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Text" }).click();
+  await page.getByRole("button", { name: "Text", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Add text" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("No fonts were found on this system")).toBeVisible();
@@ -2827,7 +3202,7 @@ test("text dialog: an empty font list says so and disables Insert", async ({ pag
 test("trace dialog: a failed source thumbnail surfaces instead of blanking", async ({ page }) => {
   await page.addInitScript(installMockTauri, { failImagePreview: true });
   await page.goto("/");
-  await page.getByRole("button", { name: "Trace" }).click();
+  await page.getByRole("button", { name: "Trace", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Trace image" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText(/broken thumbnail/)).toBeVisible();
@@ -2857,15 +3232,31 @@ async function toPage(page: Page, v: CanvasView, mm: { x: number; y: number }) {
   return { x: box.x + mm.x * v.scale + v.tx, y: box.y + mm.y * v.scale + v.ty };
 }
 
+/** The Cameo bed these wheel deltas were written against. Fit used to show that bed (~0.2 px/mm)
+ *  with a 24 px margin and no rulers; it now shows the mat, and the same notch count walks the
+ *  shapes off the canvas. 24 is that old margin, not the mat fit's padding. */
+const CAMEO_BED_MM = { w: 330, h: 3000 };
+const BED_FIT_MARGIN_PX = 24;
+
 /** Ctrl-wheel at (the whole pixel nearest) a document point; returns the view once the zoom has
  *  landed. Whole pixels because Chromium reports a wheel's position as integers: a fractional
- *  target puts the pinned point up to a pixel away, and a 20× zoom turns that into twenty. */
+ *  target puts the pinned point up to a pixel away, and a 20× zoom turns that into twenty.
+ *  The delta is applied to the old bed-fit scale, not the current mat fit, so a drag of
+ *  `n * v.scale` still means n millimetres on the canvas. */
 async function zoomInAt(page: Page, mm: { x: number; y: number }, deltaY: number): Promise<CanvasView> {
   const before = await fittedView(page);
+  const box = await page.getByTestId("design-canvas").boundingBox();
+  if (!box) throw new Error("design canvas has no layout box");
+  const availW = Math.max(box.width - 2 * BED_FIT_MARGIN_PX, 1);
+  const availH = Math.max(box.height - 2 * BED_FIT_MARGIN_PX, 1);
+  const bedFit = Math.min(availW / CAMEO_BED_MM.w, availH / CAMEO_BED_MM.h);
+  const target = bedFit * Math.exp(-deltaY * 0.01);
+  // Already at least as close as this delta used to get (the mat fit is past a shallow zoom).
+  if (target <= before.scale * 1.01) return before;
   const at = await toPage(page, before, mm);
   await page.mouse.move(Math.round(at.x), Math.round(at.y));
   await page.keyboard.down("Control");
-  await page.mouse.wheel(0, deltaY);
+  await page.mouse.wheel(0, Math.round(-Math.log(target / before.scale) / 0.01));
   await page.keyboard.up("Control");
   await expect.poll(async () => (await readView(page)).scale).toBeGreaterThan(before.scale);
   return readView(page);
@@ -2894,6 +3285,7 @@ test("Ctrl-wheel zooms about the cursor and the status bar reports it", async ({
 test("dragging a corner handle commits one scale about the opposite corner", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click(); // the red 10 × 10 mm rect at the origin
   // Far enough in that the handles are tens of px apart.
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
@@ -2957,6 +3349,7 @@ test("the cursor readout follows a wheel pan under a still pointer", async ({ pa
 test("a drag pressed while the previous commit is in flight does not commit", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const commits = () =>
@@ -2981,7 +3374,7 @@ test("a drag pressed while the previous commit is in flight does not commit", as
   await expect.poll(commits).toBe(2);
 });
 
-type CommitRecord = { ids: number[]; m: number[] };
+type CommitRecord = { ids: number[]; m: number[]; batch?: number };
 
 async function commitLog(page: Page): Promise<CommitRecord[]> {
   return page.evaluate(() => (window as unknown as { __commitTransforms?: CommitRecord[] }).__commitTransforms ?? []);
@@ -3006,6 +3399,7 @@ async function nodeTransform(page: Page, id: number): Promise<number[]> {
 test("a refused transform puts the shape back and the next drag starts from where it was", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const centre = await toPage(page, v, { x: 5, y: 5 });
@@ -3023,6 +3417,7 @@ test("a refused transform puts the shape back and the next drag starts from wher
 test("a transform that lands but cannot be re-read keeps the shape where the backend has it", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const centre = await toPage(page, v, { x: 5, y: 5 });
@@ -3042,6 +3437,7 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
   const fitted = await fittedView(page);
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
 
@@ -3054,10 +3450,79 @@ test("an edit keeps the operator's zoom; Ctrl+0 and a machine switch refit", asy
   await page.keyboard.press("Control+0");
   await expect.poll(() => readView(page)).toEqual(fitted);
 
-  await page.getByLabel("Machine").selectOption("puma");
+  await showTab(page, "Properties");
+  await page.getByLabel("Design for").selectOption("puma");
   const box = (await page.getByTestId("design-canvas").boundingBox())!;
-  // The Puma's 600 × 5000 mm bed, height-bound in this window like the Cameo's.
-  await expect.poll(async () => (await readView(page)).scale).toBeCloseTo((box.height - 48) / 5000, 3);
+  // Puma is roll-only. The default roll is the machine width by 36 in. Rulers take 24 px off the
+  // left and top, the zoom bar takes 54 px off the bottom, and the mat fit pads 32 px, so the
+  // scale is not the 600 × 5000 mm bed.
+  const margin = 32;
+  const ruler = 24;
+  const zoomBar = 54;
+  const rollW = 600;
+  const rollH = 36 * 25.4;
+  const availW = box.width - 2 * margin - ruler;
+  const availH = box.height - 2 * margin - ruler - zoomBar;
+  await expect.poll(async () => (await readView(page)).scale).toBeCloseTo(Math.min(availW / rollW, availH / rollH), 3);
+});
+
+test("Command-A selects every shape on the mat and leaves the chrome and a focused field alone", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedAlignExtras: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const rows = page.getByTestId("layer-row");
+  // Two loose rects, a group of two rects, and an empty group.
+  await expect(rows).toHaveCount(6);
+  await rows.first().click();
+  const selectedRows = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  await expect(selectedRows).toHaveCount(1);
+  await expect(page.getByText("10.0 × 10.0 mm")).toBeVisible();
+
+  // The chord belongs to the field. Stealing it would select the other three shapes.
+  await showTab(page, "Properties");
+  const x = page.getByLabel("X", { exact: true });
+  await x.focus();
+  // The platform chord: Ctrl+A on macOS moves the caret, so the field would keep its "0".
+  await page.keyboard.press("ControlOrMeta+A");
+  // Replacing the field's "0" commits x = 4. The other rect stays at the origin, so the
+  // union below is still 0..80 × 0..50.
+  await x.press("4");
+  await expect(x).toHaveValue("4");
+  await showTab(page, "Layers");
+  await expect(selectedRows).toHaveCount(1);
+  // Shift stays free. The one selected shape must not become every shape.
+  await page.keyboard.press("Shift+Meta+A");
+  await expect(selectedRows).toHaveCount(1);
+
+  // Focus stays on the toolbar button, the same way keyboard zoom is reached.
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  // The two grouped rects sit at 50,20 and 70,40, so the box is the whole mat, 0..80 × 0..50.
+  await expect(page.getByText("80.0 × 50.0 mm")).toBeVisible();
+  await expect(selectedRows).toHaveCount(4);
+  const groups = rows.filter({ hasText: "Group" });
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0)).toHaveAttribute("data-selected", "false");
+  await expect(groups.nth(1)).toHaveAttribute("data-selected", "false");
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+
+  await rows.first().click();
+  await expect(selectedRows).toHaveCount(1);
+  await page.keyboard.press("Control+A");
+  await expect(selectedRows).toHaveCount(4);
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
+});
+
+test("Command-A on an empty mat leaves the chrome unselected", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Select", exact: true }).click();
+  await page.keyboard.press("Meta+A");
+  await page.keyboard.press("Control+A");
+  await expect(page.getByText("No selection")).toBeVisible();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Select an object to edit its size and position.")).toBeVisible();
+  expect(await page.evaluate(() => window.getSelection()?.toString() ?? "")).toBe("");
 });
 
 test("keyboard zoom works after a toolbar click and leaves a focused field alone", async ({ page }) => {
@@ -3073,7 +3538,9 @@ test("keyboard zoom works after a toolbar click and leaves a focused field alone
   await page.keyboard.press("Control+0");
   await expect.poll(() => readView(page)).toEqual(fitted);
 
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
   await page.getByLabel("X", { exact: true }).focus();
   await page.keyboard.press("Control+=");
   expect(await readView(page)).toEqual(fitted);
@@ -3099,10 +3566,14 @@ test("Shift-click inside the selection toggles a shape out without dragging the 
 test("Space-drag pans after a toolbar click without pressing the button, and so does a middle drag", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
-  const v0 = await fittedView(page);
-  await page.getByRole("button", { name: "Rectangle" }).click(); // adds one; focus stays on it
+  const beforeAdd = await fittedView(page);
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click(); // adds one; focus stays on it
+  await showTab(page, "Layers");
   const rows = page.getByTestId("layer-row");
   await expect(rows).toHaveCount(3);
+  // Adding a shape fits the artwork, so the pan is measured from that view, not the mat fit.
+  await expect.poll(async () => Math.abs((await readView(page)).scale - beforeAdd.scale)).toBeGreaterThan(0.05);
+  const v0 = await readView(page);
   const box = (await page.getByTestId("design-canvas").boundingBox())!;
   const start = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
 
@@ -3122,9 +3593,109 @@ test("Space-drag pans after a toolbar click without pressing the button, and so 
   await expect.poll(async () => (await readView(page)).tx).toBeCloseTo(v0.tx + 30, 0);
 });
 
+test("vinyl colours stay distinct on the mat in both themes, including a gold outline inside red", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(installMockTauri, { seedVinylBoard: true });
+  await page.goto("/");
+  await fittedView(page);
+  await expect(page.getByRole("button", { name: "Fit mat" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Fit content" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom in" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Zoom out" })).toBeVisible();
+
+  const readBoard = () =>
+    page.evaluate(() => {
+      const canvas = document.querySelector("[data-testid='design-canvas']") as HTMLCanvasElement | null;
+      if (!canvas) return null;
+      const [scale, tx, ty] = (canvas.getAttribute("data-view") ?? "").split(" ").map(Number);
+      const dpr = canvas.width / canvas.clientWidth;
+      const ctx = canvas.getContext("2d");
+      if (!ctx || !(scale > 0)) return null;
+      const at = (x: number, y: number) => {
+        const sx = Math.round((x * scale + tx) * dpr);
+        const sy = Math.round((y * scale + ty) * dpr);
+        const px = ctx.getImageData(sx, sy, 1, 1).data;
+        return [px[0], px[1], px[2]];
+      };
+      const along: { x: number; rgb: number[] }[] = [];
+      for (let x = 50.8; x <= 100; x += 0.2) along.push({ x, rgb: at(x, 50.8) });
+      return {
+        along,
+        mat: at(250, 250),
+        fills: {
+          black: at(130.24, 25.24),
+          white: at(175.24, 25.24),
+          navy: at(220.24, 25.24),
+          purple: at(130.24, 70.24),
+          pale: at(175.24, 70.24),
+        },
+      };
+    });
+
+  const farFrom = (a: number[], b: number[]) => Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+  for (const theme of ["Light", "Dark"] as const) {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: theme }).click();
+    await expect.poll(async () => documentDark(page)).toBe(theme === "Dark");
+    // The mat pixel is the redraw, not just the class: the canvas keeps the previous frame until draw().
+    await expect.poll(async () => (await readBoard())?.mat[0] ?? -1).toBeLessThan(theme === "Dark" ? 120 : 255);
+    await expect.poll(async () => (await readBoard())?.mat[0] ?? -1).toBeGreaterThan(theme === "Dark" ? 20 : 160);
+
+    const board = await readBoard();
+    expect(board, theme).not.toBeNull();
+    if (!board) continue;
+    const gold = board.along.find((s) => s.x > 70 && s.x < 78 && isGoldPixel(s.rgb));
+    const red = board.along.find((s) => s.x > 82 && isRedPixel(s.rgb));
+    expect(gold, `${theme} gold outline ${JSON.stringify(board.along.filter((s) => s.x > 68 && s.x < 80))}`).toBeTruthy();
+    expect(red, `${theme} red fill`).toBeTruthy();
+    for (const [name, rgb] of Object.entries(board.fills)) {
+      expect(farFrom(rgb, board.mat), `${theme} ${name} ${rgb.join(",")}`).toBeGreaterThan(15);
+    }
+    const seen = Object.values(board.fills);
+    for (let i = 0; i < seen.length; i++) {
+      for (let j = i + 1; j < seen.length; j++) {
+        expect(farFrom(seen[i], seen[j]), theme).toBeGreaterThan(12);
+      }
+    }
+    await page.screenshot({ path: `/opt/cursor/artifacts/editor-${theme.toLowerCase()}.png` }).catch(() => undefined);
+    if (theme === "Dark") {
+      await page.getByRole("tablist").screenshot({ path: "/opt/cursor/artifacts/tabs-dark.png" }).catch(() => undefined);
+    }
+  }
+
+  const box = (await page.getByTestId("design-canvas").boundingBox())!;
+  const v = await readView(page);
+  const mat = 12 * 25.4;
+  const matBottom = box.y + v.ty + mat * v.scale;
+  const matLeft = box.x + v.tx;
+  const matRight = matLeft + mat * v.scale;
+  const bar = (await page.getByTestId("zoom-controls").boundingBox())!;
+  expect(matLeft - box.x).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(box.y + v.ty - box.y).toBeGreaterThanOrEqual(24 + 32 - 1);
+  expect(matBottom).toBeLessThanOrEqual(bar.y + 1);
+  expect(matRight).toBeLessThanOrEqual(box.x + box.width - 32 + 1);
+  const rulers = page.getByRole("button", { name: "Rulers" });
+  await expect(rulers).toHaveAttribute("aria-pressed", "true");
+});
+
+async function documentDark(page: Page): Promise<boolean> {
+  return page.evaluate(() => document.documentElement.classList.contains("dark"));
+}
+
+function isGoldPixel(rgb: number[]): boolean {
+  const [r, g, b] = rgb;
+  return r > 80 && g > 40 && b < 90 && r > b + 40 && g > b + 25;
+}
+
+function isRedPixel(rgb: number[]): boolean {
+  const [r, g, b] = rgb;
+  return r > 150 && r > g + 40 && r > b + 40 && g < 160;
+}
+
 test("dragging just outside a corner rotates about the centre; Alt scales about it", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const c = await toPage(page, v, { x: 5, y: 5 });
@@ -3149,6 +3720,7 @@ test("dragging just outside a corner rotates about the centre; Alt scales about 
 test("Alt-dragging a corner scales about the centre", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const se = await toPage(page, v, { x: 10, y: 10 });
@@ -3168,6 +3740,7 @@ test("Alt-dragging a corner scales about the centre", async ({ page }) => {
 test("a wheel pan during a drag carries the shape with the pointer and commits that", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const centre = await toPage(page, v, { x: 5, y: 5 });
@@ -3188,6 +3761,7 @@ test("a wheel pan during a drag carries the shape with the pointer and commits t
 test("a Group selected in the layers panel gets a box around its shapes and commits as itself", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedGroup: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").filter({ hasText: "Group" }).click();
   const v = await zoomInAt(page, { x: 35, y: 5 }, -350);
 
@@ -3208,6 +3782,7 @@ test("a Group selected in the layers panel gets a box around its shapes and comm
 test("a property edit after an applied-but-unread commit starts from where the shape now is", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
 
@@ -3215,6 +3790,7 @@ test("a property edit after an applied-but-unread commit starts from where the s
   await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 20 * v.scale, 0); // lands at x = 20; refresh fails
   await expect(page.getByText(/Edit applied, but the canvas could not be refreshed/)).toBeVisible();
 
+  await showTab(page, "Properties");
   await page.getByLabel("X", { exact: true }).fill("5");
   await expect.poll(async () => (await commitLog(page)).length).toBe(2);
   expect((await commitLog(page))[1].m[4]).toBeCloseTo(-15, 1);
@@ -3224,6 +3800,7 @@ test("a property edit after an applied-but-unread commit starts from where the s
 test("a property edit made while a commit is in flight waits for it, then lands where it says", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
 
@@ -3231,6 +3808,7 @@ test("a property edit made while a commit is in flight waits for it, then lands 
   await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 20 * v.scale, 0); // parked on the wire
   await expect.poll(async () => (await commitLog(page)).length).toBe(1);
 
+  await showTab(page, "Properties");
   await page.getByLabel("X", { exact: true }).fill("5");
   expect((await commitLog(page)).length).toBe(1); // queued, not sent alongside
 
@@ -3242,6 +3820,7 @@ test("a property edit made while a commit is in flight waits for it, then lands 
 test("edits to two different fields made during an in-flight commit both land", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
 
@@ -3251,7 +3830,9 @@ test("edits to two different fields made during an in-flight commit both land", 
 
   // Different fields do not supersede each other: a single queue slot dropped X when Y arrived
   // (CodeRabbit and Copilot on #298).
+  await showTab(page, "Properties");
   await page.getByLabel("X", { exact: true }).fill("5");
+  await showTab(page, "Properties");
   await page.getByLabel("Y", { exact: true }).fill("7");
   await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
 
@@ -3263,6 +3844,7 @@ test("edits to two different fields made during an in-flight commit both land", 
 test("scaling a shape inside a moved Group keeps it where the real backend would", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedGroup: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").filter({ hasText: "Rectangle" }).click(); // the Group's rect
   const v = await zoomInAt(page, { x: 35, y: 5 }, -350);
 
@@ -3273,19 +3855,23 @@ test("scaling a shape inside a moved Group keeps it where the real backend would
   await expect.poll(async () => nodeTransform(page, 3)).toEqual([2, 0, 0, 1.5, 0, 0].map((x) => expect.closeTo(x, 1)));
 });
 
-// Queued edits drain one per settled commit, and the snapshot of one can render while the next is
-// on the wire. That intermediate snapshot must not retire the in-flight preview, or the edit after
-// it is computed from geometry the backend has already left (Copilot on #298).
+// Queued edits drain one per settled commit, each built from the geometry the one before it left:
+// W scales about where X put the shape, not where the drag did (Copilot on #298). They drain after
+// the snapshot before them has rendered, so this no longer shows a snapshot rendering while a commit
+// is on the wire; the test after it does.
 test("queued X then W behind a move scale about where X put the shape", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").first().click();
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
 
   await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
   await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 20 * v.scale, 0); // to x = 20, parked
   await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  await showTab(page, "Properties");
   await page.getByLabel("X", { exact: true }).fill("5");
+  await showTab(page, "Properties");
   await page.getByLabel("W", { exact: true }).fill("20");
   await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
 
@@ -3297,11 +3883,36 @@ test("queued X then W behind a move scale about where X put the shape", async ({
   }).toEqual([expect.closeTo(2, 1), expect.closeTo(5, 1)]);
 });
 
+// A snapshot can render while a commit is on the wire, one the backend answered before the commit
+// arrived: a run() command's refresh. It must not retire that commit's preview, or the canvas and
+// fields jump back and the next edit is built from geometry the backend has left (Copilot on #298).
+// The fake runs a held commit on release, so the machine switch's snapshot here is that older one.
+test("a snapshot rendered while a commit is on the wire keeps that commit's preview", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red, at 0
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("20"); // on the wire
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+
+  const before = (await readView(page)).scale;
+  await showTab(page, "Properties");
+  await page.getByLabel("Design for").selectOption("puma"); // its refresh renders a new document now
+  await expect.poll(async () => (await readView(page)).scale).not.toBeCloseTo(before, 6);
+  await showTab(page, "Properties");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("20");
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(20, 6);
+});
+
 // Snapping (spec 2026-10-07). With both seeds: the Group's rect at 30..40 mm (id 3) and the red
 // rect (id 4) and green rect at 0..10 mm. Layer rows run Group, its rect, red, green.
 async function selectRedBesideGroup(page: Page): Promise<CanvasView> {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").nth(2).click();
   return zoomInAt(page, { x: 20, y: 5 }, -350);
 }
@@ -3339,6 +3950,7 @@ test("an edge handle that stops just short of another shape snaps its edge to it
 test("a selected Group does not snap to its own shape", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").nth(0).click(); // the Group; its rect is excluded from targets
   const v = await zoomInAt(page, { x: 35, y: 5 }, -350);
   // 0.3 mm is well within reach of where the Group's rect started; a self-snap would pull it back.
@@ -3362,11 +3974,13 @@ test("pressing on an unselected shape and dragging snaps too", async ({ page }) 
 test("a move can snap to the artboard's centre line", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
   await page.goto("/");
+  await showTab(page, "Layers");
   await page.getByTestId("layer-row").nth(0).click(); // the Group, centred at x = 35
   const v = await zoomInAt(page, { x: 35, y: 5 }, -200); // ~1.5 px/mm, so the reach is ~4 mm
   // Its centre would stop at 164.6 mm; the Cameo's 330 mm bed is centred at 165, a line only the
   // artboard has.
-  await dragBy(page, await toPage(page, v, { x: 35, y: 5 }), 129.6 * v.scale, 0);
+  const from = await toPage(page, v, { x: 35, y: 5 });
+  await dragBy(page, from, 129.6 * v.scale, 0);
   await expect.poll(async () => (await commitLog(page)).length).toBe(1);
   expect((await commitLog(page))[0].m[4]).toBeCloseTo(130, 1);
 });
@@ -3382,4 +3996,1985 @@ test("an Alt edge scale snaps the dragged edge and mirrors the other", async ({ 
   const [a, , , , e] = (await commitLog(page))[0].m;
   expect(a).toBeCloseTo(5, 2);
   expect(e).toBeCloseTo(-20, 1);
+});
+
+// Align and distribute (spec 2026-10-07). With both seeds: the Group (id 2) holds a rect at 30..40
+// mm, and the red (id 4) and green (id 5) rects sit at 0..10 mm. Layer rows run Group, its rect,
+// red, green.
+async function selectRows(page: Page, rows: number[]) {
+  const [first, ...rest] = rows;
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(first).click();
+  await showTab(page, "Layers");
+  for (const r of rest) await page.getByTestId("layer-row").nth(r).click({ modifiers: ["Shift"] });
+}
+
+test("align left on two rects and a Group commits one batch that moves only the Group", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [2, 3, 0]);
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  const [{ ids, m, batch }] = await commitLog(page);
+  expect(ids).toEqual([2]);
+  expect(m).toEqual([1, 0, 0, 1, -30, 0]);
+  expect(batch).toBe(1);
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(0, 6);
+});
+
+test("align on a single rect centres it on the artboard", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [2]);
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click();
+
+  // The 330 mm bed is centred at 165; the rect's centre is at 5.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  const [{ ids, m }] = await commitLog(page);
+  expect(ids).toEqual([4]);
+  expect(m[4]).toBeCloseTo(160, 6);
+  expect(m[5]).toBe(0);
+});
+
+test("distribute equalises the gaps and breaks a tie by document order, not click order", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [0, 3, 2]); // Group, green, red: the reverse of document order
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Distribute horizontal spacing" }).click();
+
+  // Span 0..40 holding 30 mm of shapes leaves two 5 mm gaps. Red and green both start at 0, so
+  // document order makes red first and green the one that moves, to 15.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  const [{ ids, m }] = await commitLog(page);
+  expect(ids).toEqual([5]);
+  expect(m[4]).toBeCloseTo(15, 6);
+});
+
+test("align and distribute are disabled when they cannot act", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await showTab(page, "Properties");
+  // Nothing selected is the document, not a disabled align row. The buttons come back with a selection.
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Align left edges" })).toHaveCount(0);
+
+  // The Group, its own rect and red are two units, since the rect moves with the Group: still too
+  // few to distribute.
+  await selectRows(page, [0, 1, 2]);
+  const alignLeft = page.getByRole("button", { name: "Align left edges" });
+  const distribute = page.getByRole("button", { name: "Distribute horizontal spacing" });
+  // Selecting rows shows Layers, which unmounts these buttons. They follow the selection once
+  // Properties is showing again.
+  await showTab(page, "Properties");
+  await expect(alignLeft).toBeEnabled();
+  await expect(distribute).toBeDisabled();
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(3).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+  await expect(distribute).toBeEnabled();
+});
+
+test("an align clicked while a drag's commit is on the wire lines up from where the drag left", async ({ page }) => {
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15, parked
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  expect((await commitLog(page)).length).toBe(1); // queued behind the drag, not sent
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // From the stale scene the Group would go to 0 (−30); from the drag's result it goes to 5.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  const { ids, m } = (await commitLog(page))[1];
+  expect(ids).toEqual([2]);
+  expect(m[4]).toBeCloseTo(-25, 6);
+});
+
+// With seedAlignExtras beside the rects: red (id 2) and green (id 3) at 0..10, the two-rect Group
+// (id 4) spanning 50..80 × 20..50, and the empty Group (id 7). Rows run red, green, Group, its two
+// rects, the empty Group.
+async function seedAlignExtras(page: Page) {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedAlignExtras: true });
+  await page.goto("/");
+}
+
+test("a Group aligns by the bounds of all its shapes, on both axes", async ({ page }) => {
+  await seedAlignExtras(page);
+  await selectRows(page, [0, 2]);
+
+  // The Group's right edge is its second rect's, at 80; its first rect alone would say 60.
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align right edges" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  expect((await commitLog(page))[0]).toMatchObject({ ids: [2], m: [1, 0, 0, 1, 70, 0] });
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(70, 6);
+
+  // Its bottom is 50, again from the second rect.
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align bottom edges" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  expect((await commitLog(page))[1]).toMatchObject({ ids: [2], m: [1, 0, 0, 1, 0, 40] });
+});
+
+test("distribute vertical spacing moves the middle unit on y only", async ({ page }) => {
+  await seedAlignExtras(page);
+  await selectRows(page, [0, 1, 2]);
+  // Red and green at 0..10, the Group at 20..50: span 0..50 holds 50 mm, so the gaps are 0 and
+  // green, second in document order, goes to 10.
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Distribute vertical spacing" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  expect((await commitLog(page))[0]).toMatchObject({ ids: [3], m: [1, 0, 0, 1, 0, 10] });
+});
+
+test("an empty Group is not a unit, so it does not enable distribute", async ({ page }) => {
+  await seedAlignExtras(page);
+  await selectRows(page, [0, 1, 5]);
+  await showTab(page, "Properties");
+  await expect(page.getByRole("button", { name: "Distribute horizontal spacing" })).toBeDisabled();
+  await showTab(page, "Properties");
+  await expect(page.getByRole("button", { name: "Distribute vertical spacing" })).toBeDisabled();
+  await showTab(page, "Properties");
+  await expect(page.getByRole("button", { name: "Align left edges" })).toBeEnabled();
+});
+
+test("a refused align puts every unit back and the next click starts from there", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [2, 0]); // red and the Group: centres 5 and 35, so both move to 20
+  await page.evaluate(() => (window as unknown as { __failNextCommit: () => void }).__failNextCommit());
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click();
+  await expect(page.getByText("transform refused")).toBeVisible();
+
+  // A preview left in place would have both centred already, and this click would send nothing.
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  const log = await commitLog(page);
+  expect(log.map((e) => [e.ids[0], e.m[4], e.batch])).toEqual([[2, -15, 1], [4, 15, 1]]); // document order
+});
+
+test("the fake refuses a whole batch that names a missing node", async ({ page }) => {
+  // The fake is what the frontend is tested against, so it must not half-apply what the backend
+  // refuses outright.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  const refused = await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("commit_transforms", { moves: [
+        { ids: [4], m: [1, 0, 0, 1, 5, 0] },
+        { ids: [999], m: [1, 0, 0, 1, 1, 0] },
+      ] }).then(() => false, () => true),
+  );
+  expect(refused).toBe(true);
+  expect(await commitLog(page)).toEqual([]);
+  expect(await nodeTransform(page, 4)).toEqual([1, 0, 0, 1, 0, 0]);
+});
+
+test("queued aligns replace each other per axis, not across axes", async ({ page }) => {
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 5 * v.scale); // red to 5..15 × 5..15
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align top edges" }).click();
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align right edges" }).click(); // replaces left, not top
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // Top takes red up to the Group's 0; right takes red to the Group's 40. Left (the Group to 5)
+  // never runs.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(3);
+  const [, top, right] = await commitLog(page);
+  expect(top).toMatchObject({ ids: [4], m: [1, 0, 0, 1, 0, expect.closeTo(-5, 6)] });
+  expect(right).toMatchObject({ ids: [4], m: [1, 0, 0, 1, expect.closeTo(25, 6), 0] });
+  expect(await nodeTransform(page, 2)).toEqual([1, 0, 0, 1, 30, 0]);
+});
+
+test("an align that would move nothing sends nothing and does not hold the next one", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [2, 3]); // red and green, both already at 0
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  // Never invoked, not just never logged: the fake refuses an empty batch before it logs anything,
+  // so an empty send would pass the log check below and put a refusal on screen.
+  expect(await page.evaluate(() => (window as unknown as { __maxInFlightCommits?: number }).__maxInFlightCommits)).toBeUndefined();
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  expect((await commitLog(page))[0]).toMatchObject({ ids: [2], batch: 1 });
+});
+
+test("a queued distribute does not replace a queued align on the same axis", async ({ page }) => {
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(3).click({ modifiers: ["Shift"] }); // green
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] }); // the Group
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Distribute horizontal spacing" }).click();
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // Distribute first: green 0..10 and the Group 30..40 stay, red goes to 15 (+10). Then align left
+  // from there: red −15, the Group −30. Align alone would have sent red −5.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(4);
+  const log = await commitLog(page);
+  expect(log.slice(1).map((e) => [e.ids[0], Math.round(e.m[4] * 1e6) / 1e6, e.batch])).toEqual([[4, 10, 2], [2, -30, 3], [4, -15, 3]]);
+});
+
+test("an align's preview moves every unit while its commit is on the wire", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [0, 2, 3]); // the Group, red, green: the centre of 0..40 is 20
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(3);
+
+  // The fields read the effective scene, so they show the preview: red and green both at 15. A
+  // preview that applied only the first move (the Group's) would leave them at 0.
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(2).click();
+  await showTab(page, "Properties");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("15");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(3).click();
+  await showTab(page, "Properties");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("15");
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+});
+
+test("distribute spaces the pieces inside a border selected with them", async ({ page }) => {
+  await seedAlignExtras(page);
+  await showTab(page, "Properties");
+  const horizontal = page.getByRole("button", { name: "Distribute horizontal spacing" });
+
+  // Widen red to 100 mm, a border across x over green (0..10) and the Group (50..80).
+  await selectRows(page, [0]);
+  await showTab(page, "Properties");
+  await page.getByLabel("W", { exact: true }).fill("100");
+  await expect.poll(async () => (await nodeTransform(page, 2))[0]).toBeCloseTo(10, 6);
+
+  await selectRows(page, [0, 2]);
+  await showTab(page, "Properties");
+  await expect(horizontal).toBeDisabled();
+  await expect(horizontal).toHaveAttribute("title", /select three or more pieces/);
+
+  // 100 mm less 40 mm of pieces leaves 60 over three spaces: green to 20, the Group already at 50.
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+  await horizontal.click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2); // the W edit, then this
+  expect((await commitLog(page))[1]).toMatchObject({ ids: [3], m: [1, 0, 0, 1, 20, 0] });
+});
+
+test("a border too small for its pieces blocks distribute on that axis only, and says why", async ({ page }) => {
+  await seedAlignExtras(page);
+  await showTab(page, "Properties");
+  const horizontal = page.getByRole("button", { name: "Distribute horizontal spacing" });
+  await showTab(page, "Properties");
+  const vertical = page.getByRole("button", { name: "Distribute vertical spacing" });
+
+  // Red becomes a 100 mm border; green grows to 75 mm, so with the 30 mm Group the pieces need
+  // 105 mm across. Down y nothing spans and the three distribute between two ends as usual.
+  await selectRows(page, [0]);
+  await showTab(page, "Properties");
+  await page.getByLabel("W", { exact: true }).fill("100");
+  await expect.poll(async () => (await nodeTransform(page, 2))[0]).toBeCloseTo(10, 6);
+  await selectRows(page, [1]);
+  await showTab(page, "Properties");
+  await page.getByLabel("W", { exact: true }).fill("75");
+  await expect.poll(async () => (await nodeTransform(page, 3))[0]).toBeCloseTo(7.5, 6);
+
+  await selectRows(page, [0, 1, 2]);
+  await showTab(page, "Properties");
+  await expect(horizontal).toBeDisabled();
+  await expect(horizontal).toHaveAttribute("title", /the pieces do not fit inside the one around them/);
+  await expect(vertical).toBeEnabled();
+  await expect(vertical).toHaveAttribute("title", "Distribute vertical spacing");
+});
+
+// #298: a commit drained from the queue was made before the refusal ahead of it arrived, so it
+// must not clear that refusal's message before the operator has seen it.
+test("a refusal stays on screen when an edit queued behind it lands", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => {
+    const w = window as unknown as { __holdCommits: () => void; __failNextCommit: () => void };
+    w.__holdCommits();
+    w.__failNextCommit();
+  });
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // will be refused
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30"); // queued behind it
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(30, 6);
+  await expect(page.getByText("transform refused")).toBeVisible();
+});
+
+test("a queued edit whose refresh succeeds clears the refresh warning ahead of it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // lands, refresh fails
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30"); // queued behind it
+  await page.evaluate(() => {
+    const w = window as unknown as { __failNextSnapshot: () => void; __releaseCommits: () => Promise<void> };
+    w.__failNextSnapshot();
+    return w.__releaseCommits();
+  });
+
+  // The warning was true when it went up; once the queued edit has re-read the canvas it is not.
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(30, 6);
+  await expect(page.getByText("the canvas could not be refreshed")).toBeHidden();
+});
+
+test("a fresh edit after a refusal clears its message", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __failNextCommit: () => void }).__failNextCommit());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0);
+  await expect(page.getByText("transform refused")).toBeVisible();
+
+  // Made after the refusal was on screen, so it is the operator's next act and starts clean.
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30");
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(30, 6);
+  await expect(page.getByText("transform refused")).toBeHidden();
+});
+
+// Copilot on #301: going out from the queue is not the same as being made before the refusal. An
+// align clicked once the refusal is on screen, while an edit queued earlier is still on the wire,
+// is the operator's next act and must clear it when it lands.
+test("an edit made after a refusal was shown clears it, even when it waits in the queue", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => {
+    const w = window as unknown as { __holdCommits: () => void; __failNextCommit: () => void };
+    w.__holdCommits();
+    w.__failNextCommit();
+  });
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // will be refused
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30"); // queued before the refusal
+  // Let the refusal through and hold again at once, so the X edit it drains stays on the wire.
+  await page.evaluate(() => {
+    const w = window as unknown as { __holdCommits: () => void; __releaseCommits: () => Promise<void> };
+    void w.__releaseCommits();
+    w.__holdCommits();
+  });
+  await expect(page.getByText("transform refused")).toBeVisible();
+
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click(); // queued behind X
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(160, 6);
+  await expect(page.getByText("transform refused")).toBeHidden();
+});
+
+test("a newer align replaces a queued one on the same selection in any click order", async ({ page }) => {
+  // Copilot on #301: the key followed click order, so reselecting a piece made a second request
+  // that ran after the first instead of replacing it.
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15, parked
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] }); // [red, Group]
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(2).click({ modifiers: ["Shift"] }); // [Group]
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(2).click({ modifiers: ["Shift"] }); // [Group, red]
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align right edges" }).click();
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // Right alone: red to the Group's 40 (+25). Left first would have moved the Group to 5.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  expect((await commitLog(page))[1]).toMatchObject({ ids: [4], m: [1, 0, 0, 1, expect.closeTo(25, 6), 0] });
+  expect(await nodeTransform(page, 2)).toEqual([1, 0, 0, 1, 30, 0]);
+});
+
+test("a queued align to the artboard uses the bed it lands on, not the one it was clicked on", async ({ page }) => {
+  // Copilot on #301: the queued click kept the render's artboard, so a machine switch in between
+  // centred the piece on the old bed.
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15, parked
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click(); // queued
+
+  const before = (await readView(page)).scale;
+  await showTab(page, "Properties");
+  await page.getByLabel("Design for").selectOption("puma"); // 600 mm bed
+  await expect.poll(async () => (await readView(page)).scale).not.toBeCloseTo(before, 6);
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // Red's centre is 10; the Puma's is 300. The Cameo's 165 would give 155.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  expect((await commitLog(page))[1]).toMatchObject({ ids: [4], m: [1, 0, 0, 1, expect.closeTo(290, 6), 0] });
+});
+
+test("the align row follows the preview while its commit is on the wire", async ({ page }) => {
+  // Copilot on #301: the preview lived in a ref, so the buttons kept the bounds from before it.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedGroup: true });
+  await page.goto("/");
+  await selectRows(page, [0, 2, 3]); // the Group, red, green: all 10 mm wide
+  await showTab(page, "Properties");
+  const horizontal = page.getByRole("button", { name: "Distribute horizontal spacing" });
+  await expect(horizontal).toBeEnabled();
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click();
+  // In the preview all three sit at 0..10, so each spans the rest and distribute cannot act.
+  await expect(horizontal).toBeDisabled();
+  await expect(horizontal).toHaveAttribute("title", /spans the selection on this axis/);
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+});
+
+test("the fake refuses a whole batch when a later entry's geometry cannot be reversed", async ({ page }) => {
+  // Copilot on #301: the first entry is fine and the second sits under a Group scaled to nothing.
+  // Rust refuses the batch and keeps neither; the fake must too, or a test can pass on a half-commit.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedCollapsedGroup: true });
+  await page.goto("/");
+  const refused = await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("commit_transforms", { moves: [
+        { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+        { ids: [5], m: [1, 0, 0, 1, 1, 0] },
+      ] }).then(() => false, () => true),
+  );
+  expect(refused).toBe(true);
+  expect(await nodeTransform(page, 2)).toEqual([1, 0, 0, 1, 0, 0]);
+  expect(await nodeTransform(page, 5)).toEqual([1, 0, 0, 1, 0, 0]);
+  // Nor logged: a refused batch that took a batch number would shift every later one.
+  expect(await commitLog(page)).toEqual([]);
+});
+
+test("the fake accepts a batch under a tiny but invertible parent, as Rust does", async ({ page }) => {
+  // Copilot on #301: Rust refuses only an exactly zero determinant, so a 1e-7 scale (determinant
+  // 1e-14) must commit; a tolerance in the fake refused it and could fail a valid test.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedCollapsedGroup: true, collapsedScale: 1e-7 });
+  await page.goto("/");
+  const refused = await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("commit_transforms", { moves: [
+        { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+        { ids: [5], m: [1, 0, 0, 1, 1, 0] },
+      ] }).then(() => false, () => true),
+  );
+  expect(refused).toBe(false);
+  expect((await nodeTransform(page, 2))[4]).toBeCloseTo(5, 6);
+  // A 1 mm world move beneath a 1e-7 scale is 1e7 in the rect's own space (CodeRabbit on #301).
+  expect((await nodeTransform(page, 5))[4] / 1e7).toBeCloseTo(1, 6);
+});
+
+test("the fake refuses an empty batch, or a batch with an empty entry, as transform_each does", async ({ page }) => {
+  // Copilot on #301: Rust answers EmptySelection for both and keeps nothing; the fake applied the
+  // valid first move and recorded the batch.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  const send = (moves: unknown[]) => page.evaluate((mv) =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("commit_transforms", { moves: mv }).then(() => false, () => true), moves);
+  expect(await send([{ ids: [2], m: [1, 0, 0, 1, 5, 0] }, { ids: [], m: [1, 0, 0, 1, 1, 0] }])).toBe(true);
+  expect(await send([])).toBe(true);
+  expect(await nodeTransform(page, 2)).toEqual([1, 0, 0, 1, 0, 0]);
+  expect(await commitLog(page)).toEqual([]);
+});
+
+test("a queued edit is dropped when Reload replaces the document", async ({ page }) => {
+  // Copilot on #301: Reload reuses ids, so an X edit queued against the old document moved a shape
+  // in the reloaded one.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save"); // gives Reload a path
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // on the wire
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30"); // queued behind it
+  await fileAction(page, "Revert to saved");
+  await showTab(page, "Layers");
+  await expect(page.getByTestId("layer-row").first()).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // The queued X must not follow the held drag into the reloaded document. Where the drag itself
+  // ends up is not this test's to say: the backend runs it before the load, which then replaces it,
+  // while the fake runs a held commit on release, after the load.
+  await page.waitForTimeout(300);
+  expect(await commitLog(page)).toHaveLength(1);
+  expect((await nodeTransform(page, 2))[4]).not.toBeCloseTo(30, 6);
+});
+
+test("an edit made while Reload loads is held, and dropped once the document is replaced", async ({ page }) => {
+  // An edit made during the load used to go straight out, with ids from the document on screen, and
+  // land on whatever the reloaded one gives those ids.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save"); // gives Reload a path
+  await page.evaluate(() => (window as unknown as { __holdLoad: () => void }).__holdLoad());
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await fileAction(page, "Revert to saved"); // parked
+  // Locked while it loads, and saying why: the panel used to take these, and the load then dropped
+  // them without a word (Copilot on #301).
+  await showTab(page, "Properties");
+  const centre = page.getByRole("button", { name: "Align horizontal centres" });
+  await expect(centre).toBeDisabled();
+  await expect(centre).toHaveAttribute("title", /waiting for the document to load/);
+  await showTab(page, "Properties");
+  await expect(page.getByLabel("X", { exact: true })).toBeDisabled();
+  await page.evaluate(() => (window as unknown as { __releaseLoad: () => Promise<void> }).__releaseLoad());
+
+  await page.waitForTimeout(300);
+  expect(await commitLog(page)).toEqual([]);
+  expect(await nodeTransform(page, 2)).toEqual([1, 0, 0, 1, 0, 0]);
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(centre).toBeEnabled();
+  await expect(page.getByLabel("X", { exact: true })).toBeEnabled();
+});
+
+test("a snapshot answering after a newer one has rendered is dropped", async ({ page }) => {
+  // CodeRabbit on #301: an older snapshot answering last rendered under a newer revision, so the
+  // canvas went back to geometry from before the align that the newer one already showed.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await showTab(page, "Properties");
+  const x = page.getByLabel("X", { exact: true });
+  const before = await x.inputValue();
+  await page.evaluate(() => (window as unknown as { __holdSnapshots: () => void }).__holdSnapshots());
+  await page.getByRole("checkbox", { name: "Cut this shape" }).click(); // its snapshot is held
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click(); // to the bed; held too
+  await expect.poll(() => commitLog(page).then((l) => l.length)).toBe(1);
+
+  await page.evaluate(() => (window as unknown as { __releaseLatestSnapshot: () => Promise<void> }).__releaseLatestSnapshot());
+  await expect(x).not.toHaveValue(before);
+  const aligned = await x.inputValue();
+  await page.evaluate(() => (window as unknown as { __releaseSnapshot: () => Promise<void> }).__releaseSnapshot());
+  await page.waitForTimeout(300);
+  await expect(x).toHaveValue(aligned);
+});
+
+test("Open or Reload waits for a document edit already on its way before it loads", async ({ page }) => {
+  // CodeRabbit on #301: the lock is checked when an edit starts, and an import then reads its file
+  // before it sends. A Reload in that gap loaded first, and the import's old root met the new
+  // document. A load now waits for edits already started, as it does for a transform commit.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  const loads = () => page.evaluate(() => (window as unknown as { __loads?: number }).__loads ?? 0);
+  await page.evaluate(() => (window as unknown as { __holdEdits: () => void }).__holdEdits());
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await showTab(page, "Properties");
+  await page.getByRole("checkbox", { name: "Cut this shape" }).click(); // on its way, held
+  await fileAction(page, "Revert to saved");
+  await page.waitForTimeout(300);
+  expect(await loads()).toBe(0);
+  await page.evaluate(() => (window as unknown as { __releaseEdits: () => Promise<void> }).__releaseEdits());
+
+  await expect.poll(loads).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { __loadDuringEdit?: boolean }).__loadDuringEdit)).toBeUndefined();
+});
+
+test("an import still reading its file finishes before Reload loads", async ({ page }) => {
+  // CodeRabbit on #301: the import passes the lock, then awaits its file before it sends. Paused in
+  // that read, a Reload must wait for it rather than load and take the import's old root.
+  await page.addInitScript(() => {
+    const w = window as unknown as {
+      __docOrder: string[]; __holdFileReads: () => void; __releaseFileReads: () => void; __heldFileReads: () => number;
+    };
+    w.__docOrder = [];
+    let holding = false;
+    const held: (() => void)[] = [];
+    const read = Blob.prototype.arrayBuffer;
+    Blob.prototype.arrayBuffer = function (this: Blob) {
+      if (!holding) return read.call(this);
+      return new Promise((resolve, reject) => held.push(() => read.call(this).then(resolve, reject)));
+    };
+    w.__holdFileReads = () => { holding = true; };
+    w.__releaseFileReads = () => { holding = false; held.splice(0).forEach((f) => f()); };
+    w.__heldFileReads = () => held.length;
+  });
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await page.evaluate(() => (window as unknown as { __holdFileReads: () => void }).__holdFileReads());
+  // Built in the page: the e2e build has no Node types, so no Buffer.
+  await page.evaluate(() => {
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const files = new DataTransfer();
+    files.items.add(new File(['<svg xmlns="http://www.w3.org/2000/svg"><rect width="5" height="5"/></svg>'], "a.svg", { type: "image/svg+xml" }));
+    input.files = files.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  // In the read, past the lock check, before Reload is asked for.
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __heldFileReads: () => number }).__heldFileReads())).toBe(1);
+  await fileAction(page, "Revert to saved");
+  await page.waitForTimeout(300);
+  const order = () => page.evaluate(() => (window as unknown as { __docOrder: string[] }).__docOrder);
+  expect(await order()).toEqual([]);
+  await page.evaluate(() => (window as unknown as { __releaseFileReads: () => void }).__releaseFileReads());
+
+  await expect.poll(order).toEqual(["import_svg", "load_project"]);
+});
+
+test("a transform's late snapshot retires its preview against the newer one already shown", async ({ page }) => {
+  // Copilot on #301: an align's snapshot answering after a Delete's had rendered was dropped as
+  // "nothing rendered", so the align's preview stayed up over the newer scene, still drawing (and
+  // hit-testing) the shape the Delete had removed.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  const v = await fittedView(page);
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await showTab(page, "Properties");
+  const x = page.getByLabel("X", { exact: true });
+  await page.evaluate(() => (window as unknown as { __holdSnapshots: () => void }).__holdSnapshots());
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align horizontal centres" }).click(); // its snapshot is held
+  await expect.poll(() => commitLog(page).then((l) => l.length)).toBe(1);
+  await expect(x).not.toHaveValue("0");
+  const alignedX = Number(await x.inputValue());
+  await page.keyboard.press("Delete"); // its snapshot is held too
+
+  await page.evaluate(() => (window as unknown as { __releaseLatestSnapshot: () => Promise<void> }).__releaseLatestSnapshot());
+  await showTab(page, "Layers");
+  await expect(page.getByTestId("layer-row")).toHaveCount(1); // the Delete's, red gone
+  await page.evaluate(() => (window as unknown as { __releaseSnapshot: () => Promise<void> }).__releaseSnapshot());
+  await page.waitForTimeout(300);
+
+  const at = await toPage(page, v, { x: alignedX + 5, y: 5 });
+  await page.mouse.click(at.x, at.y);
+  await expect(x).toHaveCount(0);
+});
+
+test("Delete, Undo and the other document commands are refused while a document loads", async ({ page }) => {
+  // CodeRabbit on #301: only transforms waited for a load. A Delete pressed during a Reload named ids
+  // from the document on screen, and the loaded one reuses them.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await page.evaluate(() => (window as unknown as { __holdLoad: () => void }).__holdLoad());
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await fileAction(page, "Revert to saved"); // held
+  await page.keyboard.press("Delete");
+  await expect(page.getByText("the document is still loading")).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releaseLoad: () => Promise<void> }).__releaseLoad());
+
+  await page.waitForTimeout(300);
+  await showTab(page, "Layers");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2);
+});
+
+test("an edit refused after a load whose read failed says so, reads it again, and unlocks", async ({ page }) => {
+  // After Reload loaded but its snapshot failed, every edit was refused as "still loading" until
+  // another Reload, which nothing said to do (silent-failure-hunter on #301).
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  const failNextSnapshot = () =>
+    page.evaluate(() => (window as unknown as { __failNextSnapshot: () => void }).__failNextSnapshot());
+  await failNextSnapshot();
+  await fileAction(page, "Revert to saved"); // loads; its read fails
+  await expect(page.getByText("snapshot unavailable")).toBeVisible();
+
+  await showTab(page, "Properties");
+  const centre = page.getByRole("button", { name: "Align horizontal centres" });
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(centre).toBeDisabled();
+  await expect(centre).toHaveAttribute("title", /the loaded document could not be read\. Reload to try again/);
+
+  await failNextSnapshot(); // the re-read fails too
+  await page.keyboard.press("Delete");
+  await expect(page.getByText(/Not applied: the loaded document could not be read: snapshot unavailable\. Reload to try again/)).toBeVisible();
+  await expect(centre).toBeDisabled();
+
+  await page.keyboard.press("Delete"); // this re-read works
+  await expect(page.getByText(/Not applied, but the loaded document is on screen now/)).toBeVisible();
+  await showTab(page, "Layers");
+  await expect(page.getByTestId("layer-row")).toHaveCount(2); // neither Delete went out
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(centre).toBeEnabled();
+});
+
+test("a snapshot asked for before a later load never renders over it or lifts its lock", async ({ page }) => {
+  // Copilot on #301: the lock lifted on any newer snapshot, so a first Reload's snapshot answering
+  // after a second Reload had loaded showed the first document and unlocked edits on it, while the
+  // backend held the second; an align there sent the first one's bounds into the second.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  const loads = () => page.evaluate(() => (window as unknown as { __loads?: number }).__loads ?? 0);
+  await page.evaluate(() => (window as unknown as { __holdSnapshots: () => void }).__holdSnapshots());
+  await fileAction(page, "Revert to saved"); // loads; its snapshot is held
+  await expect.poll(loads).toBe(1);
+  await fileAction(page, "Revert to saved"); // loads again; held too
+  await expect.poll(loads).toBe(2);
+
+  const release = () =>
+    page.evaluate(() => (window as unknown as { __releaseSnapshot: () => Promise<void> }).__releaseSnapshot());
+  await showTab(page, "Properties");
+  const centre = page.getByRole("button", { name: "Align horizontal centres" });
+  await release(); // the first Reload's answer, read before the second load
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(centre).toHaveAttribute("title", /waiting for the document to load/);
+  await expect(centre).toBeDisabled();
+
+  await release(); // the second's, read after its load
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(centre).toBeEnabled();
+});
+
+test("a queued align finds a Group's shapes in the tree as it stands when it is sent", async ({ page }) => {
+  // Copilot on #301: the queued click kept the tree from its render, so a shape added to the Group
+  // before it drained was left out of the Group's bounds.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedAlignExtras: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red, 0..10
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15, parked
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(2).click({ modifiers: ["Shift"] }); // + the Group, 50..80
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click(); // queued
+  // A 10 mm rect joins the Group at 0..10 while the align waits.
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("add_primitive", { parent: 4, kind: { Rect: { w: 10, h: 10 } } }));
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // With the new rect the Group reaches 0, so only red moves (to 0). The old tree said 50..80,
+  // which would have sent the Group to 5 instead.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  expect((await commitLog(page))[1]).toMatchObject({ ids: [2], m: [1, 0, 0, 1, expect.closeTo(-5, 6), 0] });
+});
+
+test("an edit made between a commit settling and the queue draining still waits its turn", async ({ page }) => {
+  // CodeRabbit on #301: inFlight cleared on settle but the queue drained a render later, so an
+  // edit made in between was sent at once and overlapped the drained one on the wire.
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 5 * v.scale); // red to 5..15 × 5..15
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] }); // + the Group
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align top edges" }).click(); // queued behind the drag
+
+  // Release without yielding a task, let the settled chain run its microtasks, then click: React
+  // has not rendered yet, so this lands in the gap before the drain.
+  await page.evaluate(async () => {
+    void (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits();
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    (document.querySelector('[aria-label="Align right edges"]') as HTMLButtonElement).click();
+  });
+
+  await expect.poll(async () => (await commitLog(page)).length).toBe(3);
+  expect(await page.evaluate(() => (window as unknown as { __maxInFlightCommits?: number }).__maxInFlightCommits)).toBe(1);
+  // In the order they were made: top was queued first. One on the wire at a time is not enough on
+  // its own; a click in the gap that went out at once would still land before the queued top.
+  const [, top, right] = await commitLog(page);
+  expect(top).toMatchObject({ ids: [4], m: [1, 0, 0, 1, 0, expect.closeTo(-5, 6)] });
+  expect(right).toMatchObject({ ids: [4], m: [1, 0, 0, 1, expect.closeTo(25, 6), 0] });
+});
+
+test("Reload waits for a commit already on the wire before it loads", async ({ page }) => {
+  // CodeRabbit on #301: gating new edits does not cover a commit that already went out. Open and
+  // Reload must not start load_project while one is unanswered, or a reused id could meet it.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // on the wire, held
+  await fileAction(page, "Revert to saved");
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // The load ran (a never-run Reload would pass a no-overlap check), and did not overlap the commit.
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __loads?: number }).__loads ?? 0)).toBe(1);
+  expect(await page.evaluate(() => (window as unknown as { __loadDuringCommit?: boolean }).__loadDuringCommit ?? false)).toBe(false);
+  // The reload did happen once the commit had settled: the saved copy has red back at 0.
+  await expect.poll(async () => (await nodeTransform(page, 2))[4]).toBeCloseTo(0, 6);
+});
+
+test("after a load whose snapshot failed, edits on the old view are not sent", async ({ page }) => {
+  // Copilot on #301: replacing cleared when the load returned, but the new document's snapshot
+  // comes after, so the canvas still showed the old one; an align there sent old bounds and a
+  // reused id into the loaded document. Edits stay off until a newer snapshot has rendered.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await page.evaluate(() => (window as unknown as { __failNextSnapshot: () => void }).__failNextSnapshot());
+  await fileAction(page, "Revert to saved");
+  await expect(page.getByText("snapshot unavailable")).toBeVisible(); // loaded, but not re-read
+
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red, from the old view
+  // Locked, and saying why, rather than taking the click and dropping it (silent-failure-hunter).
+  await showTab(page, "Properties");
+  const centre = page.getByRole("button", { name: "Align horizontal centres" });
+  await expect(centre).toBeDisabled();
+  await expect(centre).toHaveAttribute("title", /the loaded document could not be read/);
+  await showTab(page, "Properties");
+  await expect(page.getByLabel("X", { exact: true })).toBeDisabled();
+  expect(await commitLog(page)).toEqual([]);
+});
+
+test("a drag held through a Reload is dropped, not sent to the loaded document", async ({ page }) => {
+  // Copilot on #301: an unreleased drag is not a commit yet, so the load did not wait for it, and
+  // its pointer-up sent the old ids and matrix straight into the reloaded document.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  const from = await toPage(page, v, { x: 5, y: 5 });
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 5 * v.scale, from.y, { steps: 4 }); // dragging, not released
+  await page.getByRole("button", { name: "File", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("menuitem", { name: "Revert to saved" }).focus();
+  await page.keyboard.press("Enter");
+  await showTab(page, "Layers");
+  await expect(page.getByTestId("layer-row").first()).toBeVisible();
+  await page.mouse.up();
+
+  await page.waitForTimeout(300);
+  expect(await commitLog(page)).toEqual([]);
+  expect((await nodeTransform(page, 2))[4]).toBeCloseTo(0, 6);
+});
+
+test("the fake refuses a held batch whose node was deleted before it was answered", async ({ page }) => {
+  // Copilot on #301: the id check ran at the call and the staged apply skipped a node gone by
+  // the answer, so the fake applied the rest where Rust refuses the batch.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  const refused = await page.evaluate(async () => {
+    const w = window as unknown as {
+      __holdCommits: () => void; __releaseCommits: () => Promise<void>;
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> };
+    };
+    w.__holdCommits();
+    const batch = w.__TAURI_INTERNALS__.invoke("commit_transforms", { moves: [
+      { ids: [2], m: [1, 0, 0, 1, 5, 0] },
+      { ids: [3], m: [1, 0, 0, 1, 5, 0] },
+    ] }).then(() => false, () => true);
+    await w.__TAURI_INTERNALS__.invoke("delete", { ids: [2] });
+    await w.__releaseCommits();
+    return batch;
+  });
+  expect(refused).toBe(true);
+  expect(await nodeTransform(page, 3)).toEqual([1, 0, 0, 1, 0, 0]);
+});
+
+test("edits work again once a successful Reload's snapshot has rendered", async ({ page }) => {
+  // pr-test-analyzer on #301: the lock after a load was tested only while held. Were its release
+  // broken, every edit after any Open or Reload would be dead and nothing else would notice.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await fileAction(page, "Revert to saved");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  await showTab(page, "Properties");
+  const centre = page.getByRole("button", { name: "Align horizontal centres" });
+  await expect(centre).toBeEnabled();
+  await centre.click();
+  await expect.poll(async () => (await commitLog(page)).length).toBe(1);
+  expect((await commitLog(page))[0]).toMatchObject({ ids: [2], m: [1, 0, 0, 1, expect.closeTo(160, 6), 0] });
+});
+
+test("a queued align on two pieces sends nothing if one is deleted before it goes", async ({ page }) => {
+  // pr-test-analyzer on #301: an align clicked on two pieces must not turn into "send the survivor
+  // to the mat" because the other went while it waited.
+  const v = await selectRedBesideGroup(page);
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // red to 5..15, parked
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click({ modifiers: ["Shift"] }); // + the Group
+  await showTab(page, "Properties");
+  await page.getByRole("button", { name: "Align left edges" }).click(); // queued on [red, Group]
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: Record<string, unknown>) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("delete", { ids: [2] })); // the Group goes
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // The drag lands and its refresh drops the Group; the align, now on red alone, sends nothing.
+  await expect.poll(async () => (await nodeTransform(page, 4))[4]).toBeCloseTo(5, 6);
+  await page.waitForTimeout(300);
+  expect(await commitLog(page)).toHaveLength(1);
+});
+
+test("a refused edit puts back the preview of an unread commit beneath it", async ({ page }) => {
+  // pr-test-analyzer on #301: every refusal test started with no preview standing. Here the first
+  // drag lands but cannot be re-read, so its preview stands for what the backend holds; a refused
+  // edit on top must return to that, not to the stale committed scene.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+
+  await page.evaluate(() => (window as unknown as { __failNextSnapshot: () => void }).__failNextSnapshot());
+  await dragBy(page, await toPage(page, v, { x: 5, y: 5 }), 5 * v.scale, 0); // lands at 5, unread
+  await expect(page.getByText("the canvas could not be refreshed")).toBeVisible();
+  await showTab(page, "Properties");
+  // A drag of exactly 5 mm lands on a float a couple of ulps off once the canvas is not the
+  // whole window; the field shows that number, and "5" is what it means.
+  await expect.poll(async () => Number(await page.getByLabel("X", { exact: true }).inputValue())).toBeCloseTo(5, 5);
+
+  await page.evaluate(() => (window as unknown as { __failNextCommit: () => void }).__failNextCommit());
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).fill("30");
+  await expect(page.getByText("transform refused")).toBeVisible();
+  await showTab(page, "Properties");
+  await expect.poll(async () => Number(await page.getByLabel("X", { exact: true }).inputValue())).toBeCloseTo(5, 5);
+});
+
+test("an align pressed from the keyboard during a drag waits for the drag's commit", async ({ page }) => {
+  // Copilot and CodeRabbit on #301: busy() ignored a drag under the pointer, so the align went out
+  // at once and the release sent a second batch on top of it.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click(); // red
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  // Properties has to be showing before the pointer goes down: clicking the tab mid-drag
+  // is a click the canvas still owns.
+  await showTab(page, "Properties");
+
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  const from = await toPage(page, v, { x: 5, y: 5 });
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 5 * v.scale, from.y, { steps: 4 }); // dragging
+  await page.getByRole("button", { name: "Align horizontal centres" }).focus();
+  await page.keyboard.press("Enter");
+  await page.mouse.up();
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+
+  // The drag first, then the align computed from where it left red; never two on the wire.
+  await expect.poll(async () => (await commitLog(page)).length).toBe(2);
+  const [drag, align] = await commitLog(page);
+  expect(drag.m[4]).toBeCloseTo(5, 6);
+  expect(align.m[4]).toBeCloseTo(165 - 10, 6);
+  expect(await page.evaluate(() => (window as unknown as { __maxInFlightCommits?: number }).__maxInFlightCommits)).toBe(1);
+});
+
+test("a second Open or Reload while one is still loading is refused, and edits stay held", async ({ page }) => {
+  // Copilot on #301: two replacements could overlap, and the first to finish cleared the shared
+  // lock while the other was still loading, letting old-document edits reach it.
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await fileAction(page, "Save");
+  await page.evaluate(() => (window as unknown as { __holdLoad: () => void }).__holdLoad());
+  await fileAction(page, "Revert to saved"); // held
+  await fileAction(page, "Revert to saved"); // refused while the first loads
+  await expect(page.getByText("another document is still loading")).toBeVisible();
+  await page.evaluate(() => (window as unknown as { __releaseLoad: () => Promise<void> }).__releaseLoad());
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __loads?: number }).__loads ?? 0)).toBe(1);
+
+  // Once the first load's snapshot renders, editing works.
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await expect(page.getByRole("button", { name: "Align horizontal centres" })).toBeEnabled();
+});
+
+test("appearance is remembered across a reload", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const appearance = page.getByRole("button", { name: "Appearance" });
+  await expect(appearance).toBeEnabled();
+  await appearance.click();
+  await page.keyboard.press("Escape");
+  await expect(appearance).toBeFocused();
+  await expect(page.getByRole("menu", { name: "Appearance" })).toHaveCount(0);
+
+  await appearance.click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(appearance).toBeFocused();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("cuthulhu.theme"))).toBe("dark");
+
+  await page.reload();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await expect(page.getByRole("menuitemradio", { name: "Dark" })).toHaveAttribute("aria-checked", "true");
+
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.reload();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await expect(page.getByRole("menuitemradio", { name: "Light" })).toHaveAttribute("aria-checked", "true");
+});
+
+test("system appearance follows the operating system and an explicit one does not", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "Appearance" })).toBeEnabled();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect(page.locator("html")).toHaveClass(/dark/);
+
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+});
+
+test("the boot script paints the cached theme before preferences answer", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => localStorage.setItem("cuthulhu.theme", "dark"));
+  await page.addInitScript(installMockTauri, { holdPreferences: true });
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect.poll(() =>
+    page.evaluate(() => typeof (window as unknown as { __releasePreferences?: unknown }).__releasePreferences === "function"),
+  ).toBe(true);
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await page.evaluate(() => (window as unknown as { __releasePreferences: () => void }).__releasePreferences());
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await expect(page.getByRole("button", { name: "Appearance" })).toBeEnabled();
+});
+
+async function paintContrast(page: Page, locator: Locator) {
+  const bytes = (await locator.screenshot()) as unknown as Uint8Array;
+  return contrastFromPng(page, bytes);
+}
+
+async function contrastFromPng(page: Page, bytes: Uint8Array) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const rgba = await page.evaluate(async (png) => {
+    const img = new Image();
+    img.src = `data:image/png;base64,${png}`;
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no canvas");
+    ctx.drawImage(img, 0, 0);
+    return Array.from(ctx.getImageData(0, 0, canvas.width, canvas.height).data);
+  }, btoa(binary));
+  return renderedContrastFromPixels(rgba);
+}
+
+test("top-bar labels stay readable in both themes, including after a light-to-dark switch", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const importButton = page.getByRole("button", { name: "Import", exact: true });
+  const fileButton = page.getByRole("button", { name: "File", exact: true });
+  const undo = page.getByRole("button", { name: "Undo", exact: true });
+  const redo = page.getByRole("button", { name: "Redo", exact: true });
+  const layers = page.getByRole("tab", { name: "Layers", exact: true });
+  const properties = page.getByRole("tab", { name: "Properties", exact: true });
+  const devices = page.getByRole("tab", { name: "Devices", exact: true });
+  await expect(importButton).toBeEnabled();
+  await expect(undo).toBeDisabled();
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+
+  const measure = async () => ({
+    import: await paintContrast(page, importButton),
+    file: await paintContrast(page, fileButton),
+    undo: await paintContrast(page, undo),
+    redo: await paintContrast(page, redo),
+    layers: await paintContrast(page, layers),
+    properties: await paintContrast(page, properties),
+    devices: await paintContrast(page, devices),
+  });
+
+  const light = await measure();
+  expect(await importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(1, 47, 54)");
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  // `transition-colors` holds the light foreground for a frame after the class
+  // flips. The settled button color is the dark token.
+  await expect.poll(() => importButton.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(230, 240, 240)");
+  await expect.poll(() => properties.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(157, 184, 185)");
+  // Active tab: the light theme's dark teal on a white pill, in both themes.
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.hover();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).backgroundColor)).toBe("rgb(255, 255, 255)");
+  await layers.focus();
+  await expect.poll(() => layers.evaluate((el) => getComputedStyle(el).color)).toBe("rgb(16, 108, 114)");
+  const dark = await measure();
+
+  for (const [theme, sample] of [
+    ["light", light],
+    ["dark", dark],
+  ] as const) {
+    // Printed so a failure names the pixels, and so the PR can quote the ratios.
+    console.log(theme, {
+      import: sample.import.ratio.toFixed(2),
+      file: sample.file.ratio.toFixed(2),
+      undo: sample.undo.ratio.toFixed(2),
+      redo: sample.redo.ratio.toFixed(2),
+      layers: sample.layers.ratio.toFixed(2),
+      properties: sample.properties.ratio.toFixed(2),
+      devices: sample.devices.ratio.toFixed(2),
+      importInk: sample.import.ink.join(","),
+      undoInk: sample.undo.ink.join(","),
+      propertiesInk: sample.properties.ink.join(","),
+      importPeak: sample.import.peak.toFixed(2),
+      undoPeak: sample.undo.peak.toFixed(2),
+    });
+    expect(sample.import.ratio, `${theme} Import`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.file.ratio, `${theme} File`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.undo.ratio, `${theme} Undo`).toBeGreaterThanOrEqual(3);
+    expect(sample.redo.ratio, `${theme} Redo`).toBeGreaterThanOrEqual(3);
+    expect(sample.layers.ratio, `${theme} Layers`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.properties.ratio, `${theme} Properties`).toBeGreaterThanOrEqual(4.5);
+    expect(sample.devices.ratio, `${theme} Devices`).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+test("the File menu ring follows the keyboard, not a pointer click", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const file = page.getByRole("button", { name: "File", exact: true });
+  await page.getByRole("button", { name: "Import", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(file).toBeFocused();
+  await expect.poll(() => file.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+
+  await file.click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: "Save", exact: true })).toBeVisible();
+  // Radix hides the rest of the page from the accessibility tree while the menu is open.
+  const trigger = page.locator('header button[aria-label="File"]');
+  expect(await trigger.evaluate((el) => getComputedStyle(el).boxShadow)).toBe("none");
+  expect(await menu.evaluate((el) => getComputedStyle(el).boxShadow)).toBe("none");
+});
+
+test("Import names Image, with Opens Trace beside it", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Import", exact: true }).click();
+  const item = page.getByRole("menuitem", { name: "Image" });
+  await expect(item).toBeVisible();
+  await expect(item).toContainText("Opens Trace");
+  await expect(item).not.toContainText("Image…");
+});
+
+test("muted and faded button hovers still reach the foreground", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  const idle = page.getByRole("group", { name: "Units" }).locator("button[aria-pressed='false']");
+  await idle.hover();
+  const foreground = await page.evaluate(() => getComputedStyle(document.body).color);
+  await expect.poll(() => idle.evaluate((el) => getComputedStyle(el).color)).toBe(foreground);
+
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await goToSendStep(page, 2);
+  const machine = page.getByRole("dialog", { name: "Send to cutter" }).getByRole("button", { name: "Machine", exact: true });
+  const faded = await machine.evaluate((el) => getComputedStyle(el).color);
+  expect(faded).not.toBe(foreground);
+  await machine.hover();
+  await expect.poll(() => machine.evaluate((el) => getComputedStyle(el).color)).toBe(foreground);
+});
+
+test("the Appearance glyph is a 16px icon", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  const box = await page.getByRole("button", { name: "Appearance" }).locator("svg").boundingBox();
+  expect(box?.width).toBeGreaterThanOrEqual(15);
+  expect(box?.width).toBeLessThanOrEqual(17);
+  expect(box?.height).toBeGreaterThanOrEqual(15);
+  expect(box?.height).toBeLessThanOrEqual(17);
+});
+
+test("a machine with no saved unit takes inches from en-US once and then keeps them", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "language", {
+      configurable: true,
+      get: () => sessionStorage.getItem("cuthulhu.testLocale") || "en-US",
+    });
+  });
+  await page.addInitScript(installMockTauri, { unsetUnits: true });
+  await page.goto("/");
+  const inches = page.getByRole("button", { name: "in", exact: true });
+  const millimetres = page.getByRole("button", { name: "mm", exact: true });
+  await expect(inches).toHaveAttribute("aria-pressed", "true");
+
+  await page.evaluate(() => sessionStorage.setItem("cuthulhu.testLocale", "fr-FR"));
+  await page.reload();
+  await expect(inches).toHaveAttribute("aria-pressed", "true");
+  await expect(millimetres).toHaveAttribute("aria-pressed", "false");
+});
+
+test("a unit chosen while the region save is in flight is the one that sticks", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "language", {
+      configurable: true,
+      get: () => "en-US",
+    });
+  });
+  await page.addInitScript(installMockTauri, { unsetUnits: true, holdFirstUnitSave: true });
+  await page.goto("/");
+  await expect.poll(() =>
+    page.evaluate(() => typeof (window as unknown as { __releaseUnitSave?: unknown }).__releaseUnitSave === "function"),
+  ).toBe(true);
+  await page.getByRole("button", { name: "mm", exact: true }).click();
+  await page.evaluate(() => (window as unknown as { __releaseUnitSave: () => void }).__releaseUnitSave());
+  await expect(page.getByRole("button", { name: "mm", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() =>
+    page.evaluate(() => (JSON.parse(sessionStorage.getItem("cuthulhu.preferences") || "{}") as { units?: string }).units),
+  ).toBe("mm");
+});
+
+test("aiming at a host keeps the cutter after the local manager reports Disconnected", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedBusyHost: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: /No cutter connected/ }).click();
+  await page.getByRole("menuitem", { name: /this computer/ }).first().click();
+  await expect(page.getByRole("button", { name: /Active cutter/ })).toBeVisible();
+
+  await page.getByRole("button", { name: /Active cutter/ }).click();
+  await page.getByRole("menuitem", { name: /Workshop Pi/ }).click();
+  await expect.poll(() =>
+    page.evaluate(() => (window as unknown as { __hostReleaseEmitted?: boolean }).__hostReleaseEmitted === true),
+  ).toBe(true);
+  await expect(page.getByRole("button", { name: /Active cutter: Silhouette Cameo 5 Alpha/ })).toContainText("Workshop Pi");
+});
+
+test("a history reply from an earlier refresh does not rewind Undo", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { holdHistory: true });
+  await page.goto("/");
+  const waiters = () =>
+    page.evaluate(() => ((window as unknown as { __historyWaiters?: unknown[] }).__historyWaiters ?? []).length);
+  // StrictMode runs the mount refresh twice. Both are queued before the edit's.
+  await expect.poll(waiters).toBe(2);
+  await page.getByRole("button", { name: "Rectangle", exact: true }).click();
+  await page.mouse.click(400, 300);
+  await expect.poll(waiters).toBe(3);
+
+  const releaseLast = (canUndo: boolean) =>
+    page.evaluate((undo) => {
+      (window as unknown as { __releaseLastHistory: (flags: { can_undo: boolean; can_redo: boolean }) => void }).__releaseLastHistory({
+        can_undo: undo,
+        can_redo: false,
+      });
+    }, canUndo);
+  // The edit's reply is the newest. The two mount replies are older and must not land after it.
+  await releaseLast(true);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+  await releaseLast(false);
+  await releaseLast(false);
+  await expect(page.getByRole("button", { name: "Undo", exact: true })).toBeEnabled();
+});
+
+test("a refused machine change does not rebuild the open plan", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, failSetMachine: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  // The passes are the second step, and that step asks for a cutter first. The plan itself is
+  // requested as the sheet opens, which is the signal this test used the rows for.
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0)).toBeGreaterThan(0);
+  const before = await page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0);
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await expect(page.getByText("could not set the machine")).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __planCalls?: number }).__planCalls ?? 0)).toBe(before);
+});
+
+test("Option+S subtracts when the produced character is not s", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(0).click();
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await page.evaluate(() => {
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ß", code: "KeyS", metaKey: true, altKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __booleanOp?: string }).__booleanOp)).toBe("Subtract");
+});
+
+type InkBox = { name: string; box: { x: number; y: number; width: number; height: number } };
+
+/** Boxes first, then one full-page shot. A later clip is a different paint: the
+ *  screenshot walk captures the frame the theme click returns on. */
+async function contrastsOnPageShot(
+  page: Page,
+  items: { name: string; locator: Locator; inset?: number }[],
+) {
+  const regions: InkBox[] = [];
+  for (const item of items) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    regions.push({ name: item.name, box: insetBox(box, item.inset ?? 0) });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  return contrastsInPng(page, regions, bytes);
+}
+
+/** The control's own fill, not the bar it sits on. A white pill's box includes
+ *  the dark zoom bar at the edge, and that edge outranks the label. */
+function insetBox(box: InkBox["box"], inset: number): InkBox["box"] {
+  if (inset <= 0) return box;
+  return {
+    x: box.x + inset,
+    y: box.y + inset,
+    width: Math.max(1, box.width - inset * 2),
+    height: Math.max(1, box.height - inset * 2),
+  };
+}
+
+async function readPngRegions(page: Page, regions: InkBox[], bytes: Uint8Array) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return page.evaluate(
+    async (payload: { png: string; regions: InkBox[] }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${payload.png}`;
+      await img.decode();
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no canvas");
+      ctx.drawImage(img, 0, 0);
+      const scale = img.naturalWidth / window.innerWidth;
+      return payload.regions.map((region) => {
+        const width = Math.max(1, Math.round(region.box.width * scale));
+        const height = Math.max(1, Math.round(region.box.height * scale));
+        const data = ctx.getImageData(
+          Math.round(region.box.x * scale),
+          Math.round(region.box.y * scale),
+          width,
+          height,
+        ).data;
+        return { name: region.name, rgba: Array.from(data), width, height };
+      });
+    },
+    { png: btoa(binary), regions },
+  );
+}
+
+async function contrastsInPng(page: Page, regions: InkBox[], bytes: Uint8Array) {
+  const crops = await readPngRegions(page, regions, bytes);
+  return crops.map((crop) => ({ name: crop.name, hit: renderedContrastFromPixels(crop.rgba) }));
+}
+
+const JOB_INK = [
+  { name: "Cancel job", role: "button" as const, min: 4.5 },
+  { name: "Collapse", role: "button" as const, min: 4.5 },
+  { name: "Import", role: "button" as const, min: 4.5 },
+  { name: "File", role: "button" as const, min: 4.5 },
+  { name: "Fit mat", role: "button" as const, min: 4.5 },
+  { name: "Properties", role: "tab" as const, min: 4.5 },
+  { name: "Undo", role: "button" as const, min: 3 },
+];
+
+async function openSwap(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await expect(page.getByRole("region", { name: "Colour swap" })).toBeVisible();
+}
+
+function jobInkLocators(page: Page) {
+  return JOB_INK.map((item) => ({
+    ...item,
+    locator: page.getByRole(item.role, { name: item.name, exact: true }),
+  }));
+}
+
+test("a cold dark boot paints job controls on the full-page shot", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await openSwap(page);
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  const samples = await contrastsOnPageShot(page, [
+    ...jobInkLocators(page),
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ]);
+  assertDarkJobInk(samples.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(samples.filter((sample) => sample.name === "Rulers"));
+});
+
+test("a light-to-dark switch paints job controls on the screenshot the walk takes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await openSwap(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  const items = [
+    ...jobInkLocators(page),
+    { name: "Rulers", min: 4.5, locator: page.getByRole("button", { name: "Rulers", exact: true }), inset: 4 },
+  ];
+  const hit = await flipDarkShot(page, items);
+  assertDarkJobInk(hit.filter((sample) => sample.name !== "Rulers"));
+  assertFilledInk(hit.filter((sample) => sample.name === "Rulers"));
+});
+
+test("pressed, secondary and send-sheet buttons clear 4.5:1 on the full-page shot", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+
+  await page.emulateMedia({ colorScheme: "light" });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  assertFilledInk(await filledInkShot(page));
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const light = await filledSurfaces(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  // Boxes before the click. Anything awaited after it lets a transition finish,
+  // which is the frame the full-page shot does not get. The sheet covers the
+  // top bar, so the menu is opened from the element rather than the pointer.
+  const confirmHit = await flipDarkShot(page, [
+    { name: "Cancel", locator: light.cancel, inset: 4 },
+    { name: "Rulers", locator: light.rulers, inset: 4 },
+  ]);
+  assertFilledInk(confirmHit);
+});
+
+test("a pressed pill's fill differs from its container in both themes", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  await assertPressedApart(page, "light");
+
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "dark");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "dark", units: "mm" }));
+  });
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await assertPressedApart(page, "dark");
+});
+
+test("the send sheet secondary clears 4.5:1 on the theme-flip frame", async ({ page }) => {
+  test.setTimeout(60_000);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.addInitScript(installMockTauri, { seedRedGold: true });
+  await page.addInitScript(() => {
+    localStorage.setItem("cuthulhu.theme", "light");
+    sessionStorage.setItem("cuthulhu.preferences", JSON.stringify({ appearance: "light", units: "mm" }));
+  });
+  const host = await openSendHost(page);
+  await expect(page.locator("html")).not.toHaveClass(/dark/);
+  assertFilledInk(await flipDarkShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }], "class"));
+});
+
+async function openSendHost(page: Page) {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Send to cutter", exact: true }).click();
+  const host = page.getByRole("dialog", { name: "Send to cutter" }).getByRole("button", { name: "Add a Cut Host…", exact: true });
+  await expect(host).toBeVisible();
+  return host;
+}
+
+async function filledSurfaces(page: Page) {
+  const host = await openSendHost(page);
+  const hostInk = await contrastsOnPageShot(page, [{ name: "Add a Cut Host…", locator: host, inset: 4 }]);
+  await page.getByRole("radio", { name: "Silhouette Cameo 5 Alpha", exact: true }).first().click();
+  await page.evaluate(() => (window as unknown as { __holdPass: () => void }).__holdPass());
+  await startCut(page);
+  await page.evaluate(() => (window as unknown as { __releasePass: () => void }).__releasePass());
+  await callFakeWith(page, "__test_set_status", {
+    phase: "AwaitingConfirmation",
+    actions: { cancel: true, confirm: true },
+    rest: { pass: { index: 1, total: 2 }, sent: { sent: 100, total: 100 } },
+  });
+  const cancel = page.getByRole("region", { name: "Job" }).getByRole("button", { name: "Cancel", exact: true });
+  const rulers = page.getByRole("button", { name: "Rulers", exact: true });
+  await expect(cancel).toBeVisible();
+  const confirmInk = await contrastsOnPageShot(page, [
+    { name: "Cancel", locator: cancel, inset: 4 },
+    { name: "Rulers", locator: rulers, inset: 4 },
+  ]);
+  return { hostInk, confirmInk, cancel, rulers, all: [...hostInk, ...confirmInk] };
+}
+
+async function filledInkShot(page: Page) {
+  const surfaces = await filledSurfaces(page);
+  return surfaces.all;
+}
+
+async function flipDarkShot(
+  page: Page,
+  items: { name: string; locator: Locator; min?: number; inset?: number }[],
+  how: "menu" | "class" = "menu",
+) {
+  const boxed: { name: string; min?: number; box: InkBox["box"] }[] = [];
+  for (const item of items) {
+    const box = await item.locator.boundingBox();
+    if (!box) throw new Error(`no box for ${item.name}`);
+    boxed.push({ name: item.name, min: item.min, box: insetBox(box, item.inset ?? 0) });
+  }
+  if (how === "class") {
+    // The sheet is modal, so the top bar is hidden from the tree and the
+    // Appearance click cannot land. The menu's paint is this class change.
+    await page.evaluate(() => {
+      document.documentElement.classList.add("dark");
+      document.documentElement.style.colorScheme = "dark";
+    });
+  } else {
+    await page.getByRole("button", { name: "Appearance" }).click();
+    await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  const crops = await contrastsInPng(page, boxed, bytes);
+  return crops.map((crop, i) => ({ name: crop.name, min: boxed[i].min, hit: crop.hit }));
+}
+
+function assertDarkJobInk(samples: { name: string; min?: number; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    const min = sample.min ?? JOB_INK.find((item) => item.name === sample.name)?.min ?? 4.5;
+    console.log("job ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.background[0], `${sample.name} background`).toBeLessThan(80);
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(min);
+  }
+}
+
+function assertFilledInk(samples: { name: string; hit: ReturnType<typeof renderedContrastFromPixels> }[]) {
+  for (const sample of samples) {
+    console.log("filled ink", sample.name, sample.hit.ratio.toFixed(2), sample.hit.ink.join(","), "on", sample.hit.background.join(","));
+    expect(sample.hit.ratio, sample.name).toBeGreaterThanOrEqual(4.5);
+  }
+}
+
+/** The padding band above the pill, inside the control that holds it. Skipping
+ *  the parent's own 1px border keeps that edge out of the container sample. */
+function containerBand(parent: InkBox["box"], pill: InkBox["box"]): InkBox["box"] {
+  const y = parent.y + 1;
+  return {
+    x: parent.x + 2,
+    y,
+    width: Math.max(1, parent.width - 4),
+    height: Math.max(1, pill.y - y),
+  };
+}
+
+/** The top of the pill, wide enough that a rounded corner is not the sample.
+ *  Two rows cover a 1px border when the box origin rounds onto the row above. */
+function edgeBand(pill: InkBox["box"]): InkBox["box"] {
+  return {
+    x: pill.x + pill.width * 0.25,
+    y: pill.y,
+    width: Math.max(1, pill.width * 0.5),
+    height: 2,
+  };
+}
+
+function rowRgb(rgba: number[], width: number, y: number): Rgb {
+  const start = y * width * 4;
+  return modeRgb(rgba.slice(start, start + width * 4));
+}
+
+async function assertPressedApart(page: Page, theme: "light" | "dark") {
+  const pills = [
+    { name: "mm", locator: page.getByRole("button", { name: "mm", exact: true }) },
+    { name: "Rulers", locator: page.getByRole("button", { name: "Rulers", exact: true }) },
+    { name: "Layers", locator: page.getByRole("tab", { name: "Layers", exact: true }) },
+  ];
+  const regions: InkBox[] = [];
+  for (const pill of pills) {
+    const box = await pill.locator.boundingBox();
+    const parent = await pill.locator.locator("xpath=..").boundingBox();
+    if (!box || !parent) throw new Error(`no box for ${pill.name}`);
+    regions.push({ name: `${pill.name} fill`, box: insetBox(box, 4) });
+    regions.push({ name: `${pill.name} container`, box: containerBand(parent, box) });
+    regions.push({ name: `${pill.name} edge`, box: edgeBand(box) });
+  }
+  const bytes = (await page.screenshot()) as unknown as Uint8Array;
+  const crops = await readPngRegions(page, regions, bytes);
+  for (let i = 0; i < pills.length; i++) {
+    const name = pills[i].name;
+    const fillCrop = crops[i * 3];
+    const containerCrop = crops[i * 3 + 1];
+    const edgeCrop = crops[i * 3 + 2];
+    const text = renderedContrastFromPixels(fillCrop.rgba);
+    const fill = modeRgb(fillCrop.rgba);
+    const container = modeRgb(containerCrop.rgba);
+    const edges = Array.from({ length: edgeCrop.height }, (_, y) => rowRgb(edgeCrop.rgba, edgeCrop.width, y));
+    const sep = edges.map((edge) => pillApart(fill, container, edge)).find((hit) => hit.apart) ?? pillApart(fill, container, edges[0]);
+    console.log(
+      theme,
+      name,
+      "text",
+      text.ratio.toFixed(2),
+      text.ink.join(","),
+      "fill",
+      sep.fillRatio.toFixed(2),
+      fill.join(","),
+      "on",
+      container.join(","),
+      "edge",
+      sep.edgeRatio.toFixed(2),
+    );
+    expect(text.ratio, `${theme} ${name} text`).toBeGreaterThanOrEqual(4.5);
+    expect(sep.apart, `${theme} ${name} fill ${sep.fillRatio.toFixed(2)} edge ${sep.edgeRatio.toFixed(2)}`).toBe(true);
+    if (theme === "dark") {
+      expect(Math.min(...fill), `${theme} ${name} stays a white pill`).toBeGreaterThanOrEqual(250);
+    } else {
+      expect(Math.min(...fill), `${theme} ${name} is not a white pill`).toBeLessThan(250);
+    }
+  }
+}
+
+// Emits an event the *backend* sends, once the page is actually listening for it.
+//
+// The wait is on the fake's own registration rather than on an element being visible: `goto`
+// resolves at load, `App` subscribes from a `useEffect`, and an emit that arrives before that has
+// no listener to reach — which is a test that fails for its timing rather than for the sentence it
+// is about. A rendered button is a proxy for the same commit having happened; the registration is
+// the thing itself.
+const emitBackendEvent = async (page: Page, event: string) => {
+  await expect
+    .poll(() =>
+      page.evaluate((e) => {
+        const internals = window as unknown as {
+          __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+        };
+        return internals.__TAURI_INTERNALS__.invoke("__test_backend_listeners", { event: e });
+      }, event),
+    )
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__close_guard_ready__")))
+    .toBe("true");
+  await page.evaluate((e) => {
+    const internals = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    return internals.__TAURI_INTERNALS__.invoke("__test_emit_backend_event", { event: e });
+  }, event);
+};
+
+// The close guard's own half of #158 is Rust's, and tested there. This is the sentence it produces:
+// quitting stops what this process sends and leaves a Cut Host's Job cutting, so a prompt that
+// implies the quit stops everything would be telling the operator the opposite of what happens —
+// and `cancel` is cooperative, so even the local cutter finishes its buffered moves (the Silhouette
+// has no abort command; see apps/desktop/MANUAL-CHECKLIST.md).
+test("the quit prompt says what quitting stops and what it leaves running", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.evaluate(() => {
+    sessionStorage.setItem("__dialog_answer__", "ok");
+    sessionStorage.setItem("__dialog_hold__", "1");
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  const prompts = async () =>
+    JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[];
+  await expect.poll(async () => (await prompts()).length).toBe(1);
+  const [prompt] = await prompts();
+  expect(prompt).toContain("Sending to the cutter on this computer stops");
+  expect(prompt).toContain("already buffered");
+  expect(prompt).toContain("Cut Host keeps running there");
+  // The answer is held by the fake until released below, so this is an ordering and not a race
+  // against a timer: nothing may have happened yet. The prompt this replaced took a Promise
+  // for a yes and quit here.
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
+  await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
+  // Accepting it is what quits, and the fake records having been asked.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__force_quit__")))
+    .toBe("asked");
+  // Confirming is not a cancel: telling the backend both would reply to the OS twice.
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
+
+  // The handshake's own ordering, which the prompt above cannot see: readiness is stood down
+  // before anything is subscribed, and never announced while nothing is listening. Rust emits on
+  // the strength of this flag and `emit` succeeds with zero listeners, so a `true` with no listener
+  // is a prevented close the operator cannot answer — and the leading `false` is the only thing
+  // that closes the window a reload leaves open, since no effect cleanup runs on unload.
+  //
+  // A filter over the log rather than an exact sequence: Playwright runs the dev build, whose
+  // `StrictMode` mounts, cleans up and mounts again, so more than two entries is correct here.
+  const readiness = (await page.evaluate(() => sessionStorage.getItem("__ready_log__")))!.split(",");
+  expect(readiness[0]).toBe("false@0");
+  expect(readiness).not.toContain("true@0");
+
+  // The teardown direction is not observable here — Playwright cannot unmount React — and is
+  // pinned instead by `closeGuard.test.ts`, over the same handshake this page runs.
+});
+
+test("dismissing the quit prompt leaves the window open and quits nothing", async ({ page }) => {
+  await page.addInitScript(installMockTauri);
+  await page.goto("/");
+  await page.evaluate(() => {
+    sessionStorage.setItem("__dialog_answer__", "cancel");
+    sessionStorage.setItem("__dialog_hold__", "1");
+  });
+
+  await emitBackendEvent(page, "cut-in-progress");
+
+  // Held unanswered: neither door has been told anything yet.
+  await expect
+    .poll(async () =>
+      JSON.parse((await page.evaluate(() => sessionStorage.getItem("__dialog_messages__"))) ?? "[]") as string[],
+    )
+    .toHaveLength(1);
+  expect(await page.evaluate(() => sessionStorage.getItem("__quit_cancelled__"))).toBeNull();
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await page.evaluate(() => sessionStorage.setItem("__dialog_released__", "1"));
+
+  // Dismissing is told to the backend, because on the Dock's Quit or a logout the OS is waiting on
+  // the answer: a cancel that stayed in the page would leave a logout hanging on this app. It is
+  // also the beat that proves the answer was read, so the absence checks below mean something.
+  await expect
+    .poll(() => page.evaluate(() => sessionStorage.getItem("__quit_cancelled__")))
+    .toBe("asked");
+  expect(await page.evaluate(() => sessionStorage.getItem("__force_quit__"))).toBeNull();
+  await expect(page.getByRole("button", { name: "Send to cutter", exact: true })).toBeVisible();
+});
+
+function phase7Shots(): boolean {
+  return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.PHASE7_SHOTS === "1";
+}
+
+async function phaseShot(page: Page, name: string) {
+  if (!phase7Shots()) return;
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-light.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Dark", exact: true }).click();
+  await page.screenshot({ path: `/opt/cursor/artifacts/phase7-${name}-dark.png` });
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("menuitemradio", { name: "Light", exact: true }).click();
+}
+
+const VINYL_BOARD = ["Gold vinyl", "Red vinyl", "Black vinyl", "White vinyl", "Navy vinyl", "Purple vinyl", "#f5e6a3"] as const;
+
+test("layers follow the colour passes and a cut toggle stays on the row", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedVinylBoard: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+
+  await expect(page.getByTestId("colour-layer")).toHaveCount(VINYL_BOARD.length);
+  for (const name of VINYL_BOARD) {
+    await expect(page.getByRole("button", { name: `Cut ${name}`, exact: true })).toHaveAttribute("aria-pressed", "true");
+  }
+  await expect(page.getByText("Colour layers", { exact: true })).toBeVisible();
+  await expect(page.getByText("Each colour is cut as its own pass. Drag a shape to reorder it among its siblings.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Cut this shape", exact: true })).toHaveCount(0);
+
+  const red = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Red vinyl", exact: true }) });
+  const gold = page.getByTestId("colour-layer").filter({ has: page.getByRole("button", { name: "Cut Gold vinyl", exact: true }) });
+  await red.getByRole("button").nth(1).click();
+  await expect(red.getByRole("button").nth(1)).toHaveAttribute("aria-current", "true");
+  await expect(red.getByRole("button").nth(1)).not.toHaveAttribute("aria-pressed");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "false");
+  await gold.getByRole("button").nth(1).click({ modifiers: ["Shift"] });
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 1" })).toHaveAttribute("data-selected", "true");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toHaveAttribute("data-selected", "true");
+
+  for (const name of VINYL_BOARD) {
+    if (name === "Red vinyl") continue;
+    await page.getByRole("button", { name: `Collapse ${name}`, exact: true }).click();
+  }
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await expect(page.getByText("Ellipse 1", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "layers-one-open");
+
+  await page.getByRole("button", { name: "Cut Red vinyl", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toHaveAttribute("aria-pressed", "false");
+  await expect(page.getByTestId("layer-row").filter({ hasText: "Ellipse 2" })).toBeVisible();
+  await phaseShot(page, "layers-cut-off");
+});
+
+test("properties show one shape in millimetres and in inches", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Y", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("H", { exact: true })).toHaveValue("10");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Document", exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "properties-mm");
+
+  await page.getByRole("group", { name: "Units" }).getByRole("button", { name: "in", exact: true }).click();
+  await expect(page.getByLabel("W", { exact: true })).toHaveValue("0.394");
+  await expect(page.getByLabel("X", { exact: true })).toHaveValue("0");
+  await expect(page.getByLabel("Rotation", { exact: true })).toHaveValue("0");
+  await phaseShot(page, "properties-in");
+});
+
+test("a mixed selection keeps align and does not pick a material", async ({ page }) => {
+  await page.addInitScript(installMockTauri, {
+    seedTwoColorRects: true,
+    seedMachine: true,
+    seedUserPreset: true,
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await showTab(page, "Properties");
+  await page.getByLabel("Material preset").selectOption("preset:card-stock");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").nth(1).click({ modifiers: ["Shift"] });
+  await showTab(page, "Properties");
+
+  await expect(page.getByLabel("Material preset").locator("option").first()).toHaveText("Mixed");
+  await expect(page.getByLabel("Material preset")).toHaveValue("");
+  await expect(page.getByRole("button", { name: "Align left edges", exact: true })).toBeVisible();
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("Design for")).toBeVisible();
+  await phaseShot(page, "properties-mixed");
+});
+
+test("an empty selection shows the document, not a second units control", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true, seedMachine: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Properties");
+
+  const section = page.getByRole("region", { name: "Document" });
+  await expect(section.getByRole("heading", { name: "Document", exact: true })).toBeVisible();
+  await expect(section.getByText("Mat", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("12 × 12 in (305 × 305 mm)");
+  await expect(section.getByText("Units", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("mm");
+  await expect(section.getByText("Select an object to edit its size and position.")).toBeVisible();
+  await expect(section.getByText("Colour passes", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByText("Objects", { exact: true }).locator("xpath=following-sibling::span")).toHaveText("2");
+  await expect(section.getByLabel("Design for")).toBeVisible();
+  await expect(section.getByRole("button", { name: "mm", exact: true })).toHaveCount(0);
+  await expect(section.getByLabel("Mat size")).toHaveCount(0);
+  await expect(page.getByLabel("Mat size")).toHaveCount(1);
+  await expect(page.getByLabel("X", { exact: true })).toHaveCount(0);
+  await phaseShot(page, "document");
+});
+
+test("a nearly invisible shape still says it cuts", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedFaint: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await expect(page.getByRole("button", { name: "Cut Red vinyl", exact: true })).toBeVisible();
+  await page.getByTestId("layer-row").click();
+  await showTab(page, "Properties");
+  await expect(page.getByText("Nearly invisible in the file. It still cuts.")).toBeVisible();
+  await expect(page.getByLabel("Cut this shape", { exact: true })).toBeChecked();
+  await phaseShot(page, "faint");
 });

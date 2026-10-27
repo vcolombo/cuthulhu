@@ -43,3 +43,19 @@ export function shapesUnder(nodes: Record<string, TreeNode>, ids: number[]): num
   ids.forEach(walk);
   return [...out];
 }
+
+/** The selected ids no other selected id contains, in selection order, each once. A node beneath a
+ *  selected container moves with it and only with it (`transform_nodes` skips it), so align and
+ *  distribute must not count it as a unit of its own. Once, because `transform_each` applies an id
+ *  listed twice twice, and a node listed under two parents in a hand-edited manifest is hit twice. */
+export function outermost(nodes: Record<string, TreeNode>, ids: number[]): number[] {
+  const beneath = new Set<number>();
+  const walk = (id: number) => {
+    for (const c of nodes[id]?.children ?? []) {
+      beneath.add(c);
+      walk(c);
+    }
+  };
+  ids.forEach(walk);
+  return [...new Set(ids)].filter((id) => !beneath.has(id));
+}

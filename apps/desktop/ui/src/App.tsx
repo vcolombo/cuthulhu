@@ -16,10 +16,11 @@ import { useUnits } from "./hooks/useUnits";
 import { formatLength } from "./length";
 import { DevicesTab } from "./panels/DevicesTab";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
+import { unionBounds, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { IDENTITY, compose, transformBounds } from "./render/affine";
 import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
+import { selectionBounds } from "./interaction/selectionBox";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
@@ -160,16 +161,6 @@ function unitsOf(s: Scene, ids: number[], expand: (ids: number[]) => number[]): 
 function countShapes(doc: DocSnapshot | null): number {
   if (!doc) return 0;
   return Object.values(doc.nodes).filter((node) => typeof node.kind === "object" && "Shape" in node.kind).length;
-}
-
-function selectionBounds(scene: Scene, selected: number[]): Bounds | null {
-  const boxes = scene.nodes.filter((node) => selected.includes(node.id)).map((node) => node.bounds);
-  if (boxes.length === 0) return null;
-  const x = Math.min(...boxes.map((box) => box.x));
-  const y = Math.min(...boxes.map((box) => box.y));
-  const right = Math.max(...boxes.map((box) => box.x + box.w));
-  const bottom = Math.max(...boxes.map((box) => box.y + box.h));
-  return { x, y, w: right - x, h: bottom - y };
 }
 
 export function App() {

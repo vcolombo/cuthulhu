@@ -17,19 +17,14 @@ reviews:
     - "!**/package-lock.json"
     - "!apps/desktop/ui/dist/**"
   path_instructions:
-    - path: "crates/**"
+    - path: "**/*.rs"
       instructions: |
         Rust code. Focus on ownership/borrowing errors, unwrap/expect
         outside tests, and error propagation. Do not flag idiomatic
         Result/Option handling as style issues.
-    - path: "apps/desktop/src/**"
+    - path: "**/*.{ts,tsx}"
       instructions: |
-        Rust code (Tauri backend). Focus on ownership/borrowing errors,
-        unwrap/expect outside tests, and error propagation. Do not flag
-        idiomatic Result/Option handling as style issues.
-    - path: "apps/desktop/ui/**"
-      instructions: |
-        TypeScript UI. Focus on null-safety, async error handling, and
+        TypeScript. Focus on null-safety, async error handling, and
         type correctness. Do not comment on import order or formatting.
     - path: "tools/**"
       instructions: |

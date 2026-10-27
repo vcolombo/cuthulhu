@@ -538,14 +538,4 @@ impl Ledger {
     pub(super) fn no_press_registered(&self) -> bool {
         self.dispatching.lock().unwrap().is_empty()
     }
-
-    /// How many presses of `key` have begun and not returned, across every id they named.
-    #[cfg(test)]
-    pub(super) fn presses_in_flight(&self, key: &JobKey) -> usize {
-        self.dispatching
-            .lock()
-            .unwrap()
-            .get(key)
-            .map_or(0, |presses| presses.by_dispatch.values().map(|group| group.in_flight.len()).sum())
-    }
 }

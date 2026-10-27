@@ -15,7 +15,7 @@ Nothing has been released yet. Build from source.
 
 ## Machines
 
-- **Silhouette Cameo 5** (`cameo5`) — USB, GPGL, ported from `inkscape-silhouette`.
+- **Silhouette Cameo 5 Alpha** (`cameo5`) — USB, GPGL, ported from `inkscape-silhouette`.
 - **GCC Puma IV** (`puma`) — HPGL over serial.
 - Other non-Cricut HPGL/GPGL cutters are the roadmap, not this build. Cricut
   is out of scope (closed platform). See `docs/roadmap/supported-machines.md`.

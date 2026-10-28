@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::path::PathBuf;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use document::{CutLineType, Delta, MachineProfile, NodeId, PresetAssignment, ShapeKind};
 use driver_core::{CutStatus, DeviceInfo, HostId, MachineCaps};
 use geometry::{Affine, BoolOp};
@@ -14,17 +14,17 @@ pub type AppStateHandle = Mutex<AppState>;
 
 #[tauri::command]
 pub fn new_doc(state: tauri::State<AppStateHandle>) -> Result<String, String> {
-    Ok(state.lock().unwrap().new_doc())
+    Ok(state.lock().new_doc())
 }
 
 #[tauri::command]
 pub fn snapshot(state: tauri::State<AppStateHandle>) -> Result<String, String> {
-    Ok(state.lock().unwrap().snapshot())
+    Ok(state.lock().snapshot())
 }
 
 #[tauri::command]
 pub fn commit_transform(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, m: Affine) -> Result<Delta, String> {
-    state.lock().unwrap().commit_transform(ids, m).map_err(|e| e.to_string())
+    state.lock().commit_transform(ids, m).map_err(|e| e.to_string())
 }
 
 /// One entry of `commit_transforms`: the ids a matrix moves, and the world-space matrix.
@@ -37,44 +37,44 @@ pub struct TransformMove {
 #[tauri::command]
 pub fn commit_transforms(state: tauri::State<AppStateHandle>, moves: Vec<TransformMove>) -> Result<Delta, String> {
     let moves = moves.into_iter().map(|t| (t.ids, t.m)).collect();
-    state.lock().unwrap().commit_transforms(moves).map_err(|e| e.to_string())
+    state.lock().commit_transforms(moves).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn add_primitive(state: tauri::State<AppStateHandle>, parent: NodeId, kind: ShapeKind) -> Result<Delta, String> {
-    state.lock().unwrap().add_primitive(parent, kind).map_err(|e| e.to_string())
+    state.lock().add_primitive(parent, kind).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn boolean_op(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, op: BoolOp) -> Result<Delta, String> {
-    state.lock().unwrap().boolean_op(ids, op).map_err(|e| e.to_string())
+    state.lock().boolean_op(ids, op).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn add_text(state: tauri::State<AppStateHandle>, parent: NodeId, family: String, size_mm: f64, text: String) -> Result<Delta, String> {
-    state.lock().unwrap().add_text(parent, family, size_mm, text).map_err(|e| e.to_string())
+    state.lock().add_text(parent, family, size_mm, text).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn delete(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>) -> Result<Delta, String> {
-    state.lock().unwrap().delete(ids).map_err(|e| e.to_string())
+    state.lock().delete(ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn reorder(state: tauri::State<AppStateHandle>, id: NodeId, new_index: usize) -> Result<Delta, String> {
-    state.lock().unwrap().reorder(id, new_index).map_err(|e| e.to_string())
+    state.lock().reorder(id, new_index).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_cut_line_type(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: CutLineType)
     -> Result<Delta, String> {
-    state.lock().unwrap().set_cut_line_type(ids, value).map_err(|e| e.to_string())
+    state.lock().set_cut_line_type(ids, value).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_material_preset(state: tauri::State<AppStateHandle>, ids: Vec<NodeId>, value: PresetAssignment)
     -> Result<Delta, String> {
-    state.lock().unwrap().set_material_preset(ids, value).map_err(|e| e.to_string())
+    state.lock().set_material_preset(ids, value).map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -87,7 +87,7 @@ pub struct HistoryDto {
 /// are the editor's stacks (#308).
 #[tauri::command]
 pub fn history(state: tauri::State<AppStateHandle>) -> Result<HistoryDto, String> {
-    let state = state.lock().unwrap();
+    let state = state.lock();
     Ok(HistoryDto {
         can_undo: state.can_undo(),
         can_redo: state.can_redo(),
@@ -96,37 +96,37 @@ pub fn history(state: tauri::State<AppStateHandle>) -> Result<HistoryDto, String
 
 #[tauri::command]
 pub fn undo(state: tauri::State<AppStateHandle>) -> Result<Option<Delta>, String> {
-    Ok(state.lock().unwrap().undo())
+    Ok(state.lock().undo())
 }
 
 #[tauri::command]
 pub fn redo(state: tauri::State<AppStateHandle>) -> Result<Option<Delta>, String> {
-    Ok(state.lock().unwrap().redo())
+    Ok(state.lock().redo())
 }
 
 #[tauri::command]
 pub fn import_svg(state: tauri::State<AppStateHandle>, bytes: Vec<u8>, parent: NodeId) -> Result<(Delta, Vec<String>), String> {
-    state.lock().unwrap().import_svg(bytes, parent).map_err(|e| e.to_string())
+    state.lock().import_svg(bytes, parent).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn save_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Result<(), String> {
-    state.lock().unwrap().save_project(&path).map_err(|e| e.to_string())
+    state.lock().save_project(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn load_project(state: tauri::State<AppStateHandle>, path: PathBuf) -> Result<String, String> {
-    state.lock().unwrap().load_project(&path).map_err(|e| e.to_string())
+    state.lock().load_project(&path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn set_machine(state: tauri::State<AppStateHandle>, machine_id: String) -> Result<(), String> {
-    state.lock().unwrap().set_machine(&machine_id).map_err(|e| e.to_string())
+    state.lock().set_machine(&machine_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn list_machines(state: tauri::State<AppStateHandle>) -> Result<Vec<MachineProfile>, String> {
-    Ok(state.lock().unwrap().list_machines())
+    Ok(state.lock().list_machines())
 }
 
 // --- device / cut / preset commands: operate over DeviceManagerHandle, never AppStateHandle's mutex ---
@@ -183,12 +183,12 @@ pub fn cutter_statuses(dev: tauri::State<DeviceManagerHandle>) -> Result<Vec<Cut
 // device is connected after reopening the cut dialog, without a redundant reconnect.
 #[tauri::command]
 pub fn get_connected_device(dev: tauri::State<DeviceManagerHandle>) -> Result<Option<DeviceInfo>, IpcError> {
-    Ok(dev.connected.lock().unwrap().clone())
+    Ok(dev.connected.lock().clone())
 }
 
 #[tauri::command]
 pub fn plan_cut(state: tauri::State<AppStateHandle>, grouping: Grouping, weed: Option<WeedOptions>) -> Result<PlanCutResponse, IpcError> {
-    plan_cut_response(&state.lock().unwrap().editor.doc, grouping, weed.as_ref())
+    plan_cut_response(&state.lock().editor.doc, grouping, weed.as_ref())
 }
 
 #[tauri::command]
@@ -200,7 +200,7 @@ pub fn travel_for_order(
     passes: Vec<TravelPassDto>,
 ) -> Result<Vec<[f64; 4]>, IpcError> {
     // Fully qualified because the command and the function it forwards to share a name.
-    crate::device::travel_for_order(&state.lock().unwrap().editor.doc, &doc_revision, grouping, weed.as_ref(), &passes)
+    crate::device::travel_for_order(&state.lock().editor.doc, &doc_revision, grouping, weed.as_ref(), &passes)
 }
 
 // async: prepare_cut briefly locks the document (plan + preflight), then the
@@ -210,7 +210,7 @@ pub fn travel_for_order(
 #[tauri::command(async)]
 pub fn cut(state: tauri::State<AppStateHandle>, dev: tauri::State<DeviceManagerHandle>, request: CutRequest) -> Result<CutStarted, IpcError> {
     let (planned_for, passes) = {
-        let app = state.lock().unwrap();
+        let app = state.lock();
         dev.prepare_cut(&app, request)?
     };
     dev.execute_cut(planned_for, passes)
@@ -392,7 +392,7 @@ fn canonical(path: &PathBuf) -> Result<PathBuf, String> {
 /// path removes that step entirely.
 fn authorized_path(auth: &AuthorizedImages, path: &PathBuf) -> Result<PathBuf, String> {
     let real = canonical(path)?;
-    if auth.0.lock().unwrap().contains(&real) {
+    if auth.0.lock().contains(&real) {
         Ok(real)
     } else {
         Err("that image was not selected in this session".into())
@@ -417,7 +417,7 @@ pub fn pick_image(
         .into_path()
         .map_err(|e| format!("could not resolve the selected file: {e}"))?;
     let real = canonical(&path)?;
-    auth.0.lock().unwrap().insert(real.clone());
+    auth.0.lock().insert(real.clone());
     Ok(Some(real))
 }
 

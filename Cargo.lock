@@ -914,6 +914,7 @@ dependencies = [
  "geometry",
  "heck 0.5.0",
  "objc2",
+ "parking_lot",
  "serde",
  "serde_json",
  "syn 2.0.119",

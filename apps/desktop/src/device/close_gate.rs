@@ -20,18 +20,18 @@
 /// right, while never reading the flag, which is the whole check.
 #[derive(Default)]
 pub(super) struct CloseGate {
-    sends: std::sync::RwLock<()>,
+    sends: parking_lot::RwLock<()>,
     closing: std::sync::atomic::AtomicBool,
 }
 
 /// Permission to start a cut, held until the request is away.
 #[must_use = "the permit must be held across whatever starts the cut"]
-pub(super) struct SendPermit<'a>(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>);
+pub(super) struct SendPermit<'a>(#[allow(dead_code)] parking_lot::RwLockReadGuard<'a, ()>);
 
 impl CloseGate {
     /// Permission for one press, or `None` if the window has already gone.
     pub(super) fn permit(&self) -> Option<SendPermit<'_>> {
-        let sends = self.sends.read().unwrap();
+        let sends = self.sends.read();
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return None;
         }
@@ -44,7 +44,7 @@ impl CloseGate {
     /// `try_write` rather than `write`: a send in flight is a warning owed, not something for
     /// the main thread to wait out.
     pub(super) fn commit_if(&self, idle: impl FnOnce() -> bool) -> bool {
-        let Ok(_sends) = self.sends.try_write() else { return false };
+        let Some(_sends) = self.sends.try_write() else { return false };
         if !idle() {
             return false;
         }
@@ -72,7 +72,7 @@ impl CloseGate {
     /// already, or the worker keeps transmitting for the whole of this wait.
     pub(super) fn wait_for_an_inflight_send(&self) {
         let deadline = std::time::Instant::now() + super::CLOSE_GATE_WAIT;
-        while self.sends.try_write().is_err() && std::time::Instant::now() < deadline {
+        while self.sends.try_write().is_none() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }

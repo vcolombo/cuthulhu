@@ -629,7 +629,7 @@ fn a_failed_dial_leaves_the_last_successful_reading() {
     let id = HostId("host-1".into());
     dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
     let seen = 1_700_000_000_000;
-    dev.host_conn(&id).unwrap().lock().unwrap().last_seen = Some(seen);
+    dev.host_conn(&id).unwrap().lock().last_seen = Some(seen);
 
     let _ = dev.list_devices();
 
@@ -719,7 +719,7 @@ fn connect_refuses_to_move_the_aim_off_an_active_local_cut() {
     assert_eq!(err.code, "device_error", "got {err:?}");
 
     // A refused connect is not a half-connect: the aim must not have moved either.
-    assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, None, "aim must stay local");
+    assert_eq!(dev.connected.lock().as_ref().unwrap().host, None, "aim must stay local");
 }
 
 /// Aiming at a host used to leave the local `DeviceManager` connected and `Idle` — and
@@ -743,14 +743,14 @@ fn re_aiming_locally_after_a_host_succeeds() {
 fn disconnect_while_aimed_at_a_host_leaves_the_local_manager_untouched() {
     let dev = test_device_setup();
     dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
-    dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() });
+    dev.connected.lock().replace(DeviceInfo { host: Some(HostId("host-1".into())), ..test_instance() });
 
     dev.disconnect().expect("disconnecting a remote aim is bookkeeping only");
-    assert!(dev.connected.lock().unwrap().is_none(), "the aim itself must still clear");
+    assert!(dev.connected.lock().is_none(), "the aim itself must still clear");
 
     // Re-aim locally: if `disconnect` had reached the local manager, this would now read
     // `Disconnected` instead of the `Idle` it started at.
-    dev.connected.lock().unwrap().replace(test_instance());
+    dev.connected.lock().replace(test_instance());
     assert_eq!(dev.status().phase, Phase::Idle, "the local manager's connection must have survived untouched");
 }
 
@@ -932,7 +932,7 @@ fn a_device_naming_an_unknown_host_is_refused_not_run_locally() {
 #[test]
 fn status_for_a_device_on_an_unknown_host_is_not_a_local_idle() {
     let dev = test_device_setup();
-    dev.connected.lock().unwrap().replace(DeviceInfo {
+    dev.connected.lock().replace(DeviceInfo {
         host: Some(HostId("host-does-not-exist".into())),
         ..test_instance()
     });
@@ -1134,7 +1134,7 @@ fn a_forget_that_fails_to_save_removes_nothing_in_memory() {
     assert_eq!(dev.paired_hosts().len(), 1, "a failed save must not remove a host still on disk");
     let conn = dev.host_conn(&HostId("host-1".into())).expect("the host remains paired");
     assert_eq!(
-        conn.lock().unwrap().lifecycle,
+        conn.lock().lifecycle,
         HostLifecycle::Active,
         "a failed save left the connection refusing calls"
     );
@@ -1167,10 +1167,10 @@ fn a_forget_transition_refuses_calls_without_holding_host_control_behind_the_sav
             );
             // The question above already failed to reach 127.0.0.1:1, so the error it left is
             // not evidence of this call. Cleared first: dialling would write it straight back.
-            conn.lock().unwrap().last_error = None;
+            conn.lock().last_error = None;
             dev.list_devices();
             assert!(
-                conn.lock().unwrap().last_error.is_none(),
+                conn.lock().last_error.is_none(),
                 "list_devices dialled a host that is being forgotten"
             );
             let call = dev.with_host(&id, |_| Ok(()));
@@ -1185,7 +1185,7 @@ fn a_forget_transition_refuses_calls_without_holding_host_control_behind_the_sav
 
     assert_eq!(err.code, "hosts_unwritable");
     assert_eq!(
-        conn.lock().unwrap().lifecycle,
+        conn.lock().lifecycle,
         HostLifecycle::Active,
         "a failed save left the pairing stood down"
     );
@@ -1360,7 +1360,7 @@ fn a_dispatch_whose_aim_moved_after_planning_is_refused() {
     assert_eq!(planned_for.host, None);
 
     // ...and the operator connects the Pi's Cameo before the dispatch lands.
-    *dev.connected.lock().unwrap() = Some(DeviceInfo {
+    *dev.connected.lock() = Some(DeviceInfo {
         instance_id: cut_host::host::testing::CAMEO.into(),
         machine_id: "cameo5".into(),
         transport: TransportKind::Usb { locator: "1:4".into() },
@@ -1413,10 +1413,10 @@ fn forgetting_the_connected_host_clears_the_aim() {
     let id = dev
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("this host answers and the fingerprint matches");
-    dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+    dev.connected.lock().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
     dev.forget(&id, &hosts_path, false).expect("it answers, and nothing is running on it");
-    assert!(dev.connected.lock().unwrap().is_none(), "the aim must not survive the host it named");
+    assert!(dev.connected.lock().is_none(), "the aim must not survive the host it named");
 }
 
 /// A TCP listener that accepts and then says nothing at all — a Pi that answers the SYN and
@@ -1481,7 +1481,7 @@ fn a_call_to_one_host_is_not_delayed_by_a_wedged_call_to_another() {
         // the connection, and the connection's lock is held by the call that took it.
         saw_accept.recv_timeout(Duration::from_secs(10)).expect("the wedged host was never dialled");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while wedged_conn.try_lock().is_ok() {
+        while wedged_conn.try_lock().is_some() {
             assert!(Instant::now() < deadline, "the wedged call never took its connection lock");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1510,10 +1510,10 @@ fn the_close_guards_read_answers_while_another_call_holds_the_hosts_connection()
     let dev = test_device_setup();
     dev.add_host(a_paired_host("host-wedged", &silent_addr));
     let aimed = host_cameo(&HostId("host-wedged".into()));
-    *dev.connected.lock().unwrap() = Some(aimed);
+    *dev.connected.lock() = Some(aimed);
 
     let conn = dev.host_conn(&HostId("host-wedged".into())).unwrap();
-    let held = conn.lock().unwrap();
+    let held = conn.lock();
 
     let started = Instant::now();
     let status = dev.status_without_dialling();
@@ -1541,7 +1541,7 @@ fn the_close_guards_read_remembers_the_last_status_a_poll_managed() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     assert!(!dev.status_without_dialling().is_active(), "nothing has been heard yet");
 
@@ -1567,12 +1567,12 @@ fn forgetting_an_unrelated_host_leaves_the_aim_alone() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("this host answers and the fingerprint matches");
     dev.add_host(a_paired_host("host-elsewhere", "127.0.0.1:1"));
-    dev.connected.lock().unwrap().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
+    dev.connected.lock().replace(DeviceInfo { host: Some(id.clone()), ..test_instance() });
 
     // Forced: this one is unreachable, and an unreachable host is no longer forgettable
     // without it. What the test is about is the *other* host's aim, which must not move.
     dev.forget(&HostId("host-elsewhere".into()), &hosts_path, true).expect("forced");
-    assert_eq!(dev.connected.lock().unwrap().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
+    assert_eq!(dev.connected.lock().as_ref().unwrap().host, Some(id), "a different host's forget must not move the aim");
 }
 
 // --- dispatch idempotency ---
@@ -1714,7 +1714,7 @@ fn reconnecting_a_remote_cutter_clears_a_cancel_that_could_not_confirm_the_stop(
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
     // The host's TestDriver parks rather than polls, so nothing can confirm a stop there.
@@ -1764,7 +1764,7 @@ fn every_cutter_on_a_host_keeps_its_status_and_takes_its_own_commands() {
         "a snapshot that landed left no last_seen"
     );
 
-    *dev.connected.lock().unwrap() = Some(host_cameo(&id));
+    *dev.connected.lock() = Some(host_cameo(&id));
     let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
     direct
         .dispatch(
@@ -1948,7 +1948,7 @@ fn a_retry_after_a_lost_reply_does_not_cut_the_material_twice() {
     dev.list_devices();
 
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     eater.swallow.store(true, Ordering::SeqCst);
     let err = dev
@@ -1985,7 +1985,7 @@ fn cutting_the_same_design_again_after_an_answered_dispatch_starts_a_new_job() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("this host answers and the fingerprint matches");
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
 
@@ -2018,7 +2018,7 @@ fn a_remote_dispatch_carries_every_pass_and_starts_the_job_it_planned() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("this host answers and the fingerprint matches");
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let two_passes = [a_square(10.0), a_square(20.0)].concat();
     let started = dev.execute_cut(aimed, two_passes).expect("dispatch");
@@ -2163,7 +2163,7 @@ fn a_press_that_never_reached_a_host_keeps_its_id_for_the_next_one() {
     let dev = test_device_setup();
     dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("nothing answers this host");
     // A first press against an offline Pi must not claim the Job may be cutting there.
@@ -2237,7 +2237,7 @@ fn a_dispatch_that_never_reached_a_host_leaves_an_earlier_one_in_doubt() {
     let dev = test_device_setup();
     dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // An earlier dispatch of this Job is outstanding.
     let key = JobKey {
@@ -2280,7 +2280,7 @@ fn a_dispatch_answered_with_the_wrong_reply_stays_in_doubt() {
         ..a_paired_host("host-1", &host.addr)
     });
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let key = JobKey {
         host: HostId("host-1".into()),
@@ -2336,7 +2336,7 @@ fn a_dispatch_answered_about_another_job_stays_in_doubt() {
         ..a_paired_host("host-1", &host.addr)
     });
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let key = JobKey {
         host: HostId("host-1".into()),
@@ -2384,7 +2384,7 @@ fn a_refused_remote_cut_is_reported_as_the_refusal_it_is() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // 400 mm square on the test Cameo's 300x200 bed.
     let err = dev.execute_cut(aimed, a_square(400.0)).expect_err("a cut off the bed is refused");
@@ -2426,7 +2426,7 @@ fn an_unconfirmed_dispatch_promises_no_more_than_the_same_id() {
         ..a_paired_host("host-1", &host.addr)
     });
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let err = dev
         .execute_cut(aimed, a_square(10.0))
@@ -2464,7 +2464,7 @@ fn an_unconfirmed_dispatch_with_no_id_left_offers_no_retry() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // An earlier dispatch of this Job is outstanding when the press below is made.
     let key = JobKey {
@@ -2503,7 +2503,7 @@ fn a_dispatch_nothing_has_polled_yet_still_holds_the_window() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&host_id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // A poll before the cut, which is what fills the cache with `Idle`.
     assert!(!dev.status().is_active());
@@ -2550,7 +2550,7 @@ fn a_refusal_leaves_a_concurrent_press_the_id_its_retry_needs() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let key = JobKey {
         host: id.clone(),
@@ -2594,7 +2594,7 @@ fn a_refusal_leaves_a_concurrent_press_holding_the_window() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // An accepted press of some Job on this cutter, not yet seen to end.
     dev.ledger.mark_dispatched(&id, &aimed.instance_id, AttemptId::next());
@@ -2621,7 +2621,7 @@ fn a_refusal_with_nothing_else_outstanding_releases_the_window() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     dev.execute_cut(aimed, a_square(400.0)).expect_err("a cut off the bed is refused");
     assert!(!dev.a_cut_may_be_running(), "a refusal is the host saying it started nothing");
@@ -2650,7 +2650,7 @@ fn a_dispatch_holds_the_window_after_the_aim_moves_away() {
 
     dev.connect(aimed).expect("aiming at the host again");
     dev.disconnect().expect("disconnecting a remote aim is bookkeeping only");
-    assert!(dev.connected.lock().unwrap().is_none(), "the aim must really be gone");
+    assert!(dev.connected.lock().is_none(), "the aim must really be gone");
     assert!(dev.a_cut_may_be_running(), "with no aim the guard stopped answering at all");
 }
 
@@ -2684,7 +2684,7 @@ fn quitting_leaves_a_cut_host_job_running() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
 
     let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
@@ -2709,7 +2709,7 @@ fn forgetting_a_host_releases_the_window_its_dispatch_held() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     // Polled before the cut, so the cache holds a reading for the forget to clear. Nothing
     // polls after it, which is what leaves the mark standing over a Job that has since ended —
     // the state an operator who closed the dialog is in.
@@ -2727,7 +2727,7 @@ fn forgetting_a_host_releases_the_window_its_dispatch_held() {
     dev.forget(&id, &hosts_path, false).expect("an idle host can be forgotten");
     assert!(!dev.a_cut_may_be_running(), "a forgotten host's mark can never be cleared again");
     assert!(
-        dev.last_remote_status.lock().unwrap().is_empty(),
+        dev.last_remote_status.lock().is_empty(),
         "a reading nothing can ever read again was kept"
     );
 }
@@ -2748,7 +2748,7 @@ fn a_finished_press_stops_counting_as_dispatching() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     dev.execute_cut(aimed.clone(), a_square(10.0)).expect("dispatch");
     assert!(dev.ledger.no_press_registered(), "a finished press stayed registered");
@@ -2944,7 +2944,7 @@ fn a_press_that_never_reached_a_host_leaves_another_press_holding_the_window() {
     let dev = test_device_setup();
     dev.add_host(a_paired_host("host-1", "127.0.0.1:1"));
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     // An accepted press on this cutter, not yet seen to end.
     dev.ledger.mark_dispatched(&HostId("host-1".into()), &aimed.instance_id, AttemptId::next());
@@ -2971,7 +2971,7 @@ fn a_dispatch_whose_reply_was_lost_holds_the_window() {
         ..a_paired_host("host-1", &host.addr)
     });
     let aimed = host_cameo(&HostId("host-1".into()));
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("`Ok` is not an accepted dispatch");
     assert_eq!(err.code, "dispatch_unconfirmed", "got {err:?}");
@@ -2999,7 +2999,7 @@ fn a_poll_of_one_cutter_leaves_another_holding_the_window() {
     // A press outstanding on the *other* host's cutter.
     dev.ledger.mark_dispatched(&elsewhere, cut_host::host::testing::CAMEO, AttemptId::next());
 
-    *dev.connected.lock().unwrap() = Some(host_cameo(&watched));
+    *dev.connected.lock() = Some(host_cameo(&watched));
     assert!(dev.status().actions.cut, "the aimed cutter is free, which is what makes it clear marks");
     assert!(dev.a_cut_may_be_running(), "polling one cutter cleared a mark belonging to another");
     // And the same for the wide clear `list_devices` performs.
@@ -3124,7 +3124,7 @@ fn a_host_that_misanswers_the_snapshot_is_recorded_as_unreachable() {
         "the row claimed a healthy host"
     );
     assert!(
-        dev.host_conn(&HostId("host-1".into())).unwrap().lock().unwrap().client.is_none(),
+        dev.host_conn(&HostId("host-1".into())).unwrap().lock().client.is_none(),
         "the dead client was kept for the next call to reuse"
     );
 }
@@ -3141,7 +3141,7 @@ fn an_idle_cutter_does_not_release_its_neighbours_mark() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
 
     let direct = cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
@@ -3164,10 +3164,10 @@ fn a_dispatch_marks_only_after_it_owns_the_host_connection() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.list_devices(); // establish the connection before this test takes its lock
     let conn = dev.host_conn(&id).unwrap();
-    let held = conn.lock().unwrap();
+    let held = conn.lock();
 
     std::thread::scope(|s| {
         let cut = s.spawn(|| dev.execute_cut(aimed, a_square(10.0)));
@@ -3595,10 +3595,10 @@ fn a_press_queued_for_a_host_connection_holds_the_window() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.list_devices(); // establish the connection before this test holds it
     let conn = dev.host_conn(&id).unwrap();
-    let held = conn.lock().unwrap();
+    let held = conn.lock();
 
     std::thread::scope(|s| {
         let cut = s.spawn(|| dev.execute_cut(aimed, a_square(10.0)));
@@ -3633,10 +3633,10 @@ fn a_forget_and_a_queued_press_cannot_cross() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.list_devices(); // establish the connection before this test holds it
     let conn = dev.host_conn(&id).unwrap();
-    let held = conn.lock().unwrap();
+    let held = conn.lock();
 
     std::thread::scope(|s| {
         let cut = s.spawn(|| dev.execute_cut(aimed.clone(), a_square(10.0)));
@@ -3665,7 +3665,7 @@ fn a_forget_and_a_queued_press_cannot_cross() {
     // the filesystem write it wakes, sees `Forgetting`, and returns immediately — host control
     // is not held behind the disk and nothing crosses into a send.
     let conn = dev.host_conn(&id).unwrap();
-    let mut held = conn.lock().unwrap();
+    let mut held = conn.lock();
     std::thread::scope(|s| {
         let cut = s.spawn(|| dev.execute_cut(host_cameo(&id), a_square(10.0)));
         wait_until(
@@ -3702,14 +3702,14 @@ fn a_press_that_lands_after_the_idle_answer_refuses_the_forget() {
 
     // Pair leaves the client unset. The question connects, releases the connection, then
     // blocks on this lock: the window between the idle answer and publishing `Forgetting`.
-    let persist = dev.hosts_persist.lock().unwrap();
+    let persist = dev.hosts_persist.lock();
     let dev_forget = Arc::clone(&dev);
     let forget_id = id.clone();
     let path = hosts_path.clone();
     let forget = std::thread::spawn(move || dev_forget.forget(&forget_id, &path, false));
     let conn = dev.host_conn(&id).unwrap();
     wait_until(
-        || conn.try_lock().is_ok_and(|guard| guard.client.is_some()),
+        || conn.try_lock().is_some_and(|guard| guard.client.is_some()),
         "the idle question never released the connection",
     );
     dev.ledger.mark_dispatched(&id, cut_host::host::testing::CAMEO, AttemptId::next());
@@ -3723,7 +3723,7 @@ fn a_press_that_lands_after_the_idle_answer_refuses_the_forget() {
     assert!(err.message.contains("being sent"), "the refusal must say why: {err:?}");
     assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
     assert_eq!(
-        conn.lock().unwrap().lifecycle,
+        conn.lock().lifecycle,
         HostLifecycle::Active,
         "a refused forget published Forgetting"
     );
@@ -3743,14 +3743,14 @@ fn a_press_still_dispatching_after_the_idle_answer_refuses_the_forget() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
 
-    let persist = dev.hosts_persist.lock().unwrap();
+    let persist = dev.hosts_persist.lock();
     let dev_forget = Arc::clone(&dev);
     let forget_id = id.clone();
     let path = hosts_path.clone();
     let forget = std::thread::spawn(move || dev_forget.forget(&forget_id, &path, false));
     let conn = dev.host_conn(&id).unwrap();
     wait_until(
-        || conn.try_lock().is_ok_and(|guard| guard.client.is_some()),
+        || conn.try_lock().is_some_and(|guard| guard.client.is_some()),
         "the idle question never released the connection",
     );
     let key = JobKey {
@@ -3769,7 +3769,7 @@ fn a_press_still_dispatching_after_the_idle_answer_refuses_the_forget() {
     assert_eq!(err.code, "host_busy", "got {err:?}");
     assert!(err.message.contains("being sent"), "the refusal must say why: {err:?}");
     assert_eq!(dev.paired_hosts().len(), 1, "refused, so still paired");
-    assert_eq!(conn.lock().unwrap().lifecycle, HostLifecycle::Active);
+    assert_eq!(conn.lock().lifecycle, HostLifecycle::Active);
     drop(press);
 }
 
@@ -3787,20 +3787,20 @@ fn a_forget_leaves_the_connection_refusing() {
         .expect("pairing with the loopback host");
     let conn = dev.host_conn(&id).unwrap();
     assert_eq!(
-        conn.lock().unwrap().lifecycle,
+        conn.lock().lifecycle,
         HostLifecycle::Active,
         "a fresh pairing starts answering"
     );
     // Aimed before the forget, because the press below has to fail on the host rather than on
     // the aim: `forget` clears an aim that named the host it removed.
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     dev.forget(&id, &hosts_path, false).expect("an idle host is forgettable");
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     assert_eq!(
-        conn.lock().unwrap().lifecycle,
+        conn.lock().lifecycle,
         HostLifecycle::Forgotten,
         "the forget left the connection answering"
     );
@@ -3822,7 +3822,7 @@ fn a_press_that_reaches_the_host_after_a_committed_close_sends_nothing() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
 
     assert!(dev.commit_close(), "nothing is outstanding, so the window may go");
     let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("a committed close sends nothing");
@@ -3847,7 +3847,7 @@ fn forgetting_a_host_refuses_a_stop_nothing_confirmed_until_a_reconnect() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     dev.execute_cut(aimed, a_square(10.0)).expect("dispatch");
 
     wait_for_remote(&dev, |s| s.actions.confirm, "the Job to park");
@@ -3949,7 +3949,7 @@ fn a_press_after_a_stood_down_close_sends_nothing() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     let direct =
         cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
 
@@ -3965,7 +3965,7 @@ fn a_press_after_a_stood_down_close_sends_nothing() {
 #[test]
 fn a_local_press_after_a_committed_close_starts_nothing() {
     let dev = test_device_setup();
-    let aimed = dev.connected.lock().unwrap().clone().expect("the local cutter is aimed at");
+    let aimed = dev.connected.lock().clone().expect("the local cutter is aimed at");
 
     assert!(dev.commit_close(), "nothing is outstanding, so the window may go");
     let err = dev.execute_cut(aimed, a_square(10.0)).expect_err("a committed close starts nothing");
@@ -3986,7 +3986,7 @@ fn a_press_after_a_confirmed_quit_sends_nothing() {
         .pair("Pi".into(), host.addr.clone(), HOST_TOKEN.into(), host.fingerprint.clone(), &hosts_path)
         .expect("pairing with the loopback host");
     let aimed = host_cameo(&id);
-    *dev.connected.lock().unwrap() = Some(aimed.clone());
+    *dev.connected.lock() = Some(aimed.clone());
     let direct =
         cut_host::client::HostClient::connect(&host.addr, HOST_TOKEN, &host.fingerprint).unwrap();
 
@@ -4155,7 +4155,7 @@ fn a_poll_does_not_clear_the_mark_of_a_claimed_cutter() {
             ..a_paired_host("host-1", &host.addr)
         });
         dev.ledger.mark_dispatched(&id, &aimed.instance_id, AttemptId::next());
-        *dev.connected.lock().unwrap() = Some(aimed);
+        *dev.connected.lock() = Some(aimed);
 
         poll(&dev);
         assert!(
@@ -4186,7 +4186,7 @@ fn forgetting_a_host_retracts_the_marks_its_answer_covered() {
         .expect("pairing with the loopback host");
     dev.list_devices(); // establish the connection before this test holds it
     let conn = dev.host_conn(&id).unwrap();
-    let held = conn.lock().unwrap();
+    let held = conn.lock();
 
     std::thread::scope(|s| {
         let forgetting = s.spawn(|| dev.forget(&id, &hosts_path, false));

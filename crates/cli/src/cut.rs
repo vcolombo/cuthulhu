@@ -23,11 +23,22 @@ use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Ended, Phase};
 pub enum Operator {
     Interactive,
     Unattended,
+    /// Answers from caller-supplied code: handed the prompt, returning whether
+    /// the operator answered. `false` means the wait was abandoned because a
+    /// cancel landed (the callback may land that cancel itself, through a
+    /// manager it captured); returning `false` with the job uncancelled breaks
+    /// `wait_ack`'s contract and the loop can only ask again. The seam a test
+    /// drives a multi-pass cut through — the interactive arm reads the
+    /// process's stdin, which a test process either inherits from its terminal
+    /// or finds at EOF, never something it can answer. A scripted operator is
+    /// an operator, so the unattended multi-pass refusal in `run` is
+    /// deliberately not widened to it.
+    Scripted(Box<dyn FnMut(&str) -> bool + Send>),
 }
 
 impl Operator {
     /// Wait for acknowledgement. `false` means a cancel landed while waiting.
-    fn wait_ack(&self, prompt: &str, mgr: &DeviceManager) -> bool {
+    fn wait_ack(&mut self, prompt: &str, mgr: &DeviceManager) -> bool {
         match self {
             Operator::Interactive => {
                 println!("{prompt}");
@@ -37,6 +48,7 @@ impl Operator {
                 eprintln!("{prompt}: assuming done (stdin is not a terminal; completion not verified)");
                 true
             }
+            Operator::Scripted(answer) => answer(prompt),
         }
     }
 }
@@ -149,7 +161,7 @@ pub fn run(
     plan: &cutplan::CutPlan,
     info: DeviceInfo,
     factory: Arc<dyn DeviceBackendFactory>,
-    operator: Operator,
+    mut operator: Operator,
     with_cancel: impl FnOnce(Arc<DeviceManager>) -> Result<(), String>,
 ) -> Result<Outcome, String> {
     // The plan's own count, needed before a device exists (the guard below) and after

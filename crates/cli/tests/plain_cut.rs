@@ -10,7 +10,7 @@ use cli::cut::{ended_message, run, Operator, Outcome};
 use cli::pipeline::{driver_for, plan_cut_from_svg};
 use driver_core::{
     DeviceBackendFactory, DeviceInfo, Driver, DriverError, Job, MachineCaps, MachineProfile,
-    MockTransport, Settings, Transport, TransportError, TransportKind,
+    MockTransport, Phase, Settings, Transport, TransportError, TransportKind,
 };
 
 const SQUARE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
@@ -264,6 +264,103 @@ fn a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel() {
     // one rect, which flattens to one closed polyline, so that's "PASS1" (5 bytes): 10.
     assert_eq!(sent, 10, "the whole pass — prologue plus its one \"PASS1\" — went out before the cancel landed");
     assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
+}
+
+/// A multi-pass cut through `run` itself (#79). `Unattended` is refused for such a
+/// plan and `Interactive` reads the test process's stdin, so before the scripted
+/// shape nothing could answer the colour swap through `cut::run`'s own loop — the
+/// manager's parking was covered in `driver-core`, the CLI's answering of it was
+/// not. The fake machine parks for confirmation after each pass as well, so the
+/// answers come in threes: confirm pass 1, resume at the swap, confirm pass 2.
+#[test]
+fn a_two_pass_cut_is_answered_through_its_colour_swap() {
+    let plan = plan_cut_from_svg(TWO_COLORS, cameo5().as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false, None).expect("plan");
+    assert_eq!(plan.passes.len(), 2, "two stroke colours, two passes");
+    let second_key = plan.passes[1].key.to_string();
+
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(TestFactory { written: written.clone() });
+
+    // What the operator was asked, the phase the job reported while being asked,
+    // and how many passes had reached the wire by then. Recorded rather than
+    // asserted inside the answer, so a failure is reported against the finished
+    // run instead of unwinding through the cut loop.
+    let answers: Arc<Mutex<Vec<(String, Phase, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+    let operator = {
+        let answers = answers.clone();
+        let written = written.clone();
+        Operator::Scripted(Box::new(move |prompt: &str, mgr| {
+            let phase = mgr.status().phase;
+            let sent = String::from_utf8_lossy(&written.lock().unwrap()).matches("PASS").count();
+            answers.lock().unwrap().push((prompt.to_string(), phase, sent));
+        }))
+    };
+
+    let outcome = run(&plan, info(), factory, operator, |_| Ok(()))
+        .expect("a two-pass cut with an operator answering its pauses");
+
+    assert!(matches!(outcome, Outcome::Completed { passes: 2 }), "{outcome:?}");
+    assert_eq!(ended_message(&outcome), "done: 2 passes cut");
+
+    let answers = answers.lock().unwrap();
+    assert_eq!(answers.len(), 3, "confirm, swap, confirm: {answers:?}");
+    assert!(answers[0].0.contains("Pass 1/2"), "{}", answers[0].0);
+    let (swap, phase, sent) = &answers[1];
+    // The numbering and the key come from the position the manager itself reported
+    // for the parked job, not from a status the test built — the half that
+    // regressed in #76.
+    assert!(swap.contains("Pass 2/2"), "{swap}");
+    assert!(swap.contains(&format!("({second_key})")), "names the pass being swapped to: {swap}");
+    assert!(swap.contains("swap tool"), "says what to do: {swap}");
+    assert_eq!(*phase, Phase::AwaitingColorSwap, "still parked while the operator is being asked");
+    assert_eq!(*sent, 1, "no second-pass bytes went out before the operator answered");
+    assert!(answers[2].0.contains("Pass 2/2"), "{}", answers[2].0);
+
+    let bytes = String::from_utf8(written.lock().unwrap().clone()).expect("utf8");
+    assert_eq!(bytes.matches("BEGIN").count(), 1, "session must open once: {bytes}");
+    assert_eq!(bytes.matches("END").count(), 1, "session must close once: {bytes}");
+    assert_eq!(bytes.matches("PASS").count(), 2, "both passes: {bytes}");
+    assert_eq!(bytes.matches("PARK").count(), 1, "parked once, between the passes: {bytes}");
+}
+
+/// The `Busy` collision on the colour-swap pause specifically (#79): a cancel lands
+/// while the operator is answering the swap, so the loop's `resume()` meets a job
+/// that is already gone. That is the state having moved, not a device fault — the
+/// swap counterpart of
+/// `a_cancel_while_parked_for_confirmation_is_reported_as_a_cancel` above.
+#[test]
+fn a_cancel_landing_on_the_colour_swap_is_reported_as_a_cancel() {
+    let plan = plan_cut_from_svg(TWO_COLORS, cameo5().as_ref(), &Settings::default(), cutplan::Grouping::Color, &[], &[], false, None).expect("plan");
+    assert_eq!(plan.passes.len(), 2, "two stroke colours, two passes");
+
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(TestFactory { written: written.clone() });
+
+    let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let operator = {
+        let prompts = prompts.clone();
+        Operator::Scripted(Box::new(move |prompt: &str, mgr| {
+            prompts.lock().unwrap().push(prompt.to_string());
+            if prompt.contains("swap tool") {
+                // The cancel reaches the worker ahead of the resume this answer
+                // goes on to send — same channel, answered in order.
+                mgr.cancel();
+            }
+        }))
+    };
+
+    let outcome = run(&plan, info(), factory, operator, |_| Ok(()))
+        .expect("a cancel on the colour swap is an ending, not a fault");
+
+    let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
+    assert_eq!(pass, 2, "cancelled at the second pass's swap, named as the prompt named it");
+    assert_eq!(sent, 0, "parked before the second pass: none of its bytes had gone out");
+    assert_eq!(ended_message(&outcome), format!("cancelled at pass {pass} ({sent} bytes sent)"));
+
+    let prompts = prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2, "confirm and swap, and nothing after the cancel: {prompts:?}");
+    let bytes = String::from_utf8(written.lock().unwrap().clone()).expect("utf8");
+    assert_eq!(bytes.matches("PASS").count(), 1, "the second pass never went out: {bytes}");
 }
 
 /// Every method panics, so any use of the device at all fails the test that holds it.

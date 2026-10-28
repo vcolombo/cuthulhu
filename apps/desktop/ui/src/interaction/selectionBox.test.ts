@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
 import { apply, IDENTITY, rotateAbout, transformBounds, translate, type Pt } from "../render/affine";
-import { handleAt, handleWorld, selectionBox } from "./selectionBox";
+import { handleAt, handleWorld, selectionBounds, selectionBox } from "./selectionBox";
 
 const close = (a: Pt, b: Pt) => {
   expect(a.x).toBeCloseTo(b.x, 9);
@@ -38,6 +38,30 @@ describe("selectionBox", () => {
 
   it("no selection, no box", () => {
     expect(selectionBox({ nodes: [rotated] }, [])).toBeNull();
+  });
+});
+
+describe("selectionBounds", () => {
+  it("is the axis-aligned world box of the shapes that are selected", () => {
+    const a = { id: 1, bounds: { x: 1, y: 2, w: 3, h: 4 } };
+    const b = { id: 2, bounds: { x: 10, y: -1, w: 2, h: 2 } };
+    expect(selectionBounds({ nodes: [a, b] }, [1])).toEqual({ x: 1, y: 2, w: 3, h: 4 });
+    expect(selectionBounds({ nodes: [a, b] }, [2, 1])).toEqual({ x: 1, y: -1, w: 11, h: 7 });
+    expect(selectionBounds({ nodes: [a, b] }, [9])).toBeNull();
+    expect(selectionBounds({ nodes: [a] }, [])).toBeNull();
+  });
+
+  it("does not overflow the engine's argument limit", () => {
+    // The status bar used to spread every selected box into Math.min. V8 throws
+    // RangeError past ~125k arguments, and Cmd-A selects every shape, so that
+    // render took the window down. The align suite pins the same limit at 300k.
+    const nodes = Array.from({ length: 300_000 }, (_, i) => ({
+      id: i,
+      bounds: { x: i, y: 0, w: 1, h: 1 },
+    }));
+    expect(selectionBounds({ nodes }, nodes.map((n) => n.id))).toEqual({
+      x: 0, y: 0, w: 300_000, h: 1,
+    });
   });
 });
 

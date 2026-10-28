@@ -149,7 +149,7 @@ silently drops `--with-deps` if you leave out `exec --`.
 - `docs/adr/` — decisions that are still in force.
 - `docs/superpowers/` — design specs and plans. When one disagrees with the
   code, trust the code.
-- `CONTEXT.md` — the vocabulary. Use it. A DocumentPass is not a layer.
+- `GLOSSARY.md` — the vocabulary. Use it. A DocumentPass is not a layer.
 
 ## License
 

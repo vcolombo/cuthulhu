@@ -14,7 +14,7 @@
 - `cargo test --workspace --locked` is what CI runs; `--locked` is mandatory.
 - `apps/desktop/ui/dist/` is committed and CI fails on a stale bundle. Any `ui/src` change means `npm --prefix apps/desktop/ui run build` and committing `dist/` in the same commit. `npm test` does **not** typecheck (esbuild strips types) — only `run build` does.
 - **A caller is told about a cut through one value.** Render from `CutStatus::actions`; never re-derive legality from a phase. `DeviceState` stays `pub(crate)`.
-- `CONTEXT.md` is normative vocabulary: Pass, Job, Driver, Transport, Preflight, Cut Host. Never "proxy"/"server"/"relay"/"bridge".
+- `GLOSSARY.md` is normative vocabulary: Pass, Job, Driver, Transport, Preflight, Cut Host. Never "proxy"/"server"/"relay"/"bridge".
 - Comments explain why, not what. `// ponytail:` marks a deliberate simplification with its ceiling and upgrade path.
 - **Several of these defects are guarded by comments asserting the bug away.** When you fix one, fix its comment — a comment that argues for the broken behaviour is worse than none, because the next reader trusts it.
 - Commit subjects are imperative with the reason attached; keep the repo's `Co-Authored-By:` trailer.

@@ -21,7 +21,7 @@ Architecture review: candidates 3 and 1 of the 2026-07-26 review. Related open i
 - Touching `apps/desktop/ui/src` means running `npm --prefix apps/desktop/ui run build` and committing `apps/desktop/ui/dist` in the same commit — CI fails on a stale bundle.
 - `apps/desktop/ui/e2e/smoke.spec.ts` must stay green. Extend its mock; never weaken its assertions.
 - `plan_passes` is **not** modified by this plan. The stroke rule stays exactly as it is; issue #68 remains open.
-- Domain vocabulary comes from `CONTEXT.md`. New terms are added there in the same commit that introduces them, respecting existing `_Avoid_` lists (notably **Pass**: avoid run, cycle, layer).
+- Domain vocabulary comes from `GLOSSARY.md`. New terms are added there in the same commit that introduces them, respecting existing `_Avoid_` lists (notably **Pass**: avoid run, cycle, layer).
 - Machine ids are `cameo5` and `puma`, owned by `crates/driver-registry/src/lib.rs:15-16`. Do not add new string literals for them.
 
 ## Existing interfaces consumed (verified against the code)
@@ -111,7 +111,7 @@ fn describe_cut_error(e: CutError) -> String                          // becomes
 - `apps/desktop/ui/src/cut/CutDialog.tsx`, `apps/desktop/ui/src/App.tsx` — render from `CutStatus`.
 - `apps/desktop/ui/e2e/smoke.spec.ts` — mock emits `CutStatus`.
 - `crates/cli/src/cut.rs` — loop switches on `CutStatus`.
-- `CONTEXT.md` — add the **CutStatus** entry.
+- `GLOSSARY.md` — add the **CutStatus** entry.
 - `apps/desktop/MANUAL-CHECKLIST.md` — add the verification items.
 
 ---
@@ -1543,7 +1543,7 @@ git commit -m "Drive the CLI cut from the reported status, and shut the state ma
 ### Task 15: Record CutStatus in the domain language and the checklist
 
 **Files:**
-- Modify: `CONTEXT.md` (new entry after **Pass**)
+- Modify: `GLOSSARY.md` (new entry after **Pass**)
 - Modify: `apps/desktop/MANUAL-CHECKLIST.md`
 
 - [ ] **Step 1: Add the glossary entry**
@@ -1589,7 +1589,7 @@ than none.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add CONTEXT.md apps/desktop/MANUAL-CHECKLIST.md
+git add GLOSSARY.md apps/desktop/MANUAL-CHECKLIST.md
 git commit -m "Name the value a cut reports, and list what a human still has to watch"
 ```
 

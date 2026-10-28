@@ -34,7 +34,7 @@ Two gaps those left open, both tracked and neither blocking: **#102** (the write
 
 - **SPDX header on every new file**: `// SPDX-License-Identifier: GPL-3.0-or-later`.
 - **`cargo test --workspace --locked`** is what CI runs; `--locked` is mandatory. This plan **does** add one dependency — `apps/desktop` gains `cut-host = { path = "../../crates/cut-host" }`, which it does not have today — so `Cargo.lock` is committed in the same commit as that change (Task 4, where `HostClient` first enters `apps/desktop`). No third-party crate is added; everything else is already in the workspace.
-- **`CONTEXT.md` is normative vocabulary.** Use **Pass**, **Job**, **Driver**, **Transport**, **Preflight**, **Cut Host**. Never "proxy", "server", "relay" or "bridge" for the Cut Host.
+- **`GLOSSARY.md` is normative vocabulary.** Use **Pass**, **Job**, **Driver**, **Transport**, **Preflight**, **Cut Host**. Never "proxy", "server", "relay" or "bridge" for the Cut Host.
 - **A caller is told about a cut through one value.** Render from `CutStatus::actions`; never reconstruct what is legal from a phase. `DeviceState` is `pub(crate)` in `driver-core` and must stay unreachable.
 - **Comments explain why, not what.** Where a step carries a comment, that comment is part of the deliverable. Do not add restating ones.
 - **`// ponytail:` marks a deliberate simplification** with its ceiling and upgrade path.

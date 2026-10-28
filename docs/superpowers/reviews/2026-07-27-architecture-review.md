@@ -163,7 +163,7 @@ test extends to cover the CLI, which currently has none. Roughly 25 lines delete
 `crates/driver-silhouette/src/encode.rs:17-19` · `crates/driver-hpgl/src/encode.rs:18-20` ·
 `crates/cutplan/src/preflight.rs:100-112`
 
-**Problem.** `CONTEXT.md` defines **MachineCaps** as what a machine can be told to do, and each
+**Problem.** `GLOSSARY.md` defines **MachineCaps** as what a machine can be told to do, and each
 **Driver** declares its own. The dialog holds a keyed literal table of the same three booleans, so
 `fieldDisabled` greys the Puma's speed and force from the TypeScript copy while `preflight`
 range-checks them from the Rust one. They agree today because someone typed them to agree. The

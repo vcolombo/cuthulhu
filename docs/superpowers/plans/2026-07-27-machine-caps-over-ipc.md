@@ -18,7 +18,7 @@
 - Comments explain *why*, not *what*. Do not add restating comments.
 - `cargo test --workspace --locked` is what CI runs. `--locked` is mandatory. **This change adds no dependency, so `Cargo.lock` must not change.** If it does, something went wrong.
 - `apps/desktop/ui/dist/` is committed. Any change under `ui/src` requires `npm --prefix apps/desktop/ui run build` and committing the rebuilt `dist/` in the same change, or CI fails.
-- Vocabulary from `CONTEXT.md` is normative: **MachineCaps**, **Driver**, **Preflight**. Never write "capabilities flags", "support matrix", "backend", or "plugin".
+- Vocabulary from `GLOSSARY.md` is normative: **MachineCaps**, **Driver**, **Preflight**. Never write "capabilities flags", "support matrix", "backend", or "plugin".
 - Commit subjects: imperative with the reason attached.
 - Do **not** modify `apps/desktop/ui/src/cut/viewmodel.ts` or `apps/desktop/ui/src/cut/viewmodel.test.ts`. Leaving them untouched is the signal that the seam was cut in the right place. If you find yourself needing to edit `fieldDisabled`'s signature, stop and re-read the spec.
 

@@ -235,7 +235,7 @@ exists in `ui/src/ipc.ts` and is unused by this path today.
 | `apps/desktop/ui/src/trace/viewmodel.ts` | delete `toOptionsDto` and `defaultControls`; `acceptError` branches on code |
 | `apps/desktop/ui/src/trace/TraceDialog.tsx` | sliders from specs; `2048` from the payload; `color_only` from the spec |
 | `apps/desktop/ui/e2e/smoke.spec.ts` | stub `trace_controls` |
-| `CONTEXT.md` | define **TraceControls** |
+| `GLOSSARY.md` | define **TraceControls** |
 | `CHANGELOG.md` | new; records the `--detail` flip |
 
 `trace_controls` returns the table together with `MAX_DIM`, which retires the hardcoded `2048` in

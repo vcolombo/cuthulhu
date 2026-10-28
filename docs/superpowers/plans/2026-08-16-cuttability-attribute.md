@@ -17,7 +17,7 @@
 - **SPDX header on every file** — `// SPDX-License-Identifier: GPL-3.0-or-later` (`<!-- -->` in Markdown). Every file touched here already has one; do not remove it.
 - **`cargo test --workspace --locked` is the gate**, and `--locked` is mandatory. This change adds no dependency, so `Cargo.lock` must not change; if it does, something was added that this plan did not intend.
 - **`ui/dist` is committed.** Any task that edits `apps/desktop/ui/src` must end with `npm --prefix apps/desktop/ui run build` and commit `apps/desktop/ui/dist` in the same commit — CI rebuilds and fails on a stale bundle. Tasks 4 and 8 are the two that touch `ui/src`.
-- **`CONTEXT.md` is normative vocabulary**, and this change edits it. Terms in play: **Node** (not "element"/"object"), **ColorPass** (not "layer"/"colour group"), **Preflight** (not "validation"), **CutPlan**. The new term is **CutLineType**; the ColorPass entry's second sentence ("A shape with no stroke belongs to no ColorPass and is not cut") stops being true in Task 3 and must change there, not later.
+- **`GLOSSARY.md` is normative vocabulary**, and this change edits it. Terms in play: **Node** (not "element"/"object"), **ColorPass** (not "layer"/"colour group"), **Preflight** (not "validation"), **CutPlan**. The new term is **CutLineType**; the ColorPass entry's second sentence ("A shape with no stroke belongs to no ColorPass and is not cut") stops being true in Task 3 and must change there, not later.
 - **Comments explain why, not what.** Every comment specified below records a constraint, a trap, or a decision that was taken against an alternative. Do not add comments restating the code.
 - **The `ponytail:` marker marks a deliberate simplification** with its ceiling and upgrade path. The marker is the word, not the comment form — the workspace carries it on both `//` lines (`crates/driver-core/src/manager.rs:174`) and `///` doc comments (`crates/cut-host/src/resolve.rs:92`, `:206`), and `grep -rn "ponytail:"` finds either. `NodeWire` gets one, on its doc comment, because it documents the type: it exists only for documents written before the attribute did.
 - **The import default and the migration default are deliberately different values.** `Cut` for a new import, derived-from-stroke for an old file. Anywhere the two look like duplicated logic that could be unified, they must not be — a saved project must cut exactly what it cut before, on real material.
@@ -343,7 +343,7 @@ hand-writing a fixture, keeps the test from drifting from Document's shape."
 - Modify: `crates/cutplan/src/passes.rs:6` (import `CutLineType`, `Style`), `:14-16` (`ColorPass` doc), `:62-66` (`plan_passes` doc), `:90-114` (the predicate and the grouping key), and add `pass_key` above `plan_passes`
 - Modify: `crates/cutplan/src/passes.rs:188-197` (test helper), and three fixtures that made a shape skipped by removing its stroke — `:239-264`, `:341` and `:362-363`
 - Modify: `crates/cli/src/pipeline.rs:280-286` (the test whose premise inverts)
-- Modify: `CONTEXT.md:40-42` (ColorPass), and add the CutLineType term
+- Modify: `GLOSSARY.md:40-42` (ColorPass), and add the CutLineType term
 - Modify: `docs/superpowers/specs/2026-07-22-editor-shell-design.md:85` (mark superseded, do not edit silently)
 - Test: `crates/cutplan/src/passes.rs` (in `mod tests`)
 
@@ -533,7 +533,7 @@ fn a_fill_only_svg_is_planned_by_color_on_its_fill() {
 
 Reuse the deleted test's own fixture, driver and settings helpers rather than introducing `FILL_ONLY`, and take the expected colour from that fixture's fill.
 
-Finally the two documents that state the old rule. `CONTEXT.md:40-42`, the ColorPass entry:
+Finally the two documents that state the old rule. `GLOSSARY.md:40-42`, the ColorPass entry:
 
 ```markdown
 **ColorPass**:
@@ -586,7 +586,7 @@ Expected: PASS. The three #139 ordering tests (`crates/cutplan/src/passes.rs:310
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/cutplan/src/passes.rs crates/cli/src/pipeline.rs CONTEXT.md \
+git add crates/cutplan/src/passes.rs crates/cli/src/pipeline.rs GLOSSARY.md \
         docs/superpowers/specs/2026-07-22-editor-shell-design.md
 git commit -m "Cut what the Node says to cut, and key its pass on stroke or fill
 
@@ -635,7 +635,7 @@ type Node = { …; cut_line_type?: "Cut" | "NoCut"; … };
 
 - [ ] **Step 2: Verify no occurrence survives**
 
-Run: `grep -rn "skipped_no_stroke\|skippedNoStroke" crates apps docs CONTEXT.md CLAUDE.md`
+Run: `grep -rn "skipped_no_stroke\|skippedNoStroke" crates apps docs GLOSSARY.md CLAUDE.md`
 
 Expected: matches only in `docs/superpowers/plans/` and `docs/superpowers/specs/` (historical records of what the field was called, which stay as written) and in `crates/trace/src/lib.rs:326`, whose whole doc comment Task 6 deletes.
 

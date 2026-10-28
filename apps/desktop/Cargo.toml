@@ -31,6 +31,9 @@ serde_json = "1"
 base64 = "0.22"
 dirs = "6"
 tempfile = "3"
+# Already in `Cargo.lock` at 0.12.5 as a transitive dependency; direct so the crate's blocking
+# locks return their guard instead of a poison error no caller can act on (#151).
+parking_lot = "0.12"
 
 # The Dock's Quit and a logout reach the app only through `applicationShouldTerminate:`, which tao
 # does not implement. `objc2` is already in `Cargo.lock` through tauri; this makes it a direct

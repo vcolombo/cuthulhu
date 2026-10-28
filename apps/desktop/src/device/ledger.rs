@@ -5,7 +5,7 @@
 //! clear what another press is still using (#290). Nothing outside this module takes those locks.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use driver_core::HostId;
 
@@ -117,10 +117,10 @@ pub(super) struct Dispatching<'a> {
 
 impl Drop for Dispatching<'_> {
     fn drop(&mut self) {
-        // `into_inner` rather than `unwrap`, as everywhere this repo locks in a `Drop`: a panic
-        // here while unwinding aborts the process, so the one path that most needs the press
-        // deregistered would instead take the editor down.
-        let mut dispatching = self.ledger.dispatching.lock().unwrap_or_else(|e| e.into_inner());
+        // A plain lock in a `Drop` is safe only because these are `parking_lot` locks: with no
+        // poisoning there is no error for this to panic on while unwinding, which would abort
+        // the process on the one path that most needs the press deregistered (#151).
+        let mut dispatching = self.ledger.dispatching.lock();
         let Some(presses) = dispatching.get_mut(&self.key) else {
             debug_assert!(false, "a press's registration went missing while it was in flight");
             return;
@@ -141,9 +141,7 @@ impl Drop for Dispatching<'_> {
             // kept so the next press can be identified as the retry that resolves it.
             let current = self
                 .ledger
-                .in_doubt
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .in_doubt.lock()
                 .get(&self.key)
                 .is_some_and(|(held, _)| held == &self.dispatch_id);
             if !current || group.unsettled.is_empty() {
@@ -252,16 +250,14 @@ pub(super) struct Ledger {
 
 impl Ledger {
     pub(super) fn a_press_is_dispatching(&self) -> bool {
-        self.dispatching
-            .lock()
-            .unwrap()
+        self.dispatching.lock()
             .values()
             .any(|presses| presses.by_dispatch.values().any(|group| !group.in_flight.is_empty()))
     }
 
     /// The same question asked of one host, for the verb that is about to discard its token.
     pub(super) fn a_press_is_dispatching_to(&self, id: &HostId) -> bool {
-        self.dispatching.lock().unwrap().iter().any(|(key, presses)| {
+        self.dispatching.lock().iter().any(|(key, presses)| {
             &key.host == id && presses.by_dispatch.values().any(|group| !group.in_flight.is_empty())
         })
     }
@@ -279,14 +275,14 @@ impl Ledger {
         // `dispatching` first and `in_doubt` under it — the order stated on both fields, and not
         // the order they are declared in — held across the reservation so a sibling's answer cannot
         // run between the two halves and find nobody dispatching.
-        let mut dispatching = self.dispatching.lock().unwrap();
+        let mut dispatching = self.dispatching.lock();
         let (dispatch_id, first_attempt) = self.reserve_dispatch_id(key);
         // `in_doubt` prunes and evicts ids independently. An unresolved group for an id it no
         // longer holds cannot be retried, so keeping it would make `dispatching` grow past the map
         // whose bound it mirrors. Active groups stay until their guards drop; inactive replaced
         // groups go here.
         {
-            let in_doubt = self.in_doubt.lock().unwrap();
+            let in_doubt = self.in_doubt.lock();
             dispatching.retain(|job, presses| {
                 presses.by_dispatch.retain(|wire_id, group| {
                     !group.in_flight.is_empty()
@@ -332,8 +328,8 @@ impl Ledger {
         // Both locks, `dispatching` then `in_doubt` as both fields state: asking and clearing have
         // to be one step, or a press beginning between them joins an entry this call is about to
         // delete — and its retry then goes out under a name the host has never seen.
-        let mut dispatching = self.dispatching.lock().unwrap();
-        let mut in_doubt = self.in_doubt.lock().unwrap();
+        let mut dispatching = self.dispatching.lock();
+        let mut in_doubt = self.in_doubt.lock();
         let Some(group) = dispatching
             .get_mut(key)
             .and_then(|presses| presses.by_dispatch.get_mut(id))
@@ -352,9 +348,7 @@ impl Ledger {
     }
 
     pub(super) fn mark_dispatched(&self, host: &HostId, device: &str, attempt: AttemptId) {
-        self.remote_dispatched
-            .lock()
-            .unwrap()
+        self.remote_dispatched.lock()
             .entry((host.clone(), device.to_owned()))
             .or_default()
             .insert(attempt);
@@ -367,7 +361,7 @@ impl Ledger {
     /// A cutter's own "I would take a Job now" is the answer that clears them all, in `status` and
     /// `list_devices`.
     pub(super) fn unmark_dispatched(&self, host: &HostId, device: &str, attempt: AttemptId) {
-        let mut dispatched = self.remote_dispatched.lock().unwrap();
+        let mut dispatched = self.remote_dispatched.lock();
         let key = (host.clone(), device.to_owned());
         if let Some(presses) = dispatched.get_mut(&key) {
             presses.remove(&attempt);
@@ -393,9 +387,7 @@ impl Ledger {
 
     /// Every mark this desktop is holding for `host`, as the presses that wrote them.
     pub(super) fn marks_for(&self, host: &HostId) -> Vec<((HostId, String), AttemptId)> {
-        self.remote_dispatched
-            .lock()
-            .unwrap()
+        self.remote_dispatched.lock()
             .iter()
             .filter(|((h, _), _)| h == host)
             .flat_map(|(key, presses)| presses.iter().map(|p| (key.clone(), *p)).collect::<Vec<_>>())
@@ -419,7 +411,7 @@ impl Ledger {
     /// already knows and have its cuts silently deduplicated away.
     pub(super) fn reserve_dispatch_id(&self, key: &JobKey) -> (cut_host::protocol::DispatchId, bool) {
         let now = std::time::Instant::now();
-        let mut in_doubt = self.in_doubt.lock().unwrap();
+        let mut in_doubt = self.in_doubt.lock();
 
         // Entries the host can no longer recognise are not retries any more, whatever they once
         // were, and `still_reusable` is where that is decided — see there for why the boundary is
@@ -480,20 +472,18 @@ impl Ledger {
     /// `now` is a parameter because the boundary is the whole of the behaviour, and a caller that
     /// can only pass the present cannot ask about either side of it.
     pub(super) fn retry_would_reuse(&self, key: &JobKey, now: std::time::Instant) -> bool {
-        self.in_doubt
-            .lock()
-            .unwrap()
+        self.in_doubt.lock()
             .get(key)
             .is_some_and(|(_, written)| still_reusable(*written, now))
     }
 
 
     pub(super) fn any_mark(&self) -> bool {
-        !self.remote_dispatched.lock().unwrap().is_empty()
+        !self.remote_dispatched.lock().is_empty()
     }
 
     pub(super) fn clear_cutters<'a>(&self, host: &HostId, devices: impl IntoIterator<Item = &'a str>) {
-        let mut dispatched = self.remote_dispatched.lock().unwrap();
+        let mut dispatched = self.remote_dispatched.lock();
         for device in devices {
             dispatched.remove(&(host.clone(), device.to_owned()));
         }
@@ -501,41 +491,39 @@ impl Ledger {
 
     #[cfg(test)]
     pub(super) fn jobs_in_doubt(&self) -> usize {
-        self.in_doubt.lock().unwrap().len()
+        self.in_doubt.lock().len()
     }
 
     #[cfg(test)]
     pub(super) fn held_id(&self, key: &JobKey) -> Option<cut_host::protocol::DispatchId> {
-        self.in_doubt.lock().unwrap().get(key).map(|(id, _)| id.clone())
+        self.in_doubt.lock().get(key).map(|(id, _)| id.clone())
     }
 
     #[cfg(test)]
     pub(super) fn holds(&self, key: &JobKey) -> bool {
-        self.in_doubt.lock().unwrap().contains_key(key)
+        self.in_doubt.lock().contains_key(key)
     }
 
     #[cfg(test)]
     pub(super) fn written_at(&self, key: &JobKey) -> Option<std::time::Instant> {
-        self.in_doubt.lock().unwrap().get(key).map(|(_, written)| *written)
+        self.in_doubt.lock().get(key).map(|(_, written)| *written)
     }
 
     #[cfg(test)]
     pub(super) fn forget(&self, key: &JobKey) {
-        self.in_doubt.lock().unwrap().remove(key);
+        self.in_doubt.lock().remove(key);
     }
 
     /// Plant an id the ledger did not mint, so a test can show a stale answer leaving the current
     /// one alone.
     #[cfg(test)]
     pub(super) fn replace_held(&self, key: &JobKey, id: cut_host::protocol::DispatchId) {
-        self.in_doubt
-            .lock()
-            .unwrap()
+        self.in_doubt.lock()
             .insert(key.clone(), (id, std::time::Instant::now()));
     }
 
     #[cfg(test)]
     pub(super) fn no_press_registered(&self) -> bool {
-        self.dispatching.lock().unwrap().is_empty()
+        self.dispatching.lock().is_empty()
     }
 }

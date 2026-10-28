@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use cut_host::client::HostClient;
 use cutplan::presets::{
@@ -570,16 +572,14 @@ impl DeviceManagerHandle {
     }
 
     fn manager(&self) -> Result<Arc<DeviceManager>, IpcError> {
-        self.local_manager.lock().unwrap().clone()
+        self.local_manager.lock().clone()
             .ok_or_else(|| IpcError::new("shut_down", "device manager has been shut down"))
     }
 
     /// The connection for `id`, lifted out from under the map lock so the caller dials with only
     /// that one connection held. See `hosts` for why the ordering is the invariant.
     fn host_conn(&self, id: &HostId) -> Result<Arc<Mutex<HostConnection>>, IpcError> {
-        self.hosts
-            .lock()
-            .unwrap()
+        self.hosts.lock()
             .get(id)
             .cloned()
             .ok_or_else(|| IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0)))
@@ -587,7 +587,7 @@ impl DeviceManagerHandle {
 
     /// Every connection, lifted out the same way, for the callers that visit all of them.
     fn host_conns(&self) -> Vec<(HostId, Arc<Mutex<HostConnection>>)> {
-        self.hosts.lock().unwrap().iter().map(|(id, c)| (id.clone(), c.clone())).collect()
+        self.hosts.lock().iter().map(|(id, c)| (id.clone(), c.clone())).collect()
     }
 
     /// Local hardware plus every paired Cut Host's cutters, in one list.
@@ -608,7 +608,7 @@ impl DeviceManagerHandle {
     pub fn list_devices(&self) -> Vec<DeviceInfo> {
         let mut all = self.local_factory.list_devices();
         for (id, conn) in self.host_conns() {
-            let mut guard = conn.lock().unwrap();
+            let mut guard = conn.lock();
             let host = &mut *guard;
             // `forget` has published `Forgetting` and released this lock so the save does not pin
             // it. Dialling anyway would reopen a host the operator is removing; the `Arc` this
@@ -651,13 +651,13 @@ impl DeviceManagerHandle {
             last_seen: None,
             lifecycle: HostLifecycle::Active,
         };
-        self.claimed_host_ids.lock().unwrap().insert(id.clone());
-        self.hosts.lock().unwrap().insert(id, Arc::new(Mutex::new(conn)));
+        self.claimed_host_ids.lock().insert(id.clone());
+        self.hosts.lock().insert(id, Arc::new(Mutex::new(conn)));
     }
 
     /// Mint a HostId that no host or surviving mark in this process has ever meant.
     fn claim_next_host_id(&self) -> Result<HostId, IpcError> {
-        let mut claimed = self.claimed_host_ids.lock().unwrap();
+        let mut claimed = self.claimed_host_ids.lock();
         let highest = claimed
             .iter()
             .filter_map(|id| id.0.strip_prefix("host-"))
@@ -687,8 +687,8 @@ impl DeviceManagerHandle {
     /// filtering them here would be a third pruning rule for entries that are already dead. Their
     /// only cost is a cap slot until `ID_RETENTION`.
     pub fn remove_host(&self, id: &HostId) {
-        self.hosts.lock().unwrap().remove(id);
-        self.last_remote_status.lock().unwrap().retain(|(host, _), _| host != id);
+        self.hosts.lock().remove(id);
+        self.last_remote_status.lock().retain(|(host, _), _| host != id);
     }
 
     /// What `list_hosts` gives the UI: enough to render a row and address it, never the token.
@@ -702,7 +702,7 @@ impl DeviceManagerHandle {
         self.host_conns()
             .into_iter()
             .map(|(_, conn)| {
-                let h = conn.lock().unwrap();
+                let h = conn.lock();
                 PairedHostView {
                     id: h.paired.id.clone(),
                     name: h.paired.name.clone(),
@@ -721,7 +721,7 @@ impl DeviceManagerHandle {
         self.host_conns()
             .into_iter()
             .filter_map(|(_, conn)| {
-                let h = conn.lock().unwrap();
+                let h = conn.lock();
                 // A host mid-forget is still in the map so queued calls can see `Forgetting` and
                 // refuse. It is not a row to write back: its own save has already dropped it, and
                 // a concurrent `pair` or `forget` rewriting the file would resurrect it.
@@ -771,7 +771,7 @@ impl DeviceManagerHandle {
         // mark behind. Reusing its id would let an idle cutter on a new Pi erase that warning.
         // The snapshot and the save are one critical section with `forget`: each rewrites the
         // whole file, and interleaving the two puts a row back or drops one that just landed.
-        let _persist = self.hosts_persist.lock().unwrap();
+        let _persist = self.hosts_persist.lock();
         let mut prospective = self.paired_hosts();
         let id = self.claim_next_host_id()?;
         let paired = PairedHost { id: id.clone(), name, address, fingerprint, token };
@@ -901,11 +901,11 @@ impl DeviceManagerHandle {
         // Held across the snapshot and the save, same as `pair`. The connection guard is taken
         // after the snapshot: `paired_hosts` locks every connection in turn, including this one,
         // so gathering it under the guard would deadlock this verb against itself.
-        let _persist = self.hosts_persist.lock().unwrap();
+        let _persist = self.hosts_persist.lock();
         let prospective: Vec<PairedHost> =
             self.paired_hosts().into_iter().filter(|h| &h.id != id).collect();
         let conn = self.host_conn(id)?;
-        let Ok(mut guard) = conn.try_lock() else {
+        let Some(mut guard) = conn.try_lock() else {
             return Err(IpcError::new(
                 "host_busy",
                 "this Cut Host is mid-call right now; forget it again in a moment",
@@ -939,13 +939,13 @@ impl DeviceManagerHandle {
 
         if let Err(e) = save(&prospective) {
             // The file still names the host, so this process must answer for it again too.
-            conn.lock().unwrap().lifecycle = HostLifecycle::Active;
+            conn.lock().lifecycle = HostLifecycle::Active;
             return Err(IpcError::new("hosts_unwritable", e.to_string()));
         }
 
         // Save succeeded: no call can cross this transition, because every lifted `Arc` checks the
         // same state under the same mutex before it reaches the client.
-        conn.lock().unwrap().lifecycle = HostLifecycle::Forgotten;
+        conn.lock().lifecycle = HostLifecycle::Forgotten;
         self.remove_host(id);
         // A host that reported every cutter free has just said those marks are stale; a host forced
         // past unreachable had the operator told outright what forgetting discards. Either way the
@@ -954,7 +954,7 @@ impl DeviceManagerHandle {
         self.ledger.retract_marks(&marks);
         // Otherwise `get_connected_device` keeps answering with a device `list_devices` no
         // longer lists: the aim would survive the host it named.
-        let mut connected = self.connected.lock().unwrap();
+        let mut connected = self.connected.lock();
         if connected.as_ref().and_then(|d| d.host.as_ref()) == Some(id) {
             *connected = None;
         }
@@ -979,7 +979,7 @@ impl DeviceManagerHandle {
     fn route(&self, device: &DeviceInfo) -> Result<Route, IpcError> {
         match &device.host {
             None => Ok(Route::Local),
-            Some(id) if self.hosts.lock().unwrap().contains_key(id) => Ok(Route::Host(id.clone())),
+            Some(id) if self.hosts.lock().contains_key(id) => Ok(Route::Host(id.clone())),
             Some(id) => Err(IpcError::new("unknown_host", format!("no Cut Host called `{}` is paired", id.0))),
         }
     }
@@ -1057,7 +1057,7 @@ impl DeviceManagerHandle {
         f: impl FnOnce(&mut HostConnection) -> Result<T, IpcError>,
     ) -> Result<T, IpcError> {
         let conn = self.host_conn(id)?;
-        let mut guard = conn.lock().unwrap();
+        let mut guard = conn.lock();
         let host = &mut *guard;
         // Asked under the connection lock, which is where `forget` transitions it: a press that
         // queued here before the map entry went would otherwise dispatch onto a discarded token.
@@ -1091,7 +1091,7 @@ impl DeviceManagerHandle {
     /// than through `status()` at the current aim — the whole point is to catch this *before*
     /// the aim moves away from local, which is what would make `status()` stop seeing it.
     fn local_cut_is_active(&self) -> bool {
-        match self.local_manager.lock().unwrap().as_ref() {
+        match self.local_manager.lock().as_ref() {
             Some(mgr) => mgr.status().is_active(),
             None => false,
         }
@@ -1126,7 +1126,7 @@ impl DeviceManagerHandle {
                 self.manager()?.disconnect()?;
             }
         }
-        *self.connected.lock().unwrap() = Some(info);
+        *self.connected.lock() = Some(info);
         Ok(())
     }
 
@@ -1147,7 +1147,7 @@ impl DeviceManagerHandle {
     }
 
     pub fn disconnect(&self) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             // A remote cutter's connection belongs to the Cut Host, not this desktop — the
             // mirror of `connect`'s remote arm, which never opened one here to close. Routing
@@ -1159,7 +1159,7 @@ impl DeviceManagerHandle {
             }
             Some(Route::Host(_)) => {}
         }
-        *self.connected.lock().unwrap() = None;
+        *self.connected.lock() = None;
         Ok(())
     }
 
@@ -1208,7 +1208,7 @@ impl DeviceManagerHandle {
     }
 
     fn reconnect_aimed(&self) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         let Some(device) = aimed else {
             return Err(IpcError::new("device_error", "no device is connected"));
         };
@@ -1254,10 +1254,10 @@ impl DeviceManagerHandle {
     }
 
     fn status_aimed(&self) -> CutStatus {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         let Some(device) = aimed else { return CutStatus::disconnected() };
         match self.route(&device) {
-            Ok(Route::Local) => match self.local_manager.lock().unwrap().as_ref() {
+            Ok(Route::Local) => match self.local_manager.lock().as_ref() {
                 Some(mgr) => mgr.status(),
                 None => CutStatus::disconnected(),
             },
@@ -1273,9 +1273,7 @@ impl DeviceManagerHandle {
 
     /// Every remote cutter's last snapshot, without dialling.
     pub fn cutter_statuses(&self) -> Vec<CutterStatusView> {
-        self.last_remote_status
-            .lock()
-            .unwrap()
+        self.last_remote_status.lock()
             .iter()
             .map(|((host, instance_id), status)| CutterStatusView {
                 host: host.clone(),
@@ -1298,7 +1296,7 @@ impl DeviceManagerHandle {
                 .filter(|s| snapshot_is_free(s))
                 .map(|s| s.info.instance_id.as_str()),
         );
-        let mut cache = self.last_remote_status.lock().unwrap();
+        let mut cache = self.last_remote_status.lock();
         // A failed dial never gets here, so an unreachable host keeps the rows it had.
         // A host that answered and no longer names a cutter has unplugged it. This map is
         // what `cutter_statuses` publishes, and the cutting dot reads `actions.cancel` off it.
@@ -1360,7 +1358,7 @@ impl DeviceManagerHandle {
             (None, None) => Ok(CutterAddress::Aim),
             (None, Some(instance_id)) => Ok(CutterAddress::Local { instance_id }),
             (Some(host), Some(instance_id)) => {
-                if !self.hosts.lock().unwrap().contains_key(&host) {
+                if !self.hosts.lock().contains_key(&host) {
                     return Err(IpcError::new(
                         "unknown_host",
                         format!("no Cut Host called `{}` is paired", host.0),
@@ -1378,7 +1376,7 @@ impl DeviceManagerHandle {
     /// Local multi-cutter is #59. An explicit local target that is not the aimed cutter is refused
     /// rather than guessed: two USB cutters on this computer are not addressable yet.
     fn require_aimed_local(&self, instance_id: &str) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         match aimed {
             Some(device) if device.host.is_none() && device.instance_id == instance_id => Ok(()),
             _ => Err(IpcError::new(
@@ -1400,18 +1398,16 @@ impl DeviceManagerHandle {
     /// This mirrors what the local path already does — `driver-core` publishes `CutStatus`
     /// precisely so a status read never blocks.
     pub fn status_without_dialling(&self) -> CutStatus {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         let Some(device) = aimed else { return CutStatus::disconnected() };
         match self.route(&device) {
-            Ok(Route::Local) => match self.local_manager.lock().unwrap().as_ref() {
+            Ok(Route::Local) => match self.local_manager.lock().as_ref() {
                 Some(mgr) => mgr.status(),
                 None => CutStatus::disconnected(),
             },
             Err(_) => CutStatus::disconnected(),
             Ok(Route::Host(id)) => self
-                .last_remote_status
-                .lock()
-                .unwrap()
+                .last_remote_status.lock()
                 .get(&(id, device.instance_id))
                 .cloned()
                 .unwrap_or_else(CutStatus::disconnected),
@@ -1581,7 +1577,7 @@ impl DeviceManagerHandle {
     }
 
     fn cancel_aimed(&self) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => {
                 self.manager()?.cancel();
@@ -1633,7 +1629,7 @@ impl DeviceManagerHandle {
     }
 
     fn resume_aimed(&self) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => Ok(self.manager()?.resume()?),
             Some(Route::Host(id)) => {
@@ -1658,7 +1654,7 @@ impl DeviceManagerHandle {
     }
 
     fn confirm_aimed(&self) -> Result<(), IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         match aimed.as_ref().map(|d| self.route(d)).transpose()? {
             None | Some(Route::Local) => Ok(self.manager()?.confirm_pass_done()?),
             Some(Route::Host(id)) => {
@@ -1673,7 +1669,7 @@ impl DeviceManagerHandle {
     /// clone is briefly alive), that's a non-fatal race at process exit — log
     /// and move on rather than block or panic.
     pub fn shutdown(&self) {
-        let Some(arc) = self.local_manager.lock().unwrap().take() else { return };
+        let Some(arc) = self.local_manager.lock().take() else { return };
         match Arc::try_unwrap(arc) {
             Ok(mgr) => mgr.shutdown(),
             Err(_) => eprintln!("device manager shutdown skipped: a call was still in flight"),
@@ -1692,7 +1688,7 @@ impl DeviceManagerHandle {
     /// What stays here is what `cutplan` cannot know: which device is plugged
     /// in, which driver serves it, and where the presets file lives.
     pub fn prepare_cut(&self, app: &AppState, request: CutRequest) -> Result<(DeviceInfo, Vec<CutPass>), IpcError> {
-        let connected = self.connected.lock().unwrap().clone()
+        let connected = self.connected.lock().clone()
             .ok_or_else(|| IpcError::new("not_connected", "no device connected"))?;
         if connected.instance_id != request.device_instance_id {
             return Err(IpcError::new("device_mismatch", "connected device changed since planning"));
@@ -1774,7 +1770,7 @@ impl DeviceManagerHandle {
     /// because it would be handed the *new* device's own `machine_id` and so compare it
     /// against itself. So the aim is re-read and compared here, before anything is sent.
     pub fn execute_cut(&self, planned_for: DeviceInfo, passes: Vec<CutPass>) -> Result<CutStarted, IpcError> {
-        let aimed = self.connected.lock().unwrap().clone();
+        let aimed = self.connected.lock().clone();
         // A cutter is its id *and* its host, never the id alone: fallback ids are assigned by
         // location (`usb:at:1:4`, `serial:at:/dev/ttyUSB0`), so two hosts wired alike hand out
         // the same string for two different machines.

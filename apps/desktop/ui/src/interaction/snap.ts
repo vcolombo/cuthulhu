@@ -90,12 +90,26 @@ function snapAxis(cands: number[], lines: Line[], tol: number): AxisHit | null {
 // A guide here spans only the targets it lines up with. The moving box's own extent is added by
 // keepLanded from where the box actually lands, since Shift or a uniform scale can put it
 // somewhere other than the raw drag suggests.
+// A loop, not Math.min/max(...): one argument per line overflows the engine's limit once a
+// few hundred thousand targets share the snapped coordinate, and this runs inside a
+// pointer-move handler (#303, as in align.ts and unionBounds).
+function extent(lines: Line[]): [number, number] {
+  let lo = Infinity, hi = -Infinity;
+  for (const l of lines) {
+    lo = Math.min(lo, l.lo);
+    hi = Math.max(hi, l.hi);
+  }
+  return [lo, hi];
+}
+
 function guideAlongX(at: number, lines: Line[]): Guide {
-  return { axis: "x", a: { x: at, y: Math.min(...lines.map((l) => l.lo)) }, b: { x: at, y: Math.max(...lines.map((l) => l.hi)) } };
+  const [lo, hi] = extent(lines);
+  return { axis: "x", a: { x: at, y: lo }, b: { x: at, y: hi } };
 }
 
 function guideAlongY(at: number, lines: Line[]): Guide {
-  return { axis: "y", a: { x: Math.min(...lines.map((l) => l.lo)), y: at }, b: { x: Math.max(...lines.map((l) => l.hi)), y: at } };
+  const [lo, hi] = extent(lines);
+  return { axis: "y", a: { x: lo, y: at }, b: { x: hi, y: at } };
 }
 
 /** A move's pointer, pulled so the moved box's left/centre/right and top/middle/bottom lines land

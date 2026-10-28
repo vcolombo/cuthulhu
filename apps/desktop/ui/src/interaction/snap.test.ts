@@ -168,3 +168,31 @@ describe("guide orientation", () => {
     expect([Math.min(h!.a.x, h!.b.x), Math.max(h!.a.x, h!.b.x)]).toEqual([0, 30]);
   });
 });
+
+describe("a guide over a very large coincident set", () => {
+  // #303: a spread passes one argument per line sharing the snapped coordinate, which throws
+  // RangeError past the engine's argument limit (the 300,000 align.test.ts uses). A big trace
+  // or tiled import can put that many targets on one edge, inside a pointer-move handler.
+  // The two extremes sit on different interior lines and neither end supplies one, so an
+  // extent that seeds at 0, reads only the first or last line, or derives one end from the
+  // other fails here rather than passing on a symmetric fixture (gate-1 review).
+  const coincident = Array.from({ length: 300_000 }, (_, i) => ({
+    v: 30,
+    lo: i === 123_456 ? 40 : 100,
+    hi: i === 234_567 ? 900 : 200,
+  }));
+
+  it("spans every vertical line sharing its x without overflowing the argument limit", () => {
+    const r = snapMove(boxA, { x: 5, y: 5 }, { x: 24.6, y: 5 }, { x: coincident, y: [] }, 1, false);
+    const g = r.guides.find((s) => s.axis === "x")!;
+    expect([g.a.x, g.b.x]).toEqual([30, 30]);
+    expect([g.a.y, g.b.y]).toEqual([40, 900]);
+  });
+
+  it("spans every horizontal line sharing its y without overflowing the argument limit", () => {
+    const r = snapMove(boxA, { x: 5, y: 5 }, { x: 5, y: 24.6 }, { x: [], y: coincident }, 1, false);
+    const g = r.guides.find((s) => s.axis === "y")!;
+    expect([g.a.y, g.b.y]).toEqual([30, 30]);
+    expect([g.a.x, g.b.x]).toEqual([40, 900]);
+  });
+});

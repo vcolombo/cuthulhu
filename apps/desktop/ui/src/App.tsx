@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Cpu, Layers, SlidersHorizontal } from "lucide-react";
 import * as ipc from "./ipc";
 import { armCloseGuard } from "./closeGuard";
+import { answerQuitPrompt } from "./quitPrompt";
 import { Toaster } from "./components/ui/sonner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { TooltipProvider } from "./components/ui/tooltip";
@@ -15,10 +16,11 @@ import { useUnits } from "./hooks/useUnits";
 import { formatLength } from "./length";
 import { DevicesTab } from "./panels/DevicesTab";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
-import { unionBounds, type Affine6, type Bounds, type Scene, type ShapeGeom } from "./render/hittest";
+import { unionBounds, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
 import { IDENTITY, compose, transformBounds } from "./render/affine";
 import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
+import { selectionBounds } from "./interaction/selectionBox";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
@@ -161,16 +163,6 @@ function countShapes(doc: DocSnapshot | null): number {
   return Object.values(doc.nodes).filter((node) => typeof node.kind === "object" && "Shape" in node.kind).length;
 }
 
-function selectionBounds(scene: Scene, selected: number[]): Bounds | null {
-  const boxes = scene.nodes.filter((node) => selected.includes(node.id)).map((node) => node.bounds);
-  if (boxes.length === 0) return null;
-  const x = Math.min(...boxes.map((box) => box.x));
-  const y = Math.min(...boxes.map((box) => box.y));
-  const right = Math.max(...boxes.map((box) => box.x + box.w));
-  const bottom = Math.max(...boxes.map((box) => box.y + box.h));
-  return { x, y, w: right - x, h: bottom - y };
-}
-
 export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Canvas2DRenderer | null>(null);
@@ -260,7 +252,10 @@ export function App() {
 
   // Backend refuses to close the window while a cut it started may still be running (main.rs's
   // on_window_event emits this and then calls prevent_close) — ask the operator, then force_quit
-  // if they confirm. No-op on cancel, so the window just stays open.
+  // if they confirm. The Dock's Quit and a logout raise the same prompt, and there the OS is
+  // waiting on an answer (`NSTerminateLater`), so a dismissal is told to the backend too:
+  // `cancel_quit` replies "stay" to the OS when one is owed and does nothing for the window close,
+  // which is why this does not need to know which door raised the prompt.
   //
   // The handshake itself lives in `closeGuard.ts`: its ordering is the invariant, and an effect
   // body is not something a test in this UI can observe.
@@ -270,12 +265,12 @@ export function App() {
         setReady: ipc.setCloseGuardReady,
         listen: (onWarning) => listen("cut-in-progress", onWarning),
         onWarning: () => {
-          const quit = window.confirm(
-            "A cut may still be running — quit anyway? Sending to the cutter on this computer " +
-              "stops, but it finishes whatever moves it has already buffered; a Job already sent " +
-              "to a Cut Host keeps running there.",
-          );
-          if (quit) ipc.forceQuit().catch((e) => setError(ipc.ipcErrorMessage(e)));
+          void answerQuitPrompt({
+            ask: ipc.askToQuit,
+            forceQuit: ipc.forceQuit,
+            cancelQuit: ipc.cancelQuit,
+            onError: (e) => setError(ipc.ipcErrorMessage(e)),
+          });
         },
         onError: (e) => setError(ipc.ipcErrorMessage(e)),
       }),

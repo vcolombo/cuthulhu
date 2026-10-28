@@ -913,6 +913,7 @@ dependencies = [
  "fileio",
  "geometry",
  "heck 0.5.0",
+ "objc2",
  "serde",
  "serde_json",
  "syn 2.0.119",

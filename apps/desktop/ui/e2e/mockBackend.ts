@@ -1337,6 +1337,12 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
       sessionStorage.setItem("__force_quit__", "asked");
       return null;
     },
+    // Mirrors `main.rs`'s `cancel_quit`: the real one replies to the OS only when a macOS terminate
+    // is owed, which a page cannot see, so what a test can observe is that the dismissal reached it.
+    cancel_quit: () => {
+      sessionStorage.setItem("__quit_cancelled__", "asked");
+      return null;
+    },
     // Test hook (no production counterpart): how many times the dialog has asked for a status.
     __test_poll_count: () => deviceStateCalls,
     __test_list_count: () => listReads,
@@ -1665,6 +1671,39 @@ export function installMockTauri(opts?: { seedTwoColorRects?: boolean; seedRedGo
     invoke: (cmd: string, args: Record<string, unknown> = {}) => {
       if (cmd === "plugin:dialog|save" || cmd === "plugin:dialog|open") {
         return Promise.resolve("/mock/cuthulhu-project.cut");
+      }
+      // The dialog plugin's `confirm` is a `message` command, so this is the quit and switch
+      // prompts. Recorded, because a test cannot tell a prompt that was asked from one that never
+      // was by what the page did next. The answer is the test's, defaulting to Cancel, and is the
+      // label of the button the page offered, which is what the plugin compares.
+      //
+      // Held behind an explicit release when the test asks for one (`__dialog_hold__`), delivered
+      // at once otherwise. A fixed delay would make "nothing happened yet" a race: the test
+      // reading the recorded message has no way to know the delay has not already elapsed, so a
+      // slow runner fails correct code. Delivery records `__dialog_answered__` in the same turn,
+      // so a later read of it is ordered after the page's own continuation.
+      if (cmd === "plugin:dialog|message") {
+        const log = JSON.parse(sessionStorage.getItem("__dialog_messages__") ?? "[]") as string[];
+        log.push(String(args.message));
+        sessionStorage.setItem("__dialog_messages__", JSON.stringify(log));
+        // The plugin's wire form for custom labels (`buttonsToRust`), not something to validate.
+        const offered = args.buttons as { OkCancelCustom: [string, string] };
+        const [okLabel, cancelLabel] = offered.OkCancelCustom;
+        return new Promise((resolve) => {
+          const deliver = () => {
+            const held =
+              sessionStorage.getItem("__dialog_hold__") === "1" &&
+              sessionStorage.getItem("__dialog_released__") !== "1";
+            if (held) {
+              setTimeout(deliver, 10);
+              return;
+            }
+            const answered = Number(sessionStorage.getItem("__dialog_answered__") ?? 0) + 1;
+            sessionStorage.setItem("__dialog_answered__", String(answered));
+            resolve(sessionStorage.getItem("__dialog_answer__") === "ok" ? okLabel : cancelLabel);
+          };
+          deliver();
+        });
       }
       if (cmd === "plugin:event|listen") {
         const id = args.handler as number;

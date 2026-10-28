@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { unionBounds, type Affine6, type Scene } from "../render/hittest";
+import { unionBounds, type Affine6, type Bounds, type Scene } from "../render/hittest";
 import { apply, compose, invert, translate, type Pt } from "../render/affine";
 
 /** The local rectangle [0, w] × [0, h], placed in world by `frame`. Gestures work in this frame,
@@ -31,6 +31,24 @@ export function selectionBox(scene: Scene, ids: number[]): Box | null {
   }
   const u = unionBounds(nodes.map((n) => n.bounds));
   return { frame: translate(u.x, u.y), w: u.w, h: u.h };
+}
+
+/** The axis-aligned world box of the selected shapes, for the status bar.
+ *
+ *  `unionBounds` walks the boxes. A spread `Math.min` throws `RangeError` once a
+ *  selection passes the engine's argument limit, and Cmd-A selects every shape on
+ *  the mat — the render that paints the status bar is what would throw, with no
+ *  error boundary above it. Membership is a set for the same reason `selectionBox`
+ *  uses one: this runs on every render, and `includes` on the id list is quadratic. */
+export function selectionBounds(scene: Scene, selected: number[]): Bounds | null {
+  if (selected.length === 0) return null;
+  const wanted = new Set(selected);
+  const boxes: Bounds[] = [];
+  for (const node of scene.nodes) {
+    if (wanted.has(node.id)) boxes.push(node.bounds);
+  }
+  if (boxes.length === 0) return null;
+  return unionBounds(boxes);
 }
 
 export function handleLocal(box: Box, h: ScaleHandle): Pt {

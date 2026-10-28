@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
 import { connectedControl, deviceBadge, forgetFrom, groupDevices, hostCardTitle, lastSeenLabel, protocolSide, protocolUpdateUrl, retainOffline, sameCutter, staleSection, UPDATE_NEEDED_BADGE } from "./deviceList";
-import type { CutStatus, DeviceInfo, PairedHostView } from "../ipc";
+import type { CutStatus, CutterStatusView, DeviceInfo, PairedHostView } from "../ipc";
 
 const aDevice = (): DeviceInfo => ({
   instance_id: "usb:mock",
@@ -408,6 +408,17 @@ describe("retainOffline", () => {
     id: "host-1", name: "Workshop Pi", address: "pi.local:7878", unreachable, protocol_side: null,
   });
   const remote = (id: string): DeviceInfo => ({ ...aDevice(), instance_id: id, host: "host-1" });
+  const sending = (): CutStatus => ({
+    ...aStatus(),
+    phase: "Sending",
+    actions: { cut: false, cancel: true, resume: false, confirm: false },
+    jobId: 7,
+  });
+  const statusOf = (hostId: string, instance: string, status: CutStatus): CutterStatusView => ({
+    host: hostId,
+    instance_id: instance,
+    status,
+  });
 
   it("keeps the previous cutters of a host that can no longer be reached", () => {
     const previous = [remote("usb:pi:A")];
@@ -417,13 +428,69 @@ describe("retainOffline", () => {
 
   it("uses the first reading when there is nothing older to keep", () => {
     const next = [remote("usb:pi:A")];
-    const kept = retainOffline([], [], next, [host("timed out")], []);
+    const arrived = statusOf("host-1", "usb:pi:A", sending());
+    const kept = retainOffline([], [], next, [host("timed out")], [arrived]);
     expect(kept.devices).toEqual(next);
+    expect(kept.statuses).toEqual([arrived]);
+  });
+
+  // The cutter row and its status are remembered separately. A list that already
+  // names the cutter must not throw away the first status that arrives for it.
+  it("keeps a cutter it already listed and the status from the first reading of it", () => {
+    const arrived = statusOf("host-1", "usb:pi:A", sending());
+    const kept = retainOffline(
+      [remote("usb:pi:A")],
+      [],
+      [{ ...remote("usb:pi:A"), machine_id: "puma" }],
+      [host("timed out")],
+      [arrived],
+    );
+    expect(kept.devices).toEqual([remote("usb:pi:A")]);
+    expect(kept.statuses).toEqual([arrived]);
   });
 
   it("takes the new snapshot once the host answers again", () => {
     const next = [remote("usb:pi:B")];
-    const kept = retainOffline([remote("usb:pi:A")], [], next, [host(null)], []);
+    const idle = statusOf("host-1", "usb:pi:B", {
+      ...aStatus(),
+      phase: "Idle",
+      actions: { ...aStatus().actions, cut: true },
+    });
+    const kept = retainOffline(
+      [remote("usb:pi:A")],
+      [statusOf("host-1", "usb:pi:A", sending())],
+      next,
+      [host(null)],
+      [idle],
+    );
     expect(kept.devices).toEqual(next);
+    expect(kept.statuses).toEqual([idle]);
+  });
+
+  // A failed dial still returns a snapshot, and that snapshot is empty or Disconnected.
+  // Substituting it drops the row or reads as finished while the blade is still moving.
+  // Cutters that did answer — this computer, and a host that is up — take the new reading.
+  it("keeps a cut that is still sending when the live snapshot of an offline host is empty", () => {
+    const stillSending = statusOf("host-1", "usb:pi:A", sending());
+    const siblingIdle = statusOf("host-2", "usb:pi:B", {
+      ...aStatus(),
+      phase: "Idle",
+      actions: { ...aStatus().actions, cut: true },
+    });
+    const local: DeviceInfo = { ...aDevice(), instance_id: "usb:local" };
+    const sibling: DeviceInfo = { ...aDevice(), instance_id: "usb:pi:B", host: "host-2" };
+    const ghost: DeviceInfo = { ...aDevice(), instance_id: "usb:pi:GHOST", host: "host-1" };
+    const kept = retainOffline(
+      [remote("usb:pi:A"), { ...aDevice(), instance_id: "usb:old-local" }],
+      [stillSending, statusOf("host-2", "usb:pi:B", sending())],
+      [local, sibling, ghost],
+      [
+        host("timed out"),
+        { id: "host-2", name: "Office Pi", address: "office.local:7878", unreachable: null, protocol_side: null },
+      ],
+      [statusOf("host-1", "usb:pi:A", aStatus()), siblingIdle],
+    );
+    expect(kept.devices.map((device) => device.instance_id)).toEqual(["usb:local", "usb:pi:B", "usb:pi:A"]);
+    expect(kept.statuses).toEqual([siblingIdle, stillSending]);
   });
 });

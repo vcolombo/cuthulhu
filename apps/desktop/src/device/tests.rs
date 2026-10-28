@@ -1852,10 +1852,13 @@ fn a_cutter_is_named_by_the_pair_or_not_at_all() {
     dev.cut_from_request(&app, request_from(plan_for(&app))).expect("cut");
     assert!(dev.status().is_active(), "the cut never started");
 
+    let active = dev.status();
     let missed = dev.cancel_addressed(None, Some("usb:9:9".into())).expect_err("the other local id");
     assert_eq!(missed.code, "device_mismatch");
-    assert!(
-        dev.status().is_active(),
+    // A cancel is queued to the worker, so one reading can race a refusal that
+    // dispatched one anyway. Hold the claim open until it would have landed.
+    stays_false(
+        || dev.status() != active,
         "naming a cutter this computer is not aimed at cancelled the one it is",
     );
 

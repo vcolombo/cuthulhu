@@ -23,17 +23,16 @@ use driver_core::{CutStatus, DeviceBackendFactory, DeviceInfo, Ended, Phase};
 pub enum Operator {
     Interactive,
     Unattended,
-    /// Answers from caller-supplied code: handed the prompt, returning whether
-    /// the operator answered. `false` means the wait was abandoned because a
-    /// cancel landed (the callback may land that cancel itself, through a
-    /// manager it captured); returning `false` with the job uncancelled breaks
-    /// `wait_ack`'s contract and the loop can only ask again. The seam a test
-    /// drives a multi-pass cut through — the interactive arm reads the
-    /// process's stdin, which a test process either inherits from its terminal
-    /// or finds at EOF, never something it can answer. A scripted operator is
-    /// an operator, so the unattended multi-pass refusal in `run` is
-    /// deliberately not widened to it.
-    Scripted(Box<dyn FnMut(&str) -> bool + Send>),
+    /// Answers from caller-supplied code, handed the prompt and the device:
+    /// returning answers the pause. To abandon one, cancel through the device
+    /// before returning — the cancel is queued ahead of the answer the loop
+    /// then sends, which comes back `Busy` and is reported as the cancel it
+    /// was. The seam a test drives a multi-pass cut through — the interactive
+    /// arm reads the process's stdin, which a test process either inherits
+    /// from its terminal or finds at EOF, never something it can answer. A
+    /// scripted operator is an operator, so the unattended multi-pass refusal
+    /// in `run` is deliberately not widened to it.
+    Scripted(Box<dyn FnMut(&str, &DeviceManager) + Send>),
 }
 
 impl Operator {
@@ -48,7 +47,10 @@ impl Operator {
                 eprintln!("{prompt}: assuming done (stdin is not a terminal; completion not verified)");
                 true
             }
-            Operator::Scripted(answer) => answer(prompt),
+            Operator::Scripted(answer) => {
+                answer(prompt, mgr);
+                true
+            }
         }
     }
 }

@@ -10,7 +10,7 @@ use cli::cut::{ended_message, run, Operator, Outcome};
 use cli::pipeline::{driver_for, plan_cut_from_svg};
 use driver_core::{
     DeviceBackendFactory, DeviceInfo, Driver, DriverError, Job, MachineCaps, MachineProfile,
-    MockTransport, Settings, Transport, TransportError, TransportKind,
+    MockTransport, Phase, Settings, Transport, TransportError, TransportKind,
 };
 
 const SQUARE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20mm" height="20mm">
@@ -285,27 +285,19 @@ fn a_two_pass_cut_is_answered_through_its_colour_swap() {
     // and how many passes had reached the wire by then. Recorded rather than
     // asserted inside the answer, so a failure is reported against the finished
     // run instead of unwinding through the cut loop.
-    let answers: Arc<Mutex<Vec<(String, String, usize)>>> = Arc::new(Mutex::new(Vec::new()));
-    let mgr_cell: Arc<Mutex<Option<Arc<driver_core::manager::DeviceManager>>>> =
-        Arc::new(Mutex::new(None));
+    let answers: Arc<Mutex<Vec<(String, Phase, usize)>>> = Arc::new(Mutex::new(Vec::new()));
     let operator = {
         let answers = answers.clone();
-        let mgr_cell = mgr_cell.clone();
         let written = written.clone();
-        Operator::Scripted(Box::new(move |prompt: &str| {
-            let mgr = mgr_cell.lock().unwrap().clone().expect("handed out before any pause");
-            let phase = format!("{:?}", mgr.status().phase);
+        Operator::Scripted(Box::new(move |prompt: &str, mgr| {
+            let phase = mgr.status().phase;
             let sent = String::from_utf8_lossy(&written.lock().unwrap()).matches("PASS").count();
             answers.lock().unwrap().push((prompt.to_string(), phase, sent));
-            true
         }))
     };
 
-    let outcome = run(&plan, info(), factory, operator, |mgr| {
-        *mgr_cell.lock().unwrap() = Some(mgr);
-        Ok(())
-    })
-    .expect("a two-pass cut with an operator answering its pauses");
+    let outcome = run(&plan, info(), factory, operator, |_| Ok(()))
+        .expect("a two-pass cut with an operator answering its pauses");
 
     assert!(matches!(outcome, Outcome::Completed { passes: 2 }), "{outcome:?}");
     assert_eq!(ended_message(&outcome), "done: 2 passes cut");
@@ -320,7 +312,7 @@ fn a_two_pass_cut_is_answered_through_its_colour_swap() {
     assert!(swap.contains("Pass 2/2"), "{swap}");
     assert!(swap.contains(&format!("({second_key})")), "names the pass being swapped to: {swap}");
     assert!(swap.contains("swap tool"), "says what to do: {swap}");
-    assert_eq!(phase, "AwaitingColorSwap", "still parked while the operator is being asked");
+    assert_eq!(*phase, Phase::AwaitingColorSwap, "still parked while the operator is being asked");
     assert_eq!(*sent, 1, "no second-pass bytes went out before the operator answered");
     assert!(answers[2].0.contains("Pass 2/2"), "{}", answers[2].0);
 
@@ -345,27 +337,20 @@ fn a_cancel_landing_on_the_colour_swap_is_reported_as_a_cancel() {
     let factory = Arc::new(TestFactory { written: written.clone() });
 
     let prompts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let mgr_cell: Arc<Mutex<Option<Arc<driver_core::manager::DeviceManager>>>> =
-        Arc::new(Mutex::new(None));
     let operator = {
         let prompts = prompts.clone();
-        let mgr_cell = mgr_cell.clone();
-        Operator::Scripted(Box::new(move |prompt: &str| {
+        Operator::Scripted(Box::new(move |prompt: &str, mgr| {
             prompts.lock().unwrap().push(prompt.to_string());
             if prompt.contains("swap tool") {
                 // The cancel reaches the worker ahead of the resume this answer
                 // goes on to send — same channel, answered in order.
-                mgr_cell.lock().unwrap().as_ref().expect("handed out before any pause").cancel();
+                mgr.cancel();
             }
-            true
         }))
     };
 
-    let outcome = run(&plan, info(), factory, operator, |mgr| {
-        *mgr_cell.lock().unwrap() = Some(mgr);
-        Ok(())
-    })
-    .expect("a cancel on the colour swap is an ending, not a fault");
+    let outcome = run(&plan, info(), factory, operator, |_| Ok(()))
+        .expect("a cancel on the colour swap is an ending, not a fault");
 
     let Outcome::Cancelled { pass, sent } = outcome else { panic!("reported {outcome:?}, not a cancel") };
     assert_eq!(pass, 2, "cancelled at the second pass's swap, named as the prompt named it");

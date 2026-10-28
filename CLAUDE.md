@@ -9,9 +9,10 @@ Cuthulhu: GPLv3 desktop cutting software for vinyl cutters (Silhouette Cameo 5 A
 GCC Puma IV over HPGL/serial). A Rust workspace engine behind a Tauri + React shell, plus a CLI
 that shares the same planning path.
 
-`README.md` is stale on status — it claims there is no app and no GUI. Both exist
-(`apps/desktop`, ten crates, a working cut workflow and trace). Trust the code and
-`docs/superpowers/plans/` over the README's status block.
+`README.md` is the product overview: what runs, how the desktop is laid out today,
+and the three checks a commit has to pass. This file is the contributor map. Design
+history lives in `docs/superpowers/`; when a spec disagrees with the code, trust the
+code.
 
 `tools/` is the frozen Python protocol spike (USB decoder, HPGL/GPGL square senders). It is
 research tooling, not the product — do not grow it.
@@ -21,7 +22,7 @@ research tooling, not the product — do not grow it.
 ```sh
 cargo test --workspace --locked          # what CI runs; --locked is mandatory (see below)
 cargo test -p cutplan preflight          # one crate, filtered by test-name substring
-cargo run -p cli -- cut file.svg --dry-run
+cargo run -p cli -- cut file.svg --device cameo5 --dry-run
 UPDATE_IPC_INVENTORY=1 cargo test -p desktop --test ipc_inventory   # regenerate ipc-inventory.json
 
 P=apps/desktop/ui                        # every line below runs from the repo root
@@ -100,10 +101,10 @@ pass of shapes with no visible paint (`no-color`). Since #148 every mode takes t
 the plain path has no planning function of its own.
 
 A pass is identified by its `PassKey`, in one canonical string (`all`, `color:ff0000ff`,
-`no-color`, `preset:cameo5-htv`, `no-preset`) that the CLI, the IPC payloads and the cut dialog's
-row keys all share. Absence is its own token because a preset id is an unrestricted operator
+`no-color`, `preset:cameo5-htv`, `no-preset`) that the CLI, the IPC payloads and the Send
+sheet's row keys all share. Absence is its own token because a preset id is an unrestricted operator
 string. **The `Grouping` travels in the `plan_cut`, `travel_for_order` and `cut` payloads**, and
-the dialog holds it with the rows it produced: those are three separate round trips, and rows
+the sheet holds it with the rows it produced: those are three separate round trips, and rows
 keyed under one mode sent under another match passes holding different shapes.
 
 A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` is not cut.
@@ -140,8 +141,25 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   typed errors to `String`. Keep logic out of `ipc.rs`.
 - `main.rs` runs the **event bridge**: the sole consumer of the device-event channel. It coalesces
   `Progress` to ≤10 Hz — that is about webview emit cost, not about the cut — and forwards
-  everything else immediately. It keeps no state of its own; `get_device_state` and the
-  window-close handler read `driver-core`'s published `CutStatus`, which never blocks.
+  everything else immediately. The bridge keeps no state of its own. `get_device_state` reads
+  `driver-core`'s published `CutStatus`, which never blocks.
+- The window-close handler and, on macOS, the application Quit item (Cmd-Q) both call
+  `DeviceManagerHandle::decide_close`. The Dock's Quit and a logout send `terminate:` to
+  `NSApp` instead, so `apps/desktop/src/terminate.rs` adds `applicationShouldTerminate:` to
+  tao's app delegate at runtime and maps that same decision onto `NSTerminateLater` /
+  `NSTerminateNow`; `TerminateReply` owns the reply the OS is owed while the prompt is up.
+  That question is not the aimed cutter's `CutStatus`.
+  `a_cut_may_be_running` counts a local cut, a non-dialling status, every dispatch mark this
+  desktop has not seen finish, and a press that has started and not returned — on any cutter,
+  with none aimed. It does not dial. Quitting stops what this process sends and leaves a Cut
+  Host's Job running.
+  The contract is
+  `docs/adr/0002-the-close-guard-answers-for-every-cut-this-desktop-started.md`; the webview
+  handshake is `ui/src/closeGuard.ts`.
+- **Send to cutter** opens `ui/src/cut/send/SendSheet.tsx`: Machine, then Material & passes,
+  then Preview & cut. The Grouping chosen there is the same value the Layers panel and the
+  document facts in Properties read (`App`'s `grouping` state, default `Color`, not persisted).
+  A bare `cuthulhu cut` still defaults to `--group-by single`.
 - The UI reaches Rust only through `ui/src/ipc.ts`. Rendering is a hand-written Canvas2D renderer
   (`ui/src/render/`); each dialog splits into a pure `viewmodel.ts` (unit-tested) plus a thin
   `.tsx`. `e2e/smoke.spec.ts` installs an in-page fake Tauri backend that mirrors
@@ -168,7 +186,8 @@ A pass is not "enabled/disabled": a pass nobody lists in `PlanOptions::passes` i
   `<config_dir>/cuthulhu/presets.json` and the on-disk contract is *user entries only*
   (`builtin: false` forced on write). A preset is keyed on `(machine_id, id)` everywhere —
   shadowing, saving, deleting — because an operator's id is their own string (#153).
-  The cut dialog manages them (`ui/src/cut/PresetEditor.tsx`, decisions in `presetDraft.ts`): every
+  The Send sheet manages them (`ui/src/cut/PresetEditor.tsx`, opened from
+  `ui/src/cut/send/StepPasses.tsx`, decisions in `presetDraft.ts`): every
   write goes through `save_preset`/`delete_preset`, which refuse a builtin's pair, an id-less or
   blank-named entry, a setting outside range, and a delete that removed nothing — the editor is a
   caller, never the enforcement. An id is minted from the name at creation and never moves again,

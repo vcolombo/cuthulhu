@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Factory worker dispatch
+
+# Cursor's docs list "Issue label changed", but the Automations form can only
+# attach Label Change to pull requests. The factory worker is a Webhook
+# trigger. This workflow is the bridge: an issue label add becomes the POST
+# that starts cuthulhu-factory-worker. A pull_request labeled trigger would
+# not see in-progress or factory-nudge on issues, which is the bug this file
+# exists to route around.
+#
+# `issues` runs the workflow on the default branch only. A copy that exists
+# solely on a pull request branch never fires.
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'vcolombo/cuthulhu' &&
+      (github.event.label.name == 'in-progress' || github.event.label.name == 'factory-nudge') &&
+      github.event.issue.pull_request == null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Post the worker webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.CURSOR_FACTORY_WEBHOOK_URL }}
+          WEBHOOK_KEY: ${{ secrets.CURSOR_FACTORY_WEBHOOK_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.url }}
+          HTML_URL: ${{ github.event.issue.html_url }}
+          LABEL: ${{ github.event.label.name }}
+          TITLE: ${{ github.event.issue.title }}
+          REPO: vcolombo/cuthulhu
+        run: |
+          set -euo pipefail
+          # Event fields arrive as env values so a title cannot break out of
+          # the script. The URL and key are never echoed: curl stderr is
+          # discarded, and the payload below has no secret in it.
+          python3 - << 'PY'
+          import json, os
+          payload = {
+              "issue_number": int(os.environ["ISSUE_NUMBER"]),
+              "issue_url": os.environ["ISSUE_URL"],
+              "html_url": os.environ["HTML_URL"],
+              "label": os.environ["LABEL"],
+              "repo": os.environ["REPO"],
+              "title": os.environ["TITLE"],
+          }
+          with open("/tmp/factory-webhook-payload.json", "w", encoding="utf-8") as fh:
+              json.dump(payload, fh, ensure_ascii=False)
+              fh.write("\n")
+          PY
+          echo "dispatch payload:"
+          cat /tmp/factory-webhook-payload.json
+
+          # A trailing newline in Authorization makes the runner's HTTP/2
+          # client end the header block early, so Cursor sees the body start
+          # with "Content-Length:" and returns 400 before auth. The automation
+          # page's "Copy auth header" value is "Bearer <key>"; store the key
+          # alone. A pasted header still works because the prefix is removed.
+          case "$WEBHOOK_KEY" in
+            *$'\n'*|*$'\r'*) echo "webhook key contained a line break; stripping" ;;
+            *) echo "webhook key has no line breaks" ;;
+          esac
+          key="$(printf '%s' "$WEBHOOK_KEY" | tr -d '\r\n')"
+          url="$(printf '%s' "$WEBHOOK_URL" | tr -d '\r\n')"
+          case "$key" in
+            [Bb]earer\ *)
+              echo "webhook key included a Bearer prefix; using the token after it"
+              key="${key#[Bb]earer }"
+              ;;
+          esac
+          if [ -z "$key" ] || [ -z "$url" ]; then
+            echo "CURSOR_FACTORY_WEBHOOK_URL or CURSOR_FACTORY_WEBHOOK_KEY is empty"
+            exit 1
+          fi
+
+          set +e
+          http_code="$(
+            curl --silent \
+              --output /tmp/factory-webhook-body \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer ${key}" \
+              --header "Content-Type: application/json" \
+              --data-binary @/tmp/factory-webhook-payload.json \
+              --url "$url" \
+              2>/tmp/factory-webhook-curl.err
+          )"
+          curl_status=$?
+          set -e
+          if [ "$curl_status" -ne 0 ] && [ -z "${http_code}" ]; then
+            echo "curl failed before an HTTP status"
+            exit "$curl_status"
+          fi
+          echo "webhook HTTP ${http_code:-none}"
+          if [ -s /tmp/factory-webhook-body ]; then
+            cat /tmp/factory-webhook-body
+            echo
+          fi
+          if [ "$http_code" != "200" ]; then
+            echo "webhook rejected the dispatch (401: put the raw API key in CURSOR_FACTORY_WEBHOOK_KEY and re-add the label)"
+            exit 1
+          fi

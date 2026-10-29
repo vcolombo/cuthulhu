@@ -64,6 +64,9 @@ supervisor sets Status when it claims, releases, or reconciles. Humans apply
 - [ ] `CAP` is 3. The supervisor never claims a fourth open `in-progress` issue.
 - [ ] Cloud Agent secret `GH_TOKEN` is a Runtime Secret on the environment both automations use (see below).
 - [ ] The thermo-nuclear automation includes the trigger **Pull request pushed**.
+- [ ] Worker automation `cuthulhu-factory-worker` uses a **Webhook** trigger. It does not use Label Change.
+- [ ] Repository secrets `CURSOR_FACTORY_WEBHOOK_URL` and `CURSOR_FACTORY_WEBHOOK_KEY` are set on `vcolombo/cuthulhu`.
+- [ ] `.github/workflows/factory-worker-dispatch.yml` is on `main`.
 
 `in-progress` and `factory-nudge` are workflow labels, same axis as the triage
 set in `docs/agents/triage-labels.md`. They sit beside type and provenance
@@ -117,6 +120,76 @@ review only for the head it was made on, so a fix-up commit with no push
 trigger has no review that counts.
 
 That automation reviews. It does not implement, label, or merge.
+
+### Worker dispatch
+
+The Automations docs list **Issue label changed**. The Automations form
+cannot set it: Label Change attaches to pull requests only. A worker
+triggered that way never runs when the supervisor adds `in-progress` or
+`factory-nudge` to an issue.
+
+The worker automation is `cuthulhu-factory-worker`, and its trigger is
+**Webhook**. Saving the automation shows a POST URL and an API key. Those
+are repository Actions secrets on `vcolombo/cuthulhu`, not text in the
+prompt:
+
+| Secret | Value |
+| --- | --- |
+| `CURSOR_FACTORY_WEBHOOK_URL` | The webhook URL from the automation. |
+| `CURSOR_FACTORY_WEBHOOK_KEY` | The API key alone. Not the words `Bearer`. |
+
+`.github/workflows/factory-worker-dispatch.yml` listens for
+`issues: [labeled]`. It POSTs only when the label is `in-progress` or
+`factory-nudge`, the repository is `vcolombo/cuthulhu`, and the payload is
+not a pull request (`issue.pull_request` is absent). The supervisor still
+adds and removes the labels. The label add is what the workflow watches.
+The supervisor does not call the webhook itself.
+
+The request is `POST` with `Content-Type: application/json` and
+`Authorization: Bearer <key>`. That is the header Cursor's webhook accepts
+([Automations](https://cursor.com/docs/cloud-agent/automations), webhook
+section: saving the trigger creates the URL and the API key). A 200 starts
+a run. A trailing newline in the key makes the runner return 400 before
+authentication, because the HTTP/2 client ends the header block at the
+break. The workflow strips CR and LF. If the secret is the copied header
+(`Bearer crsr_...`), the leading `Bearer ` is removed and the same header
+is sent. A 401 means the key is stale: regenerate it on the automation
+page, store the raw key in `CURSOR_FACTORY_WEBHOOK_KEY`, and add the label
+again. The workflow log prints the JSON body and the HTTP status. It does
+not print the URL or the key.
+
+The `issues` event runs a workflow only from the default branch. This file
+has to be on `main` before a label add can dispatch.
+
+The body the worker reads:
+
+```json
+{
+  "issue_number": 123,
+  "issue_url": "https://api.github.com/repos/vcolombo/cuthulhu/issues/123",
+  "html_url": "https://github.com/vcolombo/cuthulhu/issues/123",
+  "label": "in-progress",
+  "repo": "vcolombo/cuthulhu",
+  "title": "the issue title"
+}
+```
+
+`label` is `in-progress` or `factory-nudge`. `issue_url` is the API URL.
+`html_url` is the issue in the browser.
+
+#### Smoke test
+
+Run this after the workflow is on `main`, the webhook trigger is saved, and
+both repository secrets are set. It starts a real worker on that issue.
+
+1. Pick an open issue you are willing to have implemented. If it already has `in-progress`, remove that label first. An existing label does not fire `labeled`.
+2. Add `in-progress`.
+3. In Actions, **Factory worker dispatch** for that issue ends with `webhook HTTP 200`. The log shows the payload and no URL or key.
+4. `cuthulhu-factory-worker` has a new run whose body `issue_number` is that issue.
+
+A 401 in that log is a key problem, not a label problem. Regenerate the
+webhook API key, update `CURSOR_FACTORY_WEBHOOK_KEY` with the raw key, then
+remove `in-progress` and add it again.
 
 ## `factory-meta`
 
@@ -230,9 +303,10 @@ already true and `nudge_count` is 3, do not add the label: set
 
 Adding the label, including a remove-and-add, increments `nudge_count` by 1
 and sets `followup_state` to `nudged`. A label that is already present does
-not wake the worker; the transition is the trigger. While the meta comment or
-the PR head has moved since the latest `factory-nudge:` comment, the worker
-is in motion and the supervisor leaves the label alone.
+not dispatch: `factory-worker-dispatch.yml` runs on the `labeled` event,
+which is the add. While the meta comment or the PR head has moved since the
+latest `factory-nudge:` comment, the worker is in motion and the supervisor
+leaves the label alone.
 
 `ready` is not a stall. Red CI or a new unresolved thread on that head moves
 `followup_state` back to `in_review`. The stall wait then applies. The
@@ -272,8 +346,8 @@ For each issue taken, in order, as two edits with a re-read between them:
 4. Write `factory-meta` with `followup_state` `awaiting_worker`, `nudge_count` 0, empty `worker_run` / `pr_url` / `branch`, and `last_supervisor_at` now.
 5. Add the issue to project `cuthulhu` if it is absent, then set Status to `In Progress`.
 
-Do not add `factory-nudge` in the same turn as a new `in-progress`. Both
-labels wake the worker, and two wakes start two branches.
+Do not add `factory-nudge` in the same turn as a new `in-progress`. Each
+added label dispatches the worker, and two dispatches start two branches.
 
 Status commands, once the project number is known (`gh project list --owner vcolombo`):
 
@@ -379,8 +453,12 @@ Each run, in this order:
      "factory-blocked: nudge ceiling reached".
    A nudge increments nudge_count by 1, sets followup_state to nudged, sets
    last_supervisor_at to now, and posts a separate comment whose first line
-   is "factory-nudge: <one sentence reason>". If the meta comment or the PR
-   head moved after that comment, the worker is in motion: leave the label.
+   is "factory-nudge: <one sentence reason>". You only change labels. You do
+   not POST the worker webhook. .github/workflows/factory-worker-dispatch.yml
+   does that when in-progress or factory-nudge is added to an issue. A label
+   that is already present does not dispatch; the stall table's remove-and-add
+   is what wakes the worker again. If the meta comment or the PR head moved
+   after that comment, the worker is in motion: leave the label.
    ready is not a stall. If that head is red or has a new unresolved thread,
    set followup_state back to in_review and let the wait run. Do not merge.
    Do not mark the draft ready for review.
@@ -408,13 +486,13 @@ new GitHub issue.
 
 ## Worker prompt
 
-Automation name: `cuthulhu factory worker`.
+Automation name: `cuthulhu-factory-worker`.
 
-Triggers, both on this one automation, issues only (not pull requests), fire
-when the label is **added**:
-
-- Issue label changed: `in-progress`
-- Issue label changed: `factory-nudge`
+Trigger: **Webhook**. Not Label Change, and not a pull-request label. The
+Automations form cannot target issue labels. `.github/workflows/factory-worker-dispatch.yml`
+POSTs when `in-progress` or `factory-nudge` is added to an issue. The
+webhook body is the JSON in the Worker dispatch section (`issue_number`,
+`issue_url`, `html_url`, `label`, `repo`, `title`).
 
 Repository `vcolombo/cuthulhu`. Same `GH_TOKEN` environment. Memories off.
 Pull request creation on. Comment on pull request on, so review threads can
@@ -430,17 +508,21 @@ docs/agents/software-factory.md disagree about claiming or nudging, the file
 wins. If this prompt and AGENTS.md disagree about how to change or review
 code, AGENTS.md wins.
 
-You implement exactly one issue: the issue in this trigger. You do not scan
-the board for other ready-for-agent work. You do not claim a slot. You do
-not merge, you do not enable auto-merge, and you do not mark the pull
-request ready for review. It stays a draft. You do not add or remove a type
-label or a provenance label. You do not apply ready-for-agent.
+This run was started by a webhook. The JSON body has issue_number, issue_url,
+html_url, label, repo, and title. repo is vcolombo/cuthulhu. label is
+in-progress or factory-nudge. You implement exactly that issue_number. You
+do not scan the board for other ready-for-agent work. You do not claim a
+slot. You do not merge, you do not enable auto-merge, and you do not mark
+the pull request ready for review. It stays a draft. You do not add or
+remove a type label or a provenance label. You do not apply ready-for-agent.
+You do not POST the webhook. GitHub Actions already did.
 
 Auth: gh must be able to read and edit issues on vcolombo/cuthulhu. A 403
 or a missing GH_TOKEN means you stop and say so. You do not print the token.
 
-Identify the issue number from the trigger payload. If you cannot, stop
-without editing labels.
+Read issue_number and label from the webhook JSON. If issue_number is
+missing, or repo is not vcolombo/cuthulhu, stop without editing labels.
+label in-progress is a fresh claim. label factory-nudge is a resume.
 
 Read the issue, its labels, its comments, and the single factory-meta
 comment (the one that contains "<!-- factory-meta"). The JSON keys are
@@ -453,18 +535,19 @@ Set worker_run to this run's Cursor URL, or to "run:<UTC timestamp>" when
 you cannot read the URL.
 
 If the issue has any of ready-for-human, needs-triage, needs-info, question,
-or wontfix: do not implement. Post "factory-blocked: <which label>". Set
-followup_state to blocked. If this wake was factory-nudge, remove
+or wontfix: do not implement. Post "factory-blocked: <which exclusion label>".
+Set followup_state to blocked. If the webhook label is factory-nudge, remove
 factory-nudge. Leave in-progress for the supervisor to release. Stop.
 
-If this wake is factory-nudge and the issue has no in-progress label: remove
-factory-nudge and stop. A nudge is not a claim.
+If the webhook label is factory-nudge and the issue has no in-progress
+label: remove factory-nudge and stop. A nudge is not a claim.
 
-If this wake is in-progress (not a nudge) and factory-meta already has a
+If the webhook label is in-progress and factory-meta already has a
 non-empty worker_run and followup_state is implementing, in_review, ready,
 or blocked: stop. You are a duplicate wake. Do not open a second branch.
-Exception: followup_state blocked is resumed only by a factory-nudge wake,
-which a human may add. The supervisor does not nudge a blocked issue.
+Exception: followup_state blocked is resumed only when the webhook label is
+factory-nudge, which a human may add. The supervisor does not nudge a
+blocked issue.
 
 First write of a real wake, before other edits: set worker_run and set
 followup_state to implementing (no pr_url yet) or leave in_review when
@@ -528,10 +611,10 @@ You never merge.
 
 ## Turn-on order
 
-Do these at [cursor.com/automations](https://cursor.com/automations), in
-this order. Save and turn each automation on before starting the next. The
-fenced prompts are the instruction text. Triggers are set in the form, not
-inside the prompt.
+Do these in this order. Automation instructions are the fenced prompts.
+Triggers are set in the form at
+[cursor.com/automations](https://cursor.com/automations), not inside the
+prompt. Save each automation before the next step.
 
 1. **Labels and board.** Walk the checklist in this file. Confirm
    `in-progress` and `factory-nudge` carry the descriptions quoted above.
@@ -547,19 +630,32 @@ inside the prompt.
    the only open trigger is **Pull request opened**, because drafts do not
    fire that one. Save. Do this before any worker pull request exists, or
    the first draft has no review that counts.
-4. **Worker.** New automation, name `cuthulhu factory worker`. Paste the
-   worker prompt. Add both issue-label triggers (`in-progress` added,
-   `factory-nudge` added, issues only). Repository `vcolombo/cuthulhu`.
-   Environment with `GH_TOKEN`. Memories off. Turn it on while zero open
-   issues are labeled `in-progress`. An idle worker does not run.
-5. **Supervisor.** New automation, name `cuthulhu factory supervisor`. Paste
-   the supervisor prompt. Schedule every 15 minutes. Same repository and
-   environment. Memories off. Turn it on last.
+4. **Worker webhook and repository secrets.** Automation name
+   `cuthulhu-factory-worker`. Trigger **Webhook** only. Do not add Label
+   Change. Paste the worker prompt. Repository `vcolombo/cuthulhu`.
+   Environment with `GH_TOKEN`. Memories off. Save, then copy the webhook
+   URL and the API key into the repository secrets
+   `CURSOR_FACTORY_WEBHOOK_URL` and `CURSOR_FACTORY_WEBHOOK_KEY`. The key
+   secret is the raw key. Turn the worker on while zero open issues are
+   labeled `in-progress`. An idle webhook does not run.
+5. **Dispatch workflow on `main`.** Merge
+   `.github/workflows/factory-worker-dispatch.yml` to `main`. The `issues`
+   event does not run a workflow that is only on a branch.
+6. **Smoke test.** On an issue you are willing to have implemented, remove
+   `in-progress` if it is already present, then add it. **Factory worker
+   dispatch** prints `webhook HTTP 200`, and `cuthulhu-factory-worker`
+   starts a run for that issue number. A 401 means regenerate the webhook
+   key into `CURSOR_FACTORY_WEBHOOK_KEY` and add the label again.
+7. **Supervisor.** Automation name `cuthulhu factory supervisor`. Paste the
+   supervisor prompt. Schedule every 15 minutes. Same repository and
+   environment. Memories off. Turn it on last, after the smoke test has
+   shown that a label add reaches the worker.
 
-A label added while the worker automation is off does not replay. If
-`in-progress` was applied early, remove it, put `ready-for-agent` back, and
-let the supervisor claim it after step 4 is on. Do not run the supervisor
-by hand before step 4.
+A label added while the worker webhook is off, or while the dispatch
+workflow is not yet on `main`, does not replay. Remove `in-progress`, put
+`ready-for-agent` back when that issue should stay in Ready, and let the
+supervisor claim it after step 6 has passed. Do not run the supervisor
+before the smoke test.
 
 Humans still triage, apply `ready-for-agent`, answer `factory-blocked`
 comments, remove `in-progress` to free a blocked slot, and merge drafts

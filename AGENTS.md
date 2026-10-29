@@ -238,6 +238,12 @@ Default triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `rea
 `wontfix`), a workflow axis alongside the type/provenance labels. See
 `docs/agents/triage-labels.md`.
 
+### Software factory
+
+Cursor automations that claim `ready-for-agent` issues and open draft pull requests.
+The supervisor fills slots and tends them; it does not implement. See
+`docs/agents/software-factory.md`.
+
 ### Domain docs
 
 Single-context: `GLOSSARY.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.

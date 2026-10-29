@@ -183,7 +183,10 @@ real network can confirm the swap end to end.
       tao's delegate at runtime, `terminate.rs`): shows the "A cut may still be running" prompt
       instead of quitting. Cancel leaves the app open and a new press still sends; "Quit anyway"
       exits. A real cut is needed, since only a real outstanding cut raises the prompt.
-- [ ] Dock icon right-click > Quit with nothing outstanding quits.
+- [x] Dock icon right-click > Quit with nothing outstanding quits (verified 2026-10-28 on the same
+      MacBook Pro Mac15,7, macOS 27.0.1, on a `cargo tauri build --debug` bundle from `main`
+      (`2f64fc8`): the Dock menu's Quit was clicked through System Events, the process exited with
+      code 0, and no "not guarded" line was logged, so `applicationShouldTerminate:` had installed).
 - [ ] With that prompt up, reload the page before answering, then Dock Quit again: the first quit
       is cancelled when the prompt's page goes away (its answer could never arrive), and the second
       raises the prompt on the new page rather than joining the orphaned one.

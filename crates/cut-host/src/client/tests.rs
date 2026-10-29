@@ -387,3 +387,86 @@ fn an_oversized_version_reply_is_refused_before_its_body() {
         "This Cut Host is running an older version. Update your Cut Host to connect."
     );
 }
+
+/// A `VersionReply` the daemon's handshake would not produce, as a real frame.
+///
+/// `establish_version` only sends `Agreed` for the version it was told to speak, and
+/// `Unsupported` only when that differs from the offer. The client's other arms — an
+/// agreement on some other number, and a refusal of the number the host claims — are
+/// reachable only from a peer built to say them.
+fn connect_replying(reply: VersionReply) -> ClientError {
+    let mut frame = Vec::new();
+    crate::frame::write_frame(&mut frame, &reply, Duration::from_secs(1))
+        .expect("a version reply encodes");
+    let host = testing::start_host_writing_version_reply(frame);
+    connect_failure(&host)
+}
+
+/// `Agreed` is not permission to continue unless it names this build's version. A host
+/// that agrees to a different number must not be sent the token, and which program to
+/// update still comes from the number it named. An unreadable frame has the same
+/// "update the host" sentence with `host_version: None`, so the number is the pin.
+#[test]
+fn an_agreement_on_another_version_opens_no_session() {
+    let older = connect_replying(VersionReply::Agreed { version: 0 });
+    match &older {
+        ClientError::Protocol {
+            host_version,
+            desktop_version,
+        } => {
+            assert_eq!(*host_version, Some(0));
+            assert_eq!(*desktop_version, PROTOCOL_VERSION);
+        }
+        other => panic!("expected a protocol mismatch, got {other:?}"),
+    }
+    assert_eq!(older.protocol_side(), Some(ProtocolSide::Host));
+    assert_eq!(
+        older.to_string(),
+        "This Cut Host is running an older version. Update your Cut Host to connect."
+    );
+
+    let newer = connect_replying(VersionReply::Agreed {
+        version: PROTOCOL_VERSION + 1,
+    });
+    match &newer {
+        ClientError::Protocol {
+            host_version,
+            desktop_version,
+        } => {
+            assert_eq!(*host_version, Some(PROTOCOL_VERSION + 1));
+            assert_eq!(*desktop_version, PROTOCOL_VERSION);
+        }
+        other => panic!("expected a protocol mismatch, got {other:?}"),
+    }
+    assert_eq!(newer.protocol_side(), Some(ProtocolSide::Desktop));
+    assert_eq!(
+        newer.to_string(),
+        "This version of Cuthulhu is older than the Cut Host. Update Cuthulhu to connect."
+    );
+}
+
+/// Equal is the host to replace. A peer that refuses the version it claims to speak is
+/// not a desktop that is behind: this build offered the version it speaks, and the peer
+/// is not speaking it. `host > desktop` would send the operator to update Cuthulhu.
+#[test]
+fn a_host_that_refuses_the_version_it_claims_is_the_host_to_update() {
+    let err = connect_replying(VersionReply::Unsupported {
+        offered: PROTOCOL_VERSION,
+        supported: PROTOCOL_VERSION,
+    });
+    match &err {
+        ClientError::Protocol {
+            host_version,
+            desktop_version,
+        } => {
+            assert_eq!(*host_version, Some(PROTOCOL_VERSION));
+            assert_eq!(*desktop_version, PROTOCOL_VERSION);
+        }
+        other => panic!("expected a protocol mismatch, got {other:?}"),
+    }
+    assert_eq!(err.protocol_side(), Some(ProtocolSide::Host));
+    assert_eq!(
+        err.to_string(),
+        "This Cut Host is running an older version. Update your Cut Host to connect."
+    );
+}

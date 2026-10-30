@@ -336,4 +336,32 @@ mod tests {
         let confirm = pause_prompt(Pause::Confirm, &plan, &parked);
         assert!(confirm.contains("(all)"), "{confirm}");
     }
+
+    /// The index is the machine's. Past the plan it must degrade to a label: indexing the
+    /// pass list would panic a process that is mid-cut. A missing position is the same
+    /// fallback the numbers use (`1/1`), and it names pass 0 when there is one.
+    #[test]
+    fn a_pass_the_plan_does_not_have_is_named_unknown_rather_than_panicking() {
+        let one = plan(&[cutplan::PassKey::All]);
+        let past_the_end = status(
+            Actions { cancel: true, resume: true, ..Actions::default() },
+            Phase::AwaitingColorSwap,
+            Some(PassPosition { index: 1, total: 2 }),
+        );
+        let swap = pause_prompt(Pause::Swap, &one, &past_the_end);
+        assert!(swap.contains("Pass 2/2"), "{swap}");
+        assert!(swap.contains("(unknown pass)"), "{swap}");
+
+        let missing = status(
+            Actions { cancel: true, confirm: true, ..Actions::default() },
+            Phase::AwaitingConfirmation,
+            None,
+        );
+        let named = pause_prompt(Pause::Confirm, &one, &missing);
+        assert!(named.contains("Pass 1/1"), "{named}");
+        assert!(named.contains("(all)"), "a missing position still names pass 0: {named}");
+
+        let empty = pause_prompt(Pause::Confirm, &plan(&[]), &missing);
+        assert!(empty.contains("Pass 1/1 (unknown pass)"), "{empty}");
+    }
 }

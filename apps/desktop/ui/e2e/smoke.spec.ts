@@ -3426,24 +3426,18 @@ test("dragging a finished band keeps its mode, and Escape leaves a move", async 
   const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
   const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
   const at = (x: number, y: number) => toPage(page, v, { x, y });
+  const band = async () => {
+    const far = await at(20, 20);
+    const clip = await at(4, 4);
+    await page.mouse.move(far.x, far.y);
+    await page.mouse.down();
+    await page.mouse.move(clip.x, clip.y, { steps: 4 });
+    await page.mouse.up();
+  };
 
-  // Right to left, so the band crosses. Both rects sit on 0..10 and the band clips them.
-  const far = await at(20, 20);
-  const clip = await at(4, 4);
-  await page.mouse.move(far.x, far.y);
-  await page.mouse.down();
-  await page.mouse.move(clip.x, clip.y, { steps: 4 });
-  await page.mouse.up();
+  // Right to left. The rectangle is 4..20, and (5, 5) is inside it and on the ink.
+  await band();
   await expect(selected).toHaveCount(2);
-
-  // Drag the empty corner of the band. It stays a crossing band, so the rects stay selected.
-  // A new band drawn over that empty corner would contain nothing.
-  const from = await at(18, 18);
-  const to = await at(22, 22);
-  await dragBy(page, from, to.x - from.x, to.y - from.y);
-  await expect(selected).toHaveCount(2);
-
-  // A click on one of them does not collapse the set. Shift toggles that one off.
   const onInk = await at(5, 5);
   await page.mouse.click(onInk.x, onInk.y);
   await expect(selected).toHaveCount(2);
@@ -3452,6 +3446,17 @@ test("dragging a finished band keeps its mode, and Escape leaves a move", async 
   await page.keyboard.up("Shift");
   await expect(selected).toHaveCount(1);
 
+  // A new crossing band, then a drag of its empty corner (12, 12) to (20, 20).
+  // The rectangle moves to 12..28 and misses the rects. Leaving the band put would keep both.
+  await band();
+  await expect(selected).toHaveCount(2);
+  const from = await at(12, 12);
+  const to = await at(20, 20);
+  await dragBy(page, from, to.x - from.x, to.y - from.y);
+  await expect(selected).toHaveCount(0);
+
+  await band();
+  await expect(selected).toHaveCount(2);
   await page.keyboard.press("Escape");
   await dragBy(page, onInk, 5 * v.scale, 0);
   await expect.poll(() => commitLog(page)).toHaveLength(1);

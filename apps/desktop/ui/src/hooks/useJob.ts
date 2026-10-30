@@ -66,11 +66,15 @@ export function useJob(onError: (message: string) => void) {
   const acceptedJobRef = useRef<number | null>(null);
   /** When the accept reported no id, a status at or below this is the previous cut. */
   const floorRef = useRef(0);
+  /** Set when the aimed host dropped. Its job counter lives in the daemon process, so a
+   *  poll after the drop that carries a smaller id is a new process numbering from 1,
+   *  not a late report of a cut this desktop already finished. */
+  const counterMayHaveReset = useRef(false);
   /** Bumped in `remember`. A read started before this accept still belongs to the
    *  previous aim, and must not land on the surface this accept just put up. */
   const acceptGenRef = useRef(0);
 
-  const ingest = useCallback((next: ipc.CutStatus) => {
+  const ingest = useCallback((next: ipc.CutStatus, published = false) => {
     if (offlineRef.current) return;
     // A host that is still aimed does not go idle by reporting Disconnected. That
     // read is a blip; the poll freezes the last status instead.
@@ -80,12 +84,25 @@ export function useJob(onError: (message: string) => void) {
     // A larger one can arrive before accept returns: that is this cut.
     if (id !== 0) {
       const accepted = acceptedJobRef.current;
-      if (accepted !== null && id < accepted) return;
-      if (accepted === null && id <= floorRef.current) return;
-      // The first id of a cut whose accept named none. A higher id that arrives
-      // while one is already accepted is the next cut, and stays above the floor
-      // until `remember` claims it — raising the floor here would hide that cut.
-      if (accepted === null) floorRef.current = id;
+      const floor = floorRef.current;
+      // A published status is the manager's current cell, which never moves
+      // backwards inside one process. After the host dropped, a smaller id is
+      // that process gone and a new one numbering from 1. A replayed event can
+      // still deliver an older id and must not take this branch: the floor
+      // exists so that one cannot paint over the cut just accepted.
+      const restarted = published && counterMayHaveReset.current && accepted === null && id < floor;
+      if (restarted) {
+        floorRef.current = id;
+        counterMayHaveReset.current = false;
+      } else {
+        if (accepted !== null && id < accepted) return;
+        if (accepted === null && id <= floor) return;
+        // The first id of a cut whose accept named none. A higher id that arrives
+        // while one is already accepted is the next cut, and stays above the floor
+        // until `remember` claims it — raising the floor here would hide that cut.
+        if (accepted === null) floorRef.current = id;
+        if (id >= floor) counterMayHaveReset.current = false;
+      }
       acceptedJobRef.current = id;
     }
     statusRef.current = next;
@@ -95,6 +112,7 @@ export function useJob(onError: (message: string) => void) {
 
   const freeze = useCallback((host: ipc.PairedHostView) => {
     offlineRef.current = true;
+    counterMayHaveReset.current = true;
     setNow(Date.now());
     setOfflineHost((prev) => (sameHost(prev, host) ? prev : host));
   }, []);
@@ -144,11 +162,11 @@ export function useJob(onError: (message: string) => void) {
       const instance = instanceRef.current;
       const target = instance === null ? undefined : { host: id, instanceId: instance };
       return ipc.cancelCut(target).catch((e) => {
-        ingest(next);
+        ingest(next, true);
         onErrorRef.current(ipc.ipcErrorMessage(e));
       });
     }
-    ingest(next);
+    ingest(next, true);
   }, [freeze, ingest]);
 
   const refreshDeviceState = useCallback((): Promise<void> => {
@@ -165,10 +183,10 @@ export function useJob(onError: (message: string) => void) {
           const nextGen = aimGenRef.current;
           return ipc.getDeviceState().then((fresh) => {
             if (acceptGenRef.current !== gen || aimGenRef.current !== nextGen) return;
-            ingest(fresh);
+            ingest(fresh, true);
           });
         }
-        ingest(next);
+        ingest(next, true);
       }).catch((e) => {
         onErrorRef.current(ipc.ipcErrorMessage(e));
       });
@@ -184,7 +202,7 @@ export function useJob(onError: (message: string) => void) {
         const aimGen = aimGenRef.current;
         return ipc.getDeviceState().then((next) => {
           if (acceptGenRef.current !== gen || aimGenRef.current !== aimGen) return;
-          ingest(next);
+          ingest(next, true);
         }).catch((e) => {
           onErrorRef.current(ipc.ipcErrorMessage(e));
         });
@@ -195,7 +213,7 @@ export function useJob(onError: (message: string) => void) {
         const nextGen = aimGenRef.current;
         return ipc.getDeviceState().then((fresh) => {
           if (acceptGenRef.current !== gen || aimGenRef.current !== nextGen) return;
-          ingest(fresh);
+          ingest(fresh, true);
         }).catch((e) => {
           onErrorRef.current(ipc.ipcErrorMessage(e));
         });
@@ -225,6 +243,9 @@ export function useJob(onError: (message: string) => void) {
       if (instance !== null) {
         acceptedJobRef.current = null;
         floorRef.current = 0;
+        // The outage belonged to the cutter we left. Its reset signal must not
+        // adopt a low id on the one now aimed.
+        counterMayHaveReset.current = false;
       }
     }
     instanceRef.current = instance;
@@ -244,7 +265,7 @@ export function useJob(onError: (message: string) => void) {
     const aimGen = aimGenRef.current;
     void ipc.getDeviceState().then((next) => {
       if (aimGenRef.current !== aimGen) return;
-      ingest(next);
+      ingest(next, true);
     }).catch((e) => onErrorRef.current(ipc.ipcErrorMessage(e)));
   }, [hostId, ingest]);
 
@@ -268,13 +289,17 @@ export function useJob(onError: (message: string) => void) {
     if (id === null || instance === null) return;
     const host = snap.hosts.find((item) => item.id === id) ?? null;
     const down = snap.stale || host === null || host.unreachable !== null;
+    // A finished job does not freeze — its panel stays — but the daemon may still have
+    // been replaced while that panel was up. The next published id below the floor is
+    // then a new process, not a late copy of the cut on screen.
+    if (down) counterMayHaveReset.current = true;
     const row = snap.statuses.find((item) => sameCutter(item, { instance_id: instance, host: id }));
     const tracked = snapshotRef.current !== null && !dismissedRef.current;
     const watching = tracked && (jobIsActive(statusRef.current.phase) || offlineRef.current);
     if (!tracked) {
       // A down host is not frozen here. Freeze is the job panel's outage, and there is
       // no job. A missing row is still not a failed read.
-      if (!down && row !== undefined) ingest(row.status);
+      if (!down && row !== undefined) ingest(row.status, true);
       return;
     }
     // A finished job is still on screen. Ingesting the next snapshot would replace

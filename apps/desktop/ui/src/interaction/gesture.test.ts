@@ -101,6 +101,32 @@ describe("skew", () => {
     close(apply(m, { x: 10, y: 40 }), { x: 10, y: 40 });
   });
 
+  it("moves each edge along itself and holds the opposite one", () => {
+    const east = gestureMatrix("skew-e", box, { x: 50, y: 30 }, { x: 50, y: 40 }, none);
+    close(apply(east, { x: 10, y: 20 }), { x: 10, y: 20 });
+    close(apply(east, { x: 50, y: 20 }), { x: 50, y: 30 });
+    const south = gestureMatrix("skew-s", box, { x: 30, y: 40 }, { x: 40, y: 40 }, none);
+    close(apply(south, { x: 10, y: 20 }), { x: 10, y: 20 });
+    close(apply(south, { x: 10, y: 40 }), { x: 20, y: 40 });
+    const west = gestureMatrix("skew-w", box, { x: 10, y: 30 }, { x: 10, y: 40 }, none);
+    close(apply(west, { x: 50, y: 20 }), { x: 50, y: 20 });
+    close(apply(west, { x: 10, y: 20 }), { x: 10, y: 30 });
+  });
+
+  it("Shift stops at 75° so a flat shear is not a commit", () => {
+    const m = gestureMatrix("skew-n", box, { x: 30, y: 20 }, { x: 30 + 1000, y: 20 }, { shift: true, alt: false });
+    const k = Math.tan((75 * Math.PI) / 180);
+    close(apply(m, { x: 10, y: 20 }), { x: 10 + k * 20, y: 20 });
+    expect(m.every(Number.isFinite)).toBe(true);
+  });
+
+  it("Alt+Shift keeps the centre and uses the snapped angle", () => {
+    const m = gestureMatrix("skew-n", box, { x: 30, y: 20 }, { x: 35, y: 20 }, { shift: true, alt: true });
+    const k = Math.tan(Math.PI / 6);
+    close(apply(m, boxCenter(box)), boxCenter(box));
+    close(apply(m, { x: 10, y: 20 }), { x: 10 + k * 10, y: 20 });
+  });
+
   it("shears a rotated box along its own top edge", () => {
     const frame = rotateAbout(Math.PI / 2, { x: 0, y: 0 });
     const turned: Box = { frame, w: 10, h: 4 };

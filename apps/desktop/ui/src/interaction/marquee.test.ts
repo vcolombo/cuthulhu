@@ -96,6 +96,40 @@ describe("geometry selection", () => {
     expect(marqueeHits({ nodes: [turned] }, { x: -4, y: 2, w: 2, h: 2 })).toEqual([4]);
   });
 
+  it("misses a hole and does not fill an open path", () => {
+    const holed = {
+      id: 7,
+      bounds: { x: 0, y: 0, w: 30, h: 30 },
+      world: IDENTITY,
+      shape: { t: "path" as const, d: "M0,0 L30,0 L30,30 L0,30 Z M10,10 L20,10 L20,20 L10,20 Z" },
+    };
+    expect(marqueeHits({ nodes: [holed] }, { x: 12, y: 12, w: 4, h: 4 })).toEqual([]);
+    expect(marqueeHits({ nodes: [holed] }, { x: 0, y: 0, w: 4, h: 4 })).toEqual([7]);
+    const open = {
+      id: 8,
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      world: IDENTITY,
+      shape: { t: "path" as const, d: "M0,0 L10,0 L10,10" },
+    };
+    // The triangle those two edges would close. An open path has no fill there.
+    expect(marqueeHits({ nodes: [open] }, { x: 1, y: 1, w: 2, h: 2 })).toEqual([]);
+  });
+
+  it("rejects containment when an edge leaves a concave loop between inside ends", () => {
+    const bridge = {
+      id: 9,
+      bounds: { x: 0, y: 0, w: 10, h: 10 },
+      world: IDENTITY,
+      shape: { t: "path" as const, d: "M1,1 L8,5 L1,9" },
+    };
+    const c = [
+      { x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 3 }, { x: 3, y: 3 },
+      { x: 3, y: 7 }, { x: 10, y: 7 }, { x: 10, y: 10 }, { x: 0, y: 10 },
+    ];
+    expect(lassoHits({ nodes: [bridge] }, c, "contain")).toEqual([]);
+    expect(lassoHits({ nodes: [bridge] }, c, "intersect")).toEqual([9]);
+  });
+
   it("a lasso contains only a shape that is fully inside, and crosses one that is not", () => {
     const rect = {
       id: 5,

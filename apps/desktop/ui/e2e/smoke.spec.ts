@@ -3419,6 +3419,40 @@ test("arrow keys nudge the selection by 1 mm and do not fire in a field", async 
   expect(await commitLog(page)).toHaveLength(1);
 });
 
+test("a bracket rotates 15° about the selection centre", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.keyboard.press("BracketRight");
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const rad = (15 * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(cos, 5);
+  expect(b).toBeCloseTo(sin, 5);
+  expect(c).toBeCloseTo(-sin, 5);
+  expect(d).toBeCloseTo(cos, 5);
+  // Centre of the 10 mm rect at the origin stays put.
+  expect(e + 5 * a + 5 * c).toBeCloseTo(5, 4);
+  expect(f + 5 * b + 5 * d).toBeCloseTo(5, 4);
+});
+
+test("arrows queued behind a held commit each move 1 mm", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+  await expect.poll(() => commitLog(page)).toHaveLength(3);
+  for (const row of await commitLog(page)) expect(row.m[4]).toBeCloseTo(1, 5);
+});
+
 test("the cursor readout follows a wheel pan under a still pointer", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

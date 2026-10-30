@@ -99,7 +99,7 @@ type Handlers = {
   onPointerEnter: () => void;
   onPointerDown: (e: PointerEvent<HTMLCanvasElement>) => void;
   onPointerMove: (e: PointerEvent<HTMLCanvasElement>) => void;
-  onPointerUp: () => void;
+  onPointerUp: (e: PointerEvent<HTMLCanvasElement>) => void;
   onPointerCancel: () => void;
   onPointerLeave: () => void;
 };
@@ -530,7 +530,9 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     // A drag still under the pointer is not a commit yet, so nothing below waits for it, and its
     // pointer-up would send the old ids and matrix into the loaded document (Copilot on #301).
     // Dropped here, before the first await, so its release has nothing to send.
+    // The band is in document millimetres; a loaded file must not inherit it.
     gesture.current = null;
+    bandRef.current = null;
     repaint();
     let replaced = false;
     try {
@@ -578,6 +580,9 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
   function transformEach(key: string, make: (s: Scene, now: SendTime) => Move[]) {
     // Dropped, not queued: it was aimed at shapes of the document that just left.
     if (stale()) return;
+    // A nudge during a drag would sit in the queue and land when Escape drops the drag.
+    // Cancel means the gesture commits nothing, so the keypress is dropped with it.
+    if (key.startsWith("nudge:") && gesture.current?.t === "transform") return;
     const at = performance.now();
     if (busy()) {
       queued.current.delete(key);
@@ -663,6 +668,11 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     }
     const hit = hitTest(s, p.x, p.y, HIT_TOL_PX / v.scale);
     if (hit === null) {
+      // Shift on the empty interior of a band is not a new band and not a clear.
+      if (e.shiftKey && band && pointInRect(normalizeRect(band.start, band.cur), p)) {
+        gesture.current = null;
+        return;
+      }
       gesture.current = { t: "marquee", start: p, cur: p, additive: e.shiftKey, base: sel };
       return;
     }
@@ -755,13 +765,9 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
       const by = { x: g.at.x - g.grab.x, y: g.at.y - g.grab.y };
       // A press that does not travel is a click. The band only claims a drag; a click still
       // selects the shape under it, which is what a click did before the band was left up.
+      // A press that does not travel leaves the selection. A click on an already selected
+      // shape is a no-op move when no band is up; the band must not turn that into "select only this".
       if (Math.hypot(by.x, by.y) * scale < CLICK_SLOP_PX) {
-        const hit = hitTest(s, g.at.x, g.at.y, HIT_TOL_PX / scale);
-        if (hit !== null) {
-          bandRef.current = null;
-          bandOwned.current = true;
-          setSelected([hit]);
-        }
         repaint();
         return;
       }
@@ -800,7 +806,10 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     repaint();
   }
 
-  const onPointerUp = () => {
+  const onPointerUp = (e: PointerEvent<HTMLCanvasElement>) => {
+    // Alt for lasso containment is the key at release, not at the last move. A pointer that
+    // stopped, then changed Alt, never gets another move to record it.
+    lastMods.current = { shift: e.shiftKey, alt: e.altKey };
     const g = gesture.current;
     gesture.current = null;
     if (!g || g.t === "pan") return;

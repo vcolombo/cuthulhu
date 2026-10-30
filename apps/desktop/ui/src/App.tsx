@@ -18,9 +18,10 @@ import { DevicesTab } from "./panels/DevicesTab";
 import { Canvas2DRenderer } from "./render/Canvas2DRenderer";
 import { unionBounds, type Affine6, type Scene, type ShapeGeom } from "./render/hittest";
 import { pathBounds } from "./render/pathdata";
-import { IDENTITY, compose, transformBounds } from "./render/affine";
+import { IDENTITY, compose, rotateAbout, transformBounds, translate } from "./render/affine";
 import { outermost, shapesUnder, toggleId } from "./interaction/marquee";
-import { selectionBounds } from "./interaction/selectionBox";
+import { boxCenter, selectionBounds, selectionBox } from "./interaction/selectionBox";
+import { isEditingTarget, nudgeFromKey } from "./interaction/nudge";
 import { AXIS, alignMoves, distributeBlock, distributeMoves, type AlignMode, type Axis, type Unit } from "./interaction/align";
 import type { Matrix } from "./interaction/transform";
 import { useCanvasInteraction, type CommitOutcome, type EditsLock } from "./interaction/useCanvasInteraction";
@@ -328,11 +329,14 @@ export function App() {
       }
     },
     sceneRev: docRev,
+    tool,
   });
   // Stored for the next edit. The document hook reads it when an edit starts, which is after this.
   editsLockNow.current = interaction.editsLockNow;
   const fitContentNow = useRef(interaction.requestFitContent);
   fitContentNow.current = interaction.requestFitContent;
+  const transformEachRef = useRef(interaction.transformEach);
+  transformEachRef.current = interaction.transformEach;
 
   // Inside `replaceDocument`, which has locked edits by then, so nothing joins the set while it waits.
   const loadDocument = (path: string) =>
@@ -534,9 +538,21 @@ export function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      const typing = t !== null && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable || t.closest("[role='dialog'], [role='menu']") !== null);
-      if (typing) return;
+      if (isEditingTarget(e.target)) return;
+      const nudge = nudgeFromKey(e);
+      if (nudge && selected.length > 0) {
+        e.preventDefault();
+        const ids = selected;
+        // A fresh key each press, so a held arrow queues a step per commit instead of keeping
+        // only the last one. Each step is its own undo.
+        transformEachRef.current(`nudge:${performance.now()}`, (sceneNow) => {
+          if (nudge.t === "move") return [{ ids, m: translate(nudge.dx, nudge.dy) }];
+          const box = selectionBox(sceneNow, expand(ids));
+          if (!box) return [];
+          return [{ ids, m: rotateAbout((nudge.deg * Math.PI) / 180, boxCenter(box)) }];
+        });
+        return;
+      }
       const key = e.key.toLowerCase();
       const mod = e.metaKey || e.ctrlKey;
       if (e.key === "Delete" || e.key === "Backspace") {
@@ -592,6 +608,7 @@ export function App() {
         return;
       }
       if (key === "v") setTool("select");
+      else if (key === "l") setTool("lasso");
       else if (key === "r") {
         void edit(() => ipc.addPrimitive({ parent: root, kind: { Rect: { w: 20, h: 20 } } })).then((ok) => {
           if (ok) fitContentNow.current();
@@ -604,7 +621,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [scene, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root]);
+  }, [scene, selected, edit, deleteSelected, history.can_undo, history.can_redo, onBooleanOp, onTrace, root, expand]);
 
   const cutting = status.actions.cancel || statuses.some((row) => row.status.actions.cancel);
   const selectionSize = selectionBounds(interaction.effectiveScene, selected);

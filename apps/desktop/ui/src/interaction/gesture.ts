@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { apply, axisLengths, compose, IDENTITY, invert, rotateAbout, scaleAbout, translate, type Pt } from "../render/affine";
 import type { Matrix } from "./transform";
-import { boxCenter, HANDLE_UNIT, handleLocal, type Box, type HandleKind, type ScaleHandle } from "./selectionBox";
+import { boxCenter, HANDLE_UNIT, handleLocal, isSkewHandle, type Box, type HandleKind, type ScaleHandle, type SkewHandle } from "./selectionBox";
 
 export type Modifiers = { shift: boolean; alt: boolean };
 
@@ -15,6 +15,7 @@ export const ROTATE_SNAP_RAD = Math.PI / 12; // 15°
 export function gestureMatrix(kind: HandleKind, box: Box, start: Pt, cur: Pt, mods: Modifiers): Matrix {
   if (kind === "move") return moveMatrix(start, cur, mods.shift);
   if (kind === "rotate") return rotateMatrix(box, start, cur, mods.shift);
+  if (isSkewHandle(kind)) return skewMatrix(kind, box, start, cur, mods);
   return scaleMatrix(kind, box, start, cur, mods);
 }
 
@@ -56,6 +57,38 @@ function scaleMatrix(h: ScaleHandle, box: Box, start: Pt, cur: Pt, mods: Modifie
     sy = sx;
   }
   return compose(compose(inv, scaleAbout(sx, sy, anchor)), box.frame);
+}
+
+/** Shears along the dragged edge. The opposite edge stays put, unless Alt, which shears about
+ *  the centre so the two edges move as a pair. Shift snaps the shear angle to the same 15°
+ *  steps as rotation and stops at 75°, because the next step is flat and its tangent is not
+ *  a number the commit can send. */
+function skewMatrix(h: SkewHandle, box: Box, start: Pt, cur: Pt, mods: Modifiers): Matrix {
+  const inv = invert(box.frame);
+  if (!inv) return IDENTITY;
+  const ps = apply(inv, start);
+  const pc = apply(inv, cur);
+  const alongX = h === "skew-n" || h === "skew-s";
+  const delta = alongX ? pc.x - ps.x : pc.y - ps.y;
+  const span = alongX ? box.h : box.w;
+  if (span === 0) return IDENTITY;
+  const fromEnd = h === "skew-n" || h === "skew-w";
+  const anchor = mods.alt ? span / 2 : fromEnd ? span : 0;
+  const reach = mods.alt ? span / 2 : span;
+  if (reach === 0) return IDENTITY;
+  const k = shearFactor(delta, reach, mods.shift);
+  const local: Matrix =
+    h === "skew-n" ? [1, 0, -k, 1, k * anchor, 0]
+    : h === "skew-s" ? [1, 0, k, 1, -k * anchor, 0]
+    : h === "skew-e" ? [1, k, 0, 1, 0, -k * anchor]
+    : [1, -k, 0, 1, 0, k * anchor];
+  return compose(compose(inv, local), box.frame);
+}
+
+function shearFactor(delta: number, reach: number, shift: boolean): number {
+  const angle = Math.atan2(delta, reach);
+  const snapped = shift ? Math.max(-5, Math.min(5, Math.round(angle / ROTATE_SNAP_RAD))) * ROTATE_SNAP_RAD : angle;
+  return Math.tan(snapped);
 }
 
 /** Factor that moves the handle at `grab` by `delta` while `anchor` stays put. Measured from the

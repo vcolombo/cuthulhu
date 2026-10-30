@@ -7,9 +7,10 @@ export type ShapeGeom =
   | { t: "rect"; w: number; h: number }
   | { t: "ellipse"; rx: number; ry: number }
   | { t: "path"; d: string };
-/** `bounds` is the world-space axis-aligned box — what a marquee tests, and all a node without
- *  geometry has. `local` is the shape's own box before `world`: what a click is tested against,
- *  so a rotated shape is hit where it is drawn rather than across its whole bounding box. */
+/** `bounds` is the world-space axis-aligned box. A marquee uses it only for a node with no
+ *  `shape`; otherwise it tests the geometry under `world`. `local` is the shape's own box
+ *  before `world`: what a click is tested against, so a rotated shape is hit where it is drawn
+ *  rather than across its whole bounding box. */
 export type SceneNode = {
   id: number;
   bounds: Bounds;

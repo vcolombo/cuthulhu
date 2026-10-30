@@ -3327,6 +3327,221 @@ test("a marquee over both shapes selects both", async ({ page }) => {
   await expect(page.locator('[data-testid="layer-row"][data-selected="true"]')).toHaveCount(2);
 });
 
+test("a left-to-right band contains and a right-to-left band crosses", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+
+  // The rects sit on 0..10. Both ends are outside the ink, so this is a band and not a move.
+  // Left to right only clips the corner: containment misses. The return trip crosses.
+  const clip = await toPage(page, v, { x: 8, y: 12 });
+  const far = await toPage(page, v, { x: 14, y: 8 });
+  await page.mouse.move(clip.x, clip.y);
+  await page.mouse.down();
+  await page.mouse.move(far.x, far.y, { steps: 4 });
+  await page.mouse.up();
+  await expect(selected).toHaveCount(0);
+
+  const beyond = await toPage(page, v, { x: 16, y: 16 });
+  const corner = await toPage(page, v, { x: 8, y: 8 });
+  await page.mouse.move(beyond.x, beyond.y);
+  await page.mouse.down();
+  await page.mouse.move(corner.x, corner.y, { steps: 4 });
+  await page.mouse.up();
+  await expect(selected).toHaveCount(2);
+});
+
+test("a lasso selects what it crosses, and Alt keeps only what it contains", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  await page.getByRole("button", { name: "Lasso", exact: true }).click();
+  const at = (x: number, y: number) => toPage(page, v, { x, y });
+  const loop = async (pts: { x: number; y: number }[]) => {
+    const first = await at(pts[0].x, pts[0].y);
+    await page.mouse.move(first.x, first.y);
+    await page.mouse.down();
+    for (const p of pts.slice(1)) {
+      const s = await at(p.x, p.y);
+      await page.mouse.move(s.x, s.y, { steps: 3 });
+    }
+    await page.mouse.up();
+  };
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  // Alt contains. The loop only clips a corner, and both of its ends are outside the ink.
+  await page.keyboard.down("Alt");
+  await loop([{ x: 8, y: 12 }, { x: 14, y: 12 }, { x: 11, y: 8 }, { x: 8, y: 12 }]);
+  await page.keyboard.up("Alt");
+  await expect(selected).toHaveCount(0);
+
+  await loop([{ x: 12, y: 12 }, { x: 4, y: 12 }, { x: 4, y: 4 }, { x: 12, y: 12 }]);
+  await expect(selected).toHaveCount(2);
+});
+
+test("a skew handle shears the top edge and commits once", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  // 22 CSS px outside the top edge, the diamond's documented centre.
+  const mid = await toPage(page, v, { x: 5, y: 0 });
+  await dragBy(page, { x: mid.x, y: mid.y - 22 }, 10 * v.scale, 0);
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(1, 1);
+  expect(d).toBeCloseTo(1, 1);
+  expect(b).toBeCloseTo(0, 1);
+  expect(f).toBeCloseTo(0, 1);
+  expect(c).toBeCloseTo(-1, 1);
+  expect(e).toBeCloseTo(10, 1);
+});
+
+test("arrow keys nudge the selection by 1 mm and do not fire in a field", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(1, 5);
+  expect(d).toBeCloseTo(1, 5);
+  expect(e).toBeCloseTo(1, 5);
+  for (const zero of [b, c, f]) expect(zero).toBeCloseTo(0, 5);
+
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).focus();
+  await page.keyboard.press("ArrowRight");
+  expect(await commitLog(page)).toHaveLength(1);
+});
+
+test("dragging a finished band keeps its mode, and Escape leaves a move", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  const at = (x: number, y: number) => toPage(page, v, { x, y });
+  const band = async () => {
+    const far = await at(20, 20);
+    const clip = await at(4, 4);
+    await page.mouse.move(far.x, far.y);
+    await page.mouse.down();
+    await page.mouse.move(clip.x, clip.y, { steps: 4 });
+    await page.mouse.up();
+  };
+
+  // Right to left. The rectangle is 4..20, and (5, 5) is inside it and on the ink.
+  await band();
+  await expect(selected).toHaveCount(2);
+  const onInk = await at(5, 5);
+  await page.mouse.click(onInk.x, onInk.y);
+  await expect(selected).toHaveCount(2);
+  await page.keyboard.down("Shift");
+  await page.mouse.click(onInk.x, onInk.y);
+  await page.keyboard.up("Shift");
+  await expect(selected).toHaveCount(1);
+
+  // A new crossing band, then a drag of its empty corner (12, 12) to (20, 20).
+  // The rectangle moves to 12..28 and misses the rects. Leaving the band put would keep both.
+  await band();
+  await expect(selected).toHaveCount(2);
+  const from = await at(12, 12);
+  const to = await at(20, 20);
+  await dragBy(page, from, to.x - from.x, to.y - from.y);
+  await expect(selected).toHaveCount(0);
+
+  await band();
+  await expect(selected).toHaveCount(2);
+  await page.keyboard.press("Escape");
+  await dragBy(page, onInk, 5 * v.scale, 0);
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+});
+
+test("a lasso click selects, and Alt is read when the button comes up", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  await page.getByRole("button", { name: "Lasso", exact: true }).click();
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  const at = async (x: number, y: number) => toPage(page, v, { x, y });
+
+  const ink = await at(5, 5);
+  await page.mouse.click(ink.x, ink.y);
+  await expect(selected).toHaveCount(1);
+  const empty = await at(20, 20);
+  await page.mouse.click(empty.x, empty.y);
+  await expect(selected).toHaveCount(0);
+
+  // Alt goes down after the pointer has stopped, so only the release event can see it.
+  const p0 = await at(8, 12);
+  const p1 = await at(14, 12);
+  const p2 = await at(11, 8);
+  await page.mouse.move(p0.x, p0.y);
+  await page.mouse.down();
+  await page.mouse.move(p1.x, p1.y, { steps: 3 });
+  await page.mouse.move(p2.x, p2.y, { steps: 3 });
+  await page.keyboard.down("Alt");
+  await page.mouse.up();
+  await page.keyboard.up("Alt");
+  await expect(selected).toHaveCount(0);
+});
+
+test("an arrow during a drag is dropped when Escape cancels it", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  const from = await toPage(page, v, { x: 5, y: 5 });
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 8 * v.scale, from.y, { steps: 3 });
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Escape");
+  await page.mouse.up();
+  expect(await commitLog(page)).toEqual([]);
+});
+
+test("a bracket rotates 15° about the selection centre", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.keyboard.press("BracketRight");
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const rad = (15 * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(cos, 5);
+  expect(b).toBeCloseTo(sin, 5);
+  expect(c).toBeCloseTo(-sin, 5);
+  expect(d).toBeCloseTo(cos, 5);
+  // Centre of the 10 mm rect at the origin stays put.
+  expect(e + 5 * a + 5 * c).toBeCloseTo(5, 4);
+  expect(f + 5 * b + 5 * d).toBeCloseTo(5, 4);
+});
+
+test("arrows queued behind a held commit each move 1 mm", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.evaluate(() => (window as unknown as { __holdCommits: () => void }).__holdCommits());
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.evaluate(() => (window as unknown as { __releaseCommits: () => Promise<void> }).__releaseCommits());
+  await expect.poll(() => commitLog(page)).toHaveLength(3);
+  for (const row of await commitLog(page)) expect(row.m[4]).toBeCloseTo(1, 5);
+});
+
 test("the cursor readout follows a wheel pan under a still pointer", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

@@ -120,7 +120,9 @@ describe("geometry selection", () => {
       id: 9,
       bounds: { x: 0, y: 0, w: 10, h: 10 },
       world: IDENTITY,
-      shape: { t: "path" as const, d: "M1,1 L8,5 L1,9" },
+      // Both ends sit in the C's bars. The middle of the segment is in the mouth, so containment
+      // has to notice the edge and not only the vertices.
+      shape: { t: "path" as const, d: "M8,1 L8,9" },
     };
     const c = [
       { x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 3 }, { x: 3, y: 3 },

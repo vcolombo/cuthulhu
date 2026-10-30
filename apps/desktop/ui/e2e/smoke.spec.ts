@@ -3327,6 +3327,98 @@ test("a marquee over both shapes selects both", async ({ page }) => {
   await expect(page.locator('[data-testid="layer-row"][data-selected="true"]')).toHaveCount(2);
 });
 
+test("a left-to-right band contains and a right-to-left band crosses", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+
+  // The rects sit on 0..10. Both ends are outside the ink, so this is a band and not a move.
+  // Left to right only clips the corner: containment misses. The return trip crosses.
+  const clip = await toPage(page, v, { x: 8, y: 12 });
+  const far = await toPage(page, v, { x: 14, y: 8 });
+  await page.mouse.move(clip.x, clip.y);
+  await page.mouse.down();
+  await page.mouse.move(far.x, far.y, { steps: 4 });
+  await page.mouse.up();
+  await expect(selected).toHaveCount(0);
+
+  const beyond = await toPage(page, v, { x: 16, y: 16 });
+  const corner = await toPage(page, v, { x: 8, y: 8 });
+  await page.mouse.move(beyond.x, beyond.y);
+  await page.mouse.down();
+  await page.mouse.move(corner.x, corner.y, { steps: 4 });
+  await page.mouse.up();
+  await expect(selected).toHaveCount(2);
+});
+
+test("a lasso selects what it crosses, and Alt keeps only what it contains", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  await page.getByRole("button", { name: "Lasso", exact: true }).click();
+  const at = (x: number, y: number) => toPage(page, v, { x, y });
+  const loop = async (pts: { x: number; y: number }[]) => {
+    const first = await at(pts[0].x, pts[0].y);
+    await page.mouse.move(first.x, first.y);
+    await page.mouse.down();
+    for (const p of pts.slice(1)) {
+      const s = await at(p.x, p.y);
+      await page.mouse.move(s.x, s.y, { steps: 3 });
+    }
+    await page.mouse.up();
+  };
+  const selected = page.locator('[data-testid="layer-row"][data-selected="true"]');
+  // Alt contains. The loop only clips a corner, and both of its ends are outside the ink.
+  await page.keyboard.down("Alt");
+  await loop([{ x: 8, y: 12 }, { x: 14, y: 12 }, { x: 11, y: 8 }, { x: 8, y: 12 }]);
+  await page.keyboard.up("Alt");
+  await expect(selected).toHaveCount(0);
+
+  await loop([{ x: 12, y: 12 }, { x: 4, y: 12 }, { x: 4, y: 4 }, { x: 12, y: 12 }]);
+  await expect(selected).toHaveCount(2);
+});
+
+test("a skew handle shears the top edge and commits once", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  const v = await zoomInAt(page, { x: 5, y: 5 }, -350);
+  // 22 CSS px outside the top edge, the diamond's documented centre.
+  const mid = await toPage(page, v, { x: 5, y: 0 });
+  await dragBy(page, { x: mid.x, y: mid.y - 22 }, 10 * v.scale, 0);
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(1, 1);
+  expect(d).toBeCloseTo(1, 1);
+  expect(b).toBeCloseTo(0, 1);
+  expect(f).toBeCloseTo(0, 1);
+  expect(c).toBeCloseTo(-1, 1);
+  expect(e).toBeCloseTo(10, 1);
+});
+
+test("arrow keys nudge the selection by 1 mm and do not fire in a field", async ({ page }) => {
+  await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
+  await page.goto("/");
+  await showTab(page, "Layers");
+  await page.getByTestId("layer-row").first().click();
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(() => commitLog(page)).toHaveLength(1);
+  const [a, b, c, d, e, f] = (await commitLog(page))[0].m;
+  expect(a).toBeCloseTo(1, 5);
+  expect(d).toBeCloseTo(1, 5);
+  expect(e).toBeCloseTo(1, 5);
+  for (const zero of [b, c, f]) expect(zero).toBeCloseTo(0, 5);
+
+  await showTab(page, "Properties");
+  await page.getByLabel("X", { exact: true }).focus();
+  await page.keyboard.press("ArrowRight");
+  expect(await commitLog(page)).toHaveLength(1);
+});
+
 test("the cursor readout follows a wheel pan under a still pointer", async ({ page }) => {
   await page.addInitScript(installMockTauri, { seedTwoColorRects: true });
   await page.goto("/");

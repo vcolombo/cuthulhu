@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import { describe, it, expect } from "vitest";
 import { apply, IDENTITY, rotateAbout, transformBounds, translate, type Pt } from "../render/affine";
-import { handleAt, handleWorld, selectionBounds, selectionBox } from "./selectionBox";
+import { handleAt, handleWorld, selectionBounds, selectionBox, skewPoint } from "./selectionBox";
 
 const close = (a: Pt, b: Pt) => {
   expect(a.x).toBeCloseTo(b.x, 9);
@@ -73,6 +73,12 @@ describe("handleAt", () => {
     expect(handleAt(box, { x: 20, y: 15 }, 1, 3)).toBe("move");
     expect(handleAt(box, { x: 32, y: 22 }, 1, 3)).toBe("rotate");
     expect(handleAt(box, { x: 50, y: 50 }, 1, 3)).toBeNull();
+  });
+
+  it("finds a skew diamond outside the edge and leaves the scale handle on the edge", () => {
+    expect(skewPoint(box, "skew-n", 5)).toEqual({ x: 20, y: 5 });
+    expect(handleAt(box, { x: 20, y: 5 }, 1, 3, 1, 5)).toBe("skew-n");
+    expect(handleAt(box, { x: 20, y: 10 }, 1, 3, 1, 5)).toBe("n");
   });
 
   it("finds a rotated box's handles where they are drawn", () => {

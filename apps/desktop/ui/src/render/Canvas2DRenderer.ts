@@ -2,7 +2,7 @@
 import type { Renderer, NodeId, Overlay } from "./Renderer";
 import type { Affine6, Bounds, Scene, ShapeGeom } from "./hittest";
 import { apply, compose, IDENTITY, transformBounds } from "./affine";
-import { boxCorners, handleWorld, SCALE_HANDLES } from "../interaction/selectionBox";
+import { boxCorners, handleWorld, HANDLE_DRAW_PX, SCALE_HANDLES, skewHandlesFor, skewPoint, SKEW_OFFSET_PX } from "../interaction/selectionBox";
 import { MM_PER_IN, type LengthUnit } from "../length";
 import { vinylDisplay, type VinylDisplay, type VinylTheme } from "./vinyl";
 
@@ -22,7 +22,6 @@ const FALLBACK_CANVAS_DARK = "#081416";
 // still reads; the selection box stays a hairline around that outline.
 const STROKE_PX = 1;
 const VINYL_STROKE_PX = 2;
-const HANDLE_PX = 8;
 const MARQUEE_ALPHA = 0.1;
 const GHOST_OPACITY = 0.03;
 
@@ -34,7 +33,7 @@ export class Canvas2DRenderer implements Renderer {
   private gridUnit: LengthUnit = "in";
   private view: Affine6 = IDENTITY;
   private dpr = 1;
-  private overlay: Overlay = { box: null, marquee: null, guides: [] };
+  private overlay: Overlay = { box: null, marquee: null, crossing: false, lasso: null, guides: [] };
   // ponytail: invalidation only — with the current full-clear+redraw loop this is just
   // a "needs redraw" signal, not a per-node dirty rect. draw() clears it each call.
   private dirty = new Set<NodeId>();
@@ -186,7 +185,7 @@ export class Canvas2DRenderer implements Renderer {
 
   private drawOverlay(selection: string, handleStroke: string, handleFill: string, guide: string): void {
     const { ctx, view } = this;
-    const { box, marquee, guides } = this.overlay;
+    const { box, marquee, crossing, lasso, guides } = this.overlay;
     // Guides first, so the box and handles they line up stay on top of them.
     if (guides.length > 0) {
       ctx.beginPath();
@@ -200,6 +199,41 @@ export class Canvas2DRenderer implements Renderer {
       ctx.lineWidth = STROKE_PX;
       ctx.stroke();
     }
+    // The band and the loop go under the box so a handle sitting on the band can still be grabbed.
+    if (marquee) {
+      const m = transformBounds(view, marquee);
+      ctx.save();
+      ctx.globalAlpha = MARQUEE_ALPHA;
+      ctx.fillStyle = selection;
+      ctx.fillRect(m.x, m.y, m.w, m.h);
+      ctx.restore();
+      ctx.save();
+      // Dashed: the band selects what it crosses. Solid: only what it contains.
+      if (crossing) ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = selection;
+      ctx.lineWidth = STROKE_PX;
+      ctx.strokeRect(m.x, m.y, m.w, m.h);
+      ctx.restore();
+    }
+    if (lasso && lasso.length > 1) {
+      ctx.beginPath();
+      lasso.forEach((p, i) => {
+        const s = apply(view, p);
+        if (i === 0) ctx.moveTo(s.x, s.y);
+        else ctx.lineTo(s.x, s.y);
+      });
+      ctx.closePath();
+      ctx.save();
+      ctx.globalAlpha = MARQUEE_ALPHA;
+      ctx.fillStyle = selection;
+      ctx.fill();
+      ctx.restore();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = selection;
+      ctx.lineWidth = STROKE_PX;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     if (box) {
       const corners = boxCorners(box).map((p) => apply(view, p));
       ctx.beginPath();
@@ -210,26 +244,26 @@ export class Canvas2DRenderer implements Renderer {
       ctx.stroke();
       ctx.fillStyle = handleFill;
       ctx.strokeStyle = handleStroke;
-      const half = HANDLE_PX / 2;
+      const half = HANDLE_DRAW_PX / 2;
+      const scale = view[0];
+      if (scale > 0) {
+        for (const h of skewHandlesFor(box)) {
+          const p = apply(view, skewPoint(box, h, SKEW_OFFSET_PX / scale));
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y - half);
+          ctx.lineTo(p.x + half, p.y);
+          ctx.lineTo(p.x, p.y + half);
+          ctx.lineTo(p.x - half, p.y);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        }
+      }
       for (const h of SCALE_HANDLES) {
         const p = apply(view, handleWorld(box, h));
-        ctx.fillRect(p.x - half, p.y - half, HANDLE_PX, HANDLE_PX);
-        ctx.strokeRect(p.x - half, p.y - half, HANDLE_PX, HANDLE_PX);
+        ctx.fillRect(p.x - half, p.y - half, HANDLE_DRAW_PX, HANDLE_DRAW_PX);
+        ctx.strokeRect(p.x - half, p.y - half, HANDLE_DRAW_PX, HANDLE_DRAW_PX);
       }
-    }
-    if (marquee) {
-      const m = transformBounds(view, marquee);
-      ctx.save();
-      ctx.globalAlpha = MARQUEE_ALPHA;
-      ctx.fillStyle = selection;
-      ctx.fillRect(m.x, m.y, m.w, m.h);
-      ctx.restore();
-      ctx.save();
-      ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = selection;
-      ctx.lineWidth = STROKE_PX;
-      ctx.strokeRect(m.x, m.y, m.w, m.h);
-      ctx.restore();
     }
   }
 

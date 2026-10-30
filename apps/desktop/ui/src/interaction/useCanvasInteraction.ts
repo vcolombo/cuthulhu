@@ -8,26 +8,28 @@ import {
   CSS_PX_PER_MM, CONTENT_FIT_MARGIN_PX, FIT_MARGIN_PX, IDENTITY_VIEW, ZOOM_STEP, fitView, minScaleFor, panBy,
   screenToWorld, wheelFactor, zoomAt, type Inset, type Size, type View,
 } from "./viewport";
-import { handleAt, selectionBox, type Box, type HandleKind } from "./selectionBox";
+import { handleAt, isSkewHandle, ROTATE_HIT_PX, SCALE_HIT_PX, selectionBox, SKEW_HIT_PX, SKEW_OFFSET_PX, type Box, type HandleKind } from "./selectionBox";
 import { gestureMatrix, type Modifiers } from "./gesture";
 import { boxBounds, keepLanded, SNAP_PX, snapMove, snapScale, snapTargets, type Guide, type Targets } from "./snap";
-import { marqueeHits, marqueeSelection, normalizeRect, toggleId } from "./marquee";
+import { lassoHits, marqueeHits, marqueeMode, marqueeSelection, normalizeRect, pointInRect, toggleId, translateCorners } from "./marquee";
+import { isEditingTarget } from "./nudge";
 import type { Move } from "./align";
 
-// CSS px, divided by the view scale at use so they feel the same at every zoom.
-const HANDLE_HIT_PX = 6;
-const ROTATE_ZONE_PX = 18;
 const HIT_TOL_PX = 3;
 /** A press that travels less than this is a click: it clears the selection instead of banding. */
 const CLICK_SLOP_PX = 3;
 /** Some wheels report lines rather than pixels; one line is about one line of text. */
 const LINE_PX = 16;
 
-const CURSORS: Record<HandleKind | "pan", string> = {
+const CURSORS: Record<HandleKind | "pan" | "lasso", string> = {
   nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize",
   n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize",
-  rotate: "crosshair", move: "move", pan: "grab",
+  "skew-n": "ew-resize", "skew-s": "ew-resize", "skew-e": "ns-resize", "skew-w": "ns-resize",
+  rotate: "crosshair", move: "move", pan: "grab", lasso: "crosshair",
 };
+
+/** Screen px between lasso samples. Closer than this and the loop stores the same point twice. */
+const LASSO_SPACING_PX = 2;
 
 type Gesture =
   | { t: "pan"; last: Pt } // screen px
@@ -36,7 +38,17 @@ type Gesture =
   // `targets` are gathered once at the press, since only the selection moves during a gesture;
   // `guides` are the snap lines of the current frame.
   | { t: "transform"; kind: HandleKind; box: Box; ids: number[]; shapes: number[]; start: Pt; m: Matrix; targets: Targets; guides: Guide[] } // world mm
-  | { t: "marquee"; start: Pt; cur: Pt; additive: boolean }; // world mm
+  | { t: "marquee"; start: Pt; cur: Pt; additive: boolean; base: number[] } // world mm
+  // `start`/`cur` are the band when the drag began; `at` is where it is now. The difference
+  // translates both corners, which is what keeps the band's size and its contain/cross mode.
+  | { t: "marquee-move"; start: Pt; cur: Pt; additive: boolean; base: number[]; grab: Pt; at: Pt }
+  | { t: "lasso"; points: Pt[]; additive: boolean; base: number[] }
+
+type Band = { start: Pt; cur: Pt; additive: boolean; base: number[] };
+
+function shownBand(start: Pt, cur: Pt): { marquee: Bounds; crossing: boolean } {
+  return { marquee: normalizeRect(start, cur), crossing: marqueeMode(start, cur) === "intersect" };
+}
 
 export type CanvasInteractionArgs = {
   canvasRef: RefObject<HTMLCanvasElement>;
@@ -57,6 +69,8 @@ export type CanvasInteractionArgs = {
   inset: Inset;
   /** Revision of the snapshot `scene` was built from; it rises with every successful refresh. */
   sceneRev: number;
+  /** "lasso" draws a freeform loop. Anything else is the select tool: click, band, handles. */
+  tool: string;
   /** A refusal puts the preview back. An applied commit keeps it until its own snapshot has
    *  rendered, even if that refresh failed, because the backend then holds the new geometry.
    *  `requestedAt` is when the operator asked for it (`performance.now()`), not when it went
@@ -139,7 +153,7 @@ function toCanvas(canvas: HTMLCanvasElement, clientX: number, clientY: number): 
 /** The part of `box` under `p` at view scale `scale`, with the CSS-px sizes converted to mm in
  *  one place so the hover cursor and the press cannot disagree about what is under the pointer. */
 function handleUnder(box: Box, p: Pt, scale: number): HandleKind | null {
-  return handleAt(box, p, HANDLE_HIT_PX / scale, ROTATE_ZONE_PX / scale);
+  return handleAt(box, p, SCALE_HIT_PX / scale, ROTATE_HIT_PX / scale, SKEW_HIT_PX / scale, SKEW_OFFSET_PX / scale);
 }
 
 function isTyping(t: EventTarget | null): boolean {
@@ -147,7 +161,7 @@ function isTyping(t: EventTarget | null): boolean {
 }
 
 export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInteraction {
-  const { canvasRef, rendererRef, scene, selected, setSelected, expand, artboard, mat, contentBounds, inset, commit, sceneRev } = args;
+  const { canvasRef, rendererRef, scene, selected, setSelected, expand, artboard, mat, contentBounds, inset, commit, sceneRev, tool } = args;
   const [view, setViewState] = useState<View>(IDENTITY_VIEW);
   const [size, setSize] = useState<Size>({ w: 0, h: 0 });
   // ponytail: the readout re-renders App on every pointer move. Fine at today's App size; if a
@@ -167,8 +181,24 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
   // Native listeners are registered once and pointer handlers run between renders; both read
   // these rather than a render's closure, so they see the selection the user just made.
   const viewRef = useRef(view);
-  const latest = useRef({ scene, selected, expand, commit, sceneRev, artboard });
-  latest.current = { scene, selected, expand, commit, sceneRev, artboard };
+  const latest = useRef({ scene, selected, expand, commit, sceneRev, artboard, tool });
+  latest.current = { scene, selected, expand, commit, sceneRev, artboard, tool };
+  // The band left on screen after a marquee, so a later drag inside it can move the band
+  // instead of the shapes. `bandOwned` is set when this hook is the one changing `selected`,
+  // so a selection made from the layers panel drops a band that no longer describes it.
+  const bandRef = useRef<Band | null>(null);
+  const bandOwned = useRef(false);
+  const selKey = selected.join(",");
+  const selKeyRef = useRef(selKey);
+  if (selKeyRef.current !== selKey) {
+    selKeyRef.current = selKey;
+    if (bandOwned.current) bandOwned.current = false;
+    else bandRef.current = null;
+  } else if (bandOwned.current) {
+    // The band's selection was already the current one, so there is no key change to consume
+    // the flag. Drop it or the next click in the layers panel would keep a stale band.
+    bandOwned.current = false;
+  }
   const pending = useRef<PendingPreview | null>(null);
   // `pending` is a ref so pointer handlers see it between renders, but `effectiveScene` is read by
   // React: the panel's buttons kept the bounds from before a preview until something else
@@ -251,16 +281,25 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     if (g?.t === "transform") {
       r.setScene(applyOptimistic(s, g.shapes, g.m));
       r.setSelection(g.shapes);
-      r.setOverlay({ box: { ...g.box, frame: compose(g.box.frame, g.m) }, marquee: null, guides: g.guides });
+      r.setOverlay({ box: { ...g.box, frame: compose(g.box.frame, g.m) }, marquee: null, crossing: false, lasso: null, guides: g.guides });
     } else {
       const shapes = latest.current.expand(sel);
       r.setScene(s);
       r.setSelection(shapes);
-      r.setOverlay(
-        g?.t === "marquee"
-          ? { box: null, marquee: normalizeRect(g.start, g.cur), guides: [] }
-          : { box: selectionBox(s, shapes), marquee: null, guides: [] },
-      );
+      const box = selectionBox(s, shapes);
+      if (g?.t === "marquee") {
+        const shown = shownBand(g.start, g.cur);
+        r.setOverlay({ box: null, ...shown, lasso: null, guides: [] });
+      } else if (g?.t === "marquee-move") {
+        const moved = translateCorners(g.start, g.cur, { x: g.at.x - g.grab.x, y: g.at.y - g.grab.y });
+        r.setOverlay({ box: null, ...shownBand(moved.start, moved.cur), lasso: null, guides: [] });
+      } else if (g?.t === "lasso") {
+        r.setOverlay({ box, marquee: null, crossing: false, lasso: g.points, guides: [] });
+      } else if (bandRef.current) {
+        r.setOverlay({ box, ...shownBand(bandRef.current.start, bandRef.current.cur), lasso: null, guides: [] });
+      } else {
+        r.setOverlay({ box, marquee: null, crossing: false, lasso: null, guides: [] });
+      }
     }
     r.draw();
   }, [rendererRef]);
@@ -275,11 +314,21 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
       gesture.current = { ...g, cur: p };
       return;
     }
+    if (g.t === "marquee-move") {
+      gesture.current = { ...g, at: p };
+      return;
+    }
+    if (g.t === "lasso") {
+      const last = g.points[g.points.length - 1];
+      const min = LASSO_SPACING_PX / viewRef.current.scale;
+      if (Math.hypot(p.x - last.x, p.y - last.y) >= min) gesture.current = { ...g, points: [...g.points, p] };
+      return;
+    }
     // Snapping moves the pointer, not the matrix, so Shift, Alt and the commit see an ordinary
-    // drag that happened to end on a line. Rotation keeps its own 15° steps.
+    // drag that happened to end on a line. Rotation and skew keep their own angle steps.
     let point = p;
     let guides: Guide[] = [];
-    if (g.kind !== "rotate" && !snapOff.current) {
+    if (g.kind !== "rotate" && !isSkewHandle(g.kind) && !snapOff.current) {
       const tol = SNAP_PX / viewRef.current.scale;
       const snapped =
         g.kind === "move"
@@ -367,6 +416,24 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     // button it would have pressed stays unpressed.
     const onDown = (e: KeyboardEvent) => {
       if (isTyping(e.target)) return;
+      if (e.key === "Escape" && !isEditingTarget(e.target) && !document.querySelector("[role='dialog'], [role='menu']")) {
+        // Same end as a cancelled pointer: the gesture is dropped and nothing is committed.
+        // A band left from an earlier marquee is dismissed too; the selection it already made stays.
+        if (gesture.current) {
+          const wasTransform = gesture.current.t === "transform";
+          gesture.current = null;
+          e.preventDefault();
+          repaint();
+          if (wasTransform) gestureEnded();
+          return;
+        }
+        if (bandRef.current) {
+          bandRef.current = null;
+          e.preventDefault();
+          repaint();
+        }
+        return;
+      }
       if (e.code === "Space") {
         const onButton = e.target instanceof HTMLElement && e.target.tagName === "BUTTON";
         if (onButton && !overCanvas.current) return;
@@ -411,6 +478,8 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
   // that decide whether to send, so a drag's release cannot put a non-finite matrix on the wire
   // either (type-design review on #301).
   function send(unfiltered: Move[], requestedAt: number) {
+    // A transform replaces the band: the shapes have moved and the old rectangle would lie.
+    bandRef.current = null;
     const moves = effective(unfiltered);
     if (moves.length === 0) {
       repaint();
@@ -564,8 +633,29 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     const shapes = latest.current.expand(sel);
     const box = selectionBox(s, shapes);
     const kind = box ? handleUnder(box, p, v.scale) : null;
+    const lassoTool = latest.current.tool === "lasso";
+    // Scale, rotate and skew win over the band. The interior is "move", and a band that is still
+    // up owns that press: dragging inside it repositions the band. Space already returned as a pan.
+    if (box && kind && kind !== "move") {
+      if (busy()) return;
+      const targets = snapTargets(s, shapes, latest.current.artboard);
+      gesture.current = { t: "transform", kind, box, ids: sel, shapes, start: p, m: IDENTITY, targets, guides: [] };
+      return;
+    }
+    const band = bandRef.current;
+    // Shift stays a toggle, the same as a shift-click on the box with no band up.
+    if (!lassoTool && !e.shiftKey && band && pointInRect(normalizeRect(band.start, band.cur), p)) {
+      gesture.current = {
+        t: "marquee-move", start: band.start, cur: band.cur, additive: band.additive, base: band.base, grab: p, at: p,
+      };
+      return;
+    }
+    if (lassoTool) {
+      gesture.current = { t: "lasso", points: [p], additive: e.shiftKey, base: sel };
+      return;
+    }
     // Shift-click inside the box toggles the node under the pointer rather than dragging.
-    if (box && kind && !(kind === "move" && e.shiftKey)) {
+    if (box && kind === "move" && !e.shiftKey) {
       if (busy()) return;
       const targets = snapTargets(s, shapes, latest.current.artboard);
       gesture.current = { t: "transform", kind, box, ids: sel, shapes, start: p, m: IDENTITY, targets, guides: [] };
@@ -573,7 +663,7 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     }
     const hit = hitTest(s, p.x, p.y, HIT_TOL_PX / v.scale);
     if (hit === null) {
-      gesture.current = { t: "marquee", start: p, cur: p, additive: e.shiftKey };
+      gesture.current = { t: "marquee", start: p, cur: p, additive: e.shiftKey, base: sel };
       return;
     }
     const next = e.shiftKey ? toggleId(sel, hit) : [hit];
@@ -594,9 +684,10 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
       : null;
   };
 
-  const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
+    const onPointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
     const canvas = e.currentTarget;
     const screen = toCanvas(canvas, e.clientX, e.clientY);
+    const prev = lastScreen.current;
     const v = viewRef.current;
     const p = screenToWorld(v, screen);
     setCursorScreen(screen);
@@ -604,10 +695,27 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     lastMods.current = { shift: e.shiftKey, alt: e.altKey };
     snapOff.current = e.metaKey || e.ctrlKey;
     const g = gesture.current;
+    // Space pans in every gesture, not only when it was already held at the press. The view
+    // moves by the same screen delta as the pointer, so the document point under the pointer
+    // stays put and the gesture does not pick up the pan as a drag.
+    if (g && g.t !== "pan" && spaceHeld.current && prev) {
+      setView(panBy(v, screen.x - prev.x, screen.y - prev.y));
+      canvas.style.cursor = "grab";
+      follow();
+      repaint();
+      return;
+    }
     if (!g) {
       const { scene: s, selected: sel } = current();
       const box = selectionBox(s, latest.current.expand(sel));
-      const kind = spaceHeld.current ? "pan" : box ? handleUnder(box, p, v.scale) : null;
+      const under = box ? handleUnder(box, p, v.scale) : null;
+      const band = bandRef.current;
+      let kind: HandleKind | "pan" | "lasso" | null;
+      if (spaceHeld.current) kind = "pan";
+      else if (under && under !== "move") kind = under;
+      else if (band && latest.current.tool !== "lasso" && pointInRect(normalizeRect(band.start, band.cur), p)) kind = "move";
+      else if (latest.current.tool === "lasso") kind = "lasso";
+      else kind = under;
       // ponytail: resize cursors are screen-aligned, so on a rotated box they point along the
       // screen rather than the edge. Upgrade: choose by the handle's on-screen angle.
       canvas.style.cursor = kind ? CURSORS[kind] : "default";
@@ -622,20 +730,82 @@ export function useCanvasInteraction(args: CanvasInteractionArgs): CanvasInterac
     repaint();
   };
 
+  function finishRegion(g: Extract<Gesture, { t: "marquee" | "marquee-move" | "lasso" }>) {
+    const { scene: s } = current();
+    const scale = viewRef.current.scale;
+    if (g.t === "marquee") {
+      const travel = Math.hypot(g.cur.x - g.start.x, g.cur.y - g.start.y) * scale;
+      if (travel < CLICK_SLOP_PX) {
+        bandRef.current = null;
+        if (!g.additive) {
+          bandOwned.current = true;
+          setSelected([]);
+        }
+      } else {
+        const hits = marqueeHits(s, normalizeRect(g.start, g.cur), marqueeMode(g.start, g.cur));
+        bandRef.current = { start: g.start, cur: g.cur, additive: g.additive, base: g.base };
+        bandOwned.current = true;
+        setSelected(marqueeSelection(g.base, hits, g.additive));
+      }
+      // The band is drawn imperatively, and a selection that did not change re-renders nothing.
+      repaint();
+      return;
+    }
+    if (g.t === "marquee-move") {
+      const by = { x: g.at.x - g.grab.x, y: g.at.y - g.grab.y };
+      // A press that does not travel is a click. The band only claims a drag; a click still
+      // selects the shape under it, which is what a click did before the band was left up.
+      if (Math.hypot(by.x, by.y) * scale < CLICK_SLOP_PX) {
+        const hit = hitTest(s, g.at.x, g.at.y, HIT_TOL_PX / scale);
+        if (hit !== null) {
+          bandRef.current = null;
+          bandOwned.current = true;
+          setSelected([hit]);
+        }
+        repaint();
+        return;
+      }
+      const moved = translateCorners(g.start, g.cur, by);
+      const hits = marqueeHits(s, normalizeRect(moved.start, moved.cur), marqueeMode(moved.start, moved.cur));
+      bandRef.current = { start: moved.start, cur: moved.cur, additive: g.additive, base: g.base };
+      bandOwned.current = true;
+      setSelected(marqueeSelection(g.base, hits, g.additive));
+      repaint();
+      return;
+    }
+    let length = 0;
+    for (let i = 1; i < g.points.length; i++) {
+      length += Math.hypot(g.points[i].x - g.points[i - 1].x, g.points[i].y - g.points[i - 1].y);
+    }
+    bandRef.current = null;
+    if (length * scale < CLICK_SLOP_PX || g.points.length < 3) {
+      const p0 = g.points[0];
+      const hit = hitTest(s, p0.x, p0.y, HIT_TOL_PX / scale);
+      if (hit === null) {
+        if (!g.additive) {
+          bandOwned.current = true;
+          setSelected([]);
+        }
+      } else {
+        bandOwned.current = true;
+        setSelected(g.additive ? toggleId(g.base, hit) : [hit]);
+      }
+    } else {
+      // Alt at release contains. The plain loop selects what it crosses, which is the marquee's
+      // right-to-left rule, and Shift was already taken at the press as "add".
+      const hits = lassoHits(s, g.points, lastMods.current.alt ? "contain" : "intersect");
+      bandOwned.current = true;
+      setSelected(marqueeSelection(g.base, hits, g.additive));
+    }
+    repaint();
+  }
+
   const onPointerUp = () => {
     const g = gesture.current;
     gesture.current = null;
     if (!g || g.t === "pan") return;
-    if (g.t === "marquee") {
-      const travel = Math.hypot(g.cur.x - g.start.x, g.cur.y - g.start.y) * viewRef.current.scale;
-      const { scene: s, selected: sel } = current();
-      if (travel < CLICK_SLOP_PX) {
-        if (!g.additive) setSelected([]);
-      } else {
-        setSelected(marqueeSelection(sel, marqueeHits(s, normalizeRect(g.start, g.cur)), g.additive));
-      }
-      // The band is drawn imperatively, and a selection that did not change re-renders nothing.
-      repaint();
+    if (g.t === "marquee" || g.t === "marquee-move" || g.t === "lasso") {
+      finishRegion(g);
       return;
     }
     if (isIdentity(g.m)) {

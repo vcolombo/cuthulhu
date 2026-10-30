@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { Circle, ImageUp, MousePointer2, Square, SquaresExclude, SquaresIntersect, SquaresSubtract, SquaresUnite, Trash2, Type } from "lucide-react";
+import { Circle, ImageUp, LassoSelect, MousePointer2, Square, SquaresExclude, SquaresIntersect, SquaresSubtract, SquaresUnite, Trash2, Type } from "lucide-react";
 import type { BoolOp } from "../App";
 import { Tip } from "../components/Tip";
 import { cn } from "../lib/cn";
@@ -40,6 +40,7 @@ export function ToolRail({
   const canBoolean = selectionCount >= 2;
   const canDelete = selectionCount > 0;
   const active = tool === "select";
+  const lasso = tool === "lasso";
   return (
     <nav className="flex w-16 shrink-0 flex-col items-center gap-1 border-r border-border bg-panel py-2" aria-label="Tools">
       <Tip label="Select" kbd="V" side="right">
@@ -53,6 +54,19 @@ export function ToolRail({
         >
           <MousePointer2 className="size-4" aria-hidden />
           Select
+        </button>
+      </Tip>
+      <Tip label="Lasso" kbd="L" side="right">
+        <button
+          type="button"
+          aria-label="Lasso"
+          aria-pressed={lasso}
+          data-ink={lasso ? "accent" : "muted"}
+          onClick={() => onSelectTool("lasso")}
+          className={cn(btn, "cursor-pointer", lasso && "border-brand bg-tint/25 text-accent-ink dark:bg-tint/10")}
+        >
+          <LassoSelect className="size-4" aria-hidden />
+          Lasso
         </button>
       </Tip>
       <Tip label="Rectangle" kbd="R" side="right">

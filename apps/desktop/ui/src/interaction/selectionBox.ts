@@ -6,7 +6,24 @@ import { apply, compose, invert, translate, type Pt } from "../render/affine";
  *  which is what lets one scale rule serve a rotated single node and an axis-aligned group alike. */
 export type Box = { frame: Affine6; w: number; h: number };
 export type ScaleHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
-export type HandleKind = ScaleHandle | "rotate" | "move";
+export type SkewHandle = "skew-n" | "skew-e" | "skew-s" | "skew-w";
+export type HandleKind = ScaleHandle | SkewHandle | "rotate" | "move";
+
+/** Screen-constant targets, in CSS px. Callers divide by the view scale before comparing them
+ *  to world mm, so a handle stays the same size on screen at every zoom.
+ *
+ *  - Scale: an 8px square (`HANDLE_DRAW_PX`). Hit radius 6px, 12px across — a mouse target,
+ *    deliberately under a 24px fingertip so a small shape can still be dragged between handles.
+ *  - Skew: an 8px diamond centred 22px outside the edge midpoint. Hit radius 12px, 24px across,
+ *    the touch target. 22 − 12 = 10px of gap past the scale handle's 6px radius, so the two
+ *    do not share a press.
+ *  - Rotate: an 18px zone outside a corner (36px across that corner), only where a press would
+ *    otherwise miss the box. */
+export const HANDLE_DRAW_PX = 8;
+export const SCALE_HIT_PX = 6;
+export const SKEW_OFFSET_PX = 22;
+export const SKEW_HIT_PX = 12;
+export const ROTATE_HIT_PX = 18;
 
 /** Each handle's place on the box, as fractions of (w, h). */
 export const HANDLE_UNIT: Record<ScaleHandle, Pt> = {
@@ -14,6 +31,24 @@ export const HANDLE_UNIT: Record<ScaleHandle, Pt> = {
   se: { x: 1, y: 1 }, s: { x: 0.5, y: 1 }, sw: { x: 0, y: 1 }, w: { x: 0, y: 0.5 },
 };
 export const SCALE_HANDLES = Object.keys(HANDLE_UNIT) as ScaleHandle[];
+export const SKEW_HANDLES = ["skew-n", "skew-e", "skew-s", "skew-w"] as const;
+
+const SKEW_EDGE: Record<SkewHandle, ScaleHandle> = {
+  "skew-n": "n", "skew-e": "e", "skew-s": "s", "skew-w": "w",
+};
+/** Outward in local space. Document y grows downward, so the top edge's outward step is −y. */
+const SKEW_NORMAL: Record<SkewHandle, Pt> = {
+  "skew-n": { x: 0, y: -1 }, "skew-e": { x: 1, y: 0 }, "skew-s": { x: 0, y: 1 }, "skew-w": { x: -1, y: 0 },
+};
+
+export function isSkewHandle(h: HandleKind): h is SkewHandle {
+  return h === "skew-n" || h === "skew-e" || h === "skew-s" || h === "skew-w";
+}
+
+/** Edge skews that have a length to shear. A straight path has no top edge to drag sideways. */
+export function skewHandlesFor(box: Box): SkewHandle[] {
+  return SKEW_HANDLES.filter((h) => (h === "skew-n" || h === "skew-s" ? box.h > 0 : box.w > 0));
+}
 
 // Float slack on the inside test, so a zero-height box (a straight path) keeps an inside.
 const INSIDE_EPS = 1e-9;
@@ -59,6 +94,17 @@ export function handleWorld(box: Box, h: ScaleHandle): Pt {
   return apply(box.frame, handleLocal(box, h));
 }
 
+/** The skew diamond, `offset` world mm outside the edge. `offset` is a screen size divided by
+ *  the view scale, so the diamond stays put on screen when the operator zooms. */
+export function skewPoint(box: Box, h: SkewHandle, offset: number): Pt {
+  const local = handleLocal(box, SKEW_EDGE[h]);
+  const n = SKEW_NORMAL[h];
+  const base = apply(box.frame, local);
+  const tip = apply(box.frame, { x: local.x + n.x, y: local.y + n.y });
+  const len = Math.hypot(tip.x - base.x, tip.y - base.y) || 1;
+  return { x: base.x + ((tip.x - base.x) / len) * offset, y: base.y + ((tip.y - base.y) / len) * offset };
+}
+
 /** World corners in drawing order: nw, ne, se, sw. */
 export function boxCorners(box: Box): Pt[] {
   return (["nw", "ne", "se", "sw"] as const).map((h) => handleWorld(box, h));
@@ -71,9 +117,23 @@ export function boxCenter(box: Box): Pt {
 /** Which part of the box is under `p`. Tolerances are world mm — the caller divides its CSS-px
  *  sizes by the view scale. Handles win over the inside so a small box can still be scaled, and
  *  the rotate zone is only outside, where a press would otherwise do nothing. */
-export function handleAt(box: Box, p: Pt, handleTol: number, rotateTol: number): HandleKind | null {
+export function handleAt(
+  box: Box,
+  p: Pt,
+  handleTol: number,
+  rotateTol: number,
+  skewTol = handleTol,
+  skewOffset = 0,
+): HandleKind | null {
   for (const h of SCALE_HANDLES) {
     if (canScale(box, h) && dist(handleWorld(box, h), p) <= handleTol) return h;
+  }
+  // Outside the edge, past the scale square. A zero offset would sit on the scale handle, which
+  // already won above; callers pass a screen offset so the two targets stay apart.
+  if (skewOffset > 0) {
+    for (const h of skewHandlesFor(box)) {
+      if (dist(skewPoint(box, h, skewOffset), p) <= skewTol) return h;
+    }
   }
   if (inside(box, p)) return "move";
   if (boxCorners(box).some((c) => dist(c, p) <= rotateTol)) return "rotate";

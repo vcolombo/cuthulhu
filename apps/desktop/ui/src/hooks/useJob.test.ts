@@ -458,6 +458,74 @@ describe("useJob", () => {
     expect(api.current?.offlineHost).toBeNull();
   });
 
+  it("shows a cut whose job id restarted after the host dropped", async () => {
+    ipc.getDeviceState.mockResolvedValue(done(5));
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(5)); });
+    await act(async () => { emit(5, done(5)); });
+
+    // A finished job does not freeze, but the poll still records that the host dropped.
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [{ ...HOST, unreachable: "the host could not be reached" }],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: done(5) }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status).toEqual(done(5));
+    expect(api.current?.offlineHost).toBeNull();
+
+    // The daemon process came back numbering from 1. The accept still reports no id.
+    ipc.listHosts.mockResolvedValue([HOST]);
+    await act(async () => { api.current?.remember(snapshot(0)); });
+    const sending = status({
+      phase: "Sending",
+      jobId: 1,
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+      pass: { index: 0, total: 2 },
+      sent: { sent: 10, total: 100 },
+    });
+    ipc.getDeviceState.mockResolvedValue(sending);
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status).toEqual(sending);
+
+    const swap = { ...SWAP, jobId: 1 };
+    act(() => {
+      api.current?.applyPoll({
+        hosts: [HOST],
+        statuses: [{ host: HOST.id, instance_id: REMOTE.instance_id, status: swap }],
+        stale: false,
+      });
+    });
+    expect(api.current?.status).toEqual(swap);
+    expect(api.current?.status.actions.resume).toBe(true);
+  });
+
+  it("still drops a lower job id when the host never dropped", async () => {
+    ipc.getDeviceState.mockResolvedValue(done(5));
+    await mount();
+    await act(async () => { api.current?.attach(REMOTE); });
+    await act(async () => { api.current?.remember(snapshot(5)); });
+    await act(async () => { emit(5, done(5)); });
+    await act(async () => { api.current?.remember(snapshot(0)); });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(0);
+
+    const sending = status({
+      phase: "Sending",
+      jobId: 1,
+      actions: { cut: false, cancel: true, resume: false, confirm: false },
+    });
+    ipc.getDeviceState.mockResolvedValue(sending);
+    await act(async () => { await api.current?.refreshDeviceState(); });
+    expect(api.current?.status.phase).toBe("Sending");
+    expect(api.current?.status.jobId).toBe(0);
+
+    await act(async () => { emit(1, sending); });
+    expect(api.current?.status.jobId).toBe(0);
+  });
+
   it("sends a queued cancel when the recovered job can still be cancelled", async () => {
     ipc.getDeviceState.mockResolvedValue(SWAP);
     await mount();

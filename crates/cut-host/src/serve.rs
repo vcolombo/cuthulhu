@@ -634,6 +634,21 @@ mod tests {
         assert!(matches!(err, VersionFailure::Io(_)), "{err:?}");
     }
 
+    /// A peer that leaves before the first byte has not offered a version. That is a clean
+    /// close, not a frame that failed part-way through, and not an agreement: treating it as
+    /// `Io` would log a fault for a client that never started, and treating it as success
+    /// would read the next frame — a token, or a replayed dispatch — as if the version had
+    /// been agreed.
+    #[test]
+    fn a_peer_that_closes_before_offering_a_version_is_not_agreed() {
+        let (client, mut server) = pair();
+        drop(client);
+        let err =
+            establish_version(&mut server, Instant::now() + Duration::from_secs(2), PROTOCOL_VERSION)
+                .unwrap_err();
+        assert!(matches!(err, VersionFailure::Closed), "{err:?}");
+    }
+
     fn pair() -> (
         std::os::unix::net::UnixStream,
         std::os::unix::net::UnixStream,

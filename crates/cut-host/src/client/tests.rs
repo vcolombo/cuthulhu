@@ -357,6 +357,64 @@ fn an_unversioned_host_is_the_older_side() {
     );
 }
 
+/// The offer was written and the host said nothing. That is reachability: the peer has not
+/// shown it speaks an old protocol. Folding the timeout into the catch-all protocol arm
+/// tells the operator to update a Cut Host that never named a version.
+#[test]
+fn a_version_reply_that_never_arrives_is_a_timeout_not_an_older_host() {
+    let host = testing::start_host_silent_after_the_version_offer();
+    let budget = Duration::from_secs(2);
+    let started = Instant::now();
+    let err = match HostClient::connect_within(&host.addr, "token", &host.fingerprint, budget) {
+        Ok(_) => panic!("a host that never agrees a version must not open a session"),
+        Err(e) => e,
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        err.protocol_side(),
+        None,
+        "a stall is not a program to update: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "the host could not be reached (the host did not agree a protocol version in time)"
+    );
+}
+
+/// `Unreadable` is a reply, not a close and not a timeout. It must not open a session,
+/// and it must not be followed by the token: the credential goes out only after an agreement.
+#[test]
+fn an_unreadable_version_reply_is_not_sent_the_token() {
+    let (host, saw_token) = testing::start_host_replying_unreadable();
+    let err = match HostClient::connect(&host.addr, "secret-token", &host.fingerprint) {
+        Ok(_) => panic!("an unreadable version reply must not open a session"),
+        Err(e) => e,
+    };
+    match &err {
+        ClientError::Protocol {
+            host_version: None,
+            desktop_version,
+        } => assert_eq!(*desktop_version, PROTOCOL_VERSION),
+        other => panic!("expected a host that named no version, got {other:?}"),
+    }
+    assert_eq!(err.protocol_side(), Some(ProtocolSide::Host));
+    assert_eq!(
+        err.to_string(),
+        "This Cut Host is running an older version. Update your Cut Host to connect."
+    );
+    let saw = saw_token
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the host reports whether a token arrived");
+    assert!(
+        !saw,
+        "the token was sent after a version reply that was not an agreement"
+    );
+}
+
 /// A version reply is capped before its body is read. A length that would be legal for a
 /// dispatch must not hold the connect open for the body, and must not be decoded as one.
 #[test]

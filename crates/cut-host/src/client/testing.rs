@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::frame::{
     read_frame, write_frame, FrameError, DEFAULT_MAX_FRAME, SOCKET_POLL_INTERVAL,
 };
-use crate::protocol::{Request, Response, PROTOCOL_VERSION, VERSION_FRAME_MAX};
+use crate::protocol::{Request, Response, VersionReply, PROTOCOL_VERSION, VERSION_FRAME_MAX};
 
 /// Where a misbehaving host is listening, and the fingerprint a client must pin to reach it.
 pub struct MisbehavingHost {
@@ -53,6 +54,48 @@ pub fn start_unversioned_host() -> MisbehavingHost {
     spawn_host(|mut tls| {
         let _ = read_frame::<_, String>(&mut tls, 1024, Some(BUDGET), BUDGET);
     })
+}
+
+/// Reads the version offer and then holds the socket open. A close here is an older host;
+/// silence is a stall, and the two are different failures for the operator.
+pub fn start_host_silent_after_the_version_offer() -> MisbehavingHost {
+    spawn_host(|mut tls| {
+        if read_frame::<_, u32>(&mut tls, VERSION_FRAME_MAX, Some(BUDGET), BUDGET).is_err() {
+            return;
+        }
+        // Until the client gives up. Returning would drop the socket, and a dropped
+        // socket is `Eof`, which the client reads as an older protocol.
+        let _ = read_frame::<_, String>(
+            &mut tls,
+            1024,
+            Some(Duration::from_secs(30)),
+            Duration::from_secs(30),
+        );
+    })
+}
+
+/// Writes `VersionReply::Unreadable` and reports whether a token frame followed it.
+///
+/// The client must not send the credential once the reply is not an agreement. The
+/// flag is that observation: the error variant alone is also what a later, failed
+/// greeting read produces, so a client that treated `Unreadable` as agreed and then
+/// lost the connection would still look like a protocol mismatch.
+pub fn start_host_replying_unreadable() -> (MisbehavingHost, Receiver<bool>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = spawn_host(move |mut tls| {
+        let saw_token = read_frame::<_, u32>(&mut tls, VERSION_FRAME_MAX, Some(BUDGET), BUDGET)
+            .is_ok()
+            && write_frame(&mut tls, &VersionReply::Unreadable, BUDGET).is_ok()
+            && read_frame::<_, String>(
+                &mut tls,
+                1024,
+                Some(Duration::from_secs(2)),
+                Duration::from_secs(2),
+            )
+            .is_ok();
+        let _ = tx.send(saw_token);
+    });
+    (host, rx)
 }
 
 /// Reads the version offer, writes `bytes` and nothing else. How a reply that is not a

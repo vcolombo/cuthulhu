@@ -131,6 +131,40 @@ describe("layer passes match the planner", () => {
     expect(passes(snapshot, "Color")).toEqual([]);
     expect(rowIds(snapshot, "Color")).toEqual([2]);
   });
+
+  test("a colour that is only partly excluded stays mixed", () => {
+    // The scissors on a colour row read `cut`, and a click writes every
+    // shapeId to Cut or NoCut from it. Passes and row ids stay the same if
+    // mixed collapses: to Cut, and the row says the colour is fully on while
+    // a shape of it will not cut; to NoCut, and the row says it is off while
+    // one will. shapeIds is the list that click writes, so dropping the
+    // excluded shape there leaves it stuck.
+    const root = container(1, "Layer", [2, 3, 4, 5]);
+    const snapshot = doc([
+      root,
+      shape(2, { stroke: RED, fill: null }, { cut_line_type: "NoCut" }),
+      shape(3, { stroke: RED, fill: null }),
+      shape(4, { stroke: GREEN, fill: null }, { cut_line_type: "NoCut" }),
+      shape(5, { stroke: BLUE, fill: null }),
+    ]);
+    const model = layerModel(snapshot, "Color", effectiveMaterials(snapshot.nodes, snapshot.root));
+    const block = (key: string) => model.blocks.find((entry) => entry.key === key);
+    expect(block("color:ff0000ff")).toMatchObject({
+      cut: "mixed",
+      cutIds: [3],
+      shapeIds: [2, 3],
+    });
+    expect(block("color:00ff00ff")).toMatchObject({
+      cut: "NoCut",
+      cutIds: [],
+      shapeIds: [4],
+    });
+    expect(block("color:0000ffff")).toMatchObject({
+      cut: "Cut",
+      cutIds: [5],
+      shapeIds: [5],
+    });
+  });
 });
 
 describe("layer row order", () => {

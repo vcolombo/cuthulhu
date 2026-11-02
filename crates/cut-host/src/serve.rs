@@ -621,6 +621,28 @@ mod tests {
         );
     }
 
+    /// The offer is already in the socket, and then the peer is gone. The read therefore
+    /// succeeds, and the agreement is the write that follows it. Swallowing that write's
+    /// error would report the version agreed and go on to read a token — or a replayed
+    /// dispatch — from a connection the reply never reached. Closing after one length byte
+    /// fails the read, so it never asks this.
+    #[test]
+    fn a_peer_that_leaves_once_the_version_is_offered_is_not_agreed() {
+        let (mut client, mut server) = pair();
+        write_frame(&mut client, &PROTOCOL_VERSION, Duration::from_secs(2)).unwrap();
+        drop(client);
+        let err = establish_version(
+            &mut server,
+            Instant::now() + Duration::from_secs(2),
+            PROTOCOL_VERSION,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, VersionFailure::Io(_)),
+            "a failed agreement write is not a clean close and not a success: {err:?}"
+        );
+    }
+
     /// A peer that closes after one byte of the length has begun a frame and then left. That is
     /// a fault, not an agreed version, and it admits nothing because nothing past it runs.
     #[test]

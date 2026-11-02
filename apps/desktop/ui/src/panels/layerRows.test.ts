@@ -198,6 +198,27 @@ describe("layer row order", () => {
     expect(model.trailing).toEqual([]);
   });
 
+  test("an excluded colour stays where it first appears among the colours that cut", () => {
+    // A NoCut-only key is not a pass. It is inserted where that colour first appears:
+    // before the cuts when it leads, after them when it trails. Appending every such
+    // key parks the leading colour after the cuts; prepending parks the trailing one
+    // in front. Passes and the cut marks stay the same either way.
+    const root = container(1, "Layer", [2, 3, 4]);
+    const snapshot = doc([
+      root,
+      shape(2, { stroke: GREEN, fill: null }, { cut_line_type: "NoCut" }),
+      shape(3, { stroke: RED, fill: null }),
+      shape(4, { stroke: BLUE, fill: null }, { cut_line_type: "NoCut" }),
+    ]);
+    const model = layerModel(snapshot, "Color", effectiveMaterials(snapshot.nodes, snapshot.root));
+    expect(model.blocks.map((block) => [block.key, block.cut, block.shapeIds])).toEqual([
+      ["color:00ff00ff", "NoCut", [2]],
+      ["color:ff0000ff", "Cut", [3]],
+      ["color:0000ffff", "NoCut", [4]],
+    ]);
+    expect(passes(snapshot, "Color").map((pass) => pass.key)).toEqual(["color:ff0000ff"]);
+  });
+
   test("a group whose shapes span colours is repeated, dimmed, under the later block", () => {
     const root = container(1, "Layer", [2]);
     const group = container(2, "Group", [3, 4]);

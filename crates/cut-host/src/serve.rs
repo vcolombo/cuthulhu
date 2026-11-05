@@ -557,6 +557,33 @@ mod tests {
         );
     }
 
+    /// The offer was read, and then the peer left, so the refusal write fails. That write is
+    /// best-effort: the outcome is still the refusal. Folding the write error into `Io`, which
+    /// is what the agreement write must do, names a transport fault for a version this host
+    /// already refused. The open-socket test still passes under that fold, because its peer is
+    /// there to read the reply.
+    #[test]
+    fn an_unsupported_offer_from_a_peer_that_has_left_is_still_refused() {
+        let offered = PROTOCOL_VERSION + 1;
+        let (mut client, mut server) = pair();
+        write_frame(&mut client, &offered, Duration::from_secs(2)).unwrap();
+        drop(client);
+        let err = establish_version(
+            &mut server,
+            Instant::now() + Duration::from_secs(2),
+            PROTOCOL_VERSION,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VersionFailure::Unsupported { offered: n, supported }
+                    if n == offered && supported == PROTOCOL_VERSION
+            ),
+            "a refusal the peer cannot hear is still a refusal, not a transport fault: {err:?}"
+        );
+    }
+
     /// What an unversioned client sent first: a token string. It is not a version, so it is
     /// refused without being read as a `Request` — a `Dispatch` in that frame would be how a
     /// replayed session started a Job.

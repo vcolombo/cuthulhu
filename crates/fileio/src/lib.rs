@@ -235,6 +235,48 @@ mod tests {
             (p.x - want.0).abs() < 0.05 && (p.y - want.1).abs() < 0.05);
         assert!(hit, "no flattened point near true quad midpoint {want:?}: {polys:?}");
     }
+    /// A quarter-turn has to move the corners, not only scale them. `mm_transformed`
+    /// reads both off-axis terms of the absolute transform; dropping either leaves a
+    /// rotated rectangle at its unrotated size, and that outline is what the blade follows.
+    /// The scale-only group above stays green either way.
+    #[test]
+    fn a_quarter_turn_swaps_the_rectangles_axes() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"
+                        viewBox="0 0 40 40">
+                        <rect width="20" height="10" transform="rotate(90)"/>
+                      </svg>"#;
+        let imp = svg_to_paths(svg).unwrap();
+        assert_eq!(imp.paths.len(), 1);
+        let b = imp.paths[0].0.bounds();
+        let mm = |px: f64| px * PX_TO_MM;
+        assert!((b.x - mm(-10.0)).abs() < 0.01, "x={} mm", b.x);
+        assert!((b.y - mm(0.0)).abs() < 0.01, "y={} mm", b.y);
+        assert!((b.w - mm(10.0)).abs() < 0.01, "w={} mm", b.w);
+        assert!((b.h - mm(20.0)).abs() < 0.01, "h={} mm", b.h);
+    }
+
+    /// A gradient cannot name a blade colour. Opaque black is the stand-in, so the
+    /// shape still has a pass key an operator can see. Transparent or absent paint is
+    /// the no-colour pass, which reads as a shape that was never painted.
+    #[test]
+    fn a_gradient_fill_imports_as_opaque_black() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"
+                        viewBox="0 0 20 20">
+                        <defs>
+                          <linearGradient id="g">
+                            <stop offset="0" stop-color="#ff0000"/>
+                            <stop offset="1" stop-color="#0000ff"/>
+                          </linearGradient>
+                        </defs>
+                        <rect width="20" height="20" fill="url(#g)" stroke="none"/>
+                      </svg>"##;
+        let imp = svg_to_paths(svg).unwrap();
+        assert_eq!(imp.paths.len(), 1, "the gradient shape must still import");
+        let hint = &imp.paths[0].1;
+        assert_eq!(hint.fill, Some(0x000000FF));
+        assert_eq!(hint.stroke, None);
+    }
+
     #[test]
     fn parses_a_rect_into_one_path_in_mm() {
         // 20x20 user units at 96dpi → but usvg keeps user units; we map px→mm at 96dpi.

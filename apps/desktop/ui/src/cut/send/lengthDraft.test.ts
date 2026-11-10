@@ -39,6 +39,17 @@ describe("inch weed fields", () => {
     expect(inchCommit("3", "", margin)).toBe("");
   });
 
+  it("shows an out-of-range millimetre as the inch it is, so blur cannot store a different legal one", () => {
+    const margin = { min: 0.5, max: 50 };
+    // 51 mm is 2.01 in. The nearest hundredth the range still accepts is 1.96 in,
+    // which is 49.784 mm: a different margin. 0.1 mm is 0.00 in; walking it up to
+    // the first legal hundredth is 0.02 in, which is 0.508 mm.
+    expect(lengthFromDraft("51", margin)).toBe("2.01");
+    expect(unitToMm(2.01, "in")).toBeGreaterThan(margin.max);
+    expect(lengthFromDraft("0.1", margin)).toBe("0.00");
+    expect(unitToMm(0.02, "in")).toBeGreaterThanOrEqual(margin.min);
+  });
+
   it("quotes a weed bound in the unit the field is showing", () => {
     expect(weedMessage("Margin must be 0.5–50 mm", "mm")).toBe("Margin must be 0.5–50 mm");
     // Hundredths that round-trip: 1.97 in is 50.038 mm, which the millimetre check refuses.

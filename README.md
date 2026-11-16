@@ -73,6 +73,15 @@ MaterialPreset, or given a weed border and weed lines. The border and the
 lines are generated for that send; they are not stored in the Document, and
 the sheet's weed settings last for the session only.
 
+**Once this session has accepted a cut**, a job panel docks at the bottom of
+the right column: the aimed cutter, pass progress, and whichever of Cancel,
+Confirm pass done, and Resume the status allows. A colour swap replaces that
+panel with a bar across the bottom ("Load …, then press Resume"). Dismiss
+hides the panel once the cut has finished, failed, or been cancelled. A
+status with no accepted cut this session opens neither. Pause and a
+remaining-time estimate are not shown: the backend has neither a pause
+command nor a rate.
+
 **Group passes by** on that step is the Grouping for the whole window. The
 Layers panel and the document facts in Properties read the same value. The
 desktop starts on *Colour (stroke, else fill)* and does not remember the

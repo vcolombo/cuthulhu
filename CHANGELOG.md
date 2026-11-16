@@ -11,10 +11,12 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Changed
 
-- **Cut passes can be grouped by stroke colour, fill colour, or material preset**, chosen in the
-  cut dialog and with `cuthulhu cut --group-by <single|color|stroke|fill|preset>`. `color` is the
-  previous rule — stroke where visible, else fill — and stays what the dialog opens on; `single`
-  is one pass over every cut shape, and stays what a bare `cuthulhu cut` does.
+- **Cut passes can be grouped by stroke colour, fill colour, or material preset**, chosen with
+  **Group passes by** on the Send sheet and with
+  `cuthulhu cut --group-by <single|color|stroke|fill|preset>`. That choice is the Grouping for the
+  whole window: the Layers panel and the document facts in Properties read it, and it is not saved.
+  `color` — stroke where visible, else fill — is what the desktop opens on; `single` is one pass
+  over every cut shape, and stays what a bare `cuthulhu cut` does.
 
 - **A Node can carry a material preset, and a Layer passes it down.** The properties panel's new
   Material control offers Inherit, No preset, or a named preset, and shows what an inherited
@@ -36,13 +38,44 @@ Nothing has been released yet, so there is no history before `Unreleased`.
 
 ### Added
 
-- **The cut dialog manages the operator's own material presets** for the cutter it is aimed at:
+- **Send to cutter is three steps:** Machine, Material & passes, Preview & cut. Next stays on
+  Machine until a cutter is aimed and its status says a cut is legal. Weed border and weed lines
+  are made for that send. They are not stored in the Document, and the sheet's weed settings last
+  for the session only.
+
+- **Once this session has accepted a cut, it has its own surface.** Progress, failure, completion,
+  and cancellation dock a job panel under the right column. A colour swap is a bar across the
+  bottom instead ("Load …, then press Resume"). The buttons follow `actions`: Cancel, Confirm pass
+  done, Resume. Dismiss hides the panel once the cut has finished, failed, or been cancelled. A
+  status with no accepted cut this session opens neither surface. There is no pause button and no
+  remaining-time estimate.
+
+- **Devices lists every cutter** this desktop can see — plugged into this computer and on every
+  paired Cut Host — not only the one the top bar is aimed at. A host that answered on the wrong
+  protocol version says which side to update. A host that cannot be reached keeps the last reading
+  that worked. Forgetting a host that is disconnected or faulted needs the force the dialog
+  offers. A cutter that is cutting, or that stopped where nothing saw it stop, cannot be forgotten.
+
+- **Appearance and the length unit are saved** in `<config dir>/cuthulhu/preferences.json`.
+  Appearance is light, dark, or system. Lengths are shown in inches or millimetres; the Document
+  stays in millimetres. With no saved unit, the first launch follows the computer's region —
+  United States, Liberia, and Myanmar in inches, everyone else in millimetres — and writes that
+  choice. A saved `in` or `mm` is not revised when the region changes.
+
+- **Cmd/Ctrl+A selects every shape the canvas drew**, once each. The chord does not run inside a
+  field, a dialog, or a menu.
+
+- **On macOS, Quit uses the close guard.** Cmd-Q, the application menu's Quit, the Dock's Quit,
+  and a logout ask the same question as the window's close button when a cut this desktop started
+  may still be running.
+
+- **The Send sheet manages the operator's own material presets** for the cutter it is aimed at:
   create, duplicate, rename, edit and delete, with speed, force and repeat count validated against
   the ranges `cutplan` refuses a cut over, and a readout of what a pass cut with the preset would
   use. A preset that ships with the app is read-only and offers **Save as Copy**, which writes a
   fresh entry rather than shadowing the shipped one. A rename moves the name only — a preset's id
   is what a Node's assignment and a `preset:<id>` pass key name it by. An unsaved edit is decided
-  before it can be lost: selecting another preset, aiming at another cutter and closing the dialog
+  before it can be lost: selecting another preset, aiming at another cutter and closing the sheet
   each ask first, and duplicating or deleting — both of which work from the stored entry — wait for
   that decision. A write the backend refuses keeps the edit on screen with the reason beside it.
   Editing is offered only once the aimed cutter's own presets have been read, since they are what a

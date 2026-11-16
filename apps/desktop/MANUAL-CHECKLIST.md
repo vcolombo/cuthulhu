@@ -1,11 +1,11 @@
 # Manual checklist (per release)
 - [ ] Switch machine Cameo 5 ⇄ Puma IV — the mat selector offers 12×12, 12×24, and roll for the Cameo and roll only for the Puma, and the canvas refits to that mat.
-- [ ] Import a complex SVG via the TopBar Import button — paths render as real geometry; stays responsive (pan/zoom deferred — SP4 candidate).
-- [ ] Drag/scale — drag via the canvas, scale via the properties panel W/H fields; one undo reverts the whole gesture. Rotate + on-canvas handles (deferred).
+- [ ] Import a complex SVG via the TopBar Import button — paths render as real geometry and the window stays responsive. Pan and zoom are covered under "Viewport and handles" below.
+- [ ] Drag, scale, and rotate on the canvas — drag a shape, scale from a corner handle or the properties panel W/H fields, rotate from the rotate handle. One undo reverts the whole gesture. Modifier behaviour is under "Viewport and handles". Skew handles are not in this build.
 - [ ] Boolean union/subtract/intersect/exclude on two overlapping shapes — correct result rendered as a real path.
 - [ ] Add text in a system font — glyph outlines render on the canvas and convert to a cut path on save.
 - [ ] Save via the native file dialog to a chosen location; Open restores the project; Reload re-reads the last used path.
-- [ ] Dark theme legible; tabular numerals align in the properties panel (light theme deferred).
+- [ ] Light and dark themes both legible; tabular numerals align in the properties panel. Appearance is Light, Dark, or System, saved in `<config dir>/cuthulhu/preferences.json`.
 
 ## SP4 — Cut workflow
 
@@ -24,17 +24,19 @@
 ### Hardware: Puma IV (non-blocking)
 - [ ] Multi-color cut via operator-confirmed pass completion (manual "pass done" button).
 - [ ] Host-queue drain ≠ cutter completion — explicitly verified that operator must confirm motion stopped before proceeding.
-- [ ] Speed and force grey out when the Puma connects and stay editable for the Cameo.
-      (Caps now come from the Driver over `machine_caps` rather than a table in `CutDialog.tsx`. Everything either side of the link is pinned — wire casing by a Rust test, per-machine values by each Driver's own caps test, the disable rule by four vitest cases — but nothing automated asserts that the fetched value reaches the field, because the e2e fake deliberately answers with one constant rather than restating the per-machine mapping it exists to remove.)
+- [ ] On the Puma, Material & passes omits the speed and force columns; on the Cameo they stay editable. In the preset editor both fields stay editable on either machine, and the readout says what the machine ignores.
+      (Caps come from the Driver over `machine_caps`. Pass rows omit those columns when `supportsSpeed` or `supportsForce` is false (`ui/src/cut/send/StepPasses.tsx`). The preset editor leaves the fields editable on purpose (`PresetEditor.tsx`). `fieldDisabled` in `viewmodel.ts` is what the vitest cases pin; the sheet does not render it. Everything either side of the link is pinned — wire casing by a Rust test, per-machine values by each Driver's own caps test, the disable rule by four vitest cases — but nothing automated asserts that the fetched caps reach the columns, because the e2e fake deliberately answers with one constant rather than restating the per-machine mapping it exists to remove.)
 
 ### GUI verification — verified 2026-07-24 in the real app (imported 2-color SVG, Cameo 5 connected)
+
+These ticks are against the cut dialog that build had. Send to cutter is now the three-step Send sheet (`ui/src/cut/send/SendSheet.tsx`). A pass of this list on the current app does not inherit them.
 - [x] Open Cut dialog on a 2-color document — displays 2 passes with correct color swatches.
 - [x] Preview shows order badges at shape start points and dashed travel lines in planned order (reordering passes does not yet update the travel lines — deferred).
       (Badges/travel render, but the preview scales to the full 330×3000mm artboard so small docs are tiny — polish candidate: fit-to-content zoom.)
 - [x] Material preset selection works; per-pass override fields functional (subject to machine capabilities).
       (Builtin presets appear after connect; picking Cardstock auto-fills force from the preset while a typed speed override wins.)
 - [x] Cut-by-color pass reorder and skip operations work via up/down and enable/disable toggles.
-- [ ] "No device" empty state is graceful (no error, device list shows "no devices" message).
+- [ ] "No device" empty state is graceful (no error). The Send sheet's Machine step shows "No devices found — connect a cutter and reopen this dialog."
       (Was unreachable on a real Mac — the OS always exposes serial ports, so every /dev/cu.* and its /dev/tty. twin showed as its own "puma (unverified serial device)" row. Fixed for #10: `list_ports` now drops dial-in duplicates and the macOS system pseudo-ports, so the list is empty on a Mac with no cutter and no paired Bluetooth serial device. The empty-state message itself is new and unverified — no automated test covers it, so this item needs a real run.)
 
 ## SP5 Trace — verified 2026-07-25 against a packaged `cargo tauri build` bundle
@@ -63,7 +65,7 @@ before SP6 leans on device connection and mid-job disconnect detection.
 - [ ] Connect to a serial device that is not a cutter (a paired Bluetooth device is the easy case) — refused with a message naming the port, and the dialog stays usable afterwards. Confirm the device itself was not disturbed by the one status byte the probe writes.
 - [ ] Unplug the Cameo mid-cut — the job fails as a disconnect, not `Io("Unknown")`.
 - [ ] Unplug a USB-serial adapter mid-cut — the job fails promptly as a disconnect rather than waiting out the completion-poll deadline.
-- [ ] With no cutter attached and no paired Bluetooth serial device, the cut dialog shows the "No devices found" empty state.
+- [ ] With no cutter attached and no paired Bluetooth serial device, the Send sheet's Machine step shows "No devices found — connect a cutter and reopen this dialog."
 
 Driving note: WebKit range inputs ignore both synthetic `click at` positioning and AX `set value`. The
 reliable way to move a slider is AX `set focused to true` on it, then arrow-key key codes.
@@ -94,17 +96,18 @@ real network can confirm the swap end to end.
 
 ## CutStatus (architecture review candidate 1)
 
-- [ ] Cut dialog buttons match what the machine allows at each stage — nothing enabled that errors when pressed.
+- [ ] Job panel and colour-swap bar buttons match `actions` at each stage — nothing enabled that errors when pressed. The Send sheet's Cut is the start control; the panel does not offer a second one.
 - [ ] Progress advances during a pass; pass n of m is correct across a colour swap.
-- [ ] Cancel mid-cut reports the cancelled ending, the dialog shows "Cancelled", and a second cut can be started straight after.
-- [ ] Unplug mid-cut shows the failure with its reason, and the dialog offers no dead buttons.
+- [ ] Cancel mid-cut reports the cancelled ending, the job panel shows "Cancelled", and a second cut can be started straight after.
+- [ ] Unplug mid-cut shows the failure with its reason, and the job panel offers no dead buttons.
 - [ ] Closing the window mid-cut still prompts.
 - [ ] `cuthulhu cut --group-by color` on the Puma still prompts per pass and completes.
 
 ## Pass grouping (#148)
 
-- [ ] Cut dialog → Group passes by: each mode replans and the rows rename themselves; Cut is
-      unavailable until the new plan lands.
+- [ ] Send sheet → Material & passes → Group passes by: each mode replans and the rows rename
+      themselves; Cut is unavailable until the new plan lands. Layers and Properties show the same
+      Grouping.
 - [ ] Assign a material to a Layer in the properties panel — every shape under it reads
       `Inherited — <name>`, and one shape set to "No preset" leaves that Layer's pass.
 - [ ] On hardware: `--group-by preset` on a document with two materials cuts one pass per
@@ -146,7 +149,7 @@ real network can confirm the swap end to end.
 - [ ] Letters distributed with their weed border selected sit inside it with even margins, and the
       border cuts where it was.
 - [ ] One ⌘Z (Ctrl+Z) after an align puts every moved piece back at once.
-- [ ] The eight icons read as what they do at the panel's size, in the dark theme (light is deferred).
+- [ ] The eight icons read as what they do at the panel's size, in both the light theme and the dark theme.
 
 ## Weed lines (spec 2026-10-09, unverified)
 
